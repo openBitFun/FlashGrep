@@ -1,0 +1,16 @@
+[package]
+name = "bitfun_grep"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+clap = { version = "4.5.20", features = ["derive"] }
+crc32fast = "1.4.2"
+memmap2 = "0.9.5"
+regex = "1.11.1"
+thiserror = "2.0.11"
+walkdir = "2.5.0"
+
+[dev-dependencies]
+tempfile = "3.14.0"
+
