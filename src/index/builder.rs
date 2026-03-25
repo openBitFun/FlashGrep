@@ -52,6 +52,10 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
     }
 
     let mut postings = inverted.into_iter().collect::<Vec<_>>();
+    for (_, docs) in &mut postings {
+        docs.sort_unstable();
+        docs.dedup();
+    }
     postings.sort_unstable_by_key(|(token_hash, _)| *token_hash);
     let high_freq_doc_threshold = (config.tokenizer == crate::config::TokenizerMode::SparseNgram)
         .then(|| compute_high_freq_doc_threshold(doc_entries.len()));

@@ -8,5 +8,6 @@ pub mod planner;
 pub mod search;
 pub mod tokenizer;
 
-pub use config::{BuildConfig, QueryConfig, TokenizerMode};
+pub use config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode};
 pub use error::{AppError, Result};
+pub use search::SearchMode;

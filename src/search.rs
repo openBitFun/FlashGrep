@@ -1,6 +1,20 @@
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SearchMode {
+    CountOnly,
+    FirstHitOnly,
+    MaterializeMatches,
+}
+
+impl SearchMode {
+    pub fn materializes_matches(self) -> bool {
+        matches!(self, Self::MaterializeMatches | Self::FirstHitOnly)
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SearchResults {
     pub candidate_docs: usize,
+    pub matched_lines: usize,
     pub hits: Vec<SearchHit>,
 }
 

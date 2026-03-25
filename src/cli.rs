@@ -4,9 +4,10 @@ use clap::{Parser, Subcommand, ValueEnum};
 
 use crate::{
     bench::{self, BenchConfig},
-    config::{BuildConfig, QueryConfig, TokenizerMode},
+    config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
     error::Result,
     index::{build_index, IndexSearcher},
+    search::SearchMode,
 };
 
 #[derive(Debug, Parser)]
@@ -24,8 +25,10 @@ enum Commands {
         repo: PathBuf,
         #[arg(long)]
         index: PathBuf,
-        #[arg(long, value_enum, default_value = "trigram")]
+        #[arg(long, value_enum, default_value = "sparse-ngram")]
         tokenizer: TokenizerArg,
+        #[arg(long, value_enum, default_value = "ignore")]
+        corpus_mode: CorpusArg,
         #[arg(long, default_value_t = 2 * 1024 * 1024)]
         max_file_size: u64,
         #[arg(long, default_value_t = 5)]
@@ -46,6 +49,8 @@ enum Commands {
         dot_matches_new_line: bool,
         #[arg(long, default_value_t = 6)]
         top_k_tokens: usize,
+        #[arg(long, value_enum, default_value = "materialize-matches")]
+        search_mode: SearchModeArg,
     },
     Candidates {
         #[arg(long)]
@@ -66,8 +71,10 @@ enum Commands {
         suite_dir: PathBuf,
         #[arg(long)]
         filter: Option<String>,
-        #[arg(long, value_enum, default_value = "trigram")]
+        #[arg(long, value_enum, default_value = "sparse-ngram")]
         tokenizer: TokenizerArg,
+        #[arg(long, value_enum, default_value = "ignore")]
+        corpus_mode: CorpusArg,
         #[arg(long, default_value_t = 1)]
         warmup_iter: usize,
         #[arg(long, default_value_t = 3)]
@@ -89,11 +96,43 @@ enum TokenizerArg {
     SparseNgram,
 }
 
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum CorpusArg {
+    Ignore,
+    NoIgnore,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum SearchModeArg {
+    CountOnly,
+    FirstHitOnly,
+    MaterializeMatches,
+}
+
 impl From<TokenizerArg> for TokenizerMode {
     fn from(value: TokenizerArg) -> Self {
         match value {
             TokenizerArg::Trigram => TokenizerMode::Trigram,
             TokenizerArg::SparseNgram => TokenizerMode::SparseNgram,
+        }
+    }
+}
+
+impl From<CorpusArg> for CorpusMode {
+    fn from(value: CorpusArg) -> Self {
+        match value {
+            CorpusArg::Ignore => CorpusMode::RespectIgnore,
+            CorpusArg::NoIgnore => CorpusMode::NoIgnore,
+        }
+    }
+}
+
+impl From<SearchModeArg> for SearchMode {
+    fn from(value: SearchModeArg) -> Self {
+        match value {
+            SearchModeArg::CountOnly => SearchMode::CountOnly,
+            SearchModeArg::FirstHitOnly => SearchMode::FirstHitOnly,
+            SearchModeArg::MaterializeMatches => SearchMode::MaterializeMatches,
         }
     }
 }
@@ -105,6 +144,7 @@ pub fn run() -> Result<()> {
             repo,
             index,
             tokenizer,
+            corpus_mode,
             max_file_size,
             min_sparse_len,
             max_sparse_len,
@@ -113,6 +153,7 @@ pub fn run() -> Result<()> {
                 repo_path: repo,
                 index_path: index,
                 tokenizer: tokenizer.into(),
+                corpus_mode: corpus_mode.into(),
                 max_file_size,
                 min_sparse_len,
                 max_sparse_len,
@@ -130,6 +171,7 @@ pub fn run() -> Result<()> {
             multiline,
             dot_matches_new_line,
             top_k_tokens,
+            search_mode,
         } => {
             let config = QueryConfig {
                 regex_pattern: pattern,
@@ -137,10 +179,13 @@ pub fn run() -> Result<()> {
                 multiline,
                 dot_matches_new_line,
                 top_k_tokens,
+                search_mode: search_mode.into(),
+                ..QueryConfig::default()
             };
             let searcher = IndexSearcher::open(index)?;
             let results = searcher.search(&config)?;
             println!("candidate docs: {}", results.candidate_docs);
+            println!("matched lines: {}", results.matched_lines);
             for hit in results.hits {
                 println!("{}", hit.path);
                 for matched in hit.matches {
@@ -165,6 +210,7 @@ pub fn run() -> Result<()> {
                 multiline,
                 dot_matches_new_line,
                 top_k_tokens,
+                ..QueryConfig::default()
             };
             let searcher = IndexSearcher::open(index)?;
             for path in searcher.candidate_paths(&config)? {
@@ -175,6 +221,7 @@ pub fn run() -> Result<()> {
             suite_dir,
             filter,
             tokenizer,
+            corpus_mode,
             warmup_iter,
             bench_iter,
             top_k_tokens,
@@ -186,6 +233,7 @@ pub fn run() -> Result<()> {
                 suite_dir,
                 filter,
                 tokenizer: tokenizer.into(),
+                corpus_mode: corpus_mode.into(),
                 warmup_iter,
                 bench_iter,
                 top_k_tokens,

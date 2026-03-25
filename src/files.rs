@@ -1,19 +1,15 @@
-use std::{collections::HashSet, fs, path::PathBuf, time::UNIX_EPOCH};
+use std::{
+    fs,
+    path::{Path, PathBuf},
+    time::UNIX_EPOCH,
+};
 
-use walkdir::{DirEntry, WalkDir};
+use ignore::WalkBuilder;
 
-use crate::{config::BuildConfig, error::Result};
-
-const IGNORED_DIRS: &[&str] = &[
-    ".git",
-    ".hg",
-    ".svn",
-    "node_modules",
-    "target",
-    "dist",
-    "build",
-    ".next",
-];
+use crate::{
+    config::{BuildConfig, CorpusMode},
+    error::Result,
+};
 
 #[derive(Debug, Clone)]
 pub struct RepositoryFile {
@@ -24,37 +20,28 @@ pub struct RepositoryFile {
 }
 
 pub fn scan_repository(config: &BuildConfig) -> Result<Vec<RepositoryFile>> {
-    let ignored: HashSet<&str> = IGNORED_DIRS.iter().copied().collect();
     let mut files = Vec::new();
 
-    for entry in WalkDir::new(&config.repo_path)
-        .follow_links(false)
-        .into_iter()
-        .filter_entry(|entry| should_visit(entry, &ignored))
-    {
+    if config.repo_path.is_file() {
+        if let Some(file) = repository_file(&config.repo_path, 0, config.max_file_size)? {
+            files.push(file);
+        }
+        return Ok(files);
+    }
+
+    let walker = build_walker(config);
+    for entry in walker.build() {
         let entry = entry?;
-        if !entry.file_type().is_file() {
+        if !entry
+            .file_type()
+            .is_some_and(|file_type| file_type.is_file())
+        {
             continue;
         }
 
-        let metadata = entry.metadata()?;
-        if metadata.len() > config.max_file_size {
-            continue;
+        if let Some(file) = repository_file(entry.path(), files.len(), config.max_file_size)? {
+            files.push(file);
         }
-
-        let mtime_secs = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| duration.as_secs())
-            .unwrap_or_default();
-
-        files.push(RepositoryFile {
-            ordinal: files.len(),
-            path: entry.path().to_path_buf(),
-            size: metadata.len(),
-            mtime_secs,
-        });
     }
 
     Ok(files)
@@ -72,13 +59,57 @@ pub fn read_text_file(path: &std::path::Path) -> Result<Option<String>> {
     }
 }
 
-fn should_visit(entry: &DirEntry, ignored: &HashSet<&str>) -> bool {
-    if !entry.file_type().is_dir() {
-        return true;
+fn build_walker(config: &BuildConfig) -> WalkBuilder {
+    let mut builder = WalkBuilder::new(&config.repo_path);
+    builder.follow_links(false);
+    builder.max_filesize(Some(config.max_file_size));
+
+    match config.corpus_mode {
+        CorpusMode::RespectIgnore => {
+            builder.hidden(false);
+            builder.ignore(true);
+            builder.git_ignore(true);
+            builder.git_global(true);
+            builder.git_exclude(true);
+            builder.parents(true);
+        }
+        CorpusMode::NoIgnore => {
+            builder.hidden(false);
+            builder.ignore(false);
+            builder.git_ignore(false);
+            builder.git_global(false);
+            builder.git_exclude(false);
+            builder.parents(false);
+            builder.require_git(false);
+        }
     }
 
-    let name = entry.file_name().to_string_lossy();
-    !ignored.contains(name.as_ref())
+    builder
+}
+
+fn repository_file(
+    path: &Path,
+    ordinal: usize,
+    max_file_size: u64,
+) -> Result<Option<RepositoryFile>> {
+    let metadata = fs::metadata(path)?;
+    if !metadata.is_file() || metadata.len() > max_file_size {
+        return Ok(None);
+    }
+
+    let mtime_secs = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+
+    Ok(Some(RepositoryFile {
+        ordinal,
+        path: path.to_path_buf(),
+        size: metadata.len(),
+        mtime_secs,
+    }))
 }
 
 fn looks_binary(bytes: &[u8]) -> bool {

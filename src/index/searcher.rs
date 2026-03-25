@@ -1,25 +1,33 @@
 use std::{
-    collections::{BTreeSet, HashMap, HashSet},
-    env,
+    collections::{HashMap, HashSet},
     path::PathBuf,
-    time::{Duration, Instant},
+    time::Instant,
 };
-
-use regex::RegexBuilder;
 
 use crate::{
     config::QueryConfig,
     error::Result,
-    index::format::{read_docs_file, read_posting_list, IndexLayout, LookupTable},
+    index::format::{read_docs_file, IndexLayout, LookupTable, PostingsData},
     planner::{plan, QueryBranch},
-    search::{FileMatch, MatchLocation, SearchHit, SearchResults},
+    search::{SearchHit, SearchMode, SearchResults},
     tokenizer::{create, TokenizerOptions},
+};
+
+#[path = "searcher_query.rs"]
+mod query;
+#[path = "searcher_verify.rs"]
+mod verify;
+
+use query::{fold_query_literal, LiteralPrefilter, SearchPreparation};
+use verify::{
+    build_matcher, requires_multiline_verification, verify_candidate_match_counts,
+    verify_candidates, SearchProfile,
 };
 
 pub struct IndexSearcher {
     docs: Vec<crate::index::format::DocMeta>,
     lookup: LookupTable,
-    postings_path: PathBuf,
+    postings: PostingsData,
     tokenizer_mode: crate::config::TokenizerMode,
     tokenizer_options: TokenizerOptions,
 }
@@ -29,11 +37,12 @@ impl IndexSearcher {
         let layout = IndexLayout::new(&index_path);
         let (metadata, docs) = read_docs_file(&layout.docs_path)?;
         let lookup = LookupTable::open(&layout.lookup_path)?;
+        let postings = PostingsData::open(&layout.postings_path)?;
 
         Ok(Self {
             docs,
             lookup,
-            postings_path: layout.postings_path,
+            postings,
             tokenizer_mode: metadata.tokenizer,
             tokenizer_options: TokenizerOptions {
                 min_sparse_len: metadata.min_sparse_len,
@@ -46,65 +55,73 @@ impl IndexSearcher {
         let profile = SearchProfile::enabled();
         let total_started = Instant::now();
 
-        let candidate_ids = self.collect_candidate_ids(config, &profile)?;
-        let candidate_doc_count = candidate_ids.len();
+        let preparation = self.prepare_search(config, &profile)?;
+        let candidate_doc_count = preparation.candidate_ids.len();
 
+        let multiline_verifier = requires_multiline_verification(config)?;
         let regex_started = Instant::now();
-        let regex = RegexBuilder::new(&config.regex_pattern)
-            .case_insensitive(config.case_insensitive)
-            .multi_line(config.multiline)
-            .dot_matches_new_line(config.dot_matches_new_line)
-            .build()?;
+        let matcher = build_matcher(config, multiline_verifier)?;
         profile.record_regex_compile(regex_started.elapsed());
 
-        let mut hits = Vec::new();
-        let mut read_duration = Duration::ZERO;
-        let mut match_duration = Duration::ZERO;
-        for doc_id in candidate_ids {
-            let doc = &self.docs[doc_id as usize];
-            let path = PathBuf::from(&doc.path);
-            let read_started = Instant::now();
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            read_duration += read_started.elapsed();
-            let match_started = Instant::now();
-            let matches = collect_matches(&text, &regex);
-            match_duration += match_started.elapsed();
-            if !matches.is_empty() {
-                hits.push(SearchHit {
-                    path: path.to_string_lossy().into_owned(),
-                    matches,
-                });
+        let match_started = Instant::now();
+        let (matched_lines, hits) = match config.search_mode {
+            SearchMode::CountOnly => (
+                verify_candidate_match_counts(
+                    &preparation.candidate_ids,
+                    &self.docs,
+                    &matcher,
+                    multiline_verifier,
+                    preparation.literal_prefilter.as_ref(),
+                )?,
+                Vec::new(),
+            ),
+            _ => {
+                let mut hits = Vec::new();
+                let mut matched_lines = 0usize;
+                let outcomes = verify_candidates(
+                    &preparation.candidate_ids,
+                    &self.docs,
+                    &matcher,
+                    multiline_verifier,
+                    config.search_mode,
+                )?;
+                for task in outcomes {
+                    matched_lines += task.outcome.matched_lines;
+                    if !task.outcome.matches.is_empty() {
+                        hits.push(SearchHit {
+                            path: self.docs[task.doc_id as usize].path.clone(),
+                            matches: task.outcome.matches,
+                        });
+                    }
+                }
+                (matched_lines, hits)
             }
-        }
-        profile.record_verify(read_duration, match_duration);
-        profile.finish(
-            total_started.elapsed(),
-            candidate_doc_count,
-            hits.iter().map(|hit| hit.matches.len()).sum(),
-        );
+        };
+        profile.record_verify(match_started.elapsed());
+        profile.finish(total_started.elapsed(), candidate_doc_count, matched_lines);
 
         Ok(SearchResults {
             candidate_docs: candidate_doc_count,
+            matched_lines,
             hits,
         })
     }
 
     pub fn candidate_paths(&self, config: &QueryConfig) -> Result<Vec<String>> {
         let profile = SearchProfile::enabled();
-        let candidate_ids = self.collect_candidate_ids(config, &profile)?;
-        Ok(candidate_ids
+        let preparation = self.prepare_search(config, &profile)?;
+        Ok(preparation
+            .candidate_ids
             .into_iter()
             .map(|doc_id| self.docs[doc_id as usize].path.clone())
             .collect())
     }
 
-    fn collect_candidate_ids(
+    fn prepare_search(
         &self,
         config: &QueryConfig,
         profile: &SearchProfile,
-    ) -> Result<BTreeSet<u32>> {
+    ) -> Result<SearchPreparation> {
         let plan_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
@@ -112,15 +129,15 @@ impl IndexSearcher {
         let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
         let candidate_started = Instant::now();
         let candidate_ids = if plan.fallback_to_scan {
-            self.docs
-                .iter()
-                .map(|doc| doc.doc_id)
-                .collect::<BTreeSet<_>>()
+            self.all_doc_ids()
         } else {
             self.collect_candidates(&plan.branches, tokenizer.as_ref(), config.top_k_tokens)?
         };
         profile.record_candidates(candidate_started.elapsed());
-        Ok(candidate_ids)
+        Ok(SearchPreparation {
+            candidate_ids,
+            literal_prefilter: LiteralPrefilter::new(&plan, config.case_insensitive),
+        })
     }
 
     fn collect_candidates(
@@ -128,8 +145,8 @@ impl IndexSearcher {
         branches: &[QueryBranch],
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
-    ) -> Result<BTreeSet<u32>> {
-        let mut all_candidates = BTreeSet::new();
+    ) -> Result<Vec<u32>> {
+        let mut all_candidates = Vec::new();
         let mut posting_cache = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
 
@@ -142,12 +159,9 @@ impl IndexSearcher {
                 &mut literal_scan_cache,
             )?
             else {
-                for doc in &self.docs {
-                    all_candidates.insert(doc.doc_id);
-                }
-                continue;
+                return Ok(self.all_doc_ids());
             };
-            all_candidates.extend(branch_candidates);
+            all_candidates = union_sorted(&all_candidates, &branch_candidates);
         }
 
         Ok(all_candidates)
@@ -158,9 +172,9 @@ impl IndexSearcher {
         branch: &QueryBranch,
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
-        posting_cache: &mut HashMap<u64, BTreeSet<u32>>,
-        literal_scan_cache: &mut HashMap<String, BTreeSet<u32>>,
-    ) -> Result<Option<BTreeSet<u32>>> {
+        posting_cache: &mut HashMap<u64, Vec<u32>>,
+        literal_scan_cache: &mut HashMap<String, Vec<u32>>,
+    ) -> Result<Option<Vec<u32>>> {
         let mut per_literal = Vec::new();
         let mut scanned_literals = Vec::new();
 
@@ -171,11 +185,17 @@ impl IndexSearcher {
             let literal_candidates =
                 self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes)?;
             match literal_candidates {
-                LiteralCandidates::Impossible => return Ok(Some(BTreeSet::new())),
+                LiteralCandidates::Impossible => return Ok(Some(Vec::new())),
                 LiteralCandidates::Unavailable => scanned_literals.push(query_literal),
                 LiteralCandidates::Available(candidates) => per_literal.push(candidates),
             }
         }
+
+        per_literal.sort_unstable_by(|left, right| {
+            left.first()
+                .map(|candidate| candidate.selection_rank())
+                .cmp(&right.first().map(|candidate| candidate.selection_rank()))
+        });
 
         if per_literal.is_empty() && scanned_literals.is_empty() {
             return Ok(None);
@@ -185,7 +205,7 @@ impl IndexSearcher {
         let mut selected_count = 0usize;
         let budget = self.branch_token_budget(top_k, per_literal.len());
         let candidate_limit = self.branch_candidate_limit();
-        let mut branch_candidates: Option<BTreeSet<u32>> = None;
+        let mut branch_candidates: Option<Vec<u32>> = None;
 
         // Seed the branch with one strong gram per literal so concatenated
         // literals still contribute independent evidence before we tighten.
@@ -195,14 +215,14 @@ impl IndexSearcher {
             };
             let docs = self.read_posting_docs(candidate.token_hash, posting_cache)?;
             branch_candidates = Some(match branch_candidates.take() {
-                Some(existing) => existing.intersection(&docs).copied().collect(),
+                Some(existing) => intersect_sorted(&existing, &docs),
                 None => docs,
             });
             selected_hashes.insert(candidate.token_hash);
             selected_count += 1;
 
-            if branch_candidates.as_ref().is_some_and(BTreeSet::is_empty) {
-                return Ok(Some(BTreeSet::new()));
+            if branch_candidates.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(Some(Vec::new()));
             }
         }
 
@@ -216,7 +236,7 @@ impl IndexSearcher {
             let current_candidates = branch_candidates
                 .as_ref()
                 .expect("checked candidate set should exist");
-            let mut best_choice: Option<(TokenCandidate, BTreeSet<u32>)> = None;
+            let mut best_choice: Option<(TokenCandidate, Vec<u32>)> = None;
 
             for candidates in &per_literal {
                 for candidate in candidates {
@@ -225,10 +245,7 @@ impl IndexSearcher {
                     }
 
                     let docs = self.read_posting_docs(candidate.token_hash, posting_cache)?;
-                    let reduced = current_candidates
-                        .intersection(&docs)
-                        .copied()
-                        .collect::<BTreeSet<_>>();
+                    let reduced = intersect_sorted(current_candidates, &docs);
                     let replace = match &best_choice {
                         Some((best_candidate, best_reduced)) => {
                             reduced.len() < best_reduced.len()
@@ -258,11 +275,11 @@ impl IndexSearcher {
         for literal in scanned_literals {
             let docs = self.scan_literal_docs(&literal, literal_scan_cache)?;
             branch_candidates = Some(match branch_candidates.take() {
-                Some(existing) => existing.intersection(&docs).copied().collect(),
+                Some(existing) => intersect_sorted(&existing, &docs),
                 None => docs,
             });
-            if branch_candidates.as_ref().is_some_and(BTreeSet::is_empty) {
-                return Ok(Some(BTreeSet::new()));
+            if branch_candidates.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(Some(Vec::new()));
             }
         }
 
@@ -328,37 +345,12 @@ impl IndexSearcher {
             }
         }
 
-        if self.tokenizer_mode == crate::config::TokenizerMode::SparseNgram {
-            let mut recovery_hashes = Vec::new();
-            collect_sparse_recovery_hashes(
-                query_literal,
-                &self.tokenizer_options,
-                &mut recovery_hashes,
-            );
-            for token_hash in recovery_hashes {
-                if !seen_hashes.insert(token_hash) {
-                    continue;
-                }
-                let Some(entry) = self.lookup.find(token_hash) else {
-                    continue;
-                };
-                if entry.offset == u64::MAX {
-                    continue;
-                }
-                selected.push(TokenCandidate {
-                    token_hash,
-                    doc_freq: entry.doc_freq,
-                    source: CandidateSource::Recovery,
-                    high_freq: entry.is_skipped_high_freq(),
-                });
-            }
-        }
-
         selected.sort_unstable_by(|left, right| {
             left.selection_rank()
                 .cmp(&right.selection_rank())
                 .then_with(|| left.doc_freq.cmp(&right.doc_freq))
         });
+        prune_high_frequency_candidates(&mut selected);
 
         if selected.is_empty() {
             Ok(LiteralCandidates::Unavailable)
@@ -370,20 +362,16 @@ impl IndexSearcher {
     fn read_posting_docs(
         &self,
         token_hash: u64,
-        posting_cache: &mut HashMap<u64, BTreeSet<u32>>,
-    ) -> Result<BTreeSet<u32>> {
+        posting_cache: &mut HashMap<u64, Vec<u32>>,
+    ) -> Result<Vec<u32>> {
         if let Some(cached) = posting_cache.get(&token_hash) {
             return Ok(cached.clone());
         }
 
         let docs = match self.lookup.find(token_hash) {
-            Some(entry) if entry.offset != u64::MAX => {
-                read_posting_list(&self.postings_path, entry.offset)?
-                    .into_iter()
-                    .collect::<BTreeSet<_>>()
-            }
-            None => BTreeSet::new(),
-            Some(_) => BTreeSet::new(),
+            Some(entry) if entry.offset != u64::MAX => self.postings.decode(entry)?,
+            None => Vec::new(),
+            Some(_) => Vec::new(),
         };
         posting_cache.insert(token_hash, docs.clone());
         Ok(docs)
@@ -413,15 +401,15 @@ impl IndexSearcher {
     fn scan_literal_docs(
         &self,
         literal: &str,
-        literal_scan_cache: &mut HashMap<String, BTreeSet<u32>>,
-    ) -> Result<BTreeSet<u32>> {
+        literal_scan_cache: &mut HashMap<String, Vec<u32>>,
+    ) -> Result<Vec<u32>> {
         if let Some(cached) = literal_scan_cache.get(literal) {
             return Ok(cached.clone());
         }
 
-        let mut docs = BTreeSet::new();
+        let mut docs = Vec::new();
         for doc in &self.docs {
-            let path = PathBuf::from(&doc.path);
+            let path = std::path::PathBuf::from(&doc.path);
             let Ok(text) = std::fs::read_to_string(&path) else {
                 continue;
             };
@@ -431,12 +419,16 @@ impl IndexSearcher {
                 text.to_lowercase()
             };
             if folded.contains(literal) {
-                docs.insert(doc.doc_id);
+                docs.push(doc.doc_id);
             }
         }
 
         literal_scan_cache.insert(literal.to_string(), docs.clone());
         Ok(docs)
+    }
+
+    fn all_doc_ids(&self) -> Vec<u32> {
+        self.docs.iter().map(|doc| doc.doc_id).collect()
     }
 }
 
@@ -459,7 +451,6 @@ impl TokenCandidate {
 enum CandidateSource {
     Covering,
     Fallback,
-    Recovery,
 }
 
 enum LiteralCandidates {
@@ -473,7 +464,6 @@ impl CandidateSource {
         match self {
             Self::Covering => 0,
             Self::Fallback => 1,
-            Self::Recovery => 2,
         }
     }
 }
@@ -487,145 +477,226 @@ fn next_unused_candidate<'a>(
         .find(|candidate| !used_hashes.contains(&candidate.token_hash))
 }
 
-fn fold_query_literal(literal: &str) -> String {
-    if literal.is_ascii() {
-        literal.to_ascii_lowercase()
-    } else {
-        literal.to_lowercase()
+fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
+    if left.is_empty() || right.is_empty() {
+        return Vec::new();
     }
+    let (small, large) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if large.len() >= small.len().saturating_mul(8) {
+        return intersect_sorted_galloping(small, large);
+    }
+
+    let mut result = Vec::with_capacity(left.len().min(right.len()));
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                result.push(left[left_index]);
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    result
 }
 
-fn collect_sparse_recovery_hashes(literal: &str, options: &TokenizerOptions, out: &mut Vec<u64>) {
-    let mut char_offsets = literal
-        .char_indices()
-        .map(|(idx, _)| idx)
-        .collect::<Vec<_>>();
-    char_offsets.push(literal.len());
-    let char_len = char_offsets.len().saturating_sub(1);
-    if char_len < options.min_sparse_len {
-        return;
-    }
+fn intersect_sorted_galloping(small: &[u32], large: &[u32]) -> Vec<u32> {
+    let mut result = Vec::with_capacity(small.len());
+    let mut large_start = 0usize;
 
-    let bytes = literal.as_bytes();
-    for start_char in 0..char_len {
-        let min_end = start_char + options.min_sparse_len;
-        if min_end > char_len {
+    for &value in small {
+        let next = lower_bound(&large[large_start..], value);
+        large_start += next;
+        if large_start >= large.len() {
             break;
         }
-        let max_end = (start_char + options.max_sparse_len).min(char_len);
-        for end_char in min_end..=max_end {
-            let start_byte = char_offsets[start_char];
-            let end_byte = char_offsets[end_char];
-            out.push(u64::from(crc32fast::hash(&bytes[start_byte..end_byte])));
+        if large[large_start] == value {
+            result.push(value);
+            large_start += 1;
         }
     }
 
-    out.sort_unstable();
-    out.dedup();
+    result
 }
 
-fn collect_matches(text: &str, regex: &regex::Regex) -> Vec<FileMatch> {
-    let line_starts = build_line_starts(text);
-    regex
-        .find_iter(text)
-        .map(|matched| {
-            let location = offset_to_location(matched.start(), &line_starts, text.len());
-            let line_text =
-                text[location.line_start_offset..location.line_end_offset].trim_end_matches('\n');
-            FileMatch {
-                location: MatchLocation {
-                    line: location.line,
-                    column: location.column,
-                },
-                snippet: line_text.to_string(),
-                matched_text: matched.as_str().to_string(),
+fn union_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
+    let mut result = Vec::with_capacity(left.len() + right.len());
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => {
+                result.push(left[left_index]);
+                left_index += 1;
             }
-        })
-        .collect()
+            std::cmp::Ordering::Greater => {
+                result.push(right[right_index]);
+                right_index += 1;
+            }
+            std::cmp::Ordering::Equal => {
+                result.push(left[left_index]);
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    result.extend_from_slice(&left[left_index..]);
+    result.extend_from_slice(&right[right_index..]);
+    result
 }
 
-#[derive(Debug, Default)]
-struct SearchProfile {
-    enabled: bool,
+fn lower_bound(values: &[u32], needle: u32) -> usize {
+    let mut left = 0usize;
+    let mut right = values.len();
+    while left < right {
+        let mid = left + (right - left) / 2;
+        if values[mid] < needle {
+            left = mid + 1;
+        } else {
+            right = mid;
+        }
+    }
+    left
 }
 
-impl SearchProfile {
-    fn enabled() -> Self {
-        Self {
-            enabled: env::var_os("BITFUN_PROFILE_SEARCH").is_some(),
-            ..Self::default()
-        }
-    }
-
-    fn record_plan(&self, duration: Duration) {
-        if self.enabled {
-            eprintln!("profile plan_secs={:.6}", duration.as_secs_f64());
-        }
-    }
-
-    fn record_candidates(&self, duration: Duration) {
-        if self.enabled {
-            eprintln!("profile candidate_secs={:.6}", duration.as_secs_f64());
-        }
-    }
-
-    fn record_regex_compile(&self, duration: Duration) {
-        if self.enabled {
-            eprintln!("profile regex_compile_secs={:.6}", duration.as_secs_f64());
-        }
-    }
-
-    fn record_verify(&self, read_duration: Duration, match_duration: Duration) {
-        if self.enabled {
-            eprintln!(
-                "profile verify_read_secs={:.6} verify_match_secs={:.6}",
-                read_duration.as_secs_f64(),
-                match_duration.as_secs_f64()
-            );
-        }
-    }
-
-    fn finish(&self, total_duration: Duration, candidate_docs: usize, match_count: usize) {
-        if self.enabled {
-            eprintln!(
-                "profile total_secs={:.6} candidate_docs={} match_count={}",
-                total_duration.as_secs_f64(),
-                candidate_docs,
-                match_count
-            );
-        }
+fn prune_high_frequency_candidates(candidates: &mut Vec<TokenCandidate>) {
+    if candidates.iter().any(|candidate| !candidate.high_freq) {
+        candidates.retain(|candidate| !candidate.high_freq);
     }
 }
 
-struct OffsetLocation {
-    line: usize,
-    column: usize,
-    line_start_offset: usize,
-    line_end_offset: usize,
-}
-
-fn build_line_starts(text: &str) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (idx, byte) in text.bytes().enumerate() {
-        if byte == b'\n' {
-            starts.push(idx + 1);
-        }
-    }
-    starts
-}
-
-fn offset_to_location(offset: usize, line_starts: &[usize], text_len: usize) -> OffsetLocation {
-    let line_index = match line_starts.binary_search(&offset) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
+#[cfg(test)]
+mod tests {
+    use super::{
+        intersect_sorted, lower_bound, prune_high_frequency_candidates, union_sorted,
+        CandidateSource, LiteralPrefilter, TokenCandidate,
     };
-    let line_start = line_starts[line_index];
-    let line_end = line_starts.get(line_index + 1).copied().unwrap_or(text_len);
+    use crate::planner::{QueryBranch, QueryPlan};
 
-    OffsetLocation {
-        line: line_index + 1,
-        column: offset.saturating_sub(line_start) + 1,
-        line_start_offset: line_start,
-        line_end_offset: line_end,
+    #[test]
+    fn galloping_intersection_matches_linear_result() {
+        let small = vec![3, 50, 120, 9_999];
+        let large = (0..20_000).step_by(3).collect::<Vec<u32>>();
+        assert_eq!(intersect_sorted(&small, &large), vec![3, 120, 9_999]);
+    }
+
+    #[test]
+    fn union_sorted_preserves_order_and_uniqueness() {
+        assert_eq!(
+            union_sorted(&[1, 3, 5], &[2, 3, 4, 5, 6]),
+            vec![1, 2, 3, 4, 5, 6]
+        );
+    }
+
+    #[test]
+    fn lower_bound_finds_first_not_less_than() {
+        assert_eq!(lower_bound(&[2, 4, 6, 8], 1), 0);
+        assert_eq!(lower_bound(&[2, 4, 6, 8], 6), 2);
+        assert_eq!(lower_bound(&[2, 4, 6, 8], 7), 3);
+        assert_eq!(lower_bound(&[2, 4, 6, 8], 9), 4);
+    }
+
+    #[test]
+    fn high_frequency_candidates_are_dropped_when_selective_ones_exist() {
+        let mut candidates = vec![
+            TokenCandidate {
+                token_hash: 1,
+                doc_freq: 10,
+                source: CandidateSource::Covering,
+                high_freq: false,
+            },
+            TokenCandidate {
+                token_hash: 2,
+                doc_freq: 1_000,
+                source: CandidateSource::Fallback,
+                high_freq: true,
+            },
+        ];
+        prune_high_frequency_candidates(&mut candidates);
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].token_hash, 1);
+    }
+
+    #[test]
+    fn literal_prefilter_requires_all_literals_in_a_branch() {
+        let prefilter = LiteralPrefilter::new(
+            &QueryPlan {
+                branches: vec![QueryBranch {
+                    literals: vec!["foo".into(), "bar".into()],
+                }],
+                fallback_to_scan: false,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(prefilter.text_may_match("prefix foo ... bar suffix"));
+        assert!(!prefilter.text_may_match("prefix foo only"));
+    }
+
+    #[test]
+    fn literal_prefilter_allows_any_branch_to_match() {
+        let prefilter = LiteralPrefilter::new(
+            &QueryPlan {
+                branches: vec![
+                    QueryBranch {
+                        literals: vec!["alpha".into()],
+                    },
+                    QueryBranch {
+                        literals: vec!["beta".into(), "gamma".into()],
+                    },
+                ],
+                fallback_to_scan: false,
+            },
+            false,
+        )
+        .unwrap();
+
+        assert!(prefilter.text_may_match("beta then gamma"));
+        assert!(prefilter.text_may_match("alpha"));
+        assert!(!prefilter.text_may_match("beta only"));
+    }
+
+    #[test]
+    fn literal_prefilter_supports_case_insensitive_matching() {
+        let prefilter = LiteralPrefilter::new(
+            &QueryPlan {
+                branches: vec![QueryBranch {
+                    literals: vec!["PM".into(), "RESUME".into()],
+                }],
+                fallback_to_scan: false,
+            },
+            true,
+        )
+        .unwrap();
+
+        assert!(prefilter.text_may_match("prefix pm ... resume suffix"));
+        assert!(prefilter.text_may_match("prefix Pm ... Resume suffix"));
+        assert!(!prefilter.text_may_match("prefix pm only suffix"));
+    }
+
+    #[test]
+    fn literal_prefilter_is_disabled_when_query_falls_back_to_scan() {
+        assert!(LiteralPrefilter::new(
+            &QueryPlan {
+                branches: vec![QueryBranch {
+                    literals: Vec::new()
+                }],
+                fallback_to_scan: true,
+            },
+            false,
+        )
+        .is_none());
     }
 }

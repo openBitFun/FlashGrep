@@ -40,7 +40,7 @@
 ## 快速开始
 
 ```bash
-cargo run -- build --repo /path/to/repo --index /path/to/repo/.bitfun-index --tokenizer trigram
+cargo run -- build --repo /path/to/repo --index /path/to/repo/.bitfun-index
 cargo run -- search --index /path/to/repo/.bitfun-index --pattern 'foo.*bar'
 ```
 

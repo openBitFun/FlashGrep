@@ -181,6 +181,7 @@ fn hash_intervals(
     out.extend(hashed_tokens);
 }
 
+#[cfg(test)]
 fn is_sparse_boundary(weights: &[u32], left_bigram: usize, right_bigram: usize) -> bool {
     if right_bigram <= left_bigram || right_bigram >= weights.len() {
         return false;

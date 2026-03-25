@@ -8,6 +8,8 @@ pub enum AppError {
     Io(#[from] io::Error),
     #[error("walkdir error: {0}")]
     Walkdir(#[from] walkdir::Error),
+    #[error("ignore error: {0}")]
+    Ignore(#[from] ignore::Error),
     #[error("regex error: {0}")]
     Regex(#[from] regex::Error),
     #[error("invalid regex pattern: {0}")]

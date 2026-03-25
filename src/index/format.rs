@@ -14,8 +14,8 @@ use crate::{
 const DOCS_MAGIC: &[u8; 4] = b"BFGD";
 const LOOKUP_MAGIC: &[u8; 4] = b"BFGL";
 const POSTINGS_MAGIC: &[u8; 4] = b"BFGP";
-const FORMAT_VERSION: u32 = 3;
-const LOOKUP_ENTRY_SIZE: usize = 24;
+const FORMAT_VERSION: u32 = 4;
+const LOOKUP_ENTRY_SIZE: usize = 28;
 pub const LOOKUP_FLAG_SKIPPED_HIGH_FREQ: u32 = 1;
 
 #[derive(Debug, Clone)]
@@ -37,6 +37,7 @@ pub struct IndexMetadata {
 pub struct LookupEntry {
     pub token_hash: u64,
     pub offset: u64,
+    pub byte_len: u32,
     pub doc_freq: u32,
     pub flags: u32,
 }
@@ -152,10 +153,8 @@ pub fn write_postings_file(
             .map(|threshold| doc_ids.len() > threshold)
             .unwrap_or(false);
         let offset = file.stream_position()?;
-        write_u32(&mut file, doc_freq)?;
-        for doc_id in doc_ids {
-            write_u32(&mut file, *doc_id)?;
-        }
+        let encoded = encode_posting_list(doc_ids);
+        file.write_all(&encoded)?;
         let flags = if skipped_high_freq {
             LOOKUP_FLAG_SKIPPED_HIGH_FREQ
         } else {
@@ -164,35 +163,13 @@ pub fn write_postings_file(
         lookup_entries.push(LookupEntry {
             token_hash: *token_hash,
             offset,
+            byte_len: encoded.len() as u32,
             doc_freq,
             flags,
         });
     }
 
     Ok(lookup_entries)
-}
-
-pub fn read_posting_list(path: &Path, offset: u64) -> Result<Vec<u32>> {
-    let mut file = File::open(path)?;
-    let file_len = file.metadata()?.len();
-    if offset >= file_len {
-        return Err(AppError::InvalidIndex(format!(
-            "posting offset out of range: {offset}"
-        )));
-    }
-    use std::io::{Seek, SeekFrom};
-    file.seek(SeekFrom::Start(offset))?;
-
-    let mut count_bytes = [0u8; 4];
-    file.read_exact(&mut count_bytes)?;
-    let count = u32::from_le_bytes(count_bytes) as usize;
-    let mut docs = Vec::with_capacity(count);
-    for _ in 0..count {
-        let mut doc_bytes = [0u8; 4];
-        file.read_exact(&mut doc_bytes)?;
-        docs.push(u32::from_le_bytes(doc_bytes));
-    }
-    Ok(docs)
 }
 
 pub fn write_lookup_file(path: &Path, entries: &[LookupEntry]) -> Result<()> {
@@ -204,6 +181,7 @@ pub fn write_lookup_file(path: &Path, entries: &[LookupEntry]) -> Result<()> {
     for entry in entries {
         write_u64(&mut file, entry.token_hash)?;
         write_u64(&mut file, entry.offset)?;
+        write_u32(&mut file, entry.byte_len)?;
         write_u32(&mut file, entry.doc_freq)?;
         write_u32(&mut file, entry.flags)?;
     }
@@ -267,15 +245,54 @@ impl LookupTable {
         let start = 16 + index * LOOKUP_ENTRY_SIZE;
         let token_hash = u64::from_le_bytes(self.mmap[start..start + 8].try_into().unwrap());
         let offset = u64::from_le_bytes(self.mmap[start + 8..start + 16].try_into().unwrap());
-        let doc_freq = u32::from_le_bytes(self.mmap[start + 16..start + 20].try_into().unwrap());
-        let flags = u32::from_le_bytes(self.mmap[start + 20..start + 24].try_into().unwrap());
+        let byte_len = u32::from_le_bytes(self.mmap[start + 16..start + 20].try_into().unwrap());
+        let doc_freq = u32::from_le_bytes(self.mmap[start + 20..start + 24].try_into().unwrap());
+        let flags = u32::from_le_bytes(self.mmap[start + 24..start + 28].try_into().unwrap());
 
         LookupEntry {
             token_hash,
             offset,
+            byte_len,
             doc_freq,
             flags,
         }
+    }
+}
+
+pub struct PostingsData {
+    mmap: Mmap,
+}
+
+impl PostingsData {
+    pub fn open(path: &Path) -> Result<Self> {
+        let file = File::open(path)?;
+        let mmap = unsafe { Mmap::map(&file)? };
+        if mmap.len() < 12 {
+            return Err(AppError::InvalidIndex("postings file too small".into()));
+        }
+        if &mmap[..4] != POSTINGS_MAGIC {
+            return Err(AppError::InvalidIndex("postings magic mismatch".into()));
+        }
+
+        let version = u32::from_le_bytes(mmap[4..8].try_into().unwrap());
+        if version != FORMAT_VERSION {
+            return Err(AppError::InvalidIndex(format!(
+                "unsupported postings version: {version}"
+            )));
+        }
+
+        Ok(Self { mmap })
+    }
+
+    pub fn decode(&self, entry: LookupEntry) -> Result<Vec<u32>> {
+        let start = entry.offset as usize;
+        let end = start
+            .checked_add(entry.byte_len as usize)
+            .ok_or_else(|| AppError::InvalidIndex("posting length overflow".into()))?;
+        if end > self.mmap.len() {
+            return Err(AppError::InvalidIndex("posting slice out of range".into()));
+        }
+        decode_posting_list(&self.mmap[start..end], entry.doc_freq as usize)
     }
 }
 
@@ -337,4 +354,79 @@ fn write_u32(writer: &mut File, value: u32) -> Result<()> {
 fn write_u64(writer: &mut File, value: u64) -> Result<()> {
     writer.write_all(&value.to_le_bytes())?;
     Ok(())
+}
+
+fn encode_posting_list(doc_ids: &[u32]) -> Vec<u8> {
+    let mut encoded = Vec::with_capacity(doc_ids.len() * 2);
+    let mut previous = 0u32;
+    for &doc_id in doc_ids {
+        let delta = doc_id.wrapping_sub(previous);
+        write_varint(&mut encoded, delta);
+        previous = doc_id;
+    }
+    encoded
+}
+
+fn decode_posting_list(bytes: &[u8], doc_freq: usize) -> Result<Vec<u32>> {
+    let mut docs = Vec::with_capacity(doc_freq);
+    let mut position = 0usize;
+    let mut previous = 0u32;
+
+    while position < bytes.len() {
+        let delta = read_varint(bytes, &mut position)?;
+        previous = previous
+            .checked_add(delta)
+            .ok_or_else(|| AppError::InvalidIndex("posting delta overflow".into()))?;
+        docs.push(previous);
+    }
+
+    if docs.len() != doc_freq {
+        return Err(AppError::InvalidIndex(format!(
+            "posting doc freq mismatch: expected {doc_freq}, got {}",
+            docs.len()
+        )));
+    }
+
+    Ok(docs)
+}
+
+fn write_varint(buffer: &mut Vec<u8>, mut value: u32) {
+    while value >= 0x80 {
+        buffer.push(((value & 0x7F) as u8) | 0x80);
+        value >>= 7;
+    }
+    buffer.push(value as u8);
+}
+
+fn read_varint(bytes: &[u8], position: &mut usize) -> Result<u32> {
+    let mut value = 0u32;
+    let mut shift = 0u32;
+
+    while *position < bytes.len() {
+        let byte = bytes[*position];
+        *position += 1;
+        value |= u32::from(byte & 0x7F) << shift;
+        if byte & 0x80 == 0 {
+            return Ok(value);
+        }
+        shift += 7;
+        if shift >= 32 {
+            return Err(AppError::InvalidIndex("posting varint overflow".into()));
+        }
+    }
+
+    Err(AppError::TruncatedData)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decode_posting_list, encode_posting_list};
+
+    #[test]
+    fn postings_roundtrip_delta_varint() {
+        let docs = vec![1, 7, 8, 15, 1_000, 65_535];
+        let encoded = encode_posting_list(&docs);
+        let decoded = decode_posting_list(&encoded, docs.len()).unwrap();
+        assert_eq!(decoded, docs);
+    }
 }

@@ -1,10 +1,16 @@
 use std::fs;
 
 use bitfun_grep::{
-    config::{BuildConfig, QueryConfig, TokenizerMode},
+    config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
     index::{build_index, IndexSearcher},
+    SearchMode,
 };
 use tempfile::tempdir;
+
+#[test]
+fn build_config_defaults_to_sparse_ngram() {
+    assert_eq!(BuildConfig::default().tokenizer, TokenizerMode::SparseNgram);
+}
 
 #[test]
 fn build_and_search_repo() {
@@ -27,6 +33,7 @@ fn build_and_search_repo() {
         repo_path: repo.clone(),
         index_path: index.clone(),
         tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
         max_file_size: 1024 * 1024,
         min_sparse_len: 3,
         max_sparse_len: 32,
@@ -40,6 +47,7 @@ fn build_and_search_repo() {
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: 6,
+        search_mode: SearchMode::MaterializeMatches,
     };
     let results = searcher.search(&query).unwrap();
 
@@ -63,6 +71,7 @@ fn case_insensitive_search_uses_folded_tokens() {
         repo_path: repo.clone(),
         index_path: index.clone(),
         tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
         max_file_size: 1024 * 1024,
         min_sparse_len: 3,
         max_sparse_len: 32,
@@ -76,6 +85,7 @@ fn case_insensitive_search_uses_folded_tokens() {
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: 6,
+        search_mode: SearchMode::MaterializeMatches,
     };
     let results = searcher.search(&query).unwrap();
 
@@ -98,6 +108,7 @@ fn sparse_search_uses_indexed_tokenizer_options() {
         repo_path: repo.clone(),
         index_path: index.clone(),
         tokenizer: TokenizerMode::SparseNgram,
+        corpus_mode: CorpusMode::RespectIgnore,
         max_file_size: 1024 * 1024,
         min_sparse_len: 4,
         max_sparse_len: 4,
@@ -111,9 +122,11 @@ fn sparse_search_uses_indexed_tokenizer_options() {
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: 6,
+        search_mode: SearchMode::MaterializeMatches,
     };
     let results = searcher.search(&query).unwrap();
 
+    assert_eq!(results.candidate_docs, 1);
     assert_eq!(results.hits.len(), 1);
     assert_eq!(results.hits[0].path, source.to_string_lossy());
     assert_eq!(results.hits[0].matches[0].matched_text, "abcdef");
@@ -132,6 +145,7 @@ fn impossible_literal_returns_no_candidates() {
         repo_path: repo.clone(),
         index_path: index.clone(),
         tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
         max_file_size: 1024 * 1024,
         min_sparse_len: 3,
         max_sparse_len: 32,
@@ -145,6 +159,7 @@ fn impossible_literal_returns_no_candidates() {
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: 6,
+        search_mode: SearchMode::MaterializeMatches,
     };
     let results = searcher.search(&query).unwrap();
 
@@ -176,6 +191,7 @@ fn sparse_literal_query_avoids_full_scan_when_fallback_tokens_exist() {
         repo_path: repo.clone(),
         index_path: index.clone(),
         tokenizer: TokenizerMode::SparseNgram,
+        corpus_mode: CorpusMode::RespectIgnore,
         max_file_size: 1024 * 1024,
         min_sparse_len: 5,
         max_sparse_len: 16,
@@ -189,6 +205,7 @@ fn sparse_literal_query_avoids_full_scan_when_fallback_tokens_exist() {
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: 6,
+        search_mode: SearchMode::MaterializeMatches,
     };
     let results = searcher.search(&query).unwrap();
 
@@ -212,6 +229,7 @@ fn candidate_paths_exports_prefiltered_docs() {
         repo_path: repo.clone(),
         index_path: index.clone(),
         tokenizer: TokenizerMode::SparseNgram,
+        corpus_mode: CorpusMode::RespectIgnore,
         max_file_size: 1024 * 1024,
         min_sparse_len: 5,
         max_sparse_len: 16,
@@ -225,8 +243,134 @@ fn candidate_paths_exports_prefiltered_docs() {
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: 6,
+        search_mode: SearchMode::MaterializeMatches,
     };
 
     let candidates = searcher.candidate_paths(&query).unwrap();
     assert_eq!(candidates, vec![source.to_string_lossy().to_string()]);
+}
+
+#[test]
+fn build_respects_gitignore_by_default() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let index = repo.join(".bitfun-index");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir(repo.join(".git")).unwrap();
+
+    fs::write(repo.join(".gitignore"), "ignored.rs\n").unwrap();
+    fs::write(
+        repo.join("ignored.rs"),
+        "const NAME: &str = \"PM_RESUME\";\n",
+    )
+    .unwrap();
+    fs::write(repo.join("tracked.rs"), "const NAME: &str = \"OTHER\";\n").unwrap();
+
+    let build = BuildConfig {
+        repo_path: repo.clone(),
+        index_path: index.clone(),
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        max_file_size: 1024 * 1024,
+        min_sparse_len: 3,
+        max_sparse_len: 32,
+    };
+    build_index(&build).unwrap();
+
+    let searcher = IndexSearcher::open(index).unwrap();
+    let query = QueryConfig {
+        regex_pattern: "PM_RESUME".into(),
+        case_insensitive: false,
+        multiline: false,
+        dot_matches_new_line: false,
+        top_k_tokens: 6,
+        search_mode: SearchMode::CountOnly,
+    };
+    let results = searcher.search(&query).unwrap();
+
+    assert_eq!(results.candidate_docs, 0);
+    assert_eq!(results.matched_lines, 0);
+}
+
+#[test]
+fn build_can_disable_ignore_rules() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let index = repo.join(".bitfun-index");
+    fs::create_dir_all(&repo).unwrap();
+    fs::create_dir(repo.join(".git")).unwrap();
+
+    fs::write(repo.join(".gitignore"), "ignored.rs\n").unwrap();
+    let ignored = repo.join("ignored.rs");
+    fs::write(&ignored, "const NAME: &str = \"PM_RESUME\";\n").unwrap();
+
+    let build = BuildConfig {
+        repo_path: repo.clone(),
+        index_path: index.clone(),
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::NoIgnore,
+        max_file_size: 1024 * 1024,
+        min_sparse_len: 3,
+        max_sparse_len: 32,
+    };
+    build_index(&build).unwrap();
+
+    let searcher = IndexSearcher::open(index).unwrap();
+    let query = QueryConfig {
+        regex_pattern: "PM_RESUME".into(),
+        case_insensitive: false,
+        multiline: false,
+        dot_matches_new_line: false,
+        top_k_tokens: 6,
+        search_mode: SearchMode::CountOnly,
+    };
+    let results = searcher.search(&query).unwrap();
+
+    assert_eq!(results.candidate_docs, 1);
+    assert_eq!(results.matched_lines, 1);
+    assert!(results.hits.is_empty());
+    assert_eq!(
+        searcher.candidate_paths(&query).unwrap(),
+        vec![ignored.to_string_lossy().to_string()]
+    );
+}
+
+#[test]
+fn multiline_verifier_handles_cross_line_matches() {
+    let temp = tempdir().unwrap();
+    let repo = temp.path().join("repo");
+    let index = repo.join(".bitfun-index");
+    fs::create_dir_all(&repo).unwrap();
+
+    let source = repo.join("story.txt");
+    fs::write(&source, "Sherlock\nHolmes\n").unwrap();
+
+    let build = BuildConfig {
+        repo_path: repo.clone(),
+        index_path: index.clone(),
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        max_file_size: 1024 * 1024,
+        min_sparse_len: 3,
+        max_sparse_len: 32,
+    };
+    build_index(&build).unwrap();
+
+    let searcher = IndexSearcher::open(index).unwrap();
+    let query = QueryConfig {
+        regex_pattern: "Sherlock.*Holmes".into(),
+        case_insensitive: false,
+        multiline: false,
+        dot_matches_new_line: true,
+        top_k_tokens: 6,
+        search_mode: SearchMode::MaterializeMatches,
+    };
+    let results = searcher.search(&query).unwrap();
+
+    assert_eq!(results.candidate_docs, 1);
+    assert_eq!(results.matched_lines, 2);
+    assert_eq!(results.hits.len(), 1);
+    assert_eq!(results.hits[0].matches.len(), 1);
+    assert_eq!(results.hits[0].matches[0].location.line, 1);
+    assert_eq!(results.hits[0].matches[0].matched_text, "Sherlock\nHolmes");
 }

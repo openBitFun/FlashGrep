@@ -1,4 +1,11 @@
+use regex_syntax::{
+    hir::{Hir, HirKind, Repetition},
+    parse,
+};
+
 use crate::error::{AppError, Result};
+
+const BRANCH_LIMIT: usize = 128;
 
 #[derive(Debug, Clone)]
 pub struct QueryPlan {
@@ -12,15 +19,23 @@ pub struct QueryBranch {
 }
 
 pub fn plan(pattern: &str) -> Result<QueryPlan> {
-    let mut parser = PatternParser::new(pattern);
-    let expression = parser.parse_expression()?;
-    if !parser.is_at_end() {
-        return Err(AppError::InvalidPattern("unexpected trailing input".into()));
+    let hir = parse(pattern).map_err(|error| AppError::InvalidPattern(error.to_string()))?;
+    let extracted = extract(&hir)?;
+    if extracted.overflow {
+        return Ok(QueryPlan {
+            branches: Vec::new(),
+            fallback_to_scan: true,
+        });
     }
 
-    let branches = normalize_branches(expression.branches, 64);
+    let branches = normalize_branches(extracted.branches);
     let fallback_to_scan =
-        branches.is_empty() || branches.iter().all(|branch| branch.literals.is_empty());
+        branches.is_empty() || branches.iter().any(|branch| branch.literals.is_empty());
+    let branches = if fallback_to_scan {
+        Vec::new()
+    } else {
+        branches
+    };
 
     Ok(QueryPlan {
         branches,
@@ -29,268 +44,203 @@ pub fn plan(pattern: &str) -> Result<QueryPlan> {
 }
 
 #[derive(Debug, Clone)]
-struct ParseResult {
+struct Extracted {
     branches: Vec<Vec<Part>>,
-    nullable: bool,
+    overflow: bool,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 enum Part {
     Literal(String),
-    Boundary,
+    Gap,
 }
 
-struct PatternParser<'a> {
-    chars: Vec<char>,
-    position: usize,
-    _source: &'a str,
-}
-
-impl<'a> PatternParser<'a> {
-    fn new(source: &'a str) -> Self {
-        Self {
-            chars: source.chars().collect(),
-            position: 0,
-            _source: source,
-        }
-    }
-
-    fn parse_expression(&mut self) -> Result<ParseResult> {
-        let mut alternatives = vec![self.parse_concat()?];
-        while self.peek() == Some('|') {
-            self.position += 1;
-            alternatives.push(self.parse_concat()?);
-        }
-
-        let nullable = alternatives.iter().any(|branch| branch.nullable);
-        let mut branches = Vec::new();
-        for alternative in alternatives {
-            branches.extend(alternative.branches);
-        }
-
-        Ok(ParseResult { branches, nullable })
-    }
-
-    fn parse_concat(&mut self) -> Result<ParseResult> {
-        let mut current = ParseResult {
+fn extract(hir: &Hir) -> Result<Extracted> {
+    let extracted = match hir.kind() {
+        HirKind::Empty => Extracted {
             branches: vec![Vec::new()],
-            nullable: true,
-        };
-
-        while let Some(ch) = self.peek() {
-            if ch == ')' || ch == '|' {
-                break;
-            }
-
-            let atom = self.parse_atom()?;
-            current = concat_results(current, atom);
-        }
-
-        Ok(current)
-    }
-
-    fn parse_atom(&mut self) -> Result<ParseResult> {
-        let base = match self
-            .next()
-            .ok_or_else(|| AppError::InvalidPattern("unexpected end of pattern".into()))?
-        {
-            '(' => {
-                let nested = self.parse_expression()?;
-                if self.next() != Some(')') {
-                    return Err(AppError::InvalidPattern("unclosed group".into()));
-                }
-                nested
-            }
-            '[' => self.parse_class(),
-            '.' | '^' | '$' => boundary_result(),
-            '\\' => self.parse_escape()?,
-            ch => ParseResult {
-                branches: vec![vec![Part::Literal(ch.to_string())]],
-                nullable: false,
-            },
-        };
-
-        Ok(self.apply_quantifier(base))
-    }
-
-    fn parse_escape(&mut self) -> Result<ParseResult> {
-        let escaped = self
-            .next()
-            .ok_or_else(|| AppError::InvalidPattern("dangling escape".into()))?;
-
-        let result = match escaped {
-            'd' | 'D' | 's' | 'S' | 'w' | 'W' | 'b' | 'B' | 'A' | 'z' | 'Z' => boundary_result(),
-            'n' => ParseResult {
-                branches: vec![vec![Part::Literal("\n".into())]],
-                nullable: false,
-            },
-            'r' => ParseResult {
-                branches: vec![vec![Part::Literal("\r".into())]],
-                nullable: false,
-            },
-            't' => ParseResult {
-                branches: vec![vec![Part::Literal("\t".into())]],
-                nullable: false,
-            },
-            other => ParseResult {
-                branches: vec![vec![Part::Literal(other.to_string())]],
-                nullable: false,
-            },
-        };
-
-        Ok(result)
-    }
-
-    fn parse_class(&mut self) -> ParseResult {
-        let mut escaped = false;
-        while let Some(ch) = self.next() {
-            if escaped {
-                escaped = false;
-                continue;
-            }
-            match ch {
-                '\\' => escaped = true,
-                ']' => break,
-                _ => {}
-            }
-        }
-
-        boundary_result()
-    }
-
-    fn apply_quantifier(&mut self, base: ParseResult) -> ParseResult {
-        match self.peek() {
-            Some('*') | Some('?') => {
-                self.position += 1;
-                boundary_result()
-            }
-            Some('+') => {
-                self.position += 1;
-                base
-            }
-            Some('{') => {
-                let (min, _) = self.parse_braced_quantifier();
-                if min == 0 {
-                    boundary_result()
-                } else {
-                    base
-                }
-            }
-            _ => base,
-        }
-    }
-
-    fn parse_braced_quantifier(&mut self) -> (usize, Option<usize>) {
-        let checkpoint = self.position;
-        self.position += 1;
-        let min = self.parse_usize();
-
-        let max = if self.peek() == Some(',') {
-            self.position += 1;
-            self.parse_usize_opt()
-        } else {
-            Some(min)
-        };
-
-        if self.peek() != Some('}') {
-            self.position = checkpoint;
-            return (1, Some(1));
-        }
-
-        self.position += 1;
-        (min, max)
-    }
-
-    fn parse_usize(&mut self) -> usize {
-        self.parse_usize_opt().unwrap_or(0)
-    }
-
-    fn parse_usize_opt(&mut self) -> Option<usize> {
-        let start = self.position;
-        while matches!(self.peek(), Some('0'..='9')) {
-            self.position += 1;
-        }
-
-        if self.position == start {
-            return None;
-        }
-
-        let digits = self.chars[start..self.position].iter().collect::<String>();
-        digits.parse().ok()
-    }
-
-    fn peek(&self) -> Option<char> {
-        self.chars.get(self.position).copied()
-    }
-
-    fn next(&mut self) -> Option<char> {
-        let value = self.peek()?;
-        self.position += 1;
-        Some(value)
-    }
-
-    fn is_at_end(&self) -> bool {
-        self.position >= self.chars.len()
-    }
+            overflow: false,
+        },
+        HirKind::Literal(literal) => Extracted {
+            branches: vec![vec![Part::Literal(
+                String::from_utf8_lossy(&literal.0).into_owned(),
+            )]],
+            overflow: false,
+        },
+        HirKind::Class(_) | HirKind::Look(_) => Extracted {
+            branches: vec![vec![Part::Gap]],
+            overflow: false,
+        },
+        HirKind::Capture(capture) => extract(&capture.sub)?,
+        HirKind::Repetition(repetition) => extract_repetition(repetition)?,
+        HirKind::Concat(hirs) => extract_concat(hirs)?,
+        HirKind::Alternation(hirs) => extract_alternation(hirs)?,
+    };
+    Ok(extracted)
 }
 
-fn concat_results(left: ParseResult, right: ParseResult) -> ParseResult {
+fn extract_repetition(repetition: &Repetition) -> Result<Extracted> {
+    if repetition.min == 0 {
+        let repeated = extract(&repetition.sub)?;
+        if repeated.overflow {
+            return Ok(repeated);
+        }
+        let mut branches = Vec::with_capacity(repeated.branches.len() + 1);
+        branches.push(Vec::new());
+        branches.extend(repeated.branches);
+        if branches.len() > BRANCH_LIMIT {
+            return Ok(Extracted {
+                branches: Vec::new(),
+                overflow: true,
+            });
+        }
+        return Ok(Extracted {
+            branches,
+            overflow: false,
+        });
+    }
+    extract(&repetition.sub)
+}
+
+fn extract_concat(hirs: &[Hir]) -> Result<Extracted> {
+    let mut current = Extracted {
+        branches: vec![Vec::new()],
+        overflow: false,
+    };
+    for hir in hirs {
+        let next = extract(hir)?;
+        current = concat(current, next);
+        if current.overflow {
+            break;
+        }
+    }
+    Ok(current)
+}
+
+fn extract_alternation(hirs: &[Hir]) -> Result<Extracted> {
+    let mut branches = Vec::new();
+    for hir in hirs {
+        let extracted = extract(hir)?;
+        if extracted.overflow {
+            return Ok(extracted);
+        }
+        branches.extend(extracted.branches);
+        if branches.len() > BRANCH_LIMIT {
+            return Ok(Extracted {
+                branches: Vec::new(),
+                overflow: true,
+            });
+        }
+    }
+    Ok(Extracted {
+        branches,
+        overflow: false,
+    })
+}
+
+fn concat(left: Extracted, right: Extracted) -> Extracted {
+    if left.overflow || right.overflow {
+        return Extracted {
+            branches: Vec::new(),
+            overflow: true,
+        };
+    }
+
     let mut branches = Vec::new();
     for left_branch in &left.branches {
         for right_branch in &right.branches {
-            let mut merged = left_branch.clone();
-            merged.extend(right_branch.iter().cloned());
-            branches.push(merged);
+            branches.push(concat_parts(left_branch, right_branch));
+            if branches.len() > BRANCH_LIMIT {
+                return Extracted {
+                    branches: Vec::new(),
+                    overflow: true,
+                };
+            }
         }
     }
 
-    ParseResult {
+    Extracted {
         branches,
-        nullable: left.nullable && right.nullable,
+        overflow: false,
     }
 }
 
-fn normalize_branches(branches: Vec<Vec<Part>>, branch_limit: usize) -> Vec<QueryBranch> {
-    let mut normalized = Vec::new();
+fn concat_parts(left: &[Part], right: &[Part]) -> Vec<Part> {
+    let mut merged = left.to_vec();
 
-    for branch in branches.into_iter().take(branch_limit) {
-        let literals = extract_literals(branch)
-            .into_iter()
-            .filter(|literal| !literal.is_empty())
-            .collect::<Vec<_>>();
-        normalized.push(QueryBranch { literals });
+    if let (Some(Part::Literal(left_literal)), Some(Part::Literal(right_literal))) =
+        (merged.last_mut(), right.first())
+    {
+        left_literal.push_str(right_literal);
+        merged.extend_from_slice(&right[1..]);
+    } else {
+        merged.extend_from_slice(right);
+    }
+
+    merged
+}
+
+fn normalize_branches(branches: Vec<Vec<Part>>) -> Vec<QueryBranch> {
+    let mut normalized: Vec<QueryBranch> = Vec::new();
+
+    for branch in branches {
+        let literals = extract_literals(branch);
+        let query_branch = QueryBranch { literals };
+        if normalized
+            .iter()
+            .any(|existing| existing == &query_branch || existing.dominates(&query_branch))
+        {
+            continue;
+        }
+
+        normalized.retain(|existing| !query_branch.dominates(existing));
+        if !normalized.iter().any(|existing| existing == &query_branch) {
+            normalized.push(query_branch);
+        }
     }
 
     normalized
 }
 
-fn boundary_result() -> ParseResult {
-    ParseResult {
-        branches: vec![vec![Part::Boundary]],
-        nullable: true,
-    }
-}
-
 fn extract_literals(parts: Vec<Part>) -> Vec<String> {
-    let mut merged = Vec::new();
+    let mut literals = Vec::new();
     let mut current = String::new();
 
     for part in parts {
         match part {
             Part::Literal(text) => current.push_str(&text),
-            Part::Boundary => {
+            Part::Gap => {
                 if !current.is_empty() {
-                    merged.push(std::mem::take(&mut current));
+                    literals.push(std::mem::take(&mut current));
                 }
             }
         }
     }
 
     if !current.is_empty() {
-        merged.push(current);
+        literals.push(current);
     }
 
-    merged
+    literals
+}
+
+impl PartialEq for QueryBranch {
+    fn eq(&self, other: &Self) -> bool {
+        self.literals == other.literals
+    }
+}
+
+impl Eq for QueryBranch {}
+
+impl QueryBranch {
+    fn dominates(&self, other: &Self) -> bool {
+        self.literals.iter().all(|needle| {
+            other
+                .literals
+                .iter()
+                .any(|haystack| haystack.contains(needle))
+        })
+    }
 }
 
 #[cfg(test)]
@@ -313,9 +263,30 @@ mod tests {
     }
 
     #[test]
-    fn optional_literals_degrade_to_empty_branch() {
+    fn optional_literals_degrade_to_remaining_required_literal() {
         let plan = plan("(foo)?bar").unwrap();
         assert_eq!(plan.branches.len(), 1);
         assert_eq!(plan.branches[0].literals, vec!["bar"]);
+    }
+
+    #[test]
+    fn unicode_property_parses_without_false_literal() {
+        let plan = plan(r"\p{Greek}").unwrap();
+        assert!(plan.fallback_to_scan);
+        assert!(plan.branches.is_empty());
+    }
+
+    #[test]
+    fn classes_split_required_literals() {
+        let plan = plan(r"foo[0-9]+bar").unwrap();
+        assert_eq!(plan.branches.len(), 1);
+        assert_eq!(plan.branches[0].literals, vec!["foo", "bar"]);
+    }
+
+    #[test]
+    fn look_around_prevents_literal_merging() {
+        let plan = plan(r"\bPM_RESUME\b").unwrap();
+        assert_eq!(plan.branches.len(), 1);
+        assert_eq!(plan.branches[0].literals, vec!["PM_RESUME"]);
     }
 }

@@ -8,9 +8,10 @@ use std::{
 };
 
 use crate::{
-    config::{BuildConfig, QueryConfig, TokenizerMode},
+    config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
     error::{AppError, Result},
     index::{build_index, IndexSearcher},
+    search::SearchMode,
 };
 
 #[derive(Debug, Clone)]
@@ -18,6 +19,7 @@ pub struct BenchConfig {
     pub suite_dir: PathBuf,
     pub filter: Option<String>,
     pub tokenizer: TokenizerMode,
+    pub corpus_mode: CorpusMode,
     pub warmup_iter: usize,
     pub bench_iter: usize,
     pub top_k_tokens: usize,
@@ -267,8 +269,9 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport> {
         ensure_corpus_exists(corpus, &config.suite_dir)?;
         let repo_path = corpus.repo_path(&config.suite_dir);
         let index_path = config.suite_dir.join(".bitfun-bench").join(format!(
-            "{}-{}",
+            "{}-{}-{}",
             corpus.label(),
+            config.corpus_mode.as_str(),
             config.tokenizer.as_str()
         ));
 
@@ -279,6 +282,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport> {
                 repo_path,
                 index_path: index_path.clone(),
                 tokenizer: config.tokenizer,
+                corpus_mode: config.corpus_mode,
                 max_file_size: 512 * 1024 * 1024,
                 min_sparse_len: 5,
                 max_sparse_len: 16,
@@ -446,20 +450,11 @@ fn run_bitfun_once(
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: config.top_k_tokens,
+        search_mode: SearchMode::CountOnly,
     })?;
     Ok(BitfunOutcome {
         candidate_docs: results.candidate_docs,
-        match_count: results
-            .hits
-            .iter()
-            .map(|hit| {
-                hit.matches
-                    .iter()
-                    .map(|matched| matched.location.line)
-                    .collect::<std::collections::BTreeSet<_>>()
-                    .len()
-            })
-            .sum(),
+        match_count: results.matched_lines,
     })
 }
 
@@ -474,12 +469,12 @@ fn run_rg_benchmark(
     let mut match_count = 0;
 
     for _ in 0..config.warmup_iter {
-        let _ = run_rg_once(benchmark, &target)?;
+        let _ = run_rg_once(benchmark, &target, config)?;
     }
 
     for iter in 0..config.bench_iter {
         let started = Instant::now();
-        let matches = run_rg_once(benchmark, &target)?;
+        let matches = run_rg_once(benchmark, &target, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
         match_count = matches;
         durations.push(duration_secs);
@@ -500,9 +495,13 @@ fn run_rg_benchmark(
     Ok(build_summary("rg".into(), durations, None, match_count))
 }
 
-fn run_rg_once(benchmark: BenchmarkCase, target: &Path) -> Result<usize> {
+fn run_rg_once(benchmark: BenchmarkCase, target: &Path, config: &BenchConfig) -> Result<usize> {
     let mut command = Command::new("rg");
-    command.arg("-n");
+    command.arg("--count");
+    command.arg("--with-filename");
+    if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
+        command.arg("--no-ignore");
+    }
     if benchmark.case_insensitive {
         command.arg("-i");
     }
@@ -518,11 +517,29 @@ fn run_rg_once(benchmark: BenchmarkCase, target: &Path) -> Result<usize> {
             benchmark.name, output.status
         )));
     }
-    Ok(output
-        .stdout
+    parse_rg_count_output(&output.stdout)
+}
+
+fn parse_rg_count_output(stdout: &[u8]) -> Result<usize> {
+    let mut total = 0usize;
+    for line in stdout
         .split(|byte| *byte == b'\n')
         .filter(|line| !line.is_empty())
-        .count())
+    {
+        let line = std::str::from_utf8(line).map_err(|error| {
+            AppError::InvalidIndex(format!("rg count output was not utf-8: {error}"))
+        })?;
+        let count = line
+            .rsplit_once(':')
+            .map(|(_, count)| count)
+            .unwrap_or(line)
+            .parse::<usize>()
+            .map_err(|error| {
+                AppError::InvalidIndex(format!("failed to parse rg count output '{line}': {error}"))
+            })?;
+        total += count;
+    }
+    Ok(total)
 }
 
 fn build_summary(
@@ -631,8 +648,8 @@ mod tests {
 
     use tempfile::tempdir;
 
-    use super::{run, BenchConfig};
-    use crate::config::TokenizerMode;
+    use super::{parse_rg_count_output, run, BenchConfig};
+    use crate::config::{CorpusMode, TokenizerMode};
 
     #[test]
     fn bench_runner_smoke_test() {
@@ -661,6 +678,7 @@ mod tests {
             suite_dir: suite_dir.to_path_buf(),
             filter: Some("linux_literal".into()),
             tokenizer: TokenizerMode::Trigram,
+            corpus_mode: CorpusMode::RespectIgnore,
             warmup_iter: 0,
             bench_iter: 1,
             top_k_tokens: 4,
@@ -675,5 +693,14 @@ mod tests {
             .summaries
             .iter()
             .all(|summary| summary.runners[0].sample_count == 1));
+    }
+
+    #[test]
+    fn parse_rg_count_output_supports_single_and_multi_file_formats() {
+        assert_eq!(parse_rg_count_output(b"3\n").unwrap(), 3);
+        assert_eq!(
+            parse_rg_count_output(b"/tmp/a.rs:2\n/tmp/b.rs:5\n").unwrap(),
+            7
+        );
     }
 }
