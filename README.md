@@ -1,4 +1,4 @@
-# bitfun_grep
+# fast_code_search
 
 本项目是一个本地 regex 预筛索引系统骨架，目标是把全库正则搜索拆成两段：
 
