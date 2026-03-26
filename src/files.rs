@@ -114,5 +114,5 @@ fn repository_file(
 
 fn looks_binary(bytes: &[u8]) -> bool {
     let probe_len = bytes.len().min(8 * 1024);
-    bytes[..probe_len].iter().any(|byte| *byte == 0)
+    bytes[..probe_len].contains(&0)
 }

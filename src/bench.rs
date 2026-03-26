@@ -300,9 +300,12 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport> {
 
     let mut summaries = Vec::new();
     for benchmark in selected {
-        let index_path = index_paths
-            .get(&benchmark.corpus)
-            .expect("index path should exist");
+        let index_path = index_paths.get(&benchmark.corpus).ok_or_else(|| {
+            AppError::InvalidIndex(format!(
+                "missing benchmark index for corpus {}",
+                benchmark.corpus.label()
+            ))
+        })?;
 
         let bitfun = run_bitfun_benchmark(benchmark, index_path, config, raw_writer.as_mut())?;
         let mut runners = vec![bitfun];
@@ -364,8 +367,7 @@ pub fn print_report(report: &BenchReport) {
                 runner.sample_count,
                 runner
                     .candidate_docs
-                    .map(|count| count.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
+                    .map_or_else(|| "-".to_string(), |count| count.to_string()),
                 runner.match_count
             );
         }
@@ -531,8 +533,7 @@ fn parse_rg_count_output(stdout: &[u8]) -> Result<usize> {
         })?;
         let count = line
             .rsplit_once(':')
-            .map(|(_, count)| count)
-            .unwrap_or(line)
+            .map_or(line, |(_, count)| count)
             .parse::<usize>()
             .map_err(|error| {
                 AppError::InvalidIndex(format!("failed to parse rg count output '{line}': {error}"))
@@ -553,7 +554,7 @@ fn build_summary(
     let min_secs = durations
         .iter()
         .copied()
-        .min_by(|left, right| left.partial_cmp(right).unwrap())
+        .min_by(f64::total_cmp)
         .unwrap_or(0.0);
 
     RunnerSummary {
@@ -643,6 +644,7 @@ struct RawSample<'a> {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use std::fs;
 
@@ -653,26 +655,26 @@ mod tests {
 
     #[test]
     fn bench_runner_smoke_test() {
-        let temp = tempdir().unwrap();
+        let temp = tempdir().expect("test should succeed");
         let suite_dir = temp.path();
-        fs::create_dir_all(suite_dir.join("linux")).unwrap();
-        fs::create_dir_all(suite_dir.join("subtitles")).unwrap();
+        fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
+        fs::create_dir_all(suite_dir.join("subtitles")).expect("test should succeed");
 
         fs::write(
             suite_dir.join("linux").join("kernel.c"),
             "PM_RESUME\nERR_SYS\nabc Ah\nΩHolmesΩ\n",
         )
-        .unwrap();
+        .expect("test should succeed");
         fs::write(
             suite_dir.join("subtitles").join("en.sample.txt"),
             "Sherlock Holmes met John Watson.\n",
         )
-        .unwrap();
+        .expect("test should succeed");
         fs::write(
             suite_dir.join("subtitles").join("ru.txt"),
             "Шерлок Холмс встретил Джон Уотсон.\n",
         )
-        .unwrap();
+        .expect("test should succeed");
 
         let report = run(&BenchConfig {
             suite_dir: suite_dir.to_path_buf(),
@@ -686,7 +688,7 @@ mod tests {
             rebuild: true,
             raw_output: None,
         })
-        .unwrap();
+        .expect("test should succeed");
 
         assert_eq!(report.summaries.len(), 2);
         assert!(report
@@ -697,9 +699,12 @@ mod tests {
 
     #[test]
     fn parse_rg_count_output_supports_single_and_multi_file_formats() {
-        assert_eq!(parse_rg_count_output(b"3\n").unwrap(), 3);
         assert_eq!(
-            parse_rg_count_output(b"/tmp/a.rs:2\n/tmp/b.rs:5\n").unwrap(),
+            parse_rg_count_output(b"3\n").expect("test should succeed"),
+            3
+        );
+        assert_eq!(
+            parse_rg_count_output(b"/tmp/a.rs:2\n/tmp/b.rs:5\n").expect("test should succeed"),
             7
         );
     }

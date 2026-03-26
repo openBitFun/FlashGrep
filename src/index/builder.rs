@@ -2,7 +2,7 @@ use std::{collections::HashMap, thread};
 
 use crate::{
     config::BuildConfig,
-    error::Result,
+    error::{AppError, Result},
     files::{read_text_file, scan_repository, RepositoryFile},
     index::format::{
         ensure_dir, write_docs_file, write_lookup_file, write_postings_file, DocMeta, IndexLayout,
@@ -29,7 +29,7 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
     let mut ordinal_to_doc_id = vec![None; files.len()];
     let mut doc_entries = Vec::with_capacity(indexed_files.len());
     for (doc_id, file) in indexed_files.into_iter().enumerate() {
-        let doc_id = doc_id as u32;
+        let doc_id = usize_to_u32(doc_id, "indexed document id")?;
         ordinal_to_doc_id[file.ordinal] = Some(doc_id);
         doc_entries.push(DocMeta {
             doc_id,
@@ -43,11 +43,13 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
     for output in worker_outputs {
         for (token_hash, ordinals) in output.postings {
             let docs = inverted.entry(token_hash).or_default();
-            docs.extend(
-                ordinals
-                    .into_iter()
-                    .filter_map(|ordinal| ordinal_to_doc_id[ordinal as usize]),
-            );
+            docs.extend(ordinals.into_iter().filter_map(|ordinal| {
+                usize::try_from(ordinal)
+                    .ok()
+                    .and_then(|ordinal| ordinal_to_doc_id.get(ordinal))
+                    .copied()
+                    .flatten()
+            }));
         }
     }
 
@@ -91,7 +93,7 @@ fn process_files_in_parallel(
     }
 
     let worker_count = thread::available_parallelism()
-        .map(|count| count.get())
+        .map(std::num::NonZero::get)
         .unwrap_or(1)
         .min(files.len());
     let chunk_size = files.len().div_ceil(worker_count);
@@ -106,7 +108,10 @@ fn process_files_in_parallel(
 
         let mut outputs = Vec::with_capacity(handles.len());
         for handle in handles {
-            outputs.push(handle.join().expect("index worker panicked")?);
+            let output = handle
+                .join()
+                .map_err(|_| AppError::InvalidIndex("index worker panicked".into()))??;
+            outputs.push(output);
         }
         Ok(outputs)
     })
@@ -142,11 +147,16 @@ fn process_chunk(
             postings
                 .entry(token_hash)
                 .or_default()
-                .push(file.ordinal as u32);
+                .push(usize_to_u32(file.ordinal, "indexed file ordinal")?);
         }
     }
 
     Ok(WorkerOutput { docs, postings })
+}
+
+fn usize_to_u32(value: usize, context: &str) -> Result<u32> {
+    u32::try_from(value)
+        .map_err(|_| AppError::ValueOutOfRange(format!("{context} exceeds u32 range")))
 }
 
 fn fold_for_index(mut text: String) -> String {

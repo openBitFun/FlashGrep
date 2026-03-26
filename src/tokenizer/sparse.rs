@@ -144,7 +144,7 @@ fn build_covering_intervals(intervals: &[Interval], char_len: usize) -> Vec<Inte
         let mut best: Option<Interval> = None;
         while scan < sorted.len() && sorted[scan].start_char <= cursor {
             let candidate = sorted[scan];
-            if best.map_or(true, |current| candidate.end_char > current.end_char) {
+            if best.is_none_or(|current| candidate.end_char > current.end_char) {
                 best = Some(candidate);
             }
             scan += 1;

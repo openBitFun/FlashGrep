@@ -13,16 +13,27 @@ use crate::{
     tokenizer::{create, TokenizerOptions},
 };
 
+#[path = "searcher_count.rs"]
+mod count;
+#[path = "searcher_multi_literal.rs"]
+mod multi_literal;
 #[path = "searcher_query.rs"]
 mod query;
+#[path = "searcher_rg.rs"]
+mod rg;
+#[path = "searcher_shared.rs"]
+mod shared;
 #[path = "searcher_verify.rs"]
 mod verify;
 
-use query::{fold_query_literal, LiteralPrefilter, SearchPreparation};
-use verify::{
-    build_matcher, requires_multiline_verification, verify_candidate_match_counts,
-    verify_candidates, SearchProfile,
+use count::VerifyPlan as CountVerifyPlan;
+use multi_literal::{
+    collect_candidates as collect_multi_literal_candidates, prepare as prepare_multi_literal,
+    search as search_multi_literal,
 };
+use query::{fold_query_literal, LiteralPrefilter, SearchPreparation};
+use shared::doc_by_id;
+use verify::{build_matcher, requires_multiline_verification, verify_candidates, SearchProfile};
 
 pub struct IndexSearcher {
     docs: Vec<crate::index::format::DocMeta>,
@@ -30,6 +41,11 @@ pub struct IndexSearcher {
     postings: PostingsData,
     tokenizer_mode: crate::config::TokenizerMode,
     tokenizer_options: TokenizerOptions,
+}
+
+struct MultiLiteralPreparation {
+    prepared: multi_literal::PreparedMultiLiteral,
+    candidate_ids: Vec<u32>,
 }
 
 impl IndexSearcher {
@@ -54,28 +70,91 @@ impl IndexSearcher {
     pub fn search(&self, config: &QueryConfig) -> Result<SearchResults> {
         let profile = SearchProfile::enabled();
         let total_started = Instant::now();
+        let plan_started = Instant::now();
+        let plan = plan(&config.regex_pattern)?;
+        profile.record_plan(plan_started.elapsed());
+        let use_rg_verify = rg::enabled(config);
 
-        let preparation = self.prepare_search(config, &profile)?;
+        if let Some(multi_literal) =
+            self.prepare_multi_literal_search(&plan, config.case_insensitive, &profile)?
+        {
+            let candidate_ids = &multi_literal.candidate_ids;
+            if use_rg_verify {
+                let match_started = Instant::now();
+                let matched_lines = rg::count_matches(config, &self.docs, candidate_ids)?;
+                profile.record_verify(match_started.elapsed());
+                profile.finish(total_started.elapsed(), candidate_ids.len(), matched_lines);
+                return Ok(SearchResults {
+                    candidate_docs: candidate_ids.len(),
+                    matched_lines,
+                    hits: Vec::new(),
+                });
+            }
+            let match_started = Instant::now();
+            let results = if matches!(config.search_mode, SearchMode::CountOnly) {
+                let regex_started = Instant::now();
+                let verify_plan = CountVerifyPlan::compile_searcher_line(config, None)?;
+                profile.record_regex_compile(regex_started.elapsed());
+                let stats = verify_plan.verify_candidate_count_stats(candidate_ids, &self.docs)?;
+                SearchResults {
+                    candidate_docs: stats.matched_docs,
+                    matched_lines: stats.matched_lines,
+                    hits: Vec::new(),
+                }
+            } else {
+                search_multi_literal(
+                    &self.docs,
+                    Some(candidate_ids),
+                    &multi_literal.prepared,
+                    config.search_mode,
+                )?
+            };
+            profile.record_verify(match_started.elapsed());
+            profile.finish(
+                total_started.elapsed(),
+                results.candidate_docs,
+                results.matched_lines,
+            );
+            return Ok(results);
+        }
+
+        let preparation = self.prepare_indexed_search(config, &plan, &profile)?;
         let candidate_doc_count = preparation.candidate_ids.len();
 
+        if use_rg_verify {
+            let match_started = Instant::now();
+            let matched_lines = rg::count_matches(config, &self.docs, &preparation.candidate_ids)?;
+            profile.record_verify(match_started.elapsed());
+            profile.finish(total_started.elapsed(), candidate_doc_count, matched_lines);
+            return Ok(SearchResults {
+                candidate_docs: candidate_doc_count,
+                matched_lines,
+                hits: Vec::new(),
+            });
+        }
+
         let multiline_verifier = requires_multiline_verification(config)?;
-        let regex_started = Instant::now();
-        let matcher = build_matcher(config, multiline_verifier)?;
-        profile.record_regex_compile(regex_started.elapsed());
 
         let match_started = Instant::now();
         let (matched_lines, hits) = match config.search_mode {
-            SearchMode::CountOnly => (
-                verify_candidate_match_counts(
-                    &preparation.candidate_ids,
-                    &self.docs,
-                    &matcher,
+            SearchMode::CountOnly => {
+                let regex_started = Instant::now();
+                let verify_plan = CountVerifyPlan::compile(
+                    config,
                     multiline_verifier,
-                    preparation.literal_prefilter.as_ref(),
-                )?,
-                Vec::new(),
-            ),
+                    preparation.literal_prefilter.clone(),
+                )?;
+                profile.record_regex_compile(regex_started.elapsed());
+                (
+                    verify_plan
+                        .verify_candidate_match_counts(&preparation.candidate_ids, &self.docs)?,
+                    Vec::new(),
+                )
+            }
             _ => {
+                let regex_started = Instant::now();
+                let matcher = build_matcher(config, multiline_verifier)?;
+                profile.record_regex_compile(regex_started.elapsed());
                 let mut hits = Vec::new();
                 let mut matched_lines = 0usize;
                 let outcomes = verify_candidates(
@@ -88,8 +167,9 @@ impl IndexSearcher {
                 for task in outcomes {
                     matched_lines += task.outcome.matched_lines;
                     if !task.outcome.matches.is_empty() {
+                        let doc = doc_by_id(&self.docs, task.doc_id)?;
                         hits.push(SearchHit {
-                            path: self.docs[task.doc_id as usize].path.clone(),
+                            path: doc.path.clone(),
                             matches: task.outcome.matches,
                         });
                     }
@@ -109,23 +189,35 @@ impl IndexSearcher {
 
     pub fn candidate_paths(&self, config: &QueryConfig) -> Result<Vec<String>> {
         let profile = SearchProfile::enabled();
-        let preparation = self.prepare_search(config, &profile)?;
-        Ok(preparation
-            .candidate_ids
-            .into_iter()
-            .map(|doc_id| self.docs[doc_id as usize].path.clone())
-            .collect())
-    }
-
-    fn prepare_search(
-        &self,
-        config: &QueryConfig,
-        profile: &SearchProfile,
-    ) -> Result<SearchPreparation> {
         let plan_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
 
+        let candidate_ids = if let Some(multi_literal) =
+            self.prepare_multi_literal_search(&plan, config.case_insensitive, &profile)?
+        {
+            collect_multi_literal_candidates(
+                &self.docs,
+                Some(&multi_literal.candidate_ids),
+                &multi_literal.prepared,
+            )?
+        } else {
+            self.prepare_indexed_search(config, &plan, &profile)?
+                .candidate_ids
+        };
+
+        candidate_ids
+            .into_iter()
+            .map(|doc_id| Ok(doc_by_id(&self.docs, doc_id)?.path.clone()))
+            .collect()
+    }
+
+    fn prepare_indexed_search(
+        &self,
+        config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        profile: &SearchProfile,
+    ) -> Result<SearchPreparation> {
         let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
         let candidate_started = Instant::now();
         let candidate_ids = if plan.fallback_to_scan {
@@ -136,8 +228,68 @@ impl IndexSearcher {
         profile.record_candidates(candidate_started.elapsed());
         Ok(SearchPreparation {
             candidate_ids,
-            literal_prefilter: LiteralPrefilter::new(&plan, config.case_insensitive),
+            literal_prefilter: LiteralPrefilter::new(plan, config.case_insensitive),
         })
+    }
+
+    fn prepare_multi_literal_search(
+        &self,
+        plan: &crate::planner::QueryPlan,
+        case_insensitive: bool,
+        profile: &SearchProfile,
+    ) -> Result<Option<MultiLiteralPreparation>> {
+        let Some(prepared) = plan
+            .pure_literal_alternation
+            .as_ref()
+            .and_then(|alternation| prepare_multi_literal(alternation, case_insensitive))
+        else {
+            return Ok(None);
+        };
+
+        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
+        let candidate_started = Instant::now();
+        let prefilter_ids =
+            self.collect_multi_literal_prefilter_candidates(&prepared, tokenizer.as_ref())?;
+        profile.record_candidates(candidate_started.elapsed());
+
+        Ok(Some(MultiLiteralPreparation {
+            prepared,
+            candidate_ids: prefilter_ids.unwrap_or_else(|| self.all_doc_ids()),
+        }))
+    }
+
+    fn collect_multi_literal_prefilter_candidates(
+        &self,
+        prepared: &multi_literal::PreparedMultiLiteral,
+        tokenizer: &dyn crate::tokenizer::Tokenizer,
+    ) -> Result<Option<Vec<u32>>> {
+        let mut posting_cache = HashMap::new();
+        let mut any_available = false;
+        let mut union = Vec::new();
+
+        for literal in &prepared.literals {
+            let query_literal = fold_query_literal(literal);
+            let mut covering_hashes = Vec::new();
+            tokenizer.collect_query_token_hashes(&query_literal, &mut covering_hashes);
+            match self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes) {
+                LiteralCandidates::Impossible => {}
+                LiteralCandidates::Unavailable => return Ok(None),
+                LiteralCandidates::Available(candidates) => {
+                    let Some(candidate) = candidates.first() else {
+                        continue;
+                    };
+                    let docs = self.read_posting_docs(candidate.token_hash, &mut posting_cache)?;
+                    union = union_sorted(&union, &docs);
+                    any_available = true;
+                }
+            }
+        }
+
+        if any_available {
+            Ok(Some(union))
+        } else {
+            Ok(Some(Vec::new()))
+        }
     }
 
     fn collect_candidates(
@@ -183,7 +335,7 @@ impl IndexSearcher {
             let mut covering_hashes = Vec::new();
             tokenizer.collect_query_token_hashes(&query_literal, &mut covering_hashes);
             let literal_candidates =
-                self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes)?;
+                self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes);
             match literal_candidates {
                 LiteralCandidates::Impossible => return Ok(Some(Vec::new())),
                 LiteralCandidates::Unavailable => scanned_literals.push(query_literal),
@@ -226,16 +378,14 @@ impl IndexSearcher {
             }
         }
 
-        let mut branch_candidates = branch_candidates;
-
         while selected_count < budget
             && branch_candidates
                 .as_ref()
                 .is_some_and(|docs| docs.len() > candidate_limit)
         {
-            let current_candidates = branch_candidates
-                .as_ref()
-                .expect("checked candidate set should exist");
+            let Some(current_candidates) = branch_candidates.as_ref() else {
+                break;
+            };
             let mut best_choice: Option<(TokenCandidate, Vec<u32>)> = None;
 
             for candidates in &per_literal {
@@ -273,7 +423,7 @@ impl IndexSearcher {
         }
 
         for literal in scanned_literals {
-            let docs = self.scan_literal_docs(&literal, literal_scan_cache)?;
+            let docs = self.scan_literal_docs(&literal, literal_scan_cache);
             branch_candidates = Some(match branch_candidates.take() {
                 Some(existing) => intersect_sorted(&existing, &docs),
                 None => docs,
@@ -295,7 +445,7 @@ impl IndexSearcher {
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         query_literal: &str,
         mut covering_hashes: Vec<u64>,
-    ) -> Result<LiteralCandidates> {
+    ) -> LiteralCandidates {
         covering_hashes.sort_unstable();
         covering_hashes.dedup();
 
@@ -312,7 +462,7 @@ impl IndexSearcher {
                 continue;
             }
             let Some(entry) = self.lookup.find(token_hash) else {
-                return Ok(LiteralCandidates::Impossible);
+                return LiteralCandidates::Impossible;
             };
             if entry.offset == u64::MAX {
                 continue;
@@ -353,9 +503,9 @@ impl IndexSearcher {
         prune_high_frequency_candidates(&mut selected);
 
         if selected.is_empty() {
-            Ok(LiteralCandidates::Unavailable)
+            LiteralCandidates::Unavailable
         } else {
-            Ok(LiteralCandidates::Available(selected))
+            LiteralCandidates::Available(selected)
         }
     }
 
@@ -370,8 +520,7 @@ impl IndexSearcher {
 
         let docs = match self.lookup.find(token_hash) {
             Some(entry) if entry.offset != u64::MAX => self.postings.decode(entry)?,
-            None => Vec::new(),
-            Some(_) => Vec::new(),
+            Some(_) | None => Vec::new(),
         };
         posting_cache.insert(token_hash, docs.clone());
         Ok(docs)
@@ -402,9 +551,9 @@ impl IndexSearcher {
         &self,
         literal: &str,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
-    ) -> Result<Vec<u32>> {
+    ) -> Vec<u32> {
         if let Some(cached) = literal_scan_cache.get(literal) {
-            return Ok(cached.clone());
+            return cached.clone();
         }
 
         let mut docs = Vec::new();
@@ -424,7 +573,7 @@ impl IndexSearcher {
         }
 
         literal_scan_cache.insert(literal.to_string(), docs.clone());
-        Ok(docs)
+        docs
     }
 
     fn all_doc_ids(&self) -> Vec<u32> {
@@ -442,7 +591,7 @@ struct TokenCandidate {
 
 impl TokenCandidate {
     fn selection_rank(self) -> (u8, u32, u8) {
-        let freq_rank = if self.high_freq { 1 } else { 0 };
+        let freq_rank = u8::from(self.high_freq);
         (freq_rank, self.doc_freq, self.source.rank())
     }
 }
@@ -577,6 +726,7 @@ fn prune_high_frequency_candidates(candidates: &mut Vec<TokenCandidate>) {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::{
         intersect_sorted, lower_bound, prune_high_frequency_candidates, union_sorted,
@@ -636,10 +786,11 @@ mod tests {
                     literals: vec!["foo".into(), "bar".into()],
                 }],
                 fallback_to_scan: false,
+                pure_literal_alternation: None,
             },
             false,
         )
-        .unwrap();
+        .expect("test should succeed");
 
         assert!(prefilter.text_may_match("prefix foo ... bar suffix"));
         assert!(!prefilter.text_may_match("prefix foo only"));
@@ -658,10 +809,11 @@ mod tests {
                     },
                 ],
                 fallback_to_scan: false,
+                pure_literal_alternation: None,
             },
             false,
         )
-        .unwrap();
+        .expect("test should succeed");
 
         assert!(prefilter.text_may_match("beta then gamma"));
         assert!(prefilter.text_may_match("alpha"));
@@ -676,14 +828,51 @@ mod tests {
                     literals: vec!["PM".into(), "RESUME".into()],
                 }],
                 fallback_to_scan: false,
+                pure_literal_alternation: None,
             },
             true,
         )
-        .unwrap();
+        .expect("test should succeed");
 
         assert!(prefilter.text_may_match("prefix pm ... resume suffix"));
         assert!(prefilter.text_may_match("prefix Pm ... Resume suffix"));
         assert!(!prefilter.text_may_match("prefix pm only suffix"));
+    }
+
+    #[test]
+    fn literal_prefilter_finds_first_candidate_line() {
+        let prefilter = LiteralPrefilter::new(
+            &QueryPlan {
+                branches: vec![QueryBranch {
+                    literals: vec!["foo".into(), "bar".into()],
+                }],
+                fallback_to_scan: false,
+                pure_literal_alternation: None,
+            },
+            false,
+        )
+        .expect("test should succeed");
+
+        let haystack = b"alpha only\nfoo only\nfoo and bar\nbar only\n";
+        assert_eq!(prefilter.find_candidate_line(haystack, b'\n'), Some(20));
+    }
+
+    #[test]
+    fn literal_prefilter_matches_case_insensitive_bytes() {
+        let prefilter = LiteralPrefilter::new(
+            &QueryPlan {
+                branches: vec![QueryBranch {
+                    literals: vec!["PM".into(), "RESUME".into()],
+                }],
+                fallback_to_scan: false,
+                pure_literal_alternation: None,
+            },
+            true,
+        )
+        .expect("test should succeed");
+
+        assert!(prefilter.line_may_match_bytes(b"prefix Pm ... Resume suffix\n"));
+        assert!(!prefilter.line_may_match_bytes(b"prefix Resume only\n"));
     }
 
     #[test]
@@ -694,6 +883,7 @@ mod tests {
                     literals: Vec::new()
                 }],
                 fallback_to_scan: true,
+                pure_literal_alternation: None,
             },
             false,
         )

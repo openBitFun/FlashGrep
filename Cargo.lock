@@ -77,15 +77,18 @@ checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 name = "bitfun_grep"
 version = "0.1.0"
 dependencies = [
+ "aho-corasick",
  "clap",
  "crc32fast",
  "grep-matcher",
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "memchr",
  "memmap2",
  "rayon",
  "regex",
+ "regex-automata",
  "regex-syntax",
  "tempfile",
  "thiserror",

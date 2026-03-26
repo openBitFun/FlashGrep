@@ -137,9 +137,26 @@ impl From<SearchModeArg> for SearchMode {
     }
 }
 
+fn query_config(
+    pattern: String,
+    case_insensitive: bool,
+    multiline: bool,
+    dot_matches_new_line: bool,
+    top_k_tokens: usize,
+    search_mode: SearchMode,
+) -> QueryConfig {
+    QueryConfig {
+        regex_pattern: pattern,
+        case_insensitive,
+        multiline,
+        dot_matches_new_line,
+        top_k_tokens,
+        search_mode,
+    }
+}
+
 pub fn run() -> Result<()> {
-    let cli = Cli::parse();
-    match cli.command {
+    match Cli::parse().command {
         Commands::Build {
             repo,
             index,
@@ -148,22 +165,15 @@ pub fn run() -> Result<()> {
             max_file_size,
             min_sparse_len,
             max_sparse_len,
-        } => {
-            let config = BuildConfig {
-                repo_path: repo,
-                index_path: index,
-                tokenizer: tokenizer.into(),
-                corpus_mode: corpus_mode.into(),
-                max_file_size,
-                min_sparse_len,
-                max_sparse_len,
-            };
-            let doc_count = build_index(&config)?;
-            println!(
-                "indexed {doc_count} docs with {}",
-                config.tokenizer.as_str()
-            );
-        }
+        } => run_build(
+            repo,
+            index,
+            tokenizer,
+            corpus_mode,
+            max_file_size,
+            min_sparse_len,
+            max_sparse_len,
+        ),
         Commands::Search {
             index,
             pattern,
@@ -172,30 +182,15 @@ pub fn run() -> Result<()> {
             dot_matches_new_line,
             top_k_tokens,
             search_mode,
-        } => {
-            let config = QueryConfig {
-                regex_pattern: pattern,
-                case_insensitive,
-                multiline,
-                dot_matches_new_line,
-                top_k_tokens,
-                search_mode: search_mode.into(),
-                ..QueryConfig::default()
-            };
-            let searcher = IndexSearcher::open(index)?;
-            let results = searcher.search(&config)?;
-            println!("candidate docs: {}", results.candidate_docs);
-            println!("matched lines: {}", results.matched_lines);
-            for hit in results.hits {
-                println!("{}", hit.path);
-                for matched in hit.matches {
-                    println!(
-                        "  {}:{} {}",
-                        matched.location.line, matched.location.column, matched.snippet
-                    );
-                }
-            }
-        }
+        } => run_search(
+            index,
+            pattern,
+            case_insensitive,
+            multiline,
+            dot_matches_new_line,
+            top_k_tokens,
+            search_mode.into(),
+        ),
         Commands::Candidates {
             index,
             pattern,
@@ -203,20 +198,14 @@ pub fn run() -> Result<()> {
             multiline,
             dot_matches_new_line,
             top_k_tokens,
-        } => {
-            let config = QueryConfig {
-                regex_pattern: pattern,
-                case_insensitive,
-                multiline,
-                dot_matches_new_line,
-                top_k_tokens,
-                ..QueryConfig::default()
-            };
-            let searcher = IndexSearcher::open(index)?;
-            for path in searcher.candidate_paths(&config)? {
-                println!("{path}");
-            }
-        }
+        } => run_candidates(
+            index,
+            pattern,
+            case_insensitive,
+            multiline,
+            dot_matches_new_line,
+            top_k_tokens,
+        ),
         Commands::Bench {
             suite_dir,
             filter,
@@ -228,22 +217,105 @@ pub fn run() -> Result<()> {
             compare_rg,
             rebuild,
             raw_output,
-        } => {
-            let report = bench::run(&BenchConfig {
-                suite_dir,
-                filter,
-                tokenizer: tokenizer.into(),
-                corpus_mode: corpus_mode.into(),
-                warmup_iter,
-                bench_iter,
-                top_k_tokens,
-                compare_rg,
-                rebuild,
-                raw_output,
-            })?;
-            bench::print_report(&report);
+        } => run_bench(BenchConfig {
+            suite_dir,
+            filter,
+            tokenizer: tokenizer.into(),
+            corpus_mode: corpus_mode.into(),
+            warmup_iter,
+            bench_iter,
+            top_k_tokens,
+            compare_rg,
+            rebuild,
+            raw_output,
+        }),
+    }
+}
+
+fn run_build(
+    repo: PathBuf,
+    index: PathBuf,
+    tokenizer: TokenizerArg,
+    corpus_mode: CorpusArg,
+    max_file_size: u64,
+    min_sparse_len: usize,
+    max_sparse_len: usize,
+) -> Result<()> {
+    let config = BuildConfig {
+        repo_path: repo,
+        index_path: index,
+        tokenizer: tokenizer.into(),
+        corpus_mode: corpus_mode.into(),
+        max_file_size,
+        min_sparse_len,
+        max_sparse_len,
+    };
+    let doc_count = build_index(&config)?;
+    println!(
+        "indexed {doc_count} docs with {}",
+        config.tokenizer.as_str()
+    );
+    Ok(())
+}
+
+fn run_search(
+    index: PathBuf,
+    pattern: String,
+    case_insensitive: bool,
+    multiline: bool,
+    dot_matches_new_line: bool,
+    top_k_tokens: usize,
+    search_mode: SearchMode,
+) -> Result<()> {
+    let config = query_config(
+        pattern,
+        case_insensitive,
+        multiline,
+        dot_matches_new_line,
+        top_k_tokens,
+        search_mode,
+    );
+    let searcher = IndexSearcher::open(index)?;
+    let results = searcher.search(&config)?;
+    println!("candidate docs: {}", results.candidate_docs);
+    println!("matched lines: {}", results.matched_lines);
+    for hit in results.hits {
+        println!("{}", hit.path);
+        for matched in hit.matches {
+            println!(
+                "  {}:{} {}",
+                matched.location.line, matched.location.column, matched.snippet
+            );
         }
     }
+    Ok(())
+}
 
+fn run_candidates(
+    index: PathBuf,
+    pattern: String,
+    case_insensitive: bool,
+    multiline: bool,
+    dot_matches_new_line: bool,
+    top_k_tokens: usize,
+) -> Result<()> {
+    let config = query_config(
+        pattern,
+        case_insensitive,
+        multiline,
+        dot_matches_new_line,
+        top_k_tokens,
+        SearchMode::MaterializeMatches,
+    );
+    let searcher = IndexSearcher::open(index)?;
+    for path in searcher.candidate_paths(&config)? {
+        println!("{path}");
+    }
+    Ok(())
+}
+
+fn run_bench(config: BenchConfig) -> Result<()> {
+    let report = bench::run(&config)?;
+    bench::print_report(&report);
     Ok(())
 }

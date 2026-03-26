@@ -16,6 +16,8 @@ pub enum AppError {
     InvalidPattern(String),
     #[error("unsupported index format: {0}")]
     InvalidIndex(String),
+    #[error("value out of range: {0}")]
+    ValueOutOfRange(String),
     #[error("binary data is truncated")]
     TruncatedData,
     #[error("utf-8 decode failed for {path}: {source}")]

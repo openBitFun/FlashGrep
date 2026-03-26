@@ -11,6 +11,7 @@ const BRANCH_LIMIT: usize = 128;
 pub struct QueryPlan {
     pub branches: Vec<QueryBranch>,
     pub fallback_to_scan: bool,
+    pub pure_literal_alternation: Option<PureLiteralAlternation>,
 }
 
 #[derive(Debug, Clone)]
@@ -18,13 +19,20 @@ pub struct QueryBranch {
     pub literals: Vec<String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PureLiteralAlternation {
+    pub literals: Vec<String>,
+}
+
 pub fn plan(pattern: &str) -> Result<QueryPlan> {
     let hir = parse(pattern).map_err(|error| AppError::InvalidPattern(error.to_string()))?;
+    let pure_literal_alternation = extract_pure_literal_alternation(&hir);
     let extracted = extract(&hir)?;
     if extracted.overflow {
         return Ok(QueryPlan {
             branches: Vec::new(),
             fallback_to_scan: true,
+            pure_literal_alternation: None,
         });
     }
 
@@ -40,6 +48,7 @@ pub fn plan(pattern: &str) -> Result<QueryPlan> {
     Ok(QueryPlan {
         branches,
         fallback_to_scan,
+        pure_literal_alternation,
     })
 }
 
@@ -77,6 +86,42 @@ fn extract(hir: &Hir) -> Result<Extracted> {
         HirKind::Alternation(hirs) => extract_alternation(hirs)?,
     };
     Ok(extracted)
+}
+
+fn extract_pure_literal_alternation(hir: &Hir) -> Option<PureLiteralAlternation> {
+    let HirKind::Alternation(branches) = hir.kind() else {
+        return None;
+    };
+
+    let literals = branches
+        .iter()
+        .map(extract_pure_literal)
+        .collect::<Option<Vec<_>>>()?;
+    if literals.is_empty()
+        || literals.iter().any(String::is_empty)
+        || literals
+            .iter()
+            .any(|literal| literal.contains(['\n', '\r']))
+    {
+        return None;
+    }
+
+    Some(PureLiteralAlternation { literals })
+}
+
+fn extract_pure_literal(hir: &Hir) -> Option<String> {
+    match hir.kind() {
+        HirKind::Literal(literal) => Some(String::from_utf8_lossy(&literal.0).into_owned()),
+        HirKind::Capture(capture) => extract_pure_literal(&capture.sub),
+        HirKind::Concat(parts) => {
+            let mut literal = String::new();
+            for part in parts {
+                literal.push_str(&extract_pure_literal(part)?);
+            }
+            Some(literal)
+        }
+        _ => None,
+    }
 }
 
 fn extract_repetition(repetition: &Repetition) -> Result<Extracted> {
@@ -244,48 +289,61 @@ impl QueryBranch {
 }
 
 #[cfg(test)]
+#[allow(clippy::expect_used)]
 mod tests {
     use super::plan;
 
     #[test]
     fn plan_extracts_literals_from_concat() {
-        let plan = plan("foo.*bar").unwrap();
+        let plan = plan("foo.*bar").expect("test should succeed");
         assert_eq!(plan.branches.len(), 1);
         assert_eq!(plan.branches[0].literals, vec!["foo", "bar"]);
     }
 
     #[test]
     fn plan_keeps_alternation_as_branches() {
-        let plan = plan("get(User|Account)ById").unwrap();
+        let plan = plan("get(User|Account)ById").expect("test should succeed");
         assert_eq!(plan.branches.len(), 2);
         assert_eq!(plan.branches[0].literals, vec!["getUserById"]);
         assert_eq!(plan.branches[1].literals, vec!["getAccountById"]);
+        assert!(plan.pure_literal_alternation.is_none());
+    }
+
+    #[test]
+    fn plan_classifies_pure_literal_alternation_in_original_order() {
+        let plan = plan("ab|a").expect("test should succeed");
+        assert_eq!(
+            plan.pure_literal_alternation
+                .expect("test should succeed")
+                .literals,
+            vec!["ab", "a"]
+        );
     }
 
     #[test]
     fn optional_literals_degrade_to_remaining_required_literal() {
-        let plan = plan("(foo)?bar").unwrap();
+        let plan = plan("(foo)?bar").expect("test should succeed");
         assert_eq!(plan.branches.len(), 1);
         assert_eq!(plan.branches[0].literals, vec!["bar"]);
     }
 
     #[test]
     fn unicode_property_parses_without_false_literal() {
-        let plan = plan(r"\p{Greek}").unwrap();
+        let plan = plan(r"\p{Greek}").expect("test should succeed");
         assert!(plan.fallback_to_scan);
         assert!(plan.branches.is_empty());
     }
 
     #[test]
     fn classes_split_required_literals() {
-        let plan = plan(r"foo[0-9]+bar").unwrap();
+        let plan = plan(r"foo[0-9]+bar").expect("test should succeed");
         assert_eq!(plan.branches.len(), 1);
         assert_eq!(plan.branches[0].literals, vec!["foo", "bar"]);
     }
 
     #[test]
     fn look_around_prevents_literal_merging() {
-        let plan = plan(r"\bPM_RESUME\b").unwrap();
+        let plan = plan(r"\bPM_RESUME\b").expect("test should succeed");
         assert_eq!(plan.branches.len(), 1);
         assert_eq!(plan.branches[0].literals, vec!["PM_RESUME"]);
     }

@@ -1,7 +1,7 @@
 use std::{collections::HashSet, env, io, path::Path, time::Duration};
 
 use grep_matcher::Matcher;
-use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_regex::RegexMatcher;
 use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
 use rayon::prelude::*;
 use regex_syntax::{
@@ -16,34 +16,19 @@ use crate::{
     search::{FileMatch, MatchLocation, SearchMode},
 };
 
-use super::query::LiteralPrefilter;
+pub(super) use super::shared::build_regex_matcher as build_matcher;
+use super::shared::{
+    build_line_starts, doc_by_id, line_index_for_offset, trim_line_terminator_bytes,
+    validate_doc_ids,
+};
 
 const MAX_LOOK_AHEAD: usize = 128;
 const VERIFY_PARALLEL_THRESHOLD: usize = 512;
 
-pub(super) fn build_matcher(
-    config: &QueryConfig,
-    multiline_verifier: bool,
-) -> Result<RegexMatcher> {
-    let mut builder = RegexMatcherBuilder::new();
-    builder
-        .multi_line(true)
-        .unicode(true)
-        .octal(false)
-        .case_insensitive(config.case_insensitive)
-        .dot_matches_new_line(config.dot_matches_new_line);
-    if multiline_verifier {
-        builder.line_terminator(None);
-    } else {
-        builder.line_terminator(Some(b'\n'));
-    }
-    builder.ban_byte(Some(b'\0'));
-    builder
-        .build(&config.regex_pattern)
-        .map_err(|error| crate::error::AppError::InvalidPattern(error.to_string()))
-}
-
 pub(super) fn requires_multiline_verification(config: &QueryConfig) -> Result<bool> {
+    if !config.multiline && !config.dot_matches_new_line {
+        return Ok(false);
+    }
     let mut parser = HirParserBuilder::new();
     parser
         .case_insensitive(config.case_insensitive)
@@ -56,41 +41,6 @@ pub(super) fn requires_multiline_verification(config: &QueryConfig) -> Result<bo
     Ok(hir_can_match_line_terminator(&hir))
 }
 
-pub(super) fn verify_candidate_match_counts(
-    candidate_ids: &[u32],
-    docs: &[DocMeta],
-    matcher: &RegexMatcher,
-    multiline_verifier: bool,
-    literal_prefilter: Option<&LiteralPrefilter>,
-) -> Result<usize> {
-    if should_parallel_verify(candidate_ids.len()) {
-        candidate_ids
-            .par_iter()
-            .map_init(
-                || build_verifier(multiline_verifier, SearchMode::CountOnly),
-                |verifier, &doc_id| {
-                    let path = Path::new(docs[doc_id as usize].path.as_str());
-                    if !should_verify_path(path, literal_prefilter)? {
-                        return Ok(0usize);
-                    }
-                    verify_match_count(path, matcher, verifier)
-                },
-            )
-            .try_reduce(|| 0usize, |left, right| Ok(left + right))
-    } else {
-        let mut verifier = build_verifier(multiline_verifier, SearchMode::CountOnly);
-        let mut matched_lines = 0usize;
-        for &doc_id in candidate_ids {
-            let path = Path::new(docs[doc_id as usize].path.as_str());
-            if !should_verify_path(path, literal_prefilter)? {
-                continue;
-            }
-            matched_lines += verify_match_count(path, matcher, &mut verifier)?;
-        }
-        Ok(matched_lines)
-    }
-}
-
 pub(super) fn verify_candidates(
     candidate_ids: &[u32],
     docs: &[DocMeta],
@@ -98,6 +48,7 @@ pub(super) fn verify_candidates(
     multiline_verifier: bool,
     mode: SearchMode,
 ) -> Result<Vec<SearchTaskOutcome>> {
+    validate_doc_ids(docs, candidate_ids)?;
     let mut outcomes = if should_parallel_verify(candidate_ids.len()) {
         let results = candidate_ids
             .par_iter()
@@ -105,7 +56,7 @@ pub(super) fn verify_candidates(
             .map_init(
                 || (matcher.clone(), build_verifier(multiline_verifier, mode)),
                 |(matcher, verifier), (ordinal, &doc_id)| {
-                    let path = Path::new(docs[doc_id as usize].path.as_str());
+                    let path = Path::new(doc_by_id(docs, doc_id)?.path.as_str());
                     let outcome = verify_path(path, matcher, verifier, mode)?;
                     Ok(SearchTaskOutcome {
                         ordinal,
@@ -125,7 +76,7 @@ pub(super) fn verify_candidates(
         let mut verifier = build_verifier(multiline_verifier, mode);
         let mut outcomes = Vec::with_capacity(candidate_ids.len());
         for (ordinal, &doc_id) in candidate_ids.iter().enumerate() {
-            let path = Path::new(docs[doc_id as usize].path.as_str());
+            let path = Path::new(doc_by_id(docs, doc_id)?.path.as_str());
             let outcome = verify_path(path, matcher, &mut verifier, mode)?;
             outcomes.push(SearchTaskOutcome {
                 ordinal,
@@ -159,7 +110,6 @@ impl SearchProfile {
     pub(super) fn enabled() -> Self {
         Self {
             enabled: env::var_os("BITFUN_PROFILE_SEARCH").is_some(),
-            ..Self::default()
         }
     }
 
@@ -208,13 +158,6 @@ impl SearchProfile {
     }
 }
 
-fn should_verify_path(path: &Path, literal_prefilter: Option<&LiteralPrefilter>) -> Result<bool> {
-    match literal_prefilter {
-        Some(prefilter) => prefilter.file_may_match(path),
-        None => Ok(true),
-    }
-}
-
 fn build_verifier(multiline_verifier: bool, mode: SearchMode) -> Searcher {
     let mut builder = SearcherBuilder::new();
     builder
@@ -238,25 +181,15 @@ fn verify_path(
     Ok(sink.finish())
 }
 
-fn verify_match_count(
-    path: &Path,
-    matcher: &RegexMatcher,
-    verifier: &mut Searcher,
-) -> Result<usize> {
-    let mut sink = CountSink::default();
-    verifier.search_path(matcher, path, &mut sink)?;
-    Ok(sink.matched_lines)
-}
-
 fn should_parallel_verify(candidate_count: usize) -> bool {
     candidate_count >= VERIFY_PARALLEL_THRESHOLD
-        && std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get()) > 1
+        && std::thread::available_parallelism().map_or(1, std::num::NonZero::get) > 1
 }
 
 fn hir_can_match_line_terminator(hir: &Hir) -> bool {
     match hir.kind() {
         HirKind::Empty | HirKind::Look(_) => false,
-        HirKind::Literal(literal) => literal.0.iter().any(|byte| *byte == b'\n'),
+        HirKind::Literal(literal) => literal.0.contains(&b'\n'),
         HirKind::Class(class) => class_can_match_line_terminator(class),
         HirKind::Capture(capture) => hir_can_match_line_terminator(&capture.sub),
         HirKind::Repetition(repetition) => hir_can_match_line_terminator(&repetition.sub),
@@ -286,16 +219,6 @@ struct OffsetLocation {
     line_end_offset: usize,
 }
 
-fn build_line_starts(bytes: &[u8]) -> Vec<usize> {
-    let mut starts = vec![0];
-    for (idx, byte) in bytes.iter().enumerate() {
-        if *byte == b'\n' {
-            starts.push(idx + 1);
-        }
-    }
-    starts
-}
-
 fn offset_to_location(offset: usize, line_starts: &[usize], text_len: usize) -> OffsetLocation {
     let line_index = line_index_for_offset(offset, line_starts);
     let line_start = line_starts[line_index];
@@ -306,13 +229,6 @@ fn offset_to_location(offset: usize, line_starts: &[usize], text_len: usize) -> 
         column: offset.saturating_sub(line_start) + 1,
         line_start_offset: line_start,
         line_end_offset: line_end,
-    }
-}
-
-fn line_index_for_offset(offset: usize, line_starts: &[usize]) -> usize {
-    match line_starts.binary_search(&offset) {
-        Ok(index) => index,
-        Err(index) => index.saturating_sub(1),
     }
 }
 
@@ -404,34 +320,14 @@ impl Sink for VerifySink<'_> {
     }
 }
 
-#[derive(Default)]
-struct CountSink {
-    matched_lines: usize,
-}
-
-impl Sink for CountSink {
-    type Error = io::Error;
-
-    fn matched(
-        &mut self,
-        searcher: &Searcher,
-        mat: &SinkMatch<'_>,
-    ) -> std::result::Result<bool, Self::Error> {
-        if searcher.multi_line() {
-            self.matched_lines += mat.lines().count().max(1);
-        } else {
-            self.matched_lines += 1;
-        }
-        Ok(true)
-    }
-}
-
 fn buffer_base_line_number(mat: &SinkMatch<'_>, line_starts: &[usize]) -> usize {
     let range = mat.bytes_range_in_buffer();
     let range_start_line = line_index_for_offset(range.start, line_starts);
-    mat.line_number()
-        .map(|line| (line as usize).saturating_sub(range_start_line))
-        .unwrap_or(1)
+    mat.line_number().map_or(1, |line| {
+        usize::try_from(line)
+            .unwrap_or(usize::MAX)
+            .saturating_sub(range_start_line)
+    })
 }
 
 fn trim_line_terminator<'b>(
@@ -489,10 +385,8 @@ fn build_file_match(
     base_line: usize,
 ) -> FileMatch {
     let location = offset_to_location(matched.start(), line_starts, bytes.len());
-    let line = bytes[location.line_start_offset..location.line_end_offset]
-        .strip_suffix(b"\n")
-        .unwrap_or(&bytes[location.line_start_offset..location.line_end_offset]);
-    let line = line.strip_suffix(b"\r").unwrap_or(line);
+    let line =
+        trim_line_terminator_bytes(&bytes[location.line_start_offset..location.line_end_offset]);
 
     FileMatch {
         location: MatchLocation {
@@ -505,7 +399,7 @@ fn build_file_match(
 }
 
 fn io_error_from_matcher<E: std::fmt::Display>(error: E) -> io::Error {
-    io::Error::new(io::ErrorKind::Other, error.to_string())
+    io::Error::other(error.to_string())
 }
 
 fn record_line_span(

@@ -24,7 +24,7 @@ pub trait Tokenizer {
     fn collect_document_token_hashes(&self, text: &str, out: &mut Vec<u64>);
 
     fn collect_query_token_hashes(&self, literal: &str, out: &mut Vec<u64>) {
-        self.collect_document_token_hashes(literal, out)
+        self.collect_document_token_hashes(literal, out);
     }
 }
 
