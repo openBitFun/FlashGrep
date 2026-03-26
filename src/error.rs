@@ -26,6 +26,8 @@ pub enum AppError {
         #[source]
         source: std::string::FromUtf8Error,
     },
+    #[error("rg: No files were searched, which means ripgrep probably applied a filter you didn't expect.\nRunning with --debug will show why files are being skipped.")]
+    NoFilesSearched,
 }
 
 pub type Result<T> = std::result::Result<T, AppError>;

@@ -7,13 +7,16 @@ use std::{
 use memmap2::Mmap;
 
 use crate::{
-    config::TokenizerMode,
+    config::{CorpusMode, TokenizerMode},
     error::{AppError, Result},
 };
 
 const DOCS_MAGIC: &[u8; 4] = b"BFGD";
+const DOC_TERMS_MAGIC: &[u8; 4] = b"BFGT";
 const LOOKUP_MAGIC: &[u8; 4] = b"BFGL";
 const POSTINGS_MAGIC: &[u8; 4] = b"BFGP";
+const DOCS_FORMAT_VERSION: u32 = 5;
+const DOCS_FORMAT_VERSION_LEGACY: u32 = 4;
 const FORMAT_VERSION: u32 = 4;
 const LOOKUP_ENTRY_SIZE: usize = 28;
 pub const LOOKUP_FLAG_SKIPPED_HIGH_FREQ: u32 = 1;
@@ -23,14 +26,23 @@ pub struct DocMeta {
     pub doc_id: u32,
     pub path: String,
     pub size: u64,
-    pub mtime_secs: u64,
+    pub mtime_nanos: u64,
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct IndexMetadata {
     pub tokenizer: TokenizerMode,
     pub min_sparse_len: usize,
     pub max_sparse_len: usize,
+    pub build: Option<IndexBuildSettings>,
+}
+
+#[derive(Debug, Clone)]
+pub struct IndexBuildSettings {
+    pub repo_root: String,
+    pub corpus_mode: CorpusMode,
+    pub include_hidden: bool,
+    pub max_file_size: u64,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -51,6 +63,7 @@ impl LookupEntry {
 #[derive(Debug)]
 pub struct IndexLayout {
     pub docs_path: PathBuf,
+    pub doc_terms_path: PathBuf,
     pub lookup_path: PathBuf,
     pub postings_path: PathBuf,
 }
@@ -59,6 +72,7 @@ impl IndexLayout {
     pub fn new(root: &Path) -> Self {
         Self {
             docs_path: root.join("docs.bin"),
+            doc_terms_path: root.join("doc_terms.bin"),
             lookup_path: root.join("lookup.bin"),
             postings_path: root.join("postings.bin"),
         }
@@ -73,7 +87,7 @@ pub fn ensure_dir(path: &Path) -> Result<()> {
 pub fn write_docs_file(path: &Path, metadata: IndexMetadata, docs: &[DocMeta]) -> Result<()> {
     let mut file = File::create(path)?;
     file.write_all(DOCS_MAGIC)?;
-    write_u32(&mut file, FORMAT_VERSION)?;
+    write_u32(&mut file, DOCS_FORMAT_VERSION)?;
     file.write_all(&[metadata.tokenizer.to_byte()])?;
     write_u32(
         &mut file,
@@ -83,12 +97,24 @@ pub fn write_docs_file(path: &Path, metadata: IndexMetadata, docs: &[DocMeta]) -
         &mut file,
         usize_to_u32(metadata.max_sparse_len, "max_sparse_len")?,
     )?;
+    let build = metadata.build.ok_or_else(|| {
+        AppError::InvalidIndex("missing build metadata when writing docs file".into())
+    })?;
+    file.write_all(&[build.corpus_mode.to_byte()])?;
+    file.write_all(&[u8::from(build.include_hidden)])?;
+    write_u64(&mut file, build.max_file_size)?;
+    let repo_root_bytes = build.repo_root.as_bytes();
+    write_u32(
+        &mut file,
+        usize_to_u32(repo_root_bytes.len(), "repo root length")?,
+    )?;
+    file.write_all(repo_root_bytes)?;
     write_u32(&mut file, usize_to_u32(docs.len(), "document count")?)?;
 
     for doc in docs {
         write_u32(&mut file, doc.doc_id)?;
         write_u64(&mut file, doc.size)?;
-        write_u64(&mut file, doc.mtime_secs)?;
+        write_u64(&mut file, doc.mtime_nanos)?;
         let path_bytes = doc.path.as_bytes();
         write_u32(&mut file, usize_to_u32(path_bytes.len(), "path length")?)?;
         file.write_all(path_bytes)?;
@@ -104,7 +130,7 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
 
     cursor.expect_magic(DOCS_MAGIC)?;
     let version = cursor.read_u32()?;
-    if version != FORMAT_VERSION {
+    if version != DOCS_FORMAT_VERSION && version != DOCS_FORMAT_VERSION_LEGACY {
         return Err(AppError::InvalidIndex(format!(
             "unsupported docs version: {version}"
         )));
@@ -114,13 +140,29 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
         .ok_or_else(|| AppError::InvalidIndex("unknown tokenizer mode".into()))?;
     let min_sparse_len = u32_to_usize(cursor.read_u32()?, "min_sparse_len")?;
     let max_sparse_len = u32_to_usize(cursor.read_u32()?, "max_sparse_len")?;
+    let build = if version == DOCS_FORMAT_VERSION {
+        let corpus_mode = CorpusMode::from_byte(cursor.read_byte()?)
+            .ok_or_else(|| AppError::InvalidIndex("unknown corpus mode".into()))?;
+        let include_hidden = cursor.read_byte()? != 0;
+        let max_file_size = cursor.read_u64()?;
+        let repo_root_len = u32_to_usize(cursor.read_u32()?, "repo root length")?;
+        let repo_root = cursor.read_string(repo_root_len)?;
+        Some(IndexBuildSettings {
+            repo_root,
+            corpus_mode,
+            include_hidden,
+            max_file_size,
+        })
+    } else {
+        None
+    };
     let doc_count = u32_to_usize(cursor.read_u32()?, "document count")?;
     let mut docs = Vec::with_capacity(doc_count);
 
     for _ in 0..doc_count {
         let doc_id = cursor.read_u32()?;
         let size = cursor.read_u64()?;
-        let mtime_secs = cursor.read_u64()?;
+        let mtime_nanos = cursor.read_u64()?;
         let path_len = u32_to_usize(cursor.read_u32()?, "path length")?;
         let path = cursor.read_string(path_len)?;
 
@@ -128,7 +170,7 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
             doc_id,
             path,
             size,
-            mtime_secs,
+            mtime_nanos,
         });
     }
 
@@ -137,9 +179,63 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
             tokenizer,
             min_sparse_len,
             max_sparse_len,
+            build,
         },
         docs,
     ))
+}
+
+pub fn write_doc_terms_file(path: &Path, doc_terms: &[Vec<u64>]) -> Result<()> {
+    let mut file = File::create(path)?;
+    file.write_all(DOC_TERMS_MAGIC)?;
+    write_u32(&mut file, FORMAT_VERSION)?;
+    write_u32(&mut file, usize_to_u32(doc_terms.len(), "doc term count")?)?;
+
+    for token_hashes in doc_terms {
+        write_u32(
+            &mut file,
+            usize_to_u32(token_hashes.len(), "document token hash count")?,
+        )?;
+        for &token_hash in token_hashes {
+            write_u64(&mut file, token_hash)?;
+        }
+    }
+
+    Ok(())
+}
+
+pub fn read_doc_terms_file(path: &Path) -> Result<Vec<Vec<u64>>> {
+    let mut bytes = Vec::new();
+    File::open(path)?.read_to_end(&mut bytes)?;
+    let mut cursor = Cursor::new(&bytes);
+
+    cursor.expect_magic(DOC_TERMS_MAGIC)?;
+    let version = cursor.read_u32()?;
+    if version != FORMAT_VERSION {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported doc terms version: {version}"
+        )));
+    }
+
+    let doc_count = u32_to_usize(cursor.read_u32()?, "doc term count")?;
+    let mut doc_terms = Vec::with_capacity(doc_count);
+
+    for _ in 0..doc_count {
+        let token_count = u32_to_usize(cursor.read_u32()?, "document token hash count")?;
+        let mut token_hashes = Vec::with_capacity(token_count);
+        for _ in 0..token_count {
+            token_hashes.push(cursor.read_u64()?);
+        }
+        doc_terms.push(token_hashes);
+    }
+
+    if cursor.position != bytes.len() {
+        return Err(AppError::InvalidIndex(
+            "doc terms file has trailing bytes".into(),
+        ));
+    }
+
+    Ok(doc_terms)
 }
 
 pub fn write_postings_file(
@@ -464,7 +560,11 @@ fn read_varint(bytes: &[u8], position: &mut usize) -> Result<u32> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
-    use super::{decode_posting_list, encode_posting_list};
+    use tempfile::tempdir;
+
+    use super::{
+        decode_posting_list, encode_posting_list, read_doc_terms_file, write_doc_terms_file,
+    };
 
     #[test]
     fn postings_roundtrip_delta_varint() {
@@ -472,5 +572,17 @@ mod tests {
         let encoded = encode_posting_list(&docs);
         let decoded = decode_posting_list(&encoded, docs.len()).expect("test should succeed");
         assert_eq!(decoded, docs);
+    }
+
+    #[test]
+    fn doc_terms_roundtrip() {
+        let temp = tempdir().expect("test should succeed");
+        let path = temp.path().join("doc_terms.bin");
+        let doc_terms = vec![vec![1, 3, 5], vec![], vec![8, 13]];
+
+        write_doc_terms_file(&path, &doc_terms).expect("test should succeed");
+        let decoded = read_doc_terms_file(&path).expect("test should succeed");
+
+        assert_eq!(decoded, doc_terms);
     }
 }

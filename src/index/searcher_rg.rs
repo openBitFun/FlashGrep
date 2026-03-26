@@ -14,6 +14,11 @@ pub(super) fn enabled(config: &QueryConfig) -> bool {
     config.search_mode == crate::search::SearchMode::CountOnly
         && !config.multiline
         && !config.dot_matches_new_line
+        && !config.has_context()
+        && !config.fixed_strings
+        && !config.word_regexp
+        && !config.line_regexp
+        && config.max_count.is_none()
         && env::var_os("BITFUN_EXPERIMENTAL_RG_VERIFY").is_some()
 }
 

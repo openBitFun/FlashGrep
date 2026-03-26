@@ -1,8 +1,15 @@
-use std::{collections::HashSet, env, io, path::Path, time::Duration};
+use std::{
+    collections::HashSet,
+    env, io,
+    path::Path,
+    time::{Duration, Instant},
+};
 
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
-use grep_searcher::{BinaryDetection, Searcher, SearcherBuilder, Sink, SinkMatch};
+use grep_searcher::{
+    BinaryDetection, Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch,
+};
 use rayon::prelude::*;
 use regex_syntax::{
     hir::{Class, Hir, HirKind},
@@ -13,7 +20,8 @@ use crate::{
     config::QueryConfig,
     error::Result,
     index::format::DocMeta,
-    search::{FileMatch, MatchLocation, SearchMode},
+    json_output::{JsonContext, JsonData, JsonMatch, JsonMessage, JsonSubmatch},
+    search::{FileContext, FileMatch, MatchLocation, SearchLine, SearchMode},
 };
 
 pub(super) use super::shared::build_regex_matcher as build_matcher;
@@ -47,6 +55,9 @@ pub(super) fn verify_candidates(
     matcher: &RegexMatcher,
     multiline_verifier: bool,
     mode: SearchMode,
+    max_count: Option<usize>,
+    before_context: usize,
+    after_context: usize,
 ) -> Result<Vec<SearchTaskOutcome>> {
     validate_doc_ids(docs, candidate_ids)?;
     let mut outcomes = if should_parallel_verify(candidate_ids.len()) {
@@ -54,7 +65,18 @@ pub(super) fn verify_candidates(
             .par_iter()
             .enumerate()
             .map_init(
-                || (matcher.clone(), build_verifier(multiline_verifier, mode)),
+                || {
+                    (
+                        matcher.clone(),
+                        build_verifier(
+                            multiline_verifier,
+                            mode,
+                            max_count,
+                            before_context,
+                            after_context,
+                        ),
+                    )
+                },
                 |(matcher, verifier), (ordinal, &doc_id)| {
                     let path = Path::new(doc_by_id(docs, doc_id)?.path.as_str());
                     let outcome = verify_path(path, matcher, verifier, mode)?;
@@ -73,7 +95,13 @@ pub(super) fn verify_candidates(
         }
         outcomes
     } else {
-        let mut verifier = build_verifier(multiline_verifier, mode);
+        let mut verifier = build_verifier(
+            multiline_verifier,
+            mode,
+            max_count,
+            before_context,
+            after_context,
+        );
         let mut outcomes = Vec::with_capacity(candidate_ids.len());
         for (ordinal, &doc_id) in candidate_ids.iter().enumerate() {
             let path = Path::new(doc_by_id(docs, doc_id)?.path.as_str());
@@ -90,15 +118,64 @@ pub(super) fn verify_candidates(
     Ok(outcomes)
 }
 
+pub(super) fn verify_candidates_json(
+    candidate_ids: &[u32],
+    docs: &[DocMeta],
+    matcher: &RegexMatcher,
+    multiline_verifier: bool,
+    mode: SearchMode,
+    max_count: Option<usize>,
+    before_context: usize,
+    after_context: usize,
+) -> Result<Vec<JsonSearchTaskOutcome>> {
+    validate_doc_ids(docs, candidate_ids)?;
+    let mut verifier = build_json_verifier(
+        multiline_verifier,
+        mode,
+        max_count,
+        before_context,
+        after_context,
+    );
+    let mut outcomes = Vec::with_capacity(candidate_ids.len());
+    for &doc_id in candidate_ids {
+        let path = Path::new(doc_by_id(docs, doc_id)?.path.as_str());
+        let started = Instant::now();
+        let outcome = verify_path_json(path, matcher, &mut verifier, mode)?;
+        outcomes.push(JsonSearchTaskOutcome {
+            doc_id,
+            elapsed: started.elapsed(),
+            outcome,
+        });
+    }
+    Ok(outcomes)
+}
+
 pub(super) struct VerifyOutcome {
     pub(super) matched_lines: usize,
+    pub(super) matched_occurrences: usize,
+    pub(super) bytes_searched: u64,
     pub(super) matches: Vec<FileMatch>,
+    pub(super) lines: Vec<SearchLine>,
 }
 
 pub(super) struct SearchTaskOutcome {
     pub(super) ordinal: usize,
     pub(super) doc_id: u32,
     pub(super) outcome: VerifyOutcome,
+}
+
+pub(super) struct JsonVerifyOutcome {
+    pub(super) matched_lines: usize,
+    pub(super) matched_occurrences: usize,
+    pub(super) bytes_searched: u64,
+    pub(super) binary_offset: Option<u64>,
+    pub(super) messages: Vec<JsonMessage>,
+}
+
+pub(super) struct JsonSearchTaskOutcome {
+    pub(super) doc_id: u32,
+    pub(super) elapsed: Duration,
+    pub(super) outcome: JsonVerifyOutcome,
 }
 
 #[derive(Debug, Default)]
@@ -111,6 +188,10 @@ impl SearchProfile {
         Self {
             enabled: env::var_os("BITFUN_PROFILE_SEARCH").is_some(),
         }
+    }
+
+    pub(super) fn disabled() -> Self {
+        Self { enabled: false }
     }
 
     pub(super) fn record_plan(&self, duration: Duration) {
@@ -158,14 +239,56 @@ impl SearchProfile {
     }
 }
 
-fn build_verifier(multiline_verifier: bool, mode: SearchMode) -> Searcher {
+fn build_verifier(
+    multiline_verifier: bool,
+    mode: SearchMode,
+    max_count: Option<usize>,
+    before_context: usize,
+    after_context: usize,
+) -> Searcher {
     let mut builder = SearcherBuilder::new();
     builder
         .line_number(mode.materializes_matches())
         .binary_detection(BinaryDetection::quit(b'\0'))
         .multi_line(multiline_verifier);
-    if matches!(mode, SearchMode::FirstHitOnly) {
-        builder.max_matches(Some(1));
+    if mode.materializes_matches() {
+        builder
+            .before_context(before_context)
+            .after_context(after_context);
+    }
+    let limit = if matches!(mode, SearchMode::FirstHitOnly) {
+        Some(1)
+    } else {
+        max_count.and_then(|count| u64::try_from(count).ok())
+    };
+    if limit.is_some() {
+        builder.max_matches(limit);
+    }
+    builder.build()
+}
+
+fn build_json_verifier(
+    multiline_verifier: bool,
+    mode: SearchMode,
+    max_count: Option<usize>,
+    before_context: usize,
+    after_context: usize,
+) -> Searcher {
+    let mut builder = SearcherBuilder::new();
+    builder
+        .line_number(true)
+        .binary_detection(BinaryDetection::quit(b'\0'))
+        .multi_line(multiline_verifier);
+    builder
+        .before_context(before_context)
+        .after_context(after_context);
+    let limit = if matches!(mode, SearchMode::FirstHitOnly) {
+        Some(1)
+    } else {
+        max_count.and_then(|count| u64::try_from(count).ok())
+    };
+    if limit.is_some() {
+        builder.max_matches(limit);
     }
     builder.build()
 }
@@ -177,6 +300,27 @@ fn verify_path(
     mode: SearchMode,
 ) -> Result<VerifyOutcome> {
     let mut sink = VerifySink::new(matcher, mode);
+    verifier.search_path(matcher, path, &mut sink)?;
+    Ok(sink.finish())
+}
+
+fn verify_path_json(
+    path: &Path,
+    matcher: &RegexMatcher,
+    verifier: &mut Searcher,
+    mode: SearchMode,
+) -> Result<JsonVerifyOutcome> {
+    let multiline_verifier = verifier.multi_line();
+    let mut verifier = build_json_verifier(
+        multiline_verifier,
+        mode,
+        verifier
+            .max_matches()
+            .and_then(|count| usize::try_from(count).ok()),
+        verifier.before_context(),
+        verifier.after_context(),
+    );
+    let mut sink = JsonCollectSink::new(matcher, mode);
     verifier.search_path(matcher, path, &mut sink)?;
     Ok(sink.finish())
 }
@@ -236,7 +380,10 @@ struct VerifySink<'m> {
     matcher: &'m RegexMatcher,
     mode: SearchMode,
     matched_lines: usize,
+    matched_occurrences: usize,
+    bytes_searched: u64,
     matches: Vec<FileMatch>,
+    lines: Vec<SearchLine>,
 }
 
 impl<'m> VerifySink<'m> {
@@ -245,14 +392,20 @@ impl<'m> VerifySink<'m> {
             matcher,
             mode,
             matched_lines: 0,
+            matched_occurrences: 0,
+            bytes_searched: 0,
             matches: Vec::new(),
+            lines: Vec::new(),
         }
     }
 
     fn finish(self) -> VerifyOutcome {
         VerifyOutcome {
             matched_lines: self.matched_lines,
+            matched_occurrences: self.matched_occurrences,
+            bytes_searched: self.bytes_searched,
             matches: self.matches,
+            lines: self.lines,
         }
     }
 
@@ -264,6 +417,24 @@ impl<'m> VerifySink<'m> {
                 } else {
                     self.matched_lines += 1;
                 }
+                Ok(true)
+            }
+            SearchMode::CountMatches => {
+                let buffer = mat.buffer();
+                let range = mat.bytes_range_in_buffer();
+                let line_starts = build_line_starts(buffer);
+                let mut seen_lines = HashSet::new();
+                let mut matched_occurrences = 0usize;
+                find_iter_at_in_context(searcher, self.matcher, buffer, range, |matched| {
+                    record_line_span(&mut seen_lines, &line_starts, matched);
+                    matched_occurrences += 1;
+                    true
+                })
+                .map_err(io_error_from_matcher)?;
+                if !seen_lines.is_empty() {
+                    self.matched_lines += seen_lines.len();
+                }
+                self.matched_occurrences += matched_occurrences;
                 Ok(true)
             }
             SearchMode::FirstHitOnly => {
@@ -282,8 +453,10 @@ impl<'m> VerifySink<'m> {
                     return Ok(true);
                 };
                 self.matched_lines += seen_lines.len().max(1);
-                self.matches
-                    .push(build_file_match(buffer, matched, &line_starts, base_line));
+                self.matched_occurrences += 1;
+                let file_match = build_file_match(buffer, matched, &line_starts, base_line);
+                self.matches.push(file_match.clone());
+                self.lines.push(SearchLine::Match(file_match));
                 Ok(false)
             }
             SearchMode::MaterializeMatches => {
@@ -294,8 +467,10 @@ impl<'m> VerifySink<'m> {
                 let mut seen_lines = HashSet::new();
                 find_iter_at_in_context(searcher, self.matcher, buffer, range, |matched| {
                     record_line_span(&mut seen_lines, &line_starts, matched);
-                    self.matches
-                        .push(build_file_match(buffer, matched, &line_starts, base_line));
+                    self.matched_occurrences += 1;
+                    let file_match = build_file_match(buffer, matched, &line_starts, base_line);
+                    self.matches.push(file_match.clone());
+                    self.lines.push(SearchLine::Match(file_match));
                     true
                 })
                 .map_err(io_error_from_matcher)?;
@@ -305,6 +480,99 @@ impl<'m> VerifySink<'m> {
                 Ok(true)
             }
         }
+    }
+
+    fn record_context(&mut self, context: &SinkContext<'_>) -> io::Result<bool> {
+        if !self.mode.materializes_matches() {
+            return Ok(true);
+        }
+        let line_number = context
+            .line_number()
+            .and_then(|line| usize::try_from(line).ok())
+            .unwrap_or(1);
+        self.lines.push(SearchLine::Context(FileContext {
+            line_number,
+            snippet: String::from_utf8_lossy(trim_line_terminator_bytes(context.bytes()))
+                .into_owned(),
+        }));
+        Ok(true)
+    }
+}
+
+struct JsonCollectSink<'m> {
+    matcher: &'m RegexMatcher,
+    mode: SearchMode,
+    matched_lines: usize,
+    matched_occurrences: usize,
+    bytes_searched: u64,
+    binary_offset: Option<u64>,
+    messages: Vec<JsonMessage>,
+}
+
+impl<'m> JsonCollectSink<'m> {
+    fn new(matcher: &'m RegexMatcher, mode: SearchMode) -> Self {
+        Self {
+            matcher,
+            mode,
+            matched_lines: 0,
+            matched_occurrences: 0,
+            bytes_searched: 0,
+            binary_offset: None,
+            messages: Vec::new(),
+        }
+    }
+
+    fn finish(self) -> JsonVerifyOutcome {
+        JsonVerifyOutcome {
+            matched_lines: self.matched_lines,
+            matched_occurrences: self.matched_occurrences,
+            bytes_searched: self.bytes_searched,
+            binary_offset: self.binary_offset,
+            messages: self.messages,
+        }
+    }
+
+    fn record_match_group(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> io::Result<bool> {
+        let buffer = mat.buffer();
+        let range = mat.bytes_range_in_buffer();
+        let lines = mat.bytes();
+        let mut submatches = Vec::new();
+        find_iter_at_in_context(searcher, self.matcher, buffer, range.clone(), |matched| {
+            submatches.push(JsonSubmatch {
+                m: JsonData::from_bytes(&buffer[matched.start()..matched.end()]),
+                start: matched.start().saturating_sub(range.start),
+                end: matched.end().saturating_sub(range.start),
+            });
+            !matches!(self.mode, SearchMode::FirstHitOnly)
+        })
+        .map_err(io_error_from_matcher)?;
+
+        if submatches.is_empty() {
+            return Ok(true);
+        }
+
+        self.matched_occurrences += submatches.len();
+        self.matched_lines += mat.lines().count().max(1);
+        self.messages.push(JsonMessage::Match(JsonMatch {
+            path: None,
+            lines: JsonData::from_bytes(lines),
+            line_number: mat.line_number(),
+            absolute_offset: mat.absolute_byte_offset(),
+            submatches,
+        }));
+
+        Ok(!matches!(self.mode, SearchMode::FirstHitOnly))
+    }
+
+    fn record_context(&mut self, context: &SinkContext<'_>) -> io::Result<bool> {
+        self.messages.push(JsonMessage::Context(JsonContext {
+            path: None,
+            lines: JsonData::from_bytes(context.bytes()),
+            line_number: context.line_number(),
+            absolute_offset: context.absolute_byte_offset(),
+            submatches: Vec::new(),
+        }));
+        Ok(true)
     }
 }
 
@@ -317,6 +585,60 @@ impl Sink for VerifySink<'_> {
         mat: &SinkMatch<'_>,
     ) -> std::result::Result<bool, Self::Error> {
         self.record_match_group(searcher, mat)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        context: &SinkContext<'_>,
+    ) -> std::result::Result<bool, Self::Error> {
+        self.record_context(context)
+    }
+
+    fn context_break(&mut self, _searcher: &Searcher) -> std::result::Result<bool, Self::Error> {
+        if self.mode.materializes_matches() {
+            self.lines.push(SearchLine::ContextBreak);
+        }
+        Ok(true)
+    }
+
+    fn finish(
+        &mut self,
+        _searcher: &Searcher,
+        finish: &SinkFinish,
+    ) -> std::result::Result<(), Self::Error> {
+        self.bytes_searched = finish.byte_count();
+        Ok(())
+    }
+}
+
+impl Sink for JsonCollectSink<'_> {
+    type Error = io::Error;
+
+    fn matched(
+        &mut self,
+        searcher: &Searcher,
+        mat: &SinkMatch<'_>,
+    ) -> std::result::Result<bool, Self::Error> {
+        self.record_match_group(searcher, mat)
+    }
+
+    fn context(
+        &mut self,
+        _searcher: &Searcher,
+        context: &SinkContext<'_>,
+    ) -> std::result::Result<bool, Self::Error> {
+        self.record_context(context)
+    }
+
+    fn finish(
+        &mut self,
+        _searcher: &Searcher,
+        finish: &SinkFinish,
+    ) -> std::result::Result<(), Self::Error> {
+        self.bytes_searched = finish.byte_count();
+        self.binary_offset = finish.binary_byte_offset();
+        Ok(())
     }
 }
 

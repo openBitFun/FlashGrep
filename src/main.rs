@@ -1,8 +1,12 @@
 use bitfun_grep::cli;
 
 fn main() {
-    if let Err(error) = cli::run() {
-        eprintln!("{error}");
-        std::process::exit(1);
+    match cli::run() {
+        Ok(true) => {}
+        Ok(false) => std::process::exit(1),
+        Err(error) => {
+            eprintln!("{error}");
+            std::process::exit(2);
+        }
     }
 }

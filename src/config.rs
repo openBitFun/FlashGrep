@@ -45,6 +45,21 @@ impl CorpusMode {
             Self::NoIgnore => "no-ignore",
         }
     }
+
+    pub fn from_byte(value: u8) -> Option<Self> {
+        match value {
+            1 => Some(Self::RespectIgnore),
+            2 => Some(Self::NoIgnore),
+            _ => None,
+        }
+    }
+
+    pub fn to_byte(self) -> u8 {
+        match self {
+            Self::RespectIgnore => 1,
+            Self::NoIgnore => 2,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -53,6 +68,7 @@ pub struct BuildConfig {
     pub index_path: PathBuf,
     pub tokenizer: TokenizerMode,
     pub corpus_mode: CorpusMode,
+    pub include_hidden: bool,
     pub max_file_size: u64,
     pub min_sparse_len: usize,
     pub max_sparse_len: usize,
@@ -65,6 +81,7 @@ impl Default for BuildConfig {
             index_path: PathBuf::new(),
             tokenizer: TokenizerMode::SparseNgram,
             corpus_mode: CorpusMode::RespectIgnore,
+            include_hidden: false,
             max_file_size: 2 * 1024 * 1024,
             min_sparse_len: 5,
             max_sparse_len: 16,
@@ -75,21 +92,41 @@ impl Default for BuildConfig {
 #[derive(Debug, Clone)]
 pub struct QueryConfig {
     pub regex_pattern: String,
+    pub patterns: Vec<String>,
     pub case_insensitive: bool,
     pub multiline: bool,
     pub dot_matches_new_line: bool,
+    pub fixed_strings: bool,
+    pub word_regexp: bool,
+    pub line_regexp: bool,
+    pub before_context: usize,
+    pub after_context: usize,
     pub top_k_tokens: usize,
+    pub max_count: Option<usize>,
     pub search_mode: SearchMode,
+}
+
+impl QueryConfig {
+    pub fn has_context(&self) -> bool {
+        self.before_context > 0 || self.after_context > 0
+    }
 }
 
 impl Default for QueryConfig {
     fn default() -> Self {
         Self {
             regex_pattern: String::new(),
+            patterns: Vec::new(),
             case_insensitive: false,
             multiline: false,
             dot_matches_new_line: false,
+            fixed_strings: false,
+            word_regexp: false,
+            line_regexp: false,
+            before_context: 0,
+            after_context: 0,
             top_k_tokens: 6,
+            max_count: None,
             search_mode: SearchMode::MaterializeMatches,
         }
     }

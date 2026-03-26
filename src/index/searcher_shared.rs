@@ -10,12 +10,20 @@ pub(super) fn build_regex_matcher(
     config: &QueryConfig,
     multiline_verifier: bool,
 ) -> Result<RegexMatcher> {
+    let patterns = if config.patterns.is_empty() {
+        vec![config.regex_pattern.as_str()]
+    } else {
+        config.patterns.iter().map(String::as_str).collect()
+    };
     let mut builder = RegexMatcherBuilder::new();
     builder
         .multi_line(true)
         .unicode(true)
         .octal(false)
         .case_insensitive(config.case_insensitive)
+        .fixed_strings(config.fixed_strings)
+        .word(config.word_regexp && !config.line_regexp)
+        .whole_line(config.line_regexp)
         .dot_matches_new_line(config.dot_matches_new_line);
     if multiline_verifier {
         builder.line_terminator(None);
@@ -24,7 +32,7 @@ pub(super) fn build_regex_matcher(
     }
     builder.ban_byte(Some(b'\0'));
     builder
-        .build(&config.regex_pattern)
+        .build_many(&patterns)
         .map_err(|error| AppError::InvalidPattern(error.to_string()))
 }
 

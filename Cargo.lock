@@ -90,6 +90,7 @@ dependencies = [
  "regex",
  "regex-automata",
  "regex-syntax",
+ "serde_json",
  "tempfile",
  "thiserror",
  "walkdir",

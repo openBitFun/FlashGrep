@@ -283,6 +283,7 @@ pub fn run(config: &BenchConfig) -> Result<BenchReport> {
                 index_path: index_path.clone(),
                 tokenizer: config.tokenizer,
                 corpus_mode: config.corpus_mode,
+                include_hidden: false,
                 max_file_size: 512 * 1024 * 1024,
                 min_sparse_len: 5,
                 max_sparse_len: 16,
@@ -448,11 +449,13 @@ fn run_bitfun_once(
     let searcher = IndexSearcher::open(index_path.to_path_buf())?;
     let results = searcher.search(&QueryConfig {
         regex_pattern: benchmark.pattern.to_string(),
+        patterns: vec![benchmark.pattern.to_string()],
         case_insensitive: benchmark.case_insensitive,
         multiline: false,
         dot_matches_new_line: false,
         top_k_tokens: config.top_k_tokens,
         search_mode: SearchMode::CountOnly,
+        ..QueryConfig::default()
     })?;
     Ok(BitfunOutcome {
         candidate_docs: results.candidate_docs,

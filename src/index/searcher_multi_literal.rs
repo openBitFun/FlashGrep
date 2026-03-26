@@ -8,7 +8,7 @@ use crate::{
     error::{AppError, Result},
     index::format::DocMeta,
     planner::PureLiteralAlternation,
-    search::{FileMatch, MatchLocation, SearchHit, SearchMode, SearchResults},
+    search::{FileMatch, MatchLocation, SearchHit, SearchLine, SearchMode, SearchResults},
 };
 
 use super::shared::{
@@ -122,14 +122,18 @@ pub(super) fn search(
         if !outcome.matches.is_empty() {
             hits.push(SearchHit {
                 path: outcome.path,
-                matches: outcome.matches,
+                matches: outcome.matches.clone(),
+                lines: outcome.matches.into_iter().map(SearchLine::Match).collect(),
             });
         }
     }
 
     Ok(SearchResults {
         candidate_docs,
+        searches_with_match: candidate_docs,
+        bytes_searched: 0,
         matched_lines,
+        matched_occurrences: hits.iter().map(|hit| hit.matches.len()).sum(),
         hits,
     })
 }
@@ -191,7 +195,10 @@ fn search_count_only(
 
     Ok(SearchResults {
         candidate_docs,
+        searches_with_match: candidate_docs,
+        bytes_searched: 0,
         matched_lines,
+        matched_occurrences: 0,
         hits: Vec::new(),
     })
 }
@@ -215,6 +222,7 @@ fn scan_doc(doc: &DocMeta, matcher: &AhoCorasick, mode: SearchMode) -> Option<Ou
     let bytes = map_doc_bytes(doc)?;
     let outcome = match mode {
         SearchMode::CountOnly => unreachable!("count-only uses search_count_only"),
+        SearchMode::CountMatches => unreachable!("count-matches uses regex verification"),
         SearchMode::FirstHitOnly => collect_matches(&doc.path, &bytes, matcher, true),
         SearchMode::MaterializeMatches => collect_matches(&doc.path, &bytes, matcher, false),
     };
