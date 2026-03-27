@@ -11,6 +11,7 @@ grep-matcher = { path = "/home/wgq/workspace/ripgrep/crates/matcher" }
 grep-regex = { path = "/home/wgq/workspace/ripgrep/crates/regex" }
 grep-searcher = { path = "/home/wgq/workspace/ripgrep/crates/searcher" }
 ignore = "0.4.23"
+libc = "0.2.177"
 memchr = "2.7.4"
 memmap2 = "0.9.5"
 rayon = "1.10.0"

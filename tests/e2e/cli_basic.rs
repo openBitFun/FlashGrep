@@ -357,21 +357,13 @@ fn cli_no_ignore_matches_ripgrep_output_when_index_supports_it() {
 }
 
 #[test]
-fn cli_hidden_requires_hidden_capable_index() {
+fn cli_hidden_falls_back_to_scan_when_index_is_not_hidden_capable() {
     let repo = TestRepo::new();
     repo.write(".hidden.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
     repo.build();
 
-    let output = repo
-        .cli()
-        .args(["--hidden", "PM_RESUME"])
-        .arg(&repo.repo)
-        .output()
-        .expect("test should succeed");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr_string(&output.stderr).contains("requires an index built with --hidden"));
+    assert_cli_matches_rg(&repo, &["--hidden", "PM_RESUME"], &repo.repo);
 }
 
 #[test]
@@ -419,7 +411,7 @@ fn cli_no_ignore_still_respects_ignore_file() {
 }
 
 #[test]
-fn cli_no_ignore_requires_no_ignore_capable_index() {
+fn cli_no_ignore_falls_back_to_scan_when_index_is_not_no_ignore_capable() {
     let repo = TestRepo::new();
     repo.create_dir(".git");
     repo.write(".gitignore", "ignored.rs\n");
@@ -427,15 +419,7 @@ fn cli_no_ignore_requires_no_ignore_capable_index() {
 
     repo.build();
 
-    let output = repo
-        .cli()
-        .args(["--no-ignore", "PM_RESUME"])
-        .arg(&repo.repo)
-        .output()
-        .expect("test should succeed");
-
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr_string(&output.stderr).contains("requires an index built with --no-ignore"));
+    assert_cli_matches_rg(&repo, &["--no-ignore", "PM_RESUME"], &repo.repo);
 }
 
 #[test]
@@ -461,7 +445,7 @@ fn cli_max_filesize_matches_ripgrep_output() {
 }
 
 #[test]
-fn cli_errors_when_index_is_stale() {
+fn cli_uses_index_without_checking_freshness() {
     let repo = TestRepo::new();
     repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
@@ -475,8 +459,46 @@ fn cli_errors_when_index_is_stale() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(output.status.code(), Some(2));
-    assert!(stderr_string(&output.stderr).contains("index is stale"));
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = stdout_string(&output.stdout);
+    assert!(stdout.contains("tracked.rs"));
+    assert!(!stdout.contains("new.rs"));
+}
+
+#[test]
+fn cli_count_uses_index_without_checking_freshness() {
+    let repo = TestRepo::new();
+    repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
+    repo.build();
+    repo.write("new.rs", "const NAME: &str = \"PM_RESUME\";\n");
+
+    let output = repo
+        .cli()
+        .args(["--count", "PM_RESUME"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(output.status.code(), Some(0));
+    let stdout = stdout_string(&output.stdout);
+    assert!(stdout.contains("tracked.rs:1"));
+    assert!(!stdout.contains("new.rs"));
+}
+
+#[test]
+fn cli_falls_back_to_scan_when_index_is_missing() {
+    let repo = TestRepo::new();
+    repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
+
+    let output = repo
+        .cli()
+        .arg("PM_RESUME")
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(stdout_string(&output.stdout).contains("tracked.rs"));
 }
 
 #[test]

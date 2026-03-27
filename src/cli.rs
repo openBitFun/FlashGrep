@@ -8,11 +8,18 @@ use std::{
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
-    bench::{self, BenchConfig},
+    bench::{self, BenchCacheMode, BenchConfig},
     config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
     error::{AppError, Result},
-    files::{scan_paths, ScanOptions},
-    index::{build_index, IndexSearcher},
+    files::{scan_paths, RepositoryFile, ScanOptions},
+    index::{
+        build_index,
+        engine::{
+            count_scanned_files, count_total_scanned_files, query_prefers_scan,
+            search_json_scanned_files, search_scanned_files,
+        },
+        IndexSearcher,
+    },
     json_output::{JsonData, JsonMessage},
     path_filter::{normalize_path, PathFilter, PathFilterArgs},
     search::{FileCount, SearchMode},
@@ -70,6 +77,8 @@ struct BenchArgs {
     tokenizer: TokenizerArg,
     #[arg(long, value_enum, default_value = "ignore")]
     corpus_mode: CorpusArg,
+    #[arg(long, value_enum, default_value = "warm")]
+    cache_mode: BenchCacheArg,
     #[arg(long, default_value_t = 1)]
     warmup_iter: usize,
     #[arg(long, default_value_t = 3)]
@@ -82,6 +91,14 @@ struct BenchArgs {
     rebuild: bool,
     #[arg(long)]
     raw_output: Option<PathBuf>,
+    #[arg(long)]
+    cold_hook: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BenchCacheArg {
+    Warm,
+    Cold,
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -247,6 +264,15 @@ impl From<CorpusArg> for CorpusMode {
     }
 }
 
+impl From<BenchCacheArg> for BenchCacheMode {
+    fn from(value: BenchCacheArg) -> Self {
+        match value {
+            BenchCacheArg::Warm => BenchCacheMode::Warm,
+            BenchCacheArg::Cold => BenchCacheMode::Cold,
+        }
+    }
+}
+
 pub fn run() -> Result<bool> {
     let cli = Cli::parse();
     match cli.command {
@@ -256,12 +282,14 @@ pub fn run() -> Result<bool> {
             filter: args.filter,
             tokenizer: args.tokenizer.into(),
             corpus_mode: args.corpus_mode.into(),
+            cache_mode: args.cache_mode.into(),
             warmup_iter: args.warmup_iter,
             bench_iter: args.bench_iter,
             top_k_tokens: args.top_k_tokens,
             compare_rg: args.compare_rg,
             rebuild: args.rebuild,
             raw_output: args.raw_output,
+            cold_hook: args.cold_hook,
         }),
         None => run_search(cli.search),
     }
@@ -307,11 +335,9 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         return Ok(!defs.is_empty());
     }
 
-    let searcher = IndexSearcher::open(request.index_path.clone())?;
-    let allowed_paths = request.collect_allowed_paths(&searcher)?;
-
     if request.files {
-        let paths = searcher.indexed_paths_with_allowed_paths(None, Some(&allowed_paths));
+        let execution = request.prepare_listing_execution()?;
+        let paths = execution.paths();
         if !request.quiet {
             print_paths(
                 &paths,
@@ -329,24 +355,20 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         ));
     };
 
+    let execution = request.prepare_query_execution(config)?;
+
     if request.quiet && !request.files_without_match && !request.stats {
-        if request.used_default_search_path && allowed_paths.is_empty() {
+        if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        return Ok(searcher
-            .search_with_allowed_paths(config, Some(&request.path_filter), Some(&allowed_paths))?
-            .has_match());
+        return Ok(execute_search(&execution, config, request.filter())?.has_match());
     }
 
     if request.json {
-        if request.used_default_search_path && allowed_paths.is_empty() {
+        if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        let mut report = searcher.search_json_with_allowed_paths(
-            config,
-            Some(&request.path_filter),
-            Some(&allowed_paths),
-        )?;
+        let mut report = execute_search_json(&execution, config, request.filter())?;
         rewrite_json_paths(
             &mut report,
             &request.current_dir,
@@ -367,14 +389,10 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     }
 
     if request.files_with_matches {
-        if request.used_default_search_path && allowed_paths.is_empty() {
+        if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        let paths = searcher.files_with_matches_and_allowed_paths(
-            config,
-            Some(&request.path_filter),
-            Some(&allowed_paths),
-        )?;
+        let paths = execute_files_with_matches(&execution, config, request.filter())?;
         if !request.quiet {
             print_paths(
                 &paths,
@@ -387,14 +405,10 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     }
 
     if request.files_without_match {
-        if request.used_default_search_path && allowed_paths.is_empty() {
+        if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        let paths = searcher.files_without_matches_and_allowed_paths(
-            config,
-            Some(&request.path_filter),
-            Some(&allowed_paths),
-        )?;
+        let paths = execute_files_without_matches(&execution, config, request.filter())?;
         if !request.quiet {
             print_paths(
                 &paths,
@@ -407,18 +421,13 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     }
 
     if request.count {
-        if request.used_default_search_path && allowed_paths.is_empty() {
+        if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
         let search_started = std::time::Instant::now();
         let counts = if request.only_matching {
             if request.include_zero {
-                searcher
-                    .count_total_matches_by_file_including_zero_with_allowed_paths(
-                        config,
-                        Some(&request.path_filter),
-                        Some(&allowed_paths),
-                    )?
+                execute_count_total_matches(&execution, config, request.filter(), true)?
                     .into_iter()
                     .map(|count| FileCount {
                         path: count.path,
@@ -426,12 +435,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                     })
                     .collect::<Vec<_>>()
             } else {
-                searcher
-                    .count_total_matches_by_file_with_allowed_paths(
-                        config,
-                        Some(&request.path_filter),
-                        Some(&allowed_paths),
-                    )?
+                execute_count_total_matches(&execution, config, request.filter(), false)?
                     .into_iter()
                     .map(|count| FileCount {
                         path: count.path,
@@ -440,17 +444,9 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                     .collect::<Vec<_>>()
             }
         } else if request.include_zero {
-            searcher.count_matches_by_file_including_zero_with_allowed_paths(
-                config,
-                Some(&request.path_filter),
-                Some(&allowed_paths),
-            )?
+            execute_count_matches(&execution, config, request.filter(), true)?
         } else {
-            searcher.count_matches_by_file_with_allowed_paths(
-                config,
-                Some(&request.path_filter),
-                Some(&allowed_paths),
-            )?
+            execute_count_matches(&execution, config, request.filter(), false)?
         };
         let search_elapsed = search_started.elapsed();
         if !request.quiet {
@@ -463,11 +459,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             );
         }
         if request.stats {
-            let summary = searcher.search_with_allowed_paths(
-                config,
-                Some(&request.path_filter),
-                Some(&allowed_paths),
-            )?;
+            let summary = execute_search(&execution, config, request.filter())?;
             print_stats(
                 SearchStats {
                     matches: if request.only_matching {
@@ -489,22 +481,14 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     }
 
     if request.count_matches {
-        if request.used_default_search_path && allowed_paths.is_empty() {
+        if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
         let search_started = std::time::Instant::now();
         let counts = if request.include_zero {
-            searcher.count_total_matches_by_file_including_zero_with_allowed_paths(
-                config,
-                Some(&request.path_filter),
-                Some(&allowed_paths),
-            )?
+            execute_count_total_matches(&execution, config, request.filter(), true)?
         } else {
-            searcher.count_total_matches_by_file_with_allowed_paths(
-                config,
-                Some(&request.path_filter),
-                Some(&allowed_paths),
-            )?
+            execute_count_total_matches(&execution, config, request.filter(), false)?
         };
         let search_elapsed = search_started.elapsed();
         if !request.quiet {
@@ -517,11 +501,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             );
         }
         if request.stats {
-            let summary = searcher.search_with_allowed_paths(
-                config,
-                Some(&request.path_filter),
-                Some(&allowed_paths),
-            )?;
+            let summary = execute_search(&execution, config, request.filter())?;
             print_stats(
                 SearchStats {
                     matches: summary.matched_occurrences,
@@ -538,15 +518,11 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         return Ok(counts.iter().any(crate::search::FileMatchCount::has_match));
     }
 
-    if request.used_default_search_path && allowed_paths.is_empty() {
+    if request.used_default_search_path && execution.is_empty() {
         return Err(AppError::NoFilesSearched);
     }
     let search_started = std::time::Instant::now();
-    let results = searcher.search_with_allowed_paths(
-        config,
-        Some(&request.path_filter),
-        Some(&allowed_paths),
-    )?;
+    let results = execute_search(&execution, config, request.filter())?;
     let search_elapsed = search_started.elapsed();
     let mut bytes_printed = 0u64;
     if !request.quiet {
@@ -744,6 +720,36 @@ struct SearchStats {
     bytes_searched: u64,
 }
 
+enum SearchExecution {
+    Indexed {
+        searcher: IndexSearcher,
+        allowed_paths: Option<HashSet<String>>,
+        paths: Vec<String>,
+    },
+    Scan {
+        files: Vec<RepositoryFile>,
+    },
+}
+
+impl SearchExecution {
+    fn is_empty(&self) -> bool {
+        match self {
+            Self::Indexed { paths, .. } => paths.is_empty(),
+            Self::Scan { files } => files.is_empty(),
+        }
+    }
+
+    fn paths(&self) -> Vec<String> {
+        match self {
+            Self::Indexed { paths, .. } => paths.clone(),
+            Self::Scan { files } => files
+                .iter()
+                .map(|file| file.path.to_string_lossy().into_owned())
+                .collect(),
+        }
+    }
+}
+
 fn print_stats(
     stats: SearchStats,
     search_elapsed: std::time::Duration,
@@ -761,6 +767,135 @@ fn print_stats(
         search_elapsed.as_secs_f64()
     );
     println!("{:.6} seconds total", total_elapsed.as_secs_f64());
+}
+
+fn execute_search(
+    execution: &SearchExecution,
+    config: &QueryConfig,
+    filter: Option<&PathFilter>,
+) -> Result<crate::search::SearchResults> {
+    match execution {
+        SearchExecution::Indexed {
+            searcher,
+            allowed_paths,
+            ..
+        } => searcher.search_with_allowed_paths(config, filter, allowed_paths.as_ref()),
+        SearchExecution::Scan { files } => search_scanned_files(config, files),
+    }
+}
+
+fn execute_search_json(
+    execution: &SearchExecution,
+    config: &QueryConfig,
+    filter: Option<&PathFilter>,
+) -> Result<crate::json_output::JsonSearchReport> {
+    match execution {
+        SearchExecution::Indexed {
+            searcher,
+            allowed_paths,
+            ..
+        } => searcher.search_json_with_allowed_paths(config, filter, allowed_paths.as_ref()),
+        SearchExecution::Scan { files } => search_json_scanned_files(config, files),
+    }
+}
+
+fn execute_count_matches(
+    execution: &SearchExecution,
+    config: &QueryConfig,
+    filter: Option<&PathFilter>,
+    include_zero: bool,
+) -> Result<Vec<FileCount>> {
+    match execution {
+        SearchExecution::Indexed {
+            searcher,
+            allowed_paths,
+            ..
+        } => {
+            if include_zero {
+                searcher.count_matches_by_file_including_zero_with_allowed_paths(
+                    config,
+                    filter,
+                    allowed_paths.as_ref(),
+                )
+            } else {
+                searcher.count_matches_by_file_with_allowed_paths(
+                    config,
+                    filter,
+                    allowed_paths.as_ref(),
+                )
+            }
+        }
+        SearchExecution::Scan { files } => count_scanned_files(config, files, include_zero),
+    }
+}
+
+fn execute_count_total_matches(
+    execution: &SearchExecution,
+    config: &QueryConfig,
+    filter: Option<&PathFilter>,
+    include_zero: bool,
+) -> Result<Vec<crate::search::FileMatchCount>> {
+    match execution {
+        SearchExecution::Indexed {
+            searcher,
+            allowed_paths,
+            ..
+        } => {
+            if include_zero {
+                searcher.count_total_matches_by_file_including_zero_with_allowed_paths(
+                    config,
+                    filter,
+                    allowed_paths.as_ref(),
+                )
+            } else {
+                searcher.count_total_matches_by_file_with_allowed_paths(
+                    config,
+                    filter,
+                    allowed_paths.as_ref(),
+                )
+            }
+        }
+        SearchExecution::Scan { files } => count_total_scanned_files(config, files, include_zero),
+    }
+}
+
+fn execute_files_with_matches(
+    execution: &SearchExecution,
+    config: &QueryConfig,
+    filter: Option<&PathFilter>,
+) -> Result<Vec<String>> {
+    match execution {
+        SearchExecution::Indexed {
+            searcher,
+            allowed_paths,
+            ..
+        } => searcher.files_with_matches_and_allowed_paths(config, filter, allowed_paths.as_ref()),
+        SearchExecution::Scan { files } => Ok(count_scanned_files(config, files, false)?
+            .into_iter()
+            .map(|count| count.path)
+            .collect()),
+    }
+}
+
+fn execute_files_without_matches(
+    execution: &SearchExecution,
+    config: &QueryConfig,
+    filter: Option<&PathFilter>,
+) -> Result<Vec<String>> {
+    match execution {
+        SearchExecution::Indexed {
+            searcher,
+            allowed_paths,
+            ..
+        } => {
+            searcher.files_without_matches_and_allowed_paths(config, filter, allowed_paths.as_ref())
+        }
+        SearchExecution::Scan { files } => Ok(count_scanned_files(config, files, true)?
+            .into_iter()
+            .filter(|count| !count.has_match())
+            .map(|count| count.path)
+            .collect()),
+    }
 }
 
 #[derive(Debug)]
@@ -945,49 +1080,153 @@ impl SearchRequest {
 }
 
 impl SearchRequest {
-    fn collect_allowed_paths(&self, searcher: &IndexSearcher) -> Result<HashSet<String>> {
-        searcher.ensure_query_scope_supported(
+    fn filter(&self) -> Option<&PathFilter> {
+        Some(&self.path_filter)
+    }
+
+    fn prepare_listing_execution(&self) -> Result<SearchExecution> {
+        let searcher = match IndexSearcher::open(self.index_path.clone()) {
+            Ok(searcher) => Some(searcher),
+            Err(AppError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+
+        let Some(searcher) = searcher else {
+            return Ok(SearchExecution::Scan {
+                files: self.scan_requested_files(None)?,
+            });
+        };
+
+        match searcher.ensure_query_scope_supported(
             self.include_hidden,
             self.no_ignore,
             self.max_file_size,
-        )?;
-        if let Some(reason) = searcher.stale_reason()? {
-            return Err(AppError::InvalidIndex(format!(
-                "index is stale: {reason}. Rebuild it with `bitfun-grep build --repo {}`",
-                infer_repo_root_for_message(searcher).display()
-            )));
-        }
+        ) {
+            Ok(()) => {
+                let indexed_max_file_size = searcher
+                    .build_settings()
+                    .map(|settings| settings.max_file_size);
+                if self.requires_filesystem_scope_resolution(indexed_max_file_size) {
+                    let files = self.scan_requested_files(indexed_max_file_size)?;
+                    let allowed_paths = files
+                        .iter()
+                        .map(|file| file.path.to_string_lossy().into_owned())
+                        .collect();
+                    return Ok(SearchExecution::Indexed {
+                        searcher,
+                        allowed_paths: Some(allowed_paths),
+                        paths: files
+                            .iter()
+                            .map(|file| file.path.to_string_lossy().into_owned())
+                            .collect(),
+                    });
+                }
 
-        let default_max_file_size = self.max_file_size.or_else(|| {
-            searcher
-                .build_settings()
-                .map(|settings| settings.max_file_size)
-        });
-        let scanned = scan_paths(
+                Ok(SearchExecution::Indexed {
+                    paths: searcher.indexed_paths(self.filter()),
+                    searcher,
+                    allowed_paths: None,
+                })
+            }
+            Err(AppError::InvalidIndex(_)) => Ok(SearchExecution::Scan {
+                files: self.scan_requested_files(None)?,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn prepare_query_execution(&self, config: &QueryConfig) -> Result<SearchExecution> {
+        let query_prefers_scan = query_prefers_scan(config)?;
+        let searcher = match IndexSearcher::open(self.index_path.clone()) {
+            Ok(searcher) => Some(searcher),
+            Err(AppError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
+            Err(error) => return Err(error),
+        };
+
+        let Some(searcher) = searcher else {
+            return Ok(SearchExecution::Scan {
+                files: self.scan_requested_files(None)?,
+            });
+        };
+
+        match searcher.ensure_query_scope_supported(
+            self.include_hidden,
+            self.no_ignore,
+            self.max_file_size,
+        ) {
+            Ok(()) => {
+                if query_prefers_scan {
+                    return Ok(SearchExecution::Scan {
+                        files: self.scan_requested_files(
+                            searcher
+                                .build_settings()
+                                .map(|settings| settings.max_file_size),
+                        )?,
+                    });
+                }
+
+                let indexed_max_file_size = searcher
+                    .build_settings()
+                    .map(|settings| settings.max_file_size);
+                if self.requires_filesystem_scope_resolution(indexed_max_file_size) {
+                    let files = self.scan_requested_files(indexed_max_file_size)?;
+                    let allowed_paths = files
+                        .iter()
+                        .map(|file| file.path.to_string_lossy().into_owned())
+                        .collect();
+                    return Ok(SearchExecution::Indexed {
+                        searcher,
+                        allowed_paths: Some(allowed_paths),
+                        paths: files
+                            .iter()
+                            .map(|file| file.path.to_string_lossy().into_owned())
+                            .collect(),
+                    });
+                }
+
+                Ok(SearchExecution::Indexed {
+                    paths: searcher.indexed_paths(self.filter()),
+                    searcher,
+                    allowed_paths: None,
+                })
+            }
+            Err(AppError::InvalidIndex(_)) => Ok(SearchExecution::Scan {
+                files: self.scan_requested_files(None)?,
+            }),
+            Err(error) => Err(error),
+        }
+    }
+
+    fn scan_requested_files(
+        &self,
+        default_max_file_size: Option<u64>,
+    ) -> Result<Vec<RepositoryFile>> {
+        scan_paths(
             &self.search_paths,
             Some(&self.index_path),
             ScanOptions {
                 respect_ignore: !self.no_ignore,
                 include_hidden: self.include_hidden,
-                max_file_size: default_max_file_size.unwrap_or(u64::MAX),
+                max_file_size: self
+                    .max_file_size
+                    .or(default_max_file_size)
+                    .unwrap_or(u64::MAX),
                 max_depth: self.max_depth,
                 ignore_files: self.ignore_files.clone(),
             },
             Some(&self.path_filter),
-        )?;
-
-        Ok(scanned
-            .into_iter()
-            .map(|file| file.path.to_string_lossy().into_owned())
-            .collect())
+        )
     }
-}
 
-fn infer_repo_root_for_message(searcher: &IndexSearcher) -> PathBuf {
-    searcher
-        .build_settings()
-        .map(|settings| PathBuf::from(&settings.repo_root))
-        .unwrap_or_else(|| PathBuf::from("<repo>"))
+    fn requires_filesystem_scope_resolution(&self, indexed_max_file_size: Option<u64>) -> bool {
+        if !self.ignore_files.is_empty() || self.max_depth.is_some() {
+            return true;
+        }
+
+        self.max_file_size
+            .zip(indexed_max_file_size)
+            .is_some_and(|(requested, indexed)| requested < indexed)
+    }
 }
 
 fn collect_patterns(args: &SearchArgs) -> Result<Vec<String>> {

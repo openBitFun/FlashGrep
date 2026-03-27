@@ -20,6 +20,8 @@ const DOCS_FORMAT_VERSION_LEGACY: u32 = 4;
 const FORMAT_VERSION: u32 = 4;
 const LOOKUP_ENTRY_SIZE: usize = 28;
 pub const LOOKUP_FLAG_SKIPPED_HIGH_FREQ: u32 = 1;
+const CURRENT_FILE_NAME: &str = "CURRENT";
+const GENERATIONS_DIR_NAME: &str = "generations";
 
 #[derive(Debug, Clone)]
 pub struct DocMeta {
@@ -62,6 +64,8 @@ impl LookupEntry {
 
 #[derive(Debug)]
 pub struct IndexLayout {
+    pub root_path: PathBuf,
+    pub data_path: PathBuf,
     pub docs_path: PathBuf,
     pub doc_terms_path: PathBuf,
     pub lookup_path: PathBuf,
@@ -70,17 +74,75 @@ pub struct IndexLayout {
 
 impl IndexLayout {
     pub fn new(root: &Path) -> Self {
+        Self::at_data_path(root.to_path_buf(), root.to_path_buf())
+    }
+
+    pub fn resolve(root: &Path) -> Result<Self> {
+        let legacy_docs = root.join("docs.bin");
+        if legacy_docs.exists() {
+            return Ok(Self::new(root));
+        }
+
+        let current_path = root.join(CURRENT_FILE_NAME);
+        if !current_path.exists() {
+            return Ok(Self::new(root));
+        }
+
+        let generation = fs::read_to_string(&current_path)?;
+        let generation = generation.trim();
+        if generation.is_empty() {
+            return Err(AppError::InvalidIndex(
+                "CURRENT points to an empty generation".into(),
+            ));
+        }
+
+        Ok(Self::for_generation(root, generation))
+    }
+
+    pub fn for_generation(root: &Path, generation: &str) -> Self {
+        Self::at_data_path(
+            root.to_path_buf(),
+            root.join(GENERATIONS_DIR_NAME).join(generation),
+        )
+    }
+
+    pub fn current_path(root: &Path) -> PathBuf {
+        root.join(CURRENT_FILE_NAME)
+    }
+
+    pub fn generations_dir(root: &Path) -> PathBuf {
+        root.join(GENERATIONS_DIR_NAME)
+    }
+
+    fn at_data_path(root_path: PathBuf, data_path: PathBuf) -> Self {
         Self {
-            docs_path: root.join("docs.bin"),
-            doc_terms_path: root.join("doc_terms.bin"),
-            lookup_path: root.join("lookup.bin"),
-            postings_path: root.join("postings.bin"),
+            root_path,
+            docs_path: data_path.join("docs.bin"),
+            doc_terms_path: data_path.join("doc_terms.bin"),
+            lookup_path: data_path.join("lookup.bin"),
+            postings_path: data_path.join("postings.bin"),
+            data_path,
         }
     }
 }
 
 pub fn ensure_dir(path: &Path) -> Result<()> {
     fs::create_dir_all(path)?;
+    Ok(())
+}
+
+pub fn activate_generation(root: &Path, generation: &str) -> Result<()> {
+    ensure_dir(root)?;
+    let current_path = IndexLayout::current_path(root);
+    let temp_path = root.join(format!("{CURRENT_FILE_NAME}.tmp"));
+    fs::write(&temp_path, format!("{generation}\n"))?;
+    #[cfg(windows)]
+    {
+        if current_path.exists() {
+            fs::remove_file(&current_path)?;
+        }
+    }
+    fs::rename(temp_path, current_path)?;
     Ok(())
 }
 
@@ -560,10 +622,13 @@ fn read_varint(bytes: &[u8], position: &mut usize) -> Result<u32> {
 #[cfg(test)]
 #[allow(clippy::expect_used)]
 mod tests {
+    use std::fs;
+
     use tempfile::tempdir;
 
     use super::{
-        decode_posting_list, encode_posting_list, read_doc_terms_file, write_doc_terms_file,
+        activate_generation, decode_posting_list, encode_posting_list, read_doc_terms_file,
+        write_doc_terms_file, IndexLayout,
     };
 
     #[test]
@@ -584,5 +649,18 @@ mod tests {
         let decoded = read_doc_terms_file(&path).expect("test should succeed");
 
         assert_eq!(decoded, doc_terms);
+    }
+
+    #[test]
+    fn resolve_prefers_active_generation_when_current_exists() {
+        let temp = tempdir().expect("test should succeed");
+        let root = temp.path().join("index");
+        let generation = "gen-test";
+        let generation_layout = IndexLayout::for_generation(&root, generation);
+        fs::create_dir_all(&generation_layout.data_path).expect("test should succeed");
+        activate_generation(&root, generation).expect("test should succeed");
+
+        let resolved = IndexLayout::resolve(&root).expect("test should succeed");
+        assert_eq!(resolved.data_path, generation_layout.data_path);
     }
 }

@@ -1,0 +1,85 @@
+use bitfun_grep::{SearchBackend, SearchEngine, SearchPolicy};
+
+use crate::common::{query, TestRepo};
+
+#[test]
+fn search_engine_uses_index_when_fresh() {
+    let repo = TestRepo::new();
+    let source = repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");
+    repo.build();
+
+    let engine = SearchEngine::new(repo.trigram_build_config());
+    let outcome = engine
+        .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
+        .expect("test should succeed");
+
+    assert_eq!(outcome.backend, SearchBackend::Index);
+    assert_eq!(outcome.results.hits.len(), 1);
+    assert_eq!(outcome.results.hits[0].path, source.to_string_lossy());
+}
+
+#[test]
+fn search_engine_uses_index_without_checking_freshness() {
+    let repo = TestRepo::new();
+    let tracked = repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
+    repo.build();
+    let new_file = repo.write("new.rs", "const NAME: &str = \"PM_RESUME\";\n");
+
+    let engine = SearchEngine::new(repo.trigram_build_config());
+    let outcome = engine
+        .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
+        .expect("test should succeed");
+
+    assert_eq!(outcome.backend, SearchBackend::Index);
+    assert_eq!(outcome.results.hits.len(), 1);
+    assert_eq!(outcome.results.hits[0].path, tracked.to_string_lossy());
+    assert_ne!(outcome.results.hits[0].path, new_file.to_string_lossy());
+}
+
+#[test]
+fn search_engine_scans_when_index_is_missing() {
+    let repo = TestRepo::new();
+    let source = repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");
+
+    let engine = SearchEngine::new(repo.trigram_build_config());
+    let outcome = engine
+        .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
+        .expect("test should succeed");
+
+    assert_eq!(outcome.backend, SearchBackend::Scan);
+    assert_eq!(outcome.results.hits.len(), 1);
+    assert_eq!(outcome.results.hits[0].path, source.to_string_lossy());
+}
+
+#[test]
+fn search_engine_reports_worktree_diff_separately() {
+    let repo = TestRepo::new();
+    repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
+    repo.build();
+    let new_file = repo.write("new.rs", "const NAME: &str = \"PM_RESUME\";\n");
+
+    let engine = SearchEngine::new(repo.trigram_build_config());
+    let diff = engine.diff_against_worktree().expect("test should succeed");
+
+    assert!(diff
+        .new_files
+        .contains(&new_file.to_string_lossy().into_owned()));
+    assert!(engine
+        .stale_reason()
+        .expect("test should succeed")
+        .is_some());
+}
+
+#[test]
+fn search_engine_scans_fresh_index_when_query_cannot_use_index_effectively() {
+    let repo = TestRepo::new();
+    repo.write("words.txt", "alpha beta gamma\n");
+    repo.build();
+
+    let engine = SearchEngine::new(repo.trigram_build_config());
+    let outcome = engine
+        .search(&query("\\w+\\s+\\w+"), SearchPolicy::FallbackToScan)
+        .expect("test should succeed");
+
+    assert_eq!(outcome.backend, SearchBackend::Scan);
+}

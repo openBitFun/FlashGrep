@@ -12,7 +12,10 @@ pub mod tokenizer;
 
 pub use config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode};
 pub use error::{AppError, Result};
-pub use index::{build_index, IndexSearcher};
+pub use index::{
+    build_index, rebuild_index, IndexSearcher, IndexWorktreeDiff, SearchBackend, SearchEngine,
+    SearchOutcome, SearchPolicy,
+};
 pub use json_output::{
     JsonBegin, JsonContext, JsonData, JsonDuration, JsonEnd, JsonMatch, JsonMessage,
     JsonSearchFile, JsonSearchReport, JsonStats, JsonSubmatch, JsonSummary,

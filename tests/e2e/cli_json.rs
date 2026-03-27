@@ -1,6 +1,6 @@
 use crate::{
     cli_support::assert_cli_json_matches_rg,
-    common::{json_lines, TestRepo, SHERLOCK},
+    common::{json_lines, json_values, normalize_json_messages, TestRepo, SHERLOCK},
 };
 
 #[test]
@@ -134,4 +134,33 @@ fn cli_json_emits_context_messages() {
     assert!(messages[2].contains("\"submatches\":[]"));
     assert!(messages[3].starts_with("{\"type\":\"end\""));
     assert!(messages[4].starts_with("{\"type\":\"summary\""));
+}
+
+#[test]
+fn cli_json_uses_index_without_checking_freshness() {
+    let repo = TestRepo::new();
+    repo.write("tracked.rs", "PM_RESUME\n");
+    repo.build();
+    repo.write("new.rs", "PM_RESUME\n");
+
+    let output = repo
+        .cli()
+        .arg("--json")
+        .arg("PM_RESUME")
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert!(output.status.success());
+    let mut messages = json_values(&output.stdout);
+    normalize_json_messages(&mut messages);
+    let lines = messages
+        .iter()
+        .map(serde_json::Value::to_string)
+        .collect::<Vec<_>>();
+    assert!(lines.iter().any(|line| line.contains("tracked.rs")));
+    assert!(!lines.iter().any(|line| line.contains("new.rs")));
+    assert!(lines
+        .last()
+        .is_some_and(|line| line.contains("\"searches\":1") && line.contains("\"matches\":1")));
 }

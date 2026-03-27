@@ -84,6 +84,7 @@ dependencies = [
  "grep-regex",
  "grep-searcher",
  "ignore",
+ "libc",
  "memchr",
  "memmap2",
  "rayon",

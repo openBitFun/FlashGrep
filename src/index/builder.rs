@@ -1,13 +1,17 @@
-use std::{collections::HashMap, thread};
+use std::{
+    collections::HashMap,
+    thread,
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use crate::{
     config::BuildConfig,
     error::{AppError, Result},
     files::{read_text_file, scan_repository, RepositoryFile},
     index::format::{
-        ensure_dir, read_doc_terms_file, read_docs_file, write_doc_terms_file, write_docs_file,
-        write_lookup_file, write_postings_file, DocMeta, IndexBuildSettings, IndexLayout,
-        IndexMetadata,
+        activate_generation, ensure_dir, read_doc_terms_file, read_docs_file, write_doc_terms_file,
+        write_docs_file, write_lookup_file, write_postings_file, DocMeta, IndexBuildSettings,
+        IndexLayout, IndexMetadata,
     },
     tokenizer::{create, TokenizerOptions},
 };
@@ -15,8 +19,7 @@ use crate::{
 pub fn build_index(config: &BuildConfig) -> Result<usize> {
     let files = scan_repository(config)?;
     ensure_dir(&config.index_path)?;
-    let layout = IndexLayout::new(&config.index_path);
-    let cached_docs = load_cached_docs(config, &layout);
+    let cached_docs = load_cached_docs(config);
     let tokenizer_options = TokenizerOptions {
         min_sparse_len: config.min_sparse_len,
         max_sparse_len: config.max_sparse_len,
@@ -50,6 +53,10 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
     postings.sort_unstable_by_key(|(token_hash, _)| *token_hash);
     let high_freq_doc_threshold = (config.tokenizer == crate::config::TokenizerMode::SparseNgram)
         .then(|| compute_high_freq_doc_threshold(doc_entries.len()));
+    let generation = next_generation_name();
+    let layout = IndexLayout::for_generation(&config.index_path, &generation);
+    ensure_dir(&IndexLayout::generations_dir(&config.index_path))?;
+    ensure_dir(&layout.data_path)?;
 
     write_docs_file(
         &layout.docs_path,
@@ -73,8 +80,13 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
     let lookup_entries =
         write_postings_file(&layout.postings_path, &postings, high_freq_doc_threshold)?;
     write_lookup_file(&layout.lookup_path, &lookup_entries)?;
+    activate_generation(&config.index_path, &generation)?;
 
     Ok(doc_entries.len())
+}
+
+pub fn rebuild_index(config: &BuildConfig) -> Result<usize> {
+    build_index(config)
 }
 
 fn compute_high_freq_doc_threshold(doc_count: usize) -> usize {
@@ -181,7 +193,10 @@ fn fold_for_index(mut text: String) -> String {
     }
 }
 
-fn load_cached_docs(config: &BuildConfig, layout: &IndexLayout) -> HashMap<String, CachedDoc> {
+fn load_cached_docs(config: &BuildConfig) -> HashMap<String, CachedDoc> {
+    let Ok(layout) = IndexLayout::resolve(&config.index_path) else {
+        return HashMap::new();
+    };
     let Ok((metadata, docs)) = read_docs_file(&layout.docs_path) else {
         return HashMap::new();
     };
@@ -212,6 +227,13 @@ fn load_cached_docs(config: &BuildConfig, layout: &IndexLayout) -> HashMap<Strin
             )
         })
         .collect()
+}
+
+fn next_generation_name() -> String {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default();
+    format!("gen-{}-{}", now.as_secs(), now.subsec_nanos())
 }
 
 #[derive(Debug, Clone)]

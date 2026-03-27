@@ -29,7 +29,7 @@ mod rg;
 #[path = "searcher_shared.rs"]
 mod shared;
 #[path = "searcher_verify.rs"]
-mod verify;
+pub(crate) mod verify;
 
 use count::{DocMatchCount, VerifyPlan as CountVerifyPlan};
 use multi_literal::{
@@ -42,6 +42,28 @@ use verify::{
     build_matcher, requires_multiline_verification, verify_candidates, verify_candidates_json,
     SearchProfile,
 };
+
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct IndexWorktreeDiff {
+    pub modified_files: Vec<String>,
+    pub deleted_files: Vec<String>,
+    pub new_files: Vec<String>,
+}
+
+impl IndexWorktreeDiff {
+    pub fn is_empty(&self) -> bool {
+        self.modified_files.is_empty() && self.deleted_files.is_empty() && self.new_files.is_empty()
+    }
+
+    pub fn dirty_paths(&self) -> HashSet<&str> {
+        self.modified_files
+            .iter()
+            .chain(self.deleted_files.iter())
+            .chain(self.new_files.iter())
+            .map(String::as_str)
+            .collect()
+    }
+}
 
 pub struct IndexSearcher {
     index_path: PathBuf,
@@ -60,7 +82,7 @@ struct MultiLiteralPreparation {
 
 impl IndexSearcher {
     pub fn open(index_path: PathBuf) -> Result<Self> {
-        let layout = IndexLayout::new(&index_path);
+        let layout = IndexLayout::resolve(&index_path)?;
         let (metadata, docs) = read_docs_file(&layout.docs_path)?;
         let lookup = LookupTable::open(&layout.lookup_path)?;
         let postings = PostingsData::open(&layout.postings_path)?;
@@ -127,9 +149,9 @@ impl IndexSearcher {
         Ok(())
     }
 
-    pub fn stale_reason(&self) -> Result<Option<String>> {
+    pub fn diff_against_worktree(&self) -> Result<IndexWorktreeDiff> {
         let Some(build) = self.build_settings() else {
-            return Ok(None);
+            return Ok(IndexWorktreeDiff::default());
         };
 
         let current_files = scan_repository(&BuildConfig {
@@ -157,20 +179,44 @@ impl IndexSearcher {
             .map(|doc| doc.path.as_str())
             .collect::<HashSet<_>>();
 
-        if let Some(doc) = self.docs.iter().find(|doc| {
-            current.get(&doc.path).is_none_or(|&(size, mtime_nanos)| {
-                size != doc.size || mtime_nanos != doc.mtime_nanos
-            })
-        }) {
-            return Ok(Some(format!(
-                "indexed file changed or disappeared: {}",
-                doc.path
-            )));
+        let mut modified_files = Vec::new();
+        let mut deleted_files = Vec::new();
+        for doc in &self.docs {
+            match current.get(&doc.path) {
+                Some(&(size, mtime_nanos))
+                    if size == doc.size && mtime_nanos == doc.mtime_nanos => {}
+                Some(_) => modified_files.push(doc.path.clone()),
+                None => deleted_files.push(doc.path.clone()),
+            }
         }
-        if let Some(path) = current
+
+        let mut modified_files = modified_files;
+        modified_files.sort_unstable();
+        let mut deleted_files = deleted_files;
+        deleted_files.sort_unstable();
+        let mut new_files = current
             .keys()
-            .find(|path| !indexed_paths.contains(path.as_str()))
-        {
+            .filter(|path| !indexed_paths.contains(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        new_files.sort_unstable();
+
+        Ok(IndexWorktreeDiff {
+            modified_files,
+            deleted_files,
+            new_files,
+        })
+    }
+
+    pub fn stale_reason(&self) -> Result<Option<String>> {
+        let diff = self.diff_against_worktree()?;
+        if let Some(path) = diff.modified_files.first() {
+            return Ok(Some(format!("indexed file changed: {path}")));
+        }
+        if let Some(path) = diff.deleted_files.first() {
+            return Ok(Some(format!("indexed file disappeared: {path}")));
+        }
+        if let Some(path) = diff.new_files.first() {
             return Ok(Some(format!("new file is missing from the index: {path}")));
         }
         Ok(None)
@@ -727,6 +773,15 @@ impl IndexSearcher {
 
     pub fn indexed_paths(&self, filter: Option<&PathFilter>) -> Vec<String> {
         self.indexed_paths_with_allowed_paths(filter, None)
+    }
+
+    pub fn indexed_doc_stats(&self, filter: Option<&PathFilter>) -> (usize, u64) {
+        self.docs
+            .iter()
+            .filter(|doc| self.doc_matches_filters(doc, filter, None))
+            .fold((0usize, 0u64), |(count, bytes), doc| {
+                (count + 1, bytes + doc.size)
+            })
     }
 
     pub(crate) fn indexed_paths_with_allowed_paths(

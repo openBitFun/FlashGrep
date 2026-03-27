@@ -75,7 +75,7 @@ fn incremental_build_detects_same_size_rewrite_and_reuses_unchanged_doc_terms() 
     let build = repo.trigram_build_config();
     repo.build_with(build.clone());
 
-    let layout = IndexLayout::new(&repo.index);
+    let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
     let (_, docs_before) = read_docs_file(&layout.docs_path).expect("test should succeed");
     let terms_before = read_doc_terms_file(&layout.doc_terms_path).expect("test should succeed");
     let before = docs_before
@@ -100,6 +100,7 @@ fn incremental_build_detects_same_size_rewrite_and_reuses_unchanged_doc_terms() 
     assert_eq!(omega.candidate_docs, 1);
     assert_eq!(omega.matched_lines, 1);
 
+    let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
     let (_, docs_after) = read_docs_file(&layout.docs_path).expect("test should succeed");
     let terms_after = read_doc_terms_file(&layout.doc_terms_path).expect("test should succeed");
     let after = docs_after
@@ -117,6 +118,27 @@ fn incremental_build_detects_same_size_rewrite_and_reuses_unchanged_doc_terms() 
         after[rewritten.to_string_lossy().as_ref()]
     );
     assert_eq!(after.len(), 2);
+}
+
+#[test]
+fn build_writes_current_generation_pointer() {
+    let repo = TestRepo::new();
+    repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");
+
+    repo.build();
+
+    let current_path = IndexLayout::current_path(&repo.index);
+    let generation = std::fs::read_to_string(&current_path).expect("test should succeed");
+    let generation = generation.trim();
+    assert!(!generation.is_empty());
+
+    let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
+    assert_ne!(layout.data_path, repo.index);
+    assert!(layout.docs_path.exists());
+    assert_eq!(
+        layout.data_path,
+        IndexLayout::generations_dir(&repo.index).join(generation)
+    );
 }
 
 #[test]

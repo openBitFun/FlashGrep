@@ -121,9 +121,16 @@ CLI 退出码现在与 ripgrep 保持一致：
 当前和 `rg` 的一个显式差异：
 
 - `-L` 现在保留给 `--follow`，但 indexed search 还没有实现该语义；如需“无匹配文件”，请使用 `--files-without-match`。
-- 搜索期的 `--hidden` / `--no-ignore` 只在索引本身覆盖对应 corpus 时可用；如果索引是在更窄的 corpus 上构建的，CLI 会直接报错要求重建索引，而不是静默漏结果。
+- 搜索期的 `--hidden` / `--no-ignore` 如果超出索引覆盖范围，CLI 会自动 fallback 到 scan，保证结果正确，而不是静默漏结果。
 - 搜索期的 `--ignore-file` 会像 ripgrep 一样额外缩小搜索范围，并且在 `--no-ignore` 下仍然生效。
-- 搜索前会检查索引是否过期；如果工作树里有新增、删除或改动文件，CLI 会直接报 stale index 错误，要求先重建。
+- 搜索不会在热路径里检查索引是否过期；如果工作树里有新增、删除或改动文件，是否重建索引由调用方自己决定。
+
+库 API 现在额外提供一层 `SearchEngine`：
+
+- `SearchPolicy::IndexOnly`：只允许走索引；索引缺失时直接返回错误。
+- `SearchPolicy::FallbackToScan`：索引缺失，或查询本身明显更适合 scan 时走 `Scan`；否则直接走索引。
+
+如果使用方希望检查索引是否过期，可以显式调用 `IndexSearcher::diff_against_worktree()` / `stale_reason()`，或 `SearchEngine::diff_against_worktree()` / `stale_reason()`。如果使用方希望主动刷新索引，可以显式调用 `build_index` / `rebuild_index()`，或 `SearchEngine::rebuild_index()`；库本身不会在搜索后偷偷调度后台重建。
 
 `--json` 现在对齐 ripgrep 的基本约束：
 
@@ -152,10 +159,24 @@ cargo run -- bench --suite-dir /Users/user/workspace/bitfun_grep/bench_data --fi
 cargo run -- bench --suite-dir /Users/user/workspace/bitfun_grep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
 ```
 
+如果希望比较 cold query，可以切到 `cold` cache mode。这个模式会在每个 sample 前主动驱逐本次 benchmark 会访问到的 index / corpus 文件页缓存；如果你还想连系统级 page cache 一起清掉，可以额外提供一个 hook：
+
+```bash
+cargo run -- bench \
+  --suite-dir /Users/user/workspace/bitfun_grep/bench_data \
+  --filter linux_literal \
+  --compare-rg \
+  --cache-mode cold \
+  --bench-iter 3 \
+  --cold-hook 'sync && printf 3 | tee /proc/sys/vm/drop_caches >/dev/null'
+```
+
 说明：
 
 - `bitfun_grep` 的 benchmark 会单独统计索引构建时间和查询时间。
 - `rg` 对比项只统计直接搜索耗时，不包含任何建索引步骤。
+- bench 默认是 `warm` cache mode；`warmup_iter=1`、`bench_iter=3` 的默认值测出来的不是 cold query。
+- `cold` cache mode 默认使用 `posix_fadvise(..., DONTNEED)` 驱逐本次 benchmark 文件集的 page cache；额外的 `--cold-hook` 适合在 Linux 上配合 `drop_caches` 做更严格的系统级 cold run。
 - 当前 Linux 语料只要求仓库已 clone，不要求本机必须能成功构建内核。
 
 ## 当前边界
@@ -164,7 +185,7 @@ cargo run -- bench --suite-dir /Users/user/workspace/bitfun_grep/bench_data --fi
 - 查询规划器优先保证正确性，复杂表达式会降级到弱查询或全量候选。
 - 当前增量建索引只复用文档级 token 集；posting 仍会按最新文档集整体重写，还不是基于 commit 的 overlay 索引。
 - `lookup.bin` 已做 `mmap`，`postings.bin` 仍是按 offset 解码读取。
-- 当前还没有自动重建 stale index；检测到过期后会直接报错。
+- CLI 和库层都不会在搜索热路径里自动检查或重建 stale index；如果要保证新鲜度，需要显式调用 diff/stale 检查接口，再决定是否 rebuild。
 
 ## 下一步建议
 

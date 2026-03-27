@@ -24,7 +24,7 @@ use crate::{
     search::{FileContext, FileMatch, MatchLocation, SearchLine, SearchMode},
 };
 
-pub(super) use super::shared::build_regex_matcher as build_matcher;
+pub(crate) use super::shared::build_regex_matcher as build_matcher;
 use super::shared::{
     build_line_starts, doc_by_id, line_index_for_offset, trim_line_terminator_bytes,
     validate_doc_ids,
@@ -33,7 +33,7 @@ use super::shared::{
 const MAX_LOOK_AHEAD: usize = 128;
 const VERIFY_PARALLEL_THRESHOLD: usize = 512;
 
-pub(super) fn requires_multiline_verification(config: &QueryConfig) -> Result<bool> {
+pub(crate) fn requires_multiline_verification(config: &QueryConfig) -> Result<bool> {
     if !config.multiline && !config.dot_matches_new_line {
         return Ok(false);
     }
@@ -49,7 +49,7 @@ pub(super) fn requires_multiline_verification(config: &QueryConfig) -> Result<bo
     Ok(hir_can_match_line_terminator(&hir))
 }
 
-pub(super) fn verify_candidates(
+pub(crate) fn verify_candidates(
     candidate_ids: &[u32],
     docs: &[DocMeta],
     matcher: &RegexMatcher,
@@ -118,7 +118,7 @@ pub(super) fn verify_candidates(
     Ok(outcomes)
 }
 
-pub(super) fn verify_candidates_json(
+pub(crate) fn verify_candidates_json(
     candidate_ids: &[u32],
     docs: &[DocMeta],
     matcher: &RegexMatcher,
@@ -150,32 +150,32 @@ pub(super) fn verify_candidates_json(
     Ok(outcomes)
 }
 
-pub(super) struct VerifyOutcome {
-    pub(super) matched_lines: usize,
-    pub(super) matched_occurrences: usize,
-    pub(super) bytes_searched: u64,
-    pub(super) matches: Vec<FileMatch>,
-    pub(super) lines: Vec<SearchLine>,
+pub(crate) struct VerifyOutcome {
+    pub(crate) matched_lines: usize,
+    pub(crate) matched_occurrences: usize,
+    pub(crate) bytes_searched: u64,
+    pub(crate) matches: Vec<FileMatch>,
+    pub(crate) lines: Vec<SearchLine>,
 }
 
-pub(super) struct SearchTaskOutcome {
-    pub(super) ordinal: usize,
-    pub(super) doc_id: u32,
-    pub(super) outcome: VerifyOutcome,
+pub(crate) struct SearchTaskOutcome {
+    pub(crate) ordinal: usize,
+    pub(crate) doc_id: u32,
+    pub(crate) outcome: VerifyOutcome,
 }
 
-pub(super) struct JsonVerifyOutcome {
-    pub(super) matched_lines: usize,
-    pub(super) matched_occurrences: usize,
-    pub(super) bytes_searched: u64,
-    pub(super) binary_offset: Option<u64>,
-    pub(super) messages: Vec<JsonMessage>,
+pub(crate) struct JsonVerifyOutcome {
+    pub(crate) matched_lines: usize,
+    pub(crate) matched_occurrences: usize,
+    pub(crate) bytes_searched: u64,
+    pub(crate) binary_offset: Option<u64>,
+    pub(crate) messages: Vec<JsonMessage>,
 }
 
-pub(super) struct JsonSearchTaskOutcome {
-    pub(super) doc_id: u32,
-    pub(super) elapsed: Duration,
-    pub(super) outcome: JsonVerifyOutcome,
+pub(crate) struct JsonSearchTaskOutcome {
+    pub(crate) doc_id: u32,
+    pub(crate) elapsed: Duration,
+    pub(crate) outcome: JsonVerifyOutcome,
 }
 
 #[derive(Debug, Default)]

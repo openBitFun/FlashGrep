@@ -6,7 +6,7 @@ use crate::{
     index::format::DocMeta,
 };
 
-pub(super) fn build_regex_matcher(
+pub(crate) fn build_regex_matcher(
     config: &QueryConfig,
     multiline_verifier: bool,
 ) -> Result<RegexMatcher> {
