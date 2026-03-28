@@ -24,8 +24,6 @@ mod count;
 mod multi_literal;
 #[path = "searcher_query.rs"]
 mod query;
-#[path = "searcher_rg.rs"]
-mod rg;
 #[path = "searcher_shared.rs"]
 mod shared;
 #[path = "searcher_verify.rs"]
@@ -339,7 +337,6 @@ impl IndexSearcher {
         let plan_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
-        let use_rg_verify = rg::enabled(config);
 
         if !config.has_context()
             && !matches!(config.search_mode, SearchMode::CountMatches)
@@ -353,20 +350,6 @@ impl IndexSearcher {
             {
                 let candidate_ids =
                     self.filter_candidate_ids(&multi_literal.candidate_ids, filter, allowed_paths)?;
-                if use_rg_verify {
-                    let match_started = Instant::now();
-                    let matched_lines = rg::count_matches(config, &self.docs, &candidate_ids)?;
-                    profile.record_verify(match_started.elapsed());
-                    profile.finish(total_started.elapsed(), candidate_ids.len(), matched_lines);
-                    return Ok(SearchResults {
-                        candidate_docs: candidate_ids.len(),
-                        searches_with_match: usize::from(matched_lines > 0),
-                        bytes_searched: self.sum_doc_sizes(&candidate_ids)?,
-                        matched_lines,
-                        matched_occurrences: 0,
-                        hits: Vec::new(),
-                    });
-                }
                 let match_started = Instant::now();
                 let results = if matches!(config.search_mode, SearchMode::CountOnly) {
                     let regex_started = Instant::now();
@@ -404,21 +387,6 @@ impl IndexSearcher {
         let candidate_ids =
             self.filter_candidate_ids(&preparation.candidate_ids, filter, allowed_paths)?;
         let candidate_doc_count = candidate_ids.len();
-
-        if use_rg_verify {
-            let match_started = Instant::now();
-            let matched_lines = rg::count_matches(config, &self.docs, &candidate_ids)?;
-            profile.record_verify(match_started.elapsed());
-            profile.finish(total_started.elapsed(), candidate_doc_count, matched_lines);
-            return Ok(SearchResults {
-                candidate_docs: candidate_doc_count,
-                searches_with_match: usize::from(matched_lines > 0),
-                bytes_searched: self.sum_doc_sizes(&candidate_ids)?,
-                matched_lines,
-                matched_occurrences: 0,
-                hits: Vec::new(),
-            });
-        }
 
         let multiline_verifier = requires_multiline_verification(config)?;
         let match_started = Instant::now();
