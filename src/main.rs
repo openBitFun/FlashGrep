@@ -1,7 +1,5 @@
-use bitfun_grep::cli;
-
 fn main() {
-    match cli::run() {
+    match bitfun_grep::run_cli() {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(error) => {

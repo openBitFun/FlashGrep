@@ -275,6 +275,8 @@ dependencies = [
 [[package]]
 name = "grep-matcher"
 version = "0.1.8"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "36d7b71093325ab22d780b40d7df3066ae4aebb518ba719d38c697a8228a8023"
 dependencies = [
  "memchr",
 ]
@@ -282,6 +284,8 @@ dependencies = [
 [[package]]
 name = "grep-regex"
 version = "0.1.14"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "0ce0c256c3ad82bcc07b812c15a45ec1d398122e8e15124f96695234db7112ef"
 dependencies = [
  "bstr",
  "grep-matcher",
@@ -293,6 +297,8 @@ dependencies = [
 [[package]]
 name = "grep-searcher"
 version = "0.1.16"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "ac63295322dc48ebb20a25348147905d816318888e64f531bfc2a2bc0577dc34"
 dependencies = [
  "bstr",
  "encoding_rs",

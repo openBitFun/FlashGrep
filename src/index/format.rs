@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Seek, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -15,7 +15,9 @@ const DOCS_MAGIC: &[u8; 4] = b"BFGD";
 const DOC_TERMS_MAGIC: &[u8; 4] = b"BFGT";
 const LOOKUP_MAGIC: &[u8; 4] = b"BFGL";
 const POSTINGS_MAGIC: &[u8; 4] = b"BFGP";
-const DOCS_FORMAT_VERSION: u32 = 5;
+const DOCS_FORMAT_VERSION: u32 = 7;
+const DOCS_FORMAT_VERSION_V6: u32 = 6;
+const DOCS_FORMAT_VERSION_V5: u32 = 5;
 const DOCS_FORMAT_VERSION_LEGACY: u32 = 4;
 const FORMAT_VERSION: u32 = 4;
 const LOOKUP_ENTRY_SIZE: usize = 28;
@@ -36,7 +38,14 @@ pub struct IndexMetadata {
     pub tokenizer: TokenizerMode,
     pub min_sparse_len: usize,
     pub max_sparse_len: usize,
+    pub fallback_trigram: Option<FallbackTrigramSettings>,
     pub build: Option<IndexBuildSettings>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FallbackTrigramSettings {
+    pub doc_count: usize,
+    pub key_count: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -45,6 +54,8 @@ pub struct IndexBuildSettings {
     pub corpus_mode: CorpusMode,
     pub include_hidden: bool,
     pub max_file_size: u64,
+    pub head_commit: Option<String>,
+    pub config_fingerprint: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -70,6 +81,9 @@ pub struct IndexLayout {
     pub doc_terms_path: PathBuf,
     pub lookup_path: PathBuf,
     pub postings_path: PathBuf,
+    pub trigram_fallback_doc_terms_path: PathBuf,
+    pub trigram_fallback_lookup_path: PathBuf,
+    pub trigram_fallback_postings_path: PathBuf,
 }
 
 impl IndexLayout {
@@ -121,6 +135,9 @@ impl IndexLayout {
             doc_terms_path: data_path.join("doc_terms.bin"),
             lookup_path: data_path.join("lookup.bin"),
             postings_path: data_path.join("postings.bin"),
+            trigram_fallback_doc_terms_path: data_path.join("trigram_fallback_doc_terms.bin"),
+            trigram_fallback_lookup_path: data_path.join("trigram_fallback_lookup.bin"),
+            trigram_fallback_postings_path: data_path.join("trigram_fallback_postings.bin"),
             data_path,
         }
     }
@@ -147,42 +164,105 @@ pub fn activate_generation(root: &Path, generation: &str) -> Result<()> {
 }
 
 pub fn write_docs_file(path: &Path, metadata: IndexMetadata, docs: &[DocMeta]) -> Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(DOCS_MAGIC)?;
-    write_u32(&mut file, DOCS_FORMAT_VERSION)?;
-    file.write_all(&[metadata.tokenizer.to_byte()])?;
-    write_u32(
-        &mut file,
-        usize_to_u32(metadata.min_sparse_len, "min_sparse_len")?,
-    )?;
-    write_u32(
-        &mut file,
-        usize_to_u32(metadata.max_sparse_len, "max_sparse_len")?,
-    )?;
-    let build = metadata.build.ok_or_else(|| {
-        AppError::InvalidIndex("missing build metadata when writing docs file".into())
-    })?;
-    file.write_all(&[build.corpus_mode.to_byte()])?;
-    file.write_all(&[u8::from(build.include_hidden)])?;
-    write_u64(&mut file, build.max_file_size)?;
-    let repo_root_bytes = build.repo_root.as_bytes();
-    write_u32(
-        &mut file,
-        usize_to_u32(repo_root_bytes.len(), "repo root length")?,
-    )?;
-    file.write_all(repo_root_bytes)?;
-    write_u32(&mut file, usize_to_u32(docs.len(), "document count")?)?;
-
+    let mut writer = DocsWriter::create(path, metadata)?;
     for doc in docs {
-        write_u32(&mut file, doc.doc_id)?;
-        write_u64(&mut file, doc.size)?;
-        write_u64(&mut file, doc.mtime_nanos)?;
-        let path_bytes = doc.path.as_bytes();
-        write_u32(&mut file, usize_to_u32(path_bytes.len(), "path length")?)?;
-        file.write_all(path_bytes)?;
+        writer.write_doc(doc)?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+pub struct DocsWriter {
+    file: File,
+    doc_count_offset: u64,
+    doc_count: usize,
+}
+
+impl DocsWriter {
+    pub fn create(path: &Path, metadata: IndexMetadata) -> Result<Self> {
+        let mut file = File::create(path)?;
+        file.write_all(DOCS_MAGIC)?;
+        write_u32(&mut file, DOCS_FORMAT_VERSION)?;
+        file.write_all(&[metadata.tokenizer.to_byte()])?;
+        write_u32(
+            &mut file,
+            usize_to_u32(metadata.min_sparse_len, "min_sparse_len")?,
+        )?;
+        write_u32(
+            &mut file,
+            usize_to_u32(metadata.max_sparse_len, "max_sparse_len")?,
+        )?;
+        let build = metadata.build.ok_or_else(|| {
+            AppError::InvalidIndex("missing build metadata when writing docs file".into())
+        })?;
+        file.write_all(&[u8::from(metadata.fallback_trigram.is_some())])?;
+        if let Some(fallback) = metadata.fallback_trigram {
+            write_u32(
+                &mut file,
+                usize_to_u32(fallback.doc_count, "fallback trigram doc count")?,
+            )?;
+            write_u32(
+                &mut file,
+                usize_to_u32(fallback.key_count, "fallback trigram key count")?,
+            )?;
+        }
+        file.write_all(&[build.corpus_mode.to_byte()])?;
+        file.write_all(&[u8::from(build.include_hidden)])?;
+        write_u64(&mut file, build.max_file_size)?;
+        let repo_root_bytes = build.repo_root.as_bytes();
+        write_u32(
+            &mut file,
+            usize_to_u32(repo_root_bytes.len(), "repo root length")?,
+        )?;
+        file.write_all(repo_root_bytes)?;
+        let head_commit_bytes = build.head_commit.as_deref().unwrap_or_default().as_bytes();
+        write_u32(
+            &mut file,
+            usize_to_u32(head_commit_bytes.len(), "head commit length")?,
+        )?;
+        file.write_all(head_commit_bytes)?;
+        let config_fingerprint_bytes = build
+            .config_fingerprint
+            .as_deref()
+            .unwrap_or_default()
+            .as_bytes();
+        write_u32(
+            &mut file,
+            usize_to_u32(config_fingerprint_bytes.len(), "config fingerprint length")?,
+        )?;
+        file.write_all(config_fingerprint_bytes)?;
+        let doc_count_offset = file.stream_position()?;
+        write_u32(&mut file, 0)?;
+
+        Ok(Self {
+            file,
+            doc_count_offset,
+            doc_count: 0,
+        })
     }
 
-    Ok(())
+    pub fn write_doc(&mut self, doc: &DocMeta) -> Result<()> {
+        write_u32(&mut self.file, doc.doc_id)?;
+        write_u64(&mut self.file, doc.size)?;
+        write_u64(&mut self.file, doc.mtime_nanos)?;
+        let path_bytes = doc.path.as_bytes();
+        write_u32(
+            &mut self.file,
+            usize_to_u32(path_bytes.len(), "path length")?,
+        )?;
+        self.file.write_all(path_bytes)?;
+        self.doc_count += 1;
+        Ok(())
+    }
+
+    pub fn finish(mut self) -> Result<usize> {
+        let doc_count = self.doc_count;
+        let end_offset = self.file.stream_position()?;
+        self.file.seek(SeekFrom::Start(self.doc_count_offset))?;
+        write_u32(&mut self.file, usize_to_u32(doc_count, "document count")?)?;
+        self.file.seek(SeekFrom::Start(end_offset))?;
+        Ok(doc_count)
+    }
 }
 
 pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
@@ -192,7 +272,11 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
 
     cursor.expect_magic(DOCS_MAGIC)?;
     let version = cursor.read_u32()?;
-    if version != DOCS_FORMAT_VERSION && version != DOCS_FORMAT_VERSION_LEGACY {
+    if version != DOCS_FORMAT_VERSION
+        && version != DOCS_FORMAT_VERSION_V6
+        && version != DOCS_FORMAT_VERSION_V5
+        && version != DOCS_FORMAT_VERSION_LEGACY
+    {
         return Err(AppError::InvalidIndex(format!(
             "unsupported docs version: {version}"
         )));
@@ -202,18 +286,50 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
         .ok_or_else(|| AppError::InvalidIndex("unknown tokenizer mode".into()))?;
     let min_sparse_len = u32_to_usize(cursor.read_u32()?, "min_sparse_len")?;
     let max_sparse_len = u32_to_usize(cursor.read_u32()?, "max_sparse_len")?;
-    let build = if version == DOCS_FORMAT_VERSION {
+    let fallback_trigram = if version == DOCS_FORMAT_VERSION {
+        let enabled = cursor.read_byte()? != 0;
+        enabled
+            .then(|| -> Result<FallbackTrigramSettings> {
+                Ok(FallbackTrigramSettings {
+                    doc_count: u32_to_usize(cursor.read_u32()?, "fallback trigram doc count")?,
+                    key_count: u32_to_usize(cursor.read_u32()?, "fallback trigram key count")?,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let build = if version == DOCS_FORMAT_VERSION
+        || version == DOCS_FORMAT_VERSION_V6
+        || version == DOCS_FORMAT_VERSION_V5
+    {
         let corpus_mode = CorpusMode::from_byte(cursor.read_byte()?)
             .ok_or_else(|| AppError::InvalidIndex("unknown corpus mode".into()))?;
         let include_hidden = cursor.read_byte()? != 0;
         let max_file_size = cursor.read_u64()?;
         let repo_root_len = u32_to_usize(cursor.read_u32()?, "repo root length")?;
         let repo_root = cursor.read_string(repo_root_len)?;
+        let (head_commit, config_fingerprint) =
+            if version == DOCS_FORMAT_VERSION || version == DOCS_FORMAT_VERSION_V6 {
+                let head_commit_len = u32_to_usize(cursor.read_u32()?, "head commit length")?;
+                let head_commit = cursor.read_string(head_commit_len)?;
+                let config_fingerprint_len =
+                    u32_to_usize(cursor.read_u32()?, "config fingerprint length")?;
+                let config_fingerprint = cursor.read_string(config_fingerprint_len)?;
+                (
+                    (!head_commit.is_empty()).then_some(head_commit),
+                    (!config_fingerprint.is_empty()).then_some(config_fingerprint),
+                )
+            } else {
+                (None, None)
+            };
         Some(IndexBuildSettings {
             repo_root,
             corpus_mode,
             include_hidden,
             max_file_size,
+            head_commit,
+            config_fingerprint,
         })
     } else {
         None
@@ -241,6 +357,7 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
             tokenizer,
             min_sparse_len,
             max_sparse_len,
+            fallback_trigram,
             build,
         },
         docs,
@@ -248,22 +365,54 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
 }
 
 pub fn write_doc_terms_file(path: &Path, doc_terms: &[Vec<u64>]) -> Result<()> {
-    let mut file = File::create(path)?;
-    file.write_all(DOC_TERMS_MAGIC)?;
-    write_u32(&mut file, FORMAT_VERSION)?;
-    write_u32(&mut file, usize_to_u32(doc_terms.len(), "doc term count")?)?;
-
+    let mut writer = DocTermsWriter::create(path)?;
     for token_hashes in doc_terms {
+        writer.write_doc_terms(token_hashes)?;
+    }
+    writer.finish()?;
+    Ok(())
+}
+
+pub struct DocTermsWriter {
+    file: File,
+    doc_count_offset: u64,
+    doc_count: usize,
+}
+
+impl DocTermsWriter {
+    pub fn create(path: &Path) -> Result<Self> {
+        let mut file = File::create(path)?;
+        file.write_all(DOC_TERMS_MAGIC)?;
+        write_u32(&mut file, FORMAT_VERSION)?;
+        let doc_count_offset = file.stream_position()?;
+        write_u32(&mut file, 0)?;
+        Ok(Self {
+            file,
+            doc_count_offset,
+            doc_count: 0,
+        })
+    }
+
+    pub fn write_doc_terms(&mut self, token_hashes: &[u64]) -> Result<()> {
         write_u32(
-            &mut file,
+            &mut self.file,
             usize_to_u32(token_hashes.len(), "document token hash count")?,
         )?;
         for &token_hash in token_hashes {
-            write_u64(&mut file, token_hash)?;
+            write_u64(&mut self.file, token_hash)?;
         }
+        self.doc_count += 1;
+        Ok(())
     }
 
-    Ok(())
+    pub fn finish(mut self) -> Result<usize> {
+        let doc_count = self.doc_count;
+        let end_offset = self.file.stream_position()?;
+        self.file.seek(SeekFrom::Start(self.doc_count_offset))?;
+        write_u32(&mut self.file, usize_to_u32(doc_count, "doc term count")?)?;
+        self.file.seek(SeekFrom::Start(end_offset))?;
+        Ok(doc_count)
+    }
 }
 
 pub fn read_doc_terms_file(path: &Path) -> Result<Vec<Vec<u64>>> {
@@ -305,34 +454,107 @@ pub fn write_postings_file(
     postings: &[(u64, Vec<u32>)],
     high_freq_doc_threshold: Option<usize>,
 ) -> Result<Vec<LookupEntry>> {
-    let mut file = File::create(path)?;
-    file.write_all(POSTINGS_MAGIC)?;
-    write_u32(&mut file, FORMAT_VERSION)?;
-    write_u32(&mut file, usize_to_u32(postings.len(), "posting count")?)?;
-
-    let mut lookup_entries = Vec::with_capacity(postings.len());
+    let mut writer = PostingsWriter::create(path, postings.len())?;
     for (token_hash, doc_ids) in postings {
-        let doc_freq = usize_to_u32(doc_ids.len(), "posting doc frequency")?;
+        writer.write_posting_list(*token_hash, doc_ids, high_freq_doc_threshold)?;
+    }
+    writer.finish()
+}
+
+pub struct PostingsWriter {
+    file: File,
+    entries: Vec<LookupEntry>,
+    posting_count_offset: u64,
+    expected_posting_count: Option<usize>,
+    posting_count: usize,
+}
+
+impl PostingsWriter {
+    pub fn create(path: &Path, posting_count: usize) -> Result<Self> {
+        Self::create_inner(path, Some(posting_count))
+    }
+
+    pub fn create_streaming(path: &Path) -> Result<Self> {
+        Self::create_inner(path, None)
+    }
+
+    fn create_inner(path: &Path, expected_posting_count: Option<usize>) -> Result<Self> {
+        let mut file = File::create(path)?;
+        file.write_all(POSTINGS_MAGIC)?;
+        write_u32(&mut file, FORMAT_VERSION)?;
+        let posting_count_offset = file.stream_position()?;
+        write_u32(&mut file, 0)?;
+        Ok(Self {
+            file,
+            entries: Vec::with_capacity(expected_posting_count.unwrap_or(0)),
+            posting_count_offset,
+            expected_posting_count,
+            posting_count: 0,
+        })
+    }
+
+    pub fn write_posting_list(
+        &mut self,
+        token_hash: u64,
+        doc_ids: &[u32],
+        high_freq_doc_threshold: Option<usize>,
+    ) -> Result<()> {
         let skipped_high_freq =
             high_freq_doc_threshold.is_some_and(|threshold| doc_ids.len() > threshold);
-        let offset = file.stream_position()?;
         let encoded = encode_posting_list(doc_ids);
-        file.write_all(&encoded)?;
         let flags = if skipped_high_freq {
             LOOKUP_FLAG_SKIPPED_HIGH_FREQ
         } else {
             0
         };
-        lookup_entries.push(LookupEntry {
-            token_hash: *token_hash,
+        self.write_posting_bytes(
+            token_hash,
+            &encoded,
+            usize_to_u32(doc_ids.len(), "posting doc frequency")?,
+            flags,
+        )
+    }
+
+    pub fn write_posting_bytes(
+        &mut self,
+        token_hash: u64,
+        encoded: &[u8],
+        doc_freq: u32,
+        flags: u32,
+    ) -> Result<()> {
+        let offset = self.file.stream_position()?;
+        self.file.write_all(encoded)?;
+        self.entries.push(LookupEntry {
+            token_hash,
             offset,
             byte_len: usize_to_u32(encoded.len(), "posting byte length")?,
             doc_freq,
             flags,
         });
+        self.posting_count += 1;
+        Ok(())
     }
 
-    Ok(lookup_entries)
+    pub fn finish(mut self) -> Result<Vec<LookupEntry>> {
+        if self
+            .expected_posting_count
+            .is_some_and(|expected| expected != self.posting_count)
+        {
+            return Err(AppError::InvalidIndex(format!(
+                "posting count mismatch: expected {}, got {}",
+                self.expected_posting_count.unwrap_or_default(),
+                self.posting_count
+            )));
+        }
+        let end_offset = self.file.stream_position()?;
+        self.file.seek(SeekFrom::Start(self.posting_count_offset))?;
+        write_u32(
+            &mut self.file,
+            usize_to_u32(self.posting_count, "posting count")?,
+        )?;
+        self.file.seek(SeekFrom::Start(end_offset))?;
+        Ok(self.entries)
+    }
 }
 
 pub fn write_lookup_file(path: &Path, entries: &[LookupEntry]) -> Result<()> {
@@ -407,6 +629,12 @@ impl LookupTable {
         None
     }
 
+    pub fn entries(&self) -> Vec<LookupEntry> {
+        (0..self.entries_len)
+            .map(|index| self.entry_at(index))
+            .collect()
+    }
+
     fn entry_at(&self, index: usize) -> LookupEntry {
         let start = 16 + index * LOOKUP_ENTRY_SIZE;
         let token_hash = read_u64_le(&self.mmap[start..start + 8]);
@@ -451,6 +679,14 @@ impl PostingsData {
     }
 
     pub fn decode(&self, entry: LookupEntry) -> Result<Vec<u32>> {
+        let bytes = self.bytes(entry)?;
+        decode_posting_list(
+            bytes,
+            u32_to_usize(entry.doc_freq, "posting doc frequency")?,
+        )
+    }
+
+    pub fn bytes(&self, entry: LookupEntry) -> Result<&[u8]> {
         let start = u64_to_usize(entry.offset, "posting offset")?;
         let end = start
             .checked_add(u32_to_usize(entry.byte_len, "posting byte length")?)
@@ -458,10 +694,7 @@ impl PostingsData {
         if end > self.mmap.len() {
             return Err(AppError::InvalidIndex("posting slice out of range".into()));
         }
-        decode_posting_list(
-            &self.mmap[start..end],
-            u32_to_usize(entry.doc_freq, "posting doc frequency")?,
-        )
+        Ok(&self.mmap[start..end])
     }
 }
 
@@ -628,8 +861,10 @@ mod tests {
 
     use super::{
         activate_generation, decode_posting_list, encode_posting_list, read_doc_terms_file,
-        write_doc_terms_file, IndexLayout,
+        read_docs_file, write_doc_terms_file, write_docs_file, DocMeta, FallbackTrigramSettings,
+        IndexBuildSettings, IndexLayout, IndexMetadata,
     };
+    use crate::config::{CorpusMode, TokenizerMode};
 
     #[test]
     fn postings_roundtrip_delta_varint() {
@@ -662,5 +897,52 @@ mod tests {
 
         let resolved = IndexLayout::resolve(&root).expect("test should succeed");
         assert_eq!(resolved.data_path, generation_layout.data_path);
+    }
+
+    #[test]
+    fn docs_roundtrip_preserves_snapshot_metadata() {
+        let temp = tempdir().expect("test should succeed");
+        let path = temp.path().join("docs.bin");
+        let metadata = IndexMetadata {
+            tokenizer: TokenizerMode::Trigram,
+            min_sparse_len: 3,
+            max_sparse_len: 32,
+            fallback_trigram: Some(FallbackTrigramSettings {
+                doc_count: 1,
+                key_count: 7,
+            }),
+            build: Some(IndexBuildSettings {
+                repo_root: "/tmp/repo".into(),
+                corpus_mode: CorpusMode::RespectIgnore,
+                include_hidden: true,
+                max_file_size: 1024,
+                head_commit: Some("abc123".into()),
+                config_fingerprint: Some("deadbeef".into()),
+            }),
+        };
+        let docs = vec![DocMeta {
+            doc_id: 0,
+            path: "src/lib.rs".into(),
+            size: 12,
+            mtime_nanos: 34,
+        }];
+
+        write_docs_file(&path, metadata, &docs).expect("test should succeed");
+        let (decoded, decoded_docs) = read_docs_file(&path).expect("test should succeed");
+
+        let build = decoded.build.expect("build metadata should exist");
+        let fallback = decoded
+            .fallback_trigram
+            .expect("fallback trigram metadata should exist");
+        assert_eq!(fallback.doc_count, 1);
+        assert_eq!(fallback.key_count, 7);
+        assert_eq!(build.repo_root, "/tmp/repo");
+        assert_eq!(build.corpus_mode, CorpusMode::RespectIgnore);
+        assert!(build.include_hidden);
+        assert_eq!(build.max_file_size, 1024);
+        assert_eq!(build.head_commit.as_deref(), Some("abc123"));
+        assert_eq!(build.config_fingerprint.as_deref(), Some("deadbeef"));
+        assert_eq!(decoded_docs.len(), 1);
+        assert_eq!(decoded_docs[0].path, "src/lib.rs");
     }
 }

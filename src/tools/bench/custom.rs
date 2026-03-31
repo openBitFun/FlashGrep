@@ -1,0 +1,765 @@
+use std::{
+    path::{Path, PathBuf},
+    process::{Command, Stdio},
+    time::Instant,
+};
+
+use crate::{
+    config::{BuildConfig, CorpusMode},
+    error::{AppError, Result},
+    index::{build_index, format::IndexLayout, IndexSearcher},
+    WorkspaceIndex, WorkspaceIndexOptions,
+};
+
+use super::{
+    cache::{collect_cache_paths_for_target, prepare_sample, sanitize_benchmark_name},
+    custom_query_config,
+    fixtures::prepare_dirty_worktree_fixture,
+    report::{build_summary, mean_usize, RawSample, RawWriter},
+    BenchCachePaths, BenchConfig, BenchQueryMode, BenchReport, CorpusBuildRecord,
+    CustomBenchmarkCase, CustomBenchmarkTrace, DirtyPattern, DirtyWorktreeFixture,
+};
+
+pub(super) fn run_custom(
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<BenchReport> {
+    let repo_path = config
+        .custom_repo
+        .as_ref()
+        .ok_or_else(|| AppError::InvalidPattern("custom benchmark repo path is missing".into()))?;
+    if !repo_path.exists() {
+        return Err(AppError::InvalidIndex(format!(
+            "missing custom benchmark repo at {}",
+            repo_path.display()
+        )));
+    }
+
+    let target_label = config
+        .custom_name
+        .clone()
+        .or_else(|| {
+            repo_path
+                .file_name()
+                .map(|name| name.to_string_lossy().into_owned())
+        })
+        .unwrap_or_else(|| "custom".into());
+    let index_path = custom_index_path(&config.suite_dir, &target_label, config);
+    let should_build = config.rebuild || !index_exists(&index_path);
+
+    let mut corpus_builds = Vec::new();
+    if should_build {
+        let started = Instant::now();
+        let docs_indexed = build_index(&BuildConfig {
+            repo_path: repo_path.clone(),
+            index_path: index_path.clone(),
+            tokenizer: config.tokenizer,
+            corpus_mode: config.corpus_mode,
+            include_hidden: false,
+            max_file_size: 512 * 1024 * 1024,
+            min_sparse_len: 5,
+            max_sparse_len: 16,
+        })?;
+        corpus_builds.push(CorpusBuildRecord {
+            corpus: target_label.clone(),
+            tokenizer: config.tokenizer,
+            docs_indexed,
+            duration_secs: started.elapsed().as_secs_f64(),
+        });
+    }
+
+    let cache_paths = if config.cache_mode.is_cold() {
+        Some(collect_cache_paths_for_target(
+            repo_path,
+            &index_path,
+            config,
+            &target_label,
+        )?)
+    } else {
+        None
+    };
+    let dirty_fixture = if config.compare_worktree {
+        let patterns = config
+            .custom_patterns
+            .iter()
+            .map(|pattern| DirtyPattern {
+                regex_pattern: pattern.clone(),
+                case_insensitive: config.custom_case_insensitive,
+            })
+            .collect::<Vec<_>>();
+        Some(prepare_dirty_worktree_fixture(
+            repo_path,
+            &config.suite_dir,
+            &target_label,
+            config,
+            &patterns,
+        )?)
+    } else {
+        None
+    };
+    let mut summaries = Vec::new();
+    if matches!(config.query_mode, BenchQueryMode::Trace) && config.custom_patterns.len() > 1 {
+        let benchmark = CustomBenchmarkTrace {
+            name: target_label.clone(),
+            target: target_label.clone(),
+            repo_path: repo_path.clone(),
+            patterns: config.custom_patterns.clone(),
+            case_insensitive: config.custom_case_insensitive,
+        };
+
+        let mut runners = vec![run_bitfun_custom_trace_benchmark(
+            &benchmark,
+            &index_path,
+            cache_paths.as_ref(),
+            config,
+            raw_writer.as_deref_mut(),
+        )?];
+
+        if config.compare_rg {
+            runners.push(run_rg_custom_trace_benchmark(
+                &benchmark,
+                cache_paths.as_ref(),
+                config,
+                raw_writer.as_deref_mut(),
+            )?);
+        }
+
+        if config.compare_workspace {
+            runners.push(run_workspace_custom_trace_benchmark(
+                &benchmark,
+                &index_path,
+                cache_paths.as_ref(),
+                config,
+                raw_writer.as_deref_mut(),
+            )?);
+        }
+
+        if let Some(fixture) = dirty_fixture.as_ref() {
+            runners.push(run_worktree_custom_trace_benchmark(
+                &benchmark,
+                fixture,
+                true,
+                config,
+                raw_writer.as_deref_mut(),
+            )?);
+            runners.push(run_worktree_custom_trace_benchmark(
+                &benchmark,
+                fixture,
+                false,
+                config,
+                raw_writer.as_deref_mut(),
+            )?);
+        }
+
+        summaries.push(super::BenchSummary {
+            name: benchmark.name,
+            pattern: format!("trace[{}]", benchmark.patterns.len()),
+            target: benchmark.target,
+            runners,
+        });
+    } else {
+        for (index, pattern) in config.custom_patterns.iter().enumerate() {
+            let benchmark = CustomBenchmarkCase {
+                name: if config.custom_patterns.len() == 1 {
+                    target_label.clone()
+                } else {
+                    format!("{}_{}", target_label, index + 1)
+                },
+                target: target_label.clone(),
+                repo_path: repo_path.clone(),
+                pattern: pattern.clone(),
+                case_insensitive: config.custom_case_insensitive,
+            };
+
+            let mut runners = vec![run_bitfun_custom_benchmark(
+                &benchmark,
+                &index_path,
+                cache_paths.as_ref(),
+                config,
+                raw_writer.as_deref_mut(),
+            )?];
+
+            if config.compare_rg {
+                runners.push(run_rg_custom_benchmark(
+                    &benchmark,
+                    cache_paths.as_ref(),
+                    config,
+                    raw_writer.as_deref_mut(),
+                )?);
+            }
+
+            if config.compare_workspace {
+                runners.push(run_workspace_custom_benchmark(
+                    &benchmark,
+                    &index_path,
+                    cache_paths.as_ref(),
+                    config,
+                    raw_writer.as_deref_mut(),
+                )?);
+            }
+
+            if let Some(fixture) = dirty_fixture.as_ref() {
+                runners.push(run_worktree_custom_benchmark(
+                    &benchmark,
+                    fixture,
+                    true,
+                    config,
+                    raw_writer.as_deref_mut(),
+                )?);
+                runners.push(run_worktree_custom_benchmark(
+                    &benchmark,
+                    fixture,
+                    false,
+                    config,
+                    raw_writer.as_deref_mut(),
+                )?);
+            }
+
+            summaries.push(super::BenchSummary {
+                name: benchmark.name,
+                pattern: benchmark.pattern,
+                target: benchmark.target,
+                runners,
+            });
+        }
+    }
+
+    Ok(BenchReport {
+        corpus_builds,
+        summaries,
+    })
+}
+
+pub(super) fn index_exists(index_path: &Path) -> bool {
+    IndexLayout::resolve(index_path).is_ok()
+}
+
+fn custom_index_path(suite_dir: &Path, target_label: &str, config: &BenchConfig) -> PathBuf {
+    suite_dir.join(".bitfun-bench").join(format!(
+        "custom-{}-{}-{}",
+        sanitize_benchmark_name(target_label),
+        config.corpus_mode.as_str(),
+        config.tokenizer.as_str()
+    ))
+}
+
+fn run_bitfun_custom_benchmark(
+    benchmark: &CustomBenchmarkCase,
+    index_path: &Path,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let searcher = IndexSearcher::open(index_path.to_path_buf())?;
+    let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut candidate_docs = None;
+    let mut match_count = 0;
+
+    for _ in 0..config.warmup_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let _ = run_bitfun_custom_once(
+            &searcher,
+            &benchmark.pattern,
+            benchmark.case_insensitive,
+            config,
+        )?;
+    }
+
+    for iter in 0..config.bench_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let started = Instant::now();
+        let outcome = run_bitfun_custom_once(
+            &searcher,
+            &benchmark.pattern,
+            benchmark.case_insensitive,
+            config,
+        )?;
+        let duration_secs = started.elapsed().as_secs_f64();
+        candidate_docs = Some(outcome.candidate_docs);
+        match_count = outcome.match_count;
+        durations.push(duration_secs);
+
+        if let Some(writer) = raw_writer.as_deref_mut() {
+            writer.write_sample(RawSample {
+                benchmark: &benchmark.name,
+                corpus: &benchmark.target,
+                runner: "bitfun_grep",
+                iteration: iter,
+                duration_secs,
+                candidate_docs,
+                match_count,
+            })?;
+        }
+    }
+
+    Ok(build_summary(
+        "bitfun_grep".into(),
+        durations,
+        candidate_docs,
+        match_count,
+    ))
+}
+
+fn run_bitfun_custom_trace_benchmark(
+    benchmark: &CustomBenchmarkTrace,
+    index_path: &Path,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let searcher = IndexSearcher::open(index_path.to_path_buf())?;
+    let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut total_candidate_docs = 0usize;
+    let mut total_match_count = 0usize;
+
+    for iter in 0..config.warmup_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let pattern = benchmark.pattern_at(iter);
+        let _ = run_bitfun_custom_once(&searcher, pattern, benchmark.case_insensitive, config)?;
+    }
+
+    for iter in 0..config.bench_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let pattern = benchmark.pattern_at(iter);
+        let started = Instant::now();
+        let outcome =
+            run_bitfun_custom_once(&searcher, pattern, benchmark.case_insensitive, config)?;
+        let duration_secs = started.elapsed().as_secs_f64();
+        total_candidate_docs += outcome.candidate_docs;
+        total_match_count += outcome.match_count;
+        durations.push(duration_secs);
+        if let Some(writer) = raw_writer.as_deref_mut() {
+            writer.write_sample(RawSample {
+                benchmark: &benchmark.name,
+                corpus: &benchmark.target,
+                runner: "bitfun_grep",
+                iteration: iter,
+                duration_secs,
+                candidate_docs: Some(outcome.candidate_docs),
+                match_count: outcome.match_count,
+            })?;
+        }
+    }
+
+    Ok(build_summary(
+        "bitfun_grep".into(),
+        durations,
+        Some(mean_usize(total_candidate_docs, config.bench_iter)),
+        mean_usize(total_match_count, config.bench_iter),
+    ))
+}
+
+fn run_bitfun_custom_once(
+    searcher: &IndexSearcher,
+    pattern: &str,
+    case_insensitive: bool,
+    config: &BenchConfig,
+) -> Result<super::BitfunOutcome> {
+    let results = searcher.search(&custom_query_config(pattern, case_insensitive, config))?;
+    Ok(super::BitfunOutcome {
+        candidate_docs: results.candidate_docs,
+        match_count: results.matched_lines,
+    })
+}
+
+fn run_rg_custom_benchmark(
+    benchmark: &CustomBenchmarkCase,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut match_count = 0;
+    for _ in 0..config.warmup_iter {
+        prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
+        let _ = run_rg_custom_once(
+            &benchmark.repo_path,
+            &benchmark.pattern,
+            benchmark.case_insensitive,
+            config,
+        )?;
+    }
+    for iter in 0..config.bench_iter {
+        prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
+        let started = Instant::now();
+        match_count = run_rg_custom_once(
+            &benchmark.repo_path,
+            &benchmark.pattern,
+            benchmark.case_insensitive,
+            config,
+        )?;
+        let duration_secs = started.elapsed().as_secs_f64();
+        durations.push(duration_secs);
+        if let Some(writer) = raw_writer.as_deref_mut() {
+            writer.write_sample(RawSample {
+                benchmark: &benchmark.name,
+                corpus: &benchmark.target,
+                runner: "rg",
+                iteration: iter,
+                duration_secs,
+                candidate_docs: None,
+                match_count,
+            })?;
+        }
+    }
+    Ok(build_summary("rg".into(), durations, None, match_count))
+}
+
+fn run_rg_custom_trace_benchmark(
+    benchmark: &CustomBenchmarkTrace,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut total_match_count = 0usize;
+    for iter in 0..config.warmup_iter {
+        prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
+        let pattern = benchmark.pattern_at(iter);
+        let _ = run_rg_custom_once(
+            &benchmark.repo_path,
+            pattern,
+            benchmark.case_insensitive,
+            config,
+        )?;
+    }
+    for iter in 0..config.bench_iter {
+        prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
+        let pattern = benchmark.pattern_at(iter);
+        let started = Instant::now();
+        let match_count = run_rg_custom_once(
+            &benchmark.repo_path,
+            pattern,
+            benchmark.case_insensitive,
+            config,
+        )?;
+        let duration_secs = started.elapsed().as_secs_f64();
+        total_match_count += match_count;
+        durations.push(duration_secs);
+        if let Some(writer) = raw_writer.as_deref_mut() {
+            writer.write_sample(RawSample {
+                benchmark: &benchmark.name,
+                corpus: &benchmark.target,
+                runner: "rg",
+                iteration: iter,
+                duration_secs,
+                candidate_docs: None,
+                match_count,
+            })?;
+        }
+    }
+    Ok(build_summary(
+        "rg".into(),
+        durations,
+        None,
+        mean_usize(total_match_count, config.bench_iter),
+    ))
+}
+
+fn run_rg_custom_once(
+    repo_path: &Path,
+    pattern: &str,
+    case_insensitive: bool,
+    config: &BenchConfig,
+) -> Result<usize> {
+    let mut command = Command::new("rg");
+    command.arg("--count");
+    command.arg("--with-filename");
+    if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
+        command.arg("--no-ignore");
+    }
+    if case_insensitive {
+        command.arg("-i");
+    }
+    command.arg(pattern);
+    command.arg(repo_path);
+    command.stdout(Stdio::piped());
+    command.stderr(Stdio::null());
+
+    let output = command.output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(AppError::InvalidIndex(format!(
+            "rg failed for trace benchmark {} with status {}",
+            pattern, output.status
+        )));
+    }
+    super::parse_rg_count_output(&output.stdout)
+}
+
+fn run_worktree_custom_benchmark(
+    benchmark: &CustomBenchmarkCase,
+    fixture: &DirtyWorktreeFixture,
+    build_overlay_each_sample: bool,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let workspace = open_workspace(&fixture.repo_path, &fixture.index_path, config)?;
+    run_workspace_benchmark(
+        &workspace,
+        &benchmark.name,
+        &benchmark.target,
+        if build_overlay_each_sample {
+            "bitfun_worktree_build"
+        } else {
+            "bitfun_worktree"
+        },
+        Some(&benchmark.pattern),
+        benchmark.case_insensitive,
+        Some(&fixture.index_path),
+        build_overlay_each_sample,
+        cache_paths_for_fixture(fixture, build_overlay_each_sample),
+        config,
+        raw_writer.as_deref_mut(),
+    )
+}
+
+fn run_worktree_custom_trace_benchmark(
+    benchmark: &CustomBenchmarkTrace,
+    fixture: &DirtyWorktreeFixture,
+    build_overlay_each_sample: bool,
+    config: &BenchConfig,
+    raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let workspace = open_workspace(&fixture.repo_path, &fixture.index_path, config)?;
+    run_workspace_trace_benchmark(
+        &workspace,
+        benchmark,
+        if build_overlay_each_sample {
+            "bitfun_worktree_build"
+        } else {
+            "bitfun_worktree"
+        },
+        Some(&fixture.index_path),
+        build_overlay_each_sample,
+        cache_paths_for_fixture(fixture, build_overlay_each_sample),
+        config,
+        raw_writer,
+    )
+}
+
+fn run_workspace_custom_benchmark(
+    benchmark: &CustomBenchmarkCase,
+    index_path: &Path,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let workspace = open_workspace(&benchmark.repo_path, index_path, config)?;
+    run_workspace_benchmark(
+        &workspace,
+        &benchmark.name,
+        &benchmark.target,
+        "bitfun_workspace",
+        Some(&benchmark.pattern),
+        benchmark.case_insensitive,
+        None,
+        false,
+        cache_paths,
+        config,
+        raw_writer.as_deref_mut(),
+    )
+}
+
+fn run_workspace_custom_trace_benchmark(
+    benchmark: &CustomBenchmarkTrace,
+    index_path: &Path,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let workspace = open_workspace(&benchmark.repo_path, index_path, config)?;
+    run_workspace_trace_benchmark(
+        &workspace,
+        benchmark,
+        "bitfun_workspace",
+        None,
+        false,
+        cache_paths,
+        config,
+        raw_writer,
+    )
+}
+
+fn open_workspace(
+    repo_path: &Path,
+    index_path: &Path,
+    config: &BenchConfig,
+) -> Result<WorkspaceIndex> {
+    WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: BuildConfig {
+            repo_path: repo_path.to_path_buf(),
+            index_path: index_path.to_path_buf(),
+            tokenizer: config.tokenizer,
+            corpus_mode: config.corpus_mode,
+            include_hidden: false,
+            max_file_size: 512 * 1024 * 1024,
+            min_sparse_len: 5,
+            max_sparse_len: 16,
+        },
+        auto_refresh_overlay: false,
+        overlay_cache_limit: None,
+    })
+}
+
+fn run_workspace_benchmark(
+    workspace: &WorkspaceIndex,
+    benchmark_name: &str,
+    corpus: &str,
+    runner: &str,
+    pattern: Option<&str>,
+    case_insensitive: bool,
+    worktree_index_path: Option<&Path>,
+    rebuild_overlay_each_sample: bool,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let pattern = pattern.expect("single-pattern snapshot benchmark requires a pattern");
+    let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut candidate_docs = None;
+    let mut match_count = 0;
+    for _ in 0..config.warmup_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let _ = run_workspace_query(
+            workspace,
+            pattern,
+            case_insensitive,
+            worktree_index_path,
+            rebuild_overlay_each_sample,
+            config,
+        )?;
+    }
+    for iter in 0..config.bench_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let started = Instant::now();
+        let outcome = run_workspace_query(
+            workspace,
+            pattern,
+            case_insensitive,
+            worktree_index_path,
+            rebuild_overlay_each_sample,
+            config,
+        )?;
+        let duration_secs = started.elapsed().as_secs_f64();
+        candidate_docs = Some(outcome.candidate_docs);
+        match_count = outcome.match_count;
+        durations.push(duration_secs);
+        if let Some(writer) = raw_writer.as_deref_mut() {
+            writer.write_sample(RawSample {
+                benchmark: benchmark_name,
+                corpus,
+                runner,
+                iteration: iter,
+                duration_secs,
+                candidate_docs,
+                match_count,
+            })?;
+        }
+    }
+    Ok(build_summary(
+        runner.into(),
+        durations,
+        candidate_docs,
+        match_count,
+    ))
+}
+
+fn run_workspace_trace_benchmark(
+    workspace: &WorkspaceIndex,
+    benchmark: &CustomBenchmarkTrace,
+    runner: &str,
+    worktree_index_path: Option<&Path>,
+    rebuild_overlay_each_sample: bool,
+    cache_paths: Option<&BenchCachePaths>,
+    config: &BenchConfig,
+    mut raw_writer: Option<&mut RawWriter>,
+) -> Result<super::RunnerSummary> {
+    let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut total_candidate_docs = 0usize;
+    let mut total_match_count = 0usize;
+    for iter in 0..config.warmup_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let _ = run_workspace_query(
+            workspace,
+            benchmark.pattern_at(iter),
+            benchmark.case_insensitive,
+            worktree_index_path,
+            rebuild_overlay_each_sample,
+            config,
+        )?;
+    }
+    for iter in 0..config.bench_iter {
+        prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
+        let started = Instant::now();
+        let outcome = run_workspace_query(
+            workspace,
+            benchmark.pattern_at(iter),
+            benchmark.case_insensitive,
+            worktree_index_path,
+            rebuild_overlay_each_sample,
+            config,
+        )?;
+        let duration_secs = started.elapsed().as_secs_f64();
+        total_candidate_docs += outcome.candidate_docs;
+        total_match_count += outcome.match_count;
+        durations.push(duration_secs);
+        if let Some(writer) = raw_writer.as_deref_mut() {
+            writer.write_sample(RawSample {
+                benchmark: &benchmark.name,
+                corpus: &benchmark.target,
+                runner,
+                iteration: iter,
+                duration_secs,
+                candidate_docs: Some(outcome.candidate_docs),
+                match_count: outcome.match_count,
+            })?;
+        }
+    }
+    Ok(build_summary(
+        runner.into(),
+        durations,
+        Some(mean_usize(total_candidate_docs, config.bench_iter)),
+        mean_usize(total_match_count, config.bench_iter),
+    ))
+}
+
+fn run_workspace_query(
+    workspace: &WorkspaceIndex,
+    pattern: &str,
+    case_insensitive: bool,
+    worktree_index_path: Option<&Path>,
+    rebuild_overlay_each_sample: bool,
+    config: &BenchConfig,
+) -> Result<super::BitfunOutcome> {
+    if let Some(index_path) = worktree_index_path {
+        if rebuild_overlay_each_sample {
+            reset_overlay_cache(index_path)?;
+        }
+        let _ = workspace.refresh_overlay()?;
+    }
+    let snapshot = workspace.snapshot()?;
+    let results = snapshot.search(&custom_query_config(pattern, case_insensitive, config))?;
+    Ok(super::BitfunOutcome {
+        candidate_docs: results.candidate_docs,
+        match_count: results.matched_lines,
+    })
+}
+
+fn cache_paths_for_fixture(
+    fixture: &DirtyWorktreeFixture,
+    build_overlay_each_sample: bool,
+) -> Option<&BenchCachePaths> {
+    if build_overlay_each_sample {
+        fixture.build_cache_paths.as_ref()
+    } else {
+        fixture.cache_paths.as_ref()
+    }
+}
+
+fn reset_overlay_cache(index_path: &Path) -> Result<()> {
+    let overlays_dir = index_path.join("overlays");
+    if overlays_dir.exists() {
+        std::fs::remove_dir_all(&overlays_dir)?;
+    }
+    Ok(())
+}

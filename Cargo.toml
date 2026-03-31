@@ -7,9 +7,9 @@ edition = "2021"
 aho-corasick = "1.1.4"
 clap = { version = "4.5.20", features = ["derive"] }
 crc32fast = "1.4.2"
-grep-matcher = { path = "/home/wgq/workspace/ripgrep/crates/matcher" }
-grep-regex = { path = "/home/wgq/workspace/ripgrep/crates/regex" }
-grep-searcher = { path = "/home/wgq/workspace/ripgrep/crates/searcher" }
+grep-matcher = "0.1.8"
+grep-regex = "0.1.14"
+grep-searcher = "0.1.16"
 ignore = "0.4.23"
 libc = "0.2.177"
 memchr = "2.7.4"

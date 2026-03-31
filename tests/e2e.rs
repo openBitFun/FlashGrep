@@ -25,3 +25,6 @@ mod cli_json;
 
 #[path = "e2e/cli_regression.rs"]
 mod cli_regression;
+
+#[path = "e2e/workspace_index.rs"]
+mod workspace_index;

@@ -17,11 +17,7 @@ impl Tokenizer for SparseNgramTokenizer {
     }
 
     fn collect_query_token_hashes(&self, literal: &str, out: &mut Vec<u64>) {
-        let start_len = out.len();
         collect_query_sparse_token_hashes(literal, &self.options, out);
-        if out.len() == start_len {
-            self.collect_document_token_hashes(literal, out);
-        }
     }
 }
 
@@ -40,6 +36,7 @@ fn collect_document_sparse_token_hashes(
     let weights = build_bigram_weights(bytes, &char_offsets);
     let intervals = build_all_intervals(&weights, options);
     hash_intervals(bytes, &char_offsets, intervals, out);
+    collect_ascii_span_fallback_trigrams(bytes, options, out);
 }
 
 fn collect_query_sparse_token_hashes(text: &str, options: &TokenizerOptions, out: &mut Vec<u64>) {
@@ -181,6 +178,53 @@ fn hash_intervals(
     out.extend(hashed_tokens);
 }
 
+fn collect_ascii_span_fallback_trigrams(
+    bytes: &[u8],
+    options: &TokenizerOptions,
+    out: &mut Vec<u64>,
+) {
+    let mut start = 0usize;
+    while start < bytes.len() {
+        while start < bytes.len() && !is_ascii_token_byte(bytes[start]) {
+            start += 1;
+        }
+        if start >= bytes.len() {
+            break;
+        }
+
+        let mut end = start;
+        while end < bytes.len() && is_ascii_token_byte(bytes[end]) {
+            end += 1;
+        }
+
+        let span = &bytes[start..end];
+        let char_len = span.len();
+        if char_len >= options.min_sparse_len {
+            let char_offsets = (0..=span.len()).collect::<Vec<_>>();
+            let weights = build_bigram_weights(span, &char_offsets);
+            if build_all_intervals(&weights, options).is_empty() {
+                collect_trigram_hashes(span, out);
+            }
+        }
+
+        start = end;
+    }
+}
+
+fn collect_trigram_hashes(bytes: &[u8], out: &mut Vec<u64>) {
+    if bytes.len() < 3 {
+        return;
+    }
+    out.reserve(bytes.len().saturating_sub(2));
+    for window in bytes.windows(3) {
+        out.push(u64::from(crc32fast::hash(window)));
+    }
+}
+
+fn is_ascii_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
+}
+
 #[cfg(test)]
 fn is_sparse_boundary(weights: &[u32], left_bigram: usize, right_bigram: usize) -> bool {
     if right_bigram <= left_bigram || right_bigram >= weights.len() {
@@ -269,6 +313,41 @@ mod tests {
     }
 
     #[test]
+    fn document_tokens_fall_back_to_trigrams_for_ascii_identifier_without_sparse_intervals() {
+        let tokenizer = SparseNgramTokenizer::new(TokenizerOptions {
+            min_sparse_len: 5,
+            max_sparse_len: 16,
+        });
+        let mut tokens = Vec::new();
+        tokenizer.collect_document_token_hashes("const err_sys = 1;", &mut tokens);
+        tokens.sort_unstable();
+        tokens.dedup();
+
+        let expected = ["err", "rr_", "r_s", "_sy", "sys"]
+            .into_iter()
+            .map(|token| u64::from(crc32fast::hash(token.as_bytes())))
+            .collect::<Vec<_>>();
+        for token in expected {
+            assert!(tokens.contains(&token));
+        }
+    }
+
+    #[test]
+    fn query_covering_can_be_empty_for_identifier_substring() {
+        let tokenizer = SparseNgramTokenizer::new(TokenizerOptions {
+            min_sparse_len: 5,
+            max_sparse_len: 16,
+        });
+
+        let mut query_tokens = Vec::new();
+        tokenizer.collect_query_token_hashes("err_sys", &mut query_tokens);
+        query_tokens.sort_unstable();
+        query_tokens.dedup();
+
+        assert!(query_tokens.is_empty());
+    }
+
+    #[test]
     fn build_all_intervals_match_boundary_rule() {
         let text = "abcd";
         let offsets = build_char_offsets(text);
@@ -338,5 +417,35 @@ mod tests {
         assert_eq!(covering.len(), 2);
         assert_eq!(covering[0].start_char, 0);
         assert_eq!(covering[0].end_char, 6);
+    }
+
+    #[test]
+    fn superstring_document_tokens_do_not_help_substring_query_covering() {
+        let tokenizer = SparseNgramTokenizer::new(TokenizerOptions {
+            min_sparse_len: 5,
+            max_sparse_len: 16,
+        });
+
+        let query = "err_sys";
+        let doc = "ac_err_system";
+
+        let mut doc_tokens = Vec::new();
+        tokenizer.collect_document_token_hashes(doc, &mut doc_tokens);
+        doc_tokens.sort_unstable();
+        doc_tokens.dedup();
+
+        let mut query_tokens = Vec::new();
+        tokenizer.collect_query_token_hashes(query, &mut query_tokens);
+        query_tokens.sort_unstable();
+        query_tokens.dedup();
+
+        let shared = query_tokens
+            .iter()
+            .filter(|token| doc_tokens.contains(token))
+            .count();
+
+        assert!(doc_tokens.len() >= 1);
+        assert!(query_tokens.is_empty());
+        assert_eq!(shared, 0);
     }
 }

@@ -137,6 +137,62 @@ CLI 退出码现在与 ripgrep 保持一致：
 - 只用于搜索结果输出，不与 `--files`、`--type-list`、`-l`、`-L`、`-c`、`--count-matches` 组合。
 - 输出事件序列为 `begin` / `match|context` / `end` / `summary`。
 
+## 库用法
+
+如果你希望把项目当成一个可复用库，而不是只走 CLI，当前推荐的接入顺序是：
+
+1. 用 `WorkspaceIndex::open(...)` 打开工作区 facade。
+2. 启动时用 `ensure_base_snapshot()` 确保 base snapshot 已存在。
+3. 需要“尽量新鲜”的工作区查询时，显式调用 `refresh_overlay()`，或者直接拿 `snapshot()`。
+4. 对同一个只读视图做多次查询时，优先复用同一个 `WorkspaceSnapshot`。
+
+最小示例：
+
+```rust
+use bitfun_grep::{
+    BuildConfig, CorpusMode, QueryConfig, TokenizerMode, WorkspaceIndex, WorkspaceIndexOptions,
+};
+
+fn main() -> bitfun_grep::Result<()> {
+    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: BuildConfig {
+            repo_path: "/path/to/repo".into(),
+            index_path: "/path/to/repo/.bitfun-index".into(),
+            tokenizer: TokenizerMode::Trigram,
+            corpus_mode: CorpusMode::RespectIgnore,
+            include_hidden: false,
+            max_file_size: 2 * 1024 * 1024,
+            min_sparse_len: 3,
+            max_sparse_len: 32,
+        },
+        auto_refresh_overlay: false,
+        overlay_cache_limit: Some(8),
+    })?;
+
+    let base = workspace.ensure_base_snapshot()?;
+    let overlay = workspace.refresh_overlay()?;
+
+    let snapshot = workspace.snapshot()?;
+    let results = snapshot.search(&QueryConfig {
+        regex_pattern: "foo.*bar".into(),
+        patterns: vec!["foo.*bar".into()],
+        ..QueryConfig::default()
+    })?;
+
+    println!("base={}", base.snapshot_key);
+    println!("overlay={}", overlay.as_ref().map(|it| it.overlay_key.as_str()).unwrap_or("<clean>"));
+    println!("hits={}", results.hits.len());
+    Ok(())
+}
+```
+
+调用建议：
+
+- `WorkspaceIndex::search()` 适合直接做一次性查询。
+- `WorkspaceIndex::snapshot()` 适合先固定一个只读视图，再连续跑多个 query。
+- 如果你自己控制刷新节奏，建议把 `auto_refresh_overlay` 关掉，然后在合适的时机显式 `refresh_overlay()`。
+- `snapshot_key` / `base_snapshot_key` / `overlay_key` 是应该对外缓存或记录的稳定身份；不要依赖内部目录命名。
+
 ## Benchmark
 
 当前项目已集成一版兼容 ripgrep `benchsuite` 命名方式的 benchmark runner。
@@ -159,6 +215,28 @@ cargo run -- bench --suite-dir /Users/user/workspace/bitfun_grep/bench_data --fi
 cargo run -- bench --suite-dir /Users/user/workspace/bitfun_grep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
 ```
 
+如果希望额外测库层 facade 和 dirty worktree 路径：
+
+```bash
+cargo run -- bench \
+  --suite-dir /Users/user/workspace/bitfun_grep/bench_data \
+  --filter linux_literal \
+  --compare-worktree \
+  --compare-workspace \
+  --rebuild
+```
+
+如果希望 dirty worktree 更贴近“只改了几份文件”的 agent 场景，可以给 worktree fixture 加一个文件数上限。这个模式会从完整语料里抽一个保留真实目录结构的小型子仓库，并保证包含当前 benchmark 需要命中的文件：
+
+```bash
+cargo run -- bench \
+  --suite-dir /Users/user/workspace/bitfun_grep/bench_data \
+  --filter linux_literal \
+  --compare-worktree \
+  --worktree-sample-files 32 \
+  --rebuild
+```
+
 如果希望比较 cold query，可以切到 `cold` cache mode。这个模式会在每个 sample 前主动驱逐本次 benchmark 会访问到的 index / corpus 文件页缓存；如果你还想连系统级 page cache 一起清掉，可以额外提供一个 hook：
 
 ```bash
@@ -174,8 +252,13 @@ cargo run -- bench \
 说明：
 
 - `bitfun_grep` 的 benchmark 会单独统计索引构建时间和查询时间。
+- `--compare-worktree` 会额外跑两条 dirty worktree 路径：`bitfun_worktree_build` 会在每个 sample 前清掉 overlay cache，再测一次“首次 `refresh_overlay() + snapshot().search()`”；`bitfun_worktree` 则保留已有 overlay cache，用来测 dirty state 稳定后的显式保鲜查询路径。
+- `--worktree-sample-files <N>` 只影响 `--compare-worktree` 的 fixture 构造：不再复制完整目录，而是抽一个最多 `N` 个文本文件的小型真实子仓库。这个模式更适合测“少量 dirty 文件”的真实查询成本；不传时仍然保留完整仓库 worst-case。
+- `--compare-workspace` 会额外跑 clean workspace facade 路径；每个 sample 都会重新走一次 `snapshot().search()`，用于把工作区读视图构造成本也计入结果，而不是只测固定 snapshot 上的纯查询。
 - `rg` 对比项只统计直接搜索耗时，不包含任何建索引步骤。
+- `--raw-output <path>` 会把每个 sample 以 CSV 形式落盘；除了 `runner` 原始 id 之外，还会额外写出 `runner_family` 和 `runner_mode`，方便脚本稳定地区分 `base_index` / `workspace_snapshot` / `dirty_first_query` / `dirty_cached_query` 等路径。
 - bench 默认是 `warm` cache mode；`warmup_iter=1`、`bench_iter=3` 的默认值测出来的不是 cold query。
+- bench 默认是 `trace` query mode：如果 ad-hoc benchmark 传了多个 `--pattern`，会把它们当成一条 query trace 顺序执行，而不是把同一个 query 热重复很多次；需要旧的 steady-state 语义时可显式传 `--query-mode same`。
 - `cold` cache mode 默认使用 `posix_fadvise(..., DONTNEED)` 驱逐本次 benchmark 文件集的 page cache；额外的 `--cold-hook` 适合在 Linux 上配合 `drop_caches` 做更严格的系统级 cold run。
 - 当前 Linux 语料只要求仓库已 clone，不要求本机必须能成功构建内核。
 
@@ -183,13 +266,44 @@ cargo run -- bench \
 
 - 只索引 UTF-8 文本文件。
 - 查询规划器优先保证正确性，复杂表达式会降级到弱查询或全量候选。
-- 当前增量建索引只复用文档级 token 集；posting 仍会按最新文档集整体重写，还不是基于 commit 的 overlay 索引。
+- base snapshot 现在已经按 `snapshot_key` 缓存：Git 仓库使用 `HEAD commit + config fingerprint`，非 Git 目录使用稳定 fallback key。
+- dirty Git worktree 在 base snapshot 缺失时会按 `HEAD` materialize 一份只读 base，再把工作树差异交给 overlay；不会再把脏工作树直接写进 commit base。
+- overlay 现在已经按 `overlay_key` 复用：同一个 `base snapshot + dirty worktree state` 会命中同一份 overlay cache，不同 dirty state 可以并存多份 overlay cache。
+- 新 overlay 构建现在还会复用旧 overlay cache 里 `size + mtime` 未变化文件的 `doc_terms`，避免在不同 dirty state 之间重复分词。
+- overlay 在连续演进时会尽量保持未变化 dirty 文件的文档顺序和 `doc_id` 稳定，给后续 posting 级增量更新留出空间。
+- overlay postings 现在已经会基于上一份 overlay 只重写受影响 token，其余 posting bytes 直接复用。
+- overlay cache 现在已经有正式生命周期管理：`WorkspaceIndexOptions::overlay_cache_limit` 可控制每个 base 保留的 overlay 代数，`WorkspaceIndex::prune_overlay_cache()` 可手动回收旧 cache。
+- 当前增量建索引仍没有做到更细粒度的字节级 patch 或跨 base 复用；overlay 仍然以“每个 dirty state 一份完整小索引”的形式落盘。
 - `lookup.bin` 已做 `mmap`，`postings.bin` 仍是按 offset 解码读取。
 - CLI 和库层都不会在搜索热路径里自动检查或重建 stale index；如果要保证新鲜度，需要显式调用 diff/stale 检查接口，再决定是否 rebuild。
+
+## 库层状态
+
+`WorkspaceIndexOptions` 现在额外支持：
+
+- `overlay_cache_limit`
+
+`WorkspaceIndex::ensure_base_snapshot()` / `WorkspaceIndex::status()` 暴露的 `BaseSnapshotInfo` 现在包含：
+
+- `snapshot_key`
+- `snapshot_kind`
+- `head_commit`
+- `config_fingerprint`
+
+`WorkspaceIndex::refresh_overlay()` / `WorkspaceIndex::status()` 返回的 `OverlaySnapshotInfo` 现在至少包含：
+
+- `base_snapshot_key`
+- `overlay_key`
+
+另外还可以直接调用：
+
+- `WorkspaceIndex::prune_overlay_cache(keep_per_base)`
+
+这里的 `snapshot_key` / `base_snapshot_key` / `overlay_key` 才是外部库应该依赖的稳定身份；内部 overlay 目录层级仍可继续沿用 generation 命名，但已经不再暴露给库 API。
 
 ## 下一步建议
 
 - 给查询规划器补充更完整的 AST/HIR 解析。
 - 为 posting list 增加压缩和缓存。
-- 把增量建索引从“文档级 token 复用”演进到“base index + working tree overlay”。
+- 把 overlay 从“按 dirty state 命中的完整小索引 + 受影响 token 级重写”继续演进到“更细粒度的字节级 patch 和跨 base 复用”。
 - 加入 doc_freq 统计与更激进的 top-k token 选择器。

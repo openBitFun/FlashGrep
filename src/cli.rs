@@ -1,29 +1,32 @@
-use std::collections::HashSet;
-use std::path::{Path, PathBuf};
-use std::{
-    fs::File,
-    io::{self, BufRead, BufReader, Write},
-};
+use std::io::Write;
+use std::path::PathBuf;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
+mod execution;
+mod output;
+mod request;
+
 use crate::{
-    bench::{self, BenchCacheMode, BenchConfig},
-    config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
+    config::{BuildConfig, CorpusMode, TokenizerMode},
     error::{AppError, Result},
-    files::{scan_paths, RepositoryFile, ScanOptions},
-    index::{
-        build_index,
-        engine::{
-            count_scanned_files, count_total_scanned_files, query_prefers_scan,
-            search_json_scanned_files, search_scanned_files,
-        },
-        IndexSearcher,
-    },
-    json_output::{JsonData, JsonMessage},
-    path_filter::{normalize_path, PathFilter, PathFilterArgs},
-    search::{FileCount, SearchMode},
+    index::build_index,
+    search::FileCount,
+    tools::bench::BenchQueryMode,
+    tools::bench::{self, BenchCacheMode, BenchConfig},
 };
+use execution::{
+    execute_count_matches, execute_count_total_matches, execute_files_with_matches,
+    execute_files_without_matches, execute_search, execute_search_json,
+};
+use output::{
+    format_output_path, print_counts, print_output_line, print_paths, print_stats,
+    print_total_counts, rewrite_json_paths, SearchStats,
+};
+use request::SearchRequest;
+
+#[cfg(test)]
+use request::{collect_search_paths, default_print_path, infer_index_path, resolve_context_mode};
 
 #[derive(Debug, Parser)]
 #[command(name = "bitfun-grep")]
@@ -73,20 +76,38 @@ struct BenchArgs {
     suite_dir: PathBuf,
     #[arg(long)]
     filter: Option<String>,
+    #[arg(long)]
+    repo: Option<PathBuf>,
+    #[arg(long = "pattern")]
+    patterns: Vec<String>,
+    #[arg(long)]
+    name: Option<String>,
+    #[arg(short = 'i', long, default_value_t = false)]
+    case_insensitive: bool,
     #[arg(long, value_enum, default_value = "sparse-ngram")]
     tokenizer: TokenizerArg,
     #[arg(long, value_enum, default_value = "ignore")]
     corpus_mode: CorpusArg,
     #[arg(long, value_enum, default_value = "warm")]
     cache_mode: BenchCacheArg,
+    #[arg(long, value_enum, default_value = "trace")]
+    query_mode: BenchQueryArg,
     #[arg(long, default_value_t = 1)]
     warmup_iter: usize,
     #[arg(long, default_value_t = 3)]
     bench_iter: usize,
     #[arg(long, default_value_t = 6)]
     top_k_tokens: usize,
+    #[arg(long, action = ArgAction::Set, default_value_t = true)]
+    compare_cli: bool,
     #[arg(long, default_value_t = false)]
     compare_rg: bool,
+    #[arg(long, default_value_t = false)]
+    compare_worktree: bool,
+    #[arg(long, default_value_t = false)]
+    compare_workspace: bool,
+    #[arg(long)]
+    worktree_sample_files: Option<usize>,
     #[arg(long, default_value_t = false)]
     rebuild: bool,
     #[arg(long)]
@@ -99,6 +120,12 @@ struct BenchArgs {
 enum BenchCacheArg {
     Warm,
     Cold,
+}
+
+#[derive(Debug, Clone, Copy, ValueEnum)]
+enum BenchQueryArg {
+    Same,
+    Trace,
 }
 
 #[derive(Debug, Args, Clone, Default)]
@@ -273,20 +300,38 @@ impl From<BenchCacheArg> for BenchCacheMode {
     }
 }
 
-pub fn run() -> Result<bool> {
+impl From<BenchQueryArg> for BenchQueryMode {
+    fn from(value: BenchQueryArg) -> Self {
+        match value {
+            BenchQueryArg::Same => BenchQueryMode::Same,
+            BenchQueryArg::Trace => BenchQueryMode::Trace,
+        }
+    }
+}
+
+pub(crate) fn run() -> Result<bool> {
     let cli = Cli::parse();
     match cli.command {
         Some(Commands::Build(args)) => run_build(args),
         Some(Commands::Bench(args)) => run_bench(BenchConfig {
             suite_dir: args.suite_dir,
             filter: args.filter,
+            custom_repo: args.repo,
+            custom_patterns: args.patterns,
+            custom_name: args.name,
+            custom_case_insensitive: args.case_insensitive,
             tokenizer: args.tokenizer.into(),
             corpus_mode: args.corpus_mode.into(),
             cache_mode: args.cache_mode.into(),
+            query_mode: args.query_mode.into(),
             warmup_iter: args.warmup_iter,
             bench_iter: args.bench_iter,
             top_k_tokens: args.top_k_tokens,
+            compare_cli: args.compare_cli,
             compare_rg: args.compare_rg,
+            compare_worktree: args.compare_worktree,
+            compare_workspace: args.compare_workspace,
+            worktree_sample_files: args.worktree_sample_files,
             rebuild: args.rebuild,
             raw_output: args.raw_output,
             cold_hook: args.cold_hook,
@@ -604,886 +649,6 @@ fn run_bench(config: BenchConfig) -> Result<bool> {
     let report = bench::run(&config)?;
     bench::print_report(&report);
     Ok(true)
-}
-
-fn print_output_line(
-    path: &str,
-    line: usize,
-    column: Option<usize>,
-    snippet: &str,
-    is_context: bool,
-    print_path: bool,
-    print_line_number: bool,
-    print_column: bool,
-    bytes_printed: &mut u64,
-) {
-    let mut fields = Vec::new();
-    if print_path {
-        fields.push(path.to_string());
-    }
-    if print_line_number {
-        fields.push(line.to_string());
-    }
-    if print_column {
-        if let Some(column) = column {
-            fields.push(column.to_string());
-        }
-    }
-    let separator = if is_context { '-' } else { ':' };
-    let line = if fields.is_empty() {
-        snippet.to_string()
-    } else {
-        format!(
-            "{}{separator}{snippet}",
-            fields.join(&separator.to_string())
-        )
-    };
-    *bytes_printed += line.len() as u64 + 1;
-    println!("{line}");
-}
-
-fn print_paths(
-    paths: &[String],
-    current_dir: &Path,
-    display_relative_paths: bool,
-    display_dot_prefix: bool,
-) {
-    for path in paths {
-        println!(
-            "{}",
-            format_output_path(
-                path,
-                current_dir,
-                display_relative_paths,
-                display_dot_prefix
-            )
-        );
-    }
-}
-
-fn print_counts(
-    counts: &[FileCount],
-    print_path: bool,
-    current_dir: &Path,
-    display_relative_paths: bool,
-    display_dot_prefix: bool,
-) {
-    for count in counts {
-        if print_path {
-            println!(
-                "{}:{}",
-                format_output_path(
-                    &count.path,
-                    current_dir,
-                    display_relative_paths,
-                    display_dot_prefix
-                ),
-                count.matched_lines
-            );
-        } else {
-            println!("{}", count.matched_lines);
-        }
-    }
-}
-
-fn print_total_counts(
-    counts: &[crate::search::FileMatchCount],
-    print_path: bool,
-    current_dir: &Path,
-    display_relative_paths: bool,
-    display_dot_prefix: bool,
-) {
-    for count in counts {
-        if print_path {
-            println!(
-                "{}:{}",
-                format_output_path(
-                    &count.path,
-                    current_dir,
-                    display_relative_paths,
-                    display_dot_prefix
-                ),
-                count.matched_occurrences
-            );
-        } else {
-            println!("{}", count.matched_occurrences);
-        }
-    }
-}
-
-struct SearchStats {
-    matches: usize,
-    matched_lines: usize,
-    searches_with_match: usize,
-    searches: usize,
-    bytes_printed: u64,
-    bytes_searched: u64,
-}
-
-enum SearchExecution {
-    Indexed {
-        searcher: IndexSearcher,
-        allowed_paths: Option<HashSet<String>>,
-        paths: Vec<String>,
-    },
-    Scan {
-        files: Vec<RepositoryFile>,
-    },
-}
-
-impl SearchExecution {
-    fn is_empty(&self) -> bool {
-        match self {
-            Self::Indexed { paths, .. } => paths.is_empty(),
-            Self::Scan { files } => files.is_empty(),
-        }
-    }
-
-    fn paths(&self) -> Vec<String> {
-        match self {
-            Self::Indexed { paths, .. } => paths.clone(),
-            Self::Scan { files } => files
-                .iter()
-                .map(|file| file.path.to_string_lossy().into_owned())
-                .collect(),
-        }
-    }
-}
-
-fn print_stats(
-    stats: SearchStats,
-    search_elapsed: std::time::Duration,
-    total_elapsed: std::time::Duration,
-) {
-    println!();
-    println!("{} matches", stats.matches);
-    println!("{} matched lines", stats.matched_lines);
-    println!("{} files contained matches", stats.searches_with_match);
-    println!("{} files searched", stats.searches);
-    println!("{} bytes printed", stats.bytes_printed);
-    println!("{} bytes searched", stats.bytes_searched);
-    println!(
-        "{:.6} seconds spent searching",
-        search_elapsed.as_secs_f64()
-    );
-    println!("{:.6} seconds total", total_elapsed.as_secs_f64());
-}
-
-fn execute_search(
-    execution: &SearchExecution,
-    config: &QueryConfig,
-    filter: Option<&PathFilter>,
-) -> Result<crate::search::SearchResults> {
-    match execution {
-        SearchExecution::Indexed {
-            searcher,
-            allowed_paths,
-            ..
-        } => searcher.search_with_allowed_paths(config, filter, allowed_paths.as_ref()),
-        SearchExecution::Scan { files } => search_scanned_files(config, files),
-    }
-}
-
-fn execute_search_json(
-    execution: &SearchExecution,
-    config: &QueryConfig,
-    filter: Option<&PathFilter>,
-) -> Result<crate::json_output::JsonSearchReport> {
-    match execution {
-        SearchExecution::Indexed {
-            searcher,
-            allowed_paths,
-            ..
-        } => searcher.search_json_with_allowed_paths(config, filter, allowed_paths.as_ref()),
-        SearchExecution::Scan { files } => search_json_scanned_files(config, files),
-    }
-}
-
-fn execute_count_matches(
-    execution: &SearchExecution,
-    config: &QueryConfig,
-    filter: Option<&PathFilter>,
-    include_zero: bool,
-) -> Result<Vec<FileCount>> {
-    match execution {
-        SearchExecution::Indexed {
-            searcher,
-            allowed_paths,
-            ..
-        } => {
-            if include_zero {
-                searcher.count_matches_by_file_including_zero_with_allowed_paths(
-                    config,
-                    filter,
-                    allowed_paths.as_ref(),
-                )
-            } else {
-                searcher.count_matches_by_file_with_allowed_paths(
-                    config,
-                    filter,
-                    allowed_paths.as_ref(),
-                )
-            }
-        }
-        SearchExecution::Scan { files } => count_scanned_files(config, files, include_zero),
-    }
-}
-
-fn execute_count_total_matches(
-    execution: &SearchExecution,
-    config: &QueryConfig,
-    filter: Option<&PathFilter>,
-    include_zero: bool,
-) -> Result<Vec<crate::search::FileMatchCount>> {
-    match execution {
-        SearchExecution::Indexed {
-            searcher,
-            allowed_paths,
-            ..
-        } => {
-            if include_zero {
-                searcher.count_total_matches_by_file_including_zero_with_allowed_paths(
-                    config,
-                    filter,
-                    allowed_paths.as_ref(),
-                )
-            } else {
-                searcher.count_total_matches_by_file_with_allowed_paths(
-                    config,
-                    filter,
-                    allowed_paths.as_ref(),
-                )
-            }
-        }
-        SearchExecution::Scan { files } => count_total_scanned_files(config, files, include_zero),
-    }
-}
-
-fn execute_files_with_matches(
-    execution: &SearchExecution,
-    config: &QueryConfig,
-    filter: Option<&PathFilter>,
-) -> Result<Vec<String>> {
-    match execution {
-        SearchExecution::Indexed {
-            searcher,
-            allowed_paths,
-            ..
-        } => searcher.files_with_matches_and_allowed_paths(config, filter, allowed_paths.as_ref()),
-        SearchExecution::Scan { files } => Ok(count_scanned_files(config, files, false)?
-            .into_iter()
-            .map(|count| count.path)
-            .collect()),
-    }
-}
-
-fn execute_files_without_matches(
-    execution: &SearchExecution,
-    config: &QueryConfig,
-    filter: Option<&PathFilter>,
-) -> Result<Vec<String>> {
-    match execution {
-        SearchExecution::Indexed {
-            searcher,
-            allowed_paths,
-            ..
-        } => {
-            searcher.files_without_matches_and_allowed_paths(config, filter, allowed_paths.as_ref())
-        }
-        SearchExecution::Scan { files } => Ok(count_scanned_files(config, files, true)?
-            .into_iter()
-            .filter(|count| !count.has_match())
-            .map(|count| count.path)
-            .collect()),
-    }
-}
-
-#[derive(Debug)]
-struct SearchRequest {
-    index_path: PathBuf,
-    current_dir: PathBuf,
-    search_paths: Vec<PathBuf>,
-    used_default_search_path: bool,
-    path_filter: PathFilter,
-    config: Option<QueryConfig>,
-    files: bool,
-    type_list: bool,
-    json: bool,
-    files_with_matches: bool,
-    files_without_match: bool,
-    count: bool,
-    count_matches: bool,
-    quiet: bool,
-    include_zero: bool,
-    only_matching: bool,
-    stats: bool,
-    print_path: bool,
-    print_line_number: bool,
-    print_column: bool,
-    display_relative_paths: bool,
-    display_dot_prefix: bool,
-    include_hidden: bool,
-    no_ignore: bool,
-    ignore_files: Vec<PathBuf>,
-    max_depth: Option<usize>,
-    max_file_size: Option<u64>,
-}
-
-impl SearchRequest {
-    fn from_args(args: SearchArgs) -> Result<Self> {
-        if args.files && args.type_list {
-            return Err(AppError::InvalidPattern(
-                "--files and --type-list cannot be used together".into(),
-            ));
-        }
-        if args.files
-            && (args.count
-                || args.count_matches
-                || args.files_with_matches
-                || args.files_without_match)
-        {
-            return Err(AppError::InvalidPattern(
-                "--files cannot be combined with -c/--count, --count-matches, -l/--files-with-matches or -L/--files-without-match".into(),
-            ));
-        }
-        if (args.files || args.type_list) && !args.regexp.is_empty() {
-            return Err(AppError::InvalidPattern(
-                "-e/--regexp is not supported with --files or --type-list".into(),
-            ));
-        }
-        if (args.files || args.type_list) && !args.pattern_files.is_empty() {
-            return Err(AppError::InvalidPattern(
-                "-f/--file is not supported with --files or --type-list".into(),
-            ));
-        }
-        let json = args.json && !args.no_json;
-        let stats = (args.stats && !args.no_stats) || json;
-        if json
-            && (args.files
-                || args.type_list
-                || args.files_with_matches
-                || args.files_without_match
-                || args.count
-                || args.count_matches)
-        {
-            return Err(AppError::InvalidPattern(
-                "--json cannot be combined with --files, --type-list, -l/--files-with-matches, -L/--files-without-match, -c/--count or --count-matches".into(),
-            ));
-        }
-        if args.multiline_dotall && !args.multiline {
-            return Err(AppError::InvalidPattern(
-                "--multiline-dotall requires --multiline".into(),
-            ));
-        }
-        if args.follow {
-            return Err(AppError::InvalidPattern(
-                "--follow is not supported yet for indexed search".into(),
-            ));
-        }
-        let used_default_search_path = uses_default_search_path(&args);
-        let paths = collect_search_paths(&args)?;
-        let current_dir = std::env::current_dir()?;
-        let normalized_paths = paths
-            .iter()
-            .map(|path| normalize_path(path, &current_dir))
-            .collect::<Vec<_>>();
-        let path_filter = PathFilter::new(
-            PathFilterArgs {
-                roots: normalized_paths.clone(),
-                globs: args.glob.clone(),
-                iglobs: args.iglob.clone(),
-                type_add: args.type_add.clone(),
-                type_clear: args.type_clear.clone(),
-                types: args.file_type.clone(),
-                type_not: args.file_type_not.clone(),
-            },
-            &current_dir,
-        )?;
-        let index_path = args
-            .index
-            .clone()
-            .unwrap_or_else(|| infer_index_path(&normalized_paths, &current_dir));
-        let print_column = args.column;
-        let print_line_number = print_column || (args.line_number && !args.no_line_number);
-        let print_path = if args.no_filename {
-            false
-        } else if args.with_filename {
-            true
-        } else {
-            default_print_path(&normalized_paths)
-        };
-        let display_relative_paths =
-            used_default_search_path || paths.iter().all(|path| !path.is_absolute());
-        let display_dot_prefix =
-            !used_default_search_path && paths.len() == 1 && paths[0] == Path::new(".");
-        let config = if args.files || args.type_list {
-            None
-        } else {
-            let patterns = collect_patterns(&args)?;
-            let pattern = combine_patterns(&patterns, args.fixed_strings);
-            let case_insensitive = resolve_case_mode(&patterns, &args);
-            let search_mode = resolve_search_mode(&args, stats)?;
-            let (before_context, after_context) = resolve_context_mode(&args);
-            Some(QueryConfig {
-                regex_pattern: pattern,
-                patterns,
-                case_insensitive,
-                multiline: args.multiline,
-                dot_matches_new_line: args.multiline_dotall,
-                fixed_strings: args.fixed_strings,
-                word_regexp: args.word_regexp,
-                line_regexp: args.line_regexp,
-                before_context,
-                after_context,
-                top_k_tokens: args.top_k_tokens,
-                max_count: args.max_count,
-                search_mode,
-            })
-        };
-
-        let ignore_files = args
-            .ignore_file
-            .iter()
-            .map(|path| normalize_path(path, &current_dir))
-            .collect();
-
-        Ok(Self {
-            index_path,
-            current_dir,
-            search_paths: normalized_paths,
-            used_default_search_path,
-            path_filter,
-            config,
-            files: args.files,
-            type_list: args.type_list,
-            json,
-            files_with_matches: args.files_with_matches,
-            files_without_match: args.files_without_match,
-            count: args.count,
-            count_matches: args.count_matches,
-            quiet: args.quiet,
-            include_zero: args.include_zero && !args.no_include_zero,
-            only_matching: args.only_matching,
-            stats,
-            print_path,
-            print_line_number,
-            print_column,
-            display_relative_paths,
-            display_dot_prefix,
-            include_hidden: args.hidden,
-            no_ignore: args.no_ignore,
-            ignore_files,
-            max_depth: args.max_depth,
-            max_file_size: args.max_filesize,
-        })
-    }
-}
-
-impl SearchRequest {
-    fn filter(&self) -> Option<&PathFilter> {
-        Some(&self.path_filter)
-    }
-
-    fn prepare_listing_execution(&self) -> Result<SearchExecution> {
-        let searcher = match IndexSearcher::open(self.index_path.clone()) {
-            Ok(searcher) => Some(searcher),
-            Err(AppError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-
-        let Some(searcher) = searcher else {
-            return Ok(SearchExecution::Scan {
-                files: self.scan_requested_files(None)?,
-            });
-        };
-
-        match searcher.ensure_query_scope_supported(
-            self.include_hidden,
-            self.no_ignore,
-            self.max_file_size,
-        ) {
-            Ok(()) => {
-                let indexed_max_file_size = searcher
-                    .build_settings()
-                    .map(|settings| settings.max_file_size);
-                if self.requires_filesystem_scope_resolution(indexed_max_file_size) {
-                    let files = self.scan_requested_files(indexed_max_file_size)?;
-                    let allowed_paths = files
-                        .iter()
-                        .map(|file| file.path.to_string_lossy().into_owned())
-                        .collect();
-                    return Ok(SearchExecution::Indexed {
-                        searcher,
-                        allowed_paths: Some(allowed_paths),
-                        paths: files
-                            .iter()
-                            .map(|file| file.path.to_string_lossy().into_owned())
-                            .collect(),
-                    });
-                }
-
-                Ok(SearchExecution::Indexed {
-                    paths: searcher.indexed_paths(self.filter()),
-                    searcher,
-                    allowed_paths: None,
-                })
-            }
-            Err(AppError::InvalidIndex(_)) => Ok(SearchExecution::Scan {
-                files: self.scan_requested_files(None)?,
-            }),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn prepare_query_execution(&self, config: &QueryConfig) -> Result<SearchExecution> {
-        let query_prefers_scan = query_prefers_scan(config)?;
-        let searcher = match IndexSearcher::open(self.index_path.clone()) {
-            Ok(searcher) => Some(searcher),
-            Err(AppError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
-            Err(error) => return Err(error),
-        };
-
-        let Some(searcher) = searcher else {
-            return Ok(SearchExecution::Scan {
-                files: self.scan_requested_files(None)?,
-            });
-        };
-
-        match searcher.ensure_query_scope_supported(
-            self.include_hidden,
-            self.no_ignore,
-            self.max_file_size,
-        ) {
-            Ok(()) => {
-                if query_prefers_scan {
-                    return Ok(SearchExecution::Scan {
-                        files: self.scan_requested_files(
-                            searcher
-                                .build_settings()
-                                .map(|settings| settings.max_file_size),
-                        )?,
-                    });
-                }
-
-                let indexed_max_file_size = searcher
-                    .build_settings()
-                    .map(|settings| settings.max_file_size);
-                if self.requires_filesystem_scope_resolution(indexed_max_file_size) {
-                    let files = self.scan_requested_files(indexed_max_file_size)?;
-                    let allowed_paths = files
-                        .iter()
-                        .map(|file| file.path.to_string_lossy().into_owned())
-                        .collect();
-                    return Ok(SearchExecution::Indexed {
-                        searcher,
-                        allowed_paths: Some(allowed_paths),
-                        paths: files
-                            .iter()
-                            .map(|file| file.path.to_string_lossy().into_owned())
-                            .collect(),
-                    });
-                }
-
-                Ok(SearchExecution::Indexed {
-                    paths: searcher.indexed_paths(self.filter()),
-                    searcher,
-                    allowed_paths: None,
-                })
-            }
-            Err(AppError::InvalidIndex(_)) => Ok(SearchExecution::Scan {
-                files: self.scan_requested_files(None)?,
-            }),
-            Err(error) => Err(error),
-        }
-    }
-
-    fn scan_requested_files(
-        &self,
-        default_max_file_size: Option<u64>,
-    ) -> Result<Vec<RepositoryFile>> {
-        scan_paths(
-            &self.search_paths,
-            Some(&self.index_path),
-            ScanOptions {
-                respect_ignore: !self.no_ignore,
-                include_hidden: self.include_hidden,
-                max_file_size: self
-                    .max_file_size
-                    .or(default_max_file_size)
-                    .unwrap_or(u64::MAX),
-                max_depth: self.max_depth,
-                ignore_files: self.ignore_files.clone(),
-            },
-            Some(&self.path_filter),
-        )
-    }
-
-    fn requires_filesystem_scope_resolution(&self, indexed_max_file_size: Option<u64>) -> bool {
-        if !self.ignore_files.is_empty() || self.max_depth.is_some() {
-            return true;
-        }
-
-        self.max_file_size
-            .zip(indexed_max_file_size)
-            .is_some_and(|(requested, indexed)| requested < indexed)
-    }
-}
-
-fn collect_patterns(args: &SearchArgs) -> Result<Vec<String>> {
-    let mut patterns = args.regexp.clone();
-    for path in &args.pattern_files {
-        patterns.extend(read_patterns_from_file(path)?);
-    }
-    if patterns.is_empty() {
-        let Some(pattern) = args.pattern.clone() else {
-            return Err(AppError::InvalidPattern(
-                "a PATTERN, -e/--regexp or -f/--file is required".into(),
-            ));
-        };
-        patterns.push(pattern);
-    }
-    Ok(patterns)
-}
-
-fn combine_patterns(patterns: &[String], fixed_strings: bool) -> String {
-    if patterns.len() == 1 {
-        if fixed_strings {
-            return regex_syntax::escape(&patterns[0]);
-        }
-        return patterns[0].clone();
-    }
-    patterns
-        .iter()
-        .map(|pattern| {
-            if fixed_strings {
-                format!("(?:{})", regex_syntax::escape(pattern))
-            } else {
-                format!("(?:{pattern})")
-            }
-        })
-        .collect::<Vec<_>>()
-        .join("|")
-}
-
-fn collect_search_paths(args: &SearchArgs) -> Result<Vec<PathBuf>> {
-    let mut paths = Vec::new();
-    if args.files || args.type_list || !args.regexp.is_empty() || !args.pattern_files.is_empty() {
-        if let Some(value) = &args.pattern {
-            paths.push(PathBuf::from(value));
-        }
-    }
-    paths.extend(args.paths.iter().cloned());
-    if paths.is_empty() {
-        paths.push(std::env::current_dir()?);
-    }
-    Ok(paths)
-}
-
-fn uses_default_search_path(args: &SearchArgs) -> bool {
-    let mut paths = 0usize;
-    if (args.files || args.type_list || !args.regexp.is_empty() || !args.pattern_files.is_empty())
-        && args.pattern.is_some()
-    {
-        paths += 1;
-    }
-    paths += args.paths.len();
-    paths == 0
-}
-
-fn read_patterns_from_file(path: &Path) -> Result<Vec<String>> {
-    if path == Path::new("-") {
-        let stdin = io::stdin();
-        return stdin
-            .lock()
-            .lines()
-            .collect::<std::result::Result<Vec<_>, _>>()
-            .map_err(Into::into);
-    }
-
-    let file = File::open(path)?;
-    BufReader::new(file)
-        .lines()
-        .collect::<std::result::Result<Vec<_>, _>>()
-        .map_err(Into::into)
-}
-
-fn resolve_case_mode(patterns: &[String], args: &SearchArgs) -> bool {
-    if args.case_sensitive > 0 {
-        return false;
-    }
-    if args.ignore_case > 0 {
-        return true;
-    }
-    args.smart_case > 0
-        && patterns.iter().any(|pattern| !pattern.is_empty())
-        && !patterns
-            .iter()
-            .flat_map(|pattern| pattern.chars())
-            .any(char::is_uppercase)
-}
-
-fn resolve_search_mode(args: &SearchArgs, stats: bool) -> Result<SearchMode> {
-    if args.quiet && !stats {
-        return Ok(SearchMode::FirstHitOnly);
-    }
-    if args.files_with_matches {
-        return Ok(SearchMode::FirstHitOnly);
-    }
-    if args.count_matches {
-        return Ok(SearchMode::CountMatches);
-    }
-    if args.count {
-        return Ok(if args.only_matching {
-            SearchMode::CountMatches
-        } else {
-            SearchMode::CountOnly
-        });
-    }
-    Ok(SearchMode::MaterializeMatches)
-}
-
-fn resolve_context_mode(args: &SearchArgs) -> (usize, usize) {
-    let context = args.context.unwrap_or(0);
-    (
-        args.before_context.unwrap_or(context),
-        args.after_context.unwrap_or(context),
-    )
-}
-
-fn default_print_path(paths: &[PathBuf]) -> bool {
-    if paths.len() != 1 {
-        return true;
-    }
-    !paths[0].is_file()
-}
-
-fn format_output_path(
-    path: &str,
-    current_dir: &Path,
-    display_relative_paths: bool,
-    display_dot_prefix: bool,
-) -> String {
-    if !display_relative_paths {
-        return path.to_string();
-    }
-    let candidate = Path::new(path);
-    let Ok(relative) = candidate.strip_prefix(current_dir) else {
-        return path.to_string();
-    };
-    if relative.as_os_str().is_empty() {
-        return if display_dot_prefix {
-            ".".to_string()
-        } else {
-            String::new()
-        };
-    }
-    let relative = relative.display().to_string();
-    if display_dot_prefix {
-        format!("./{relative}")
-    } else {
-        relative
-    }
-}
-
-fn rewrite_json_paths(
-    report: &mut crate::json_output::JsonSearchReport,
-    current_dir: &Path,
-    display_relative_paths: bool,
-    display_dot_prefix: bool,
-) {
-    for file in &mut report.files {
-        if let JsonData::Text { text } = &mut file.path {
-            *text = format_output_path(
-                text,
-                current_dir,
-                display_relative_paths,
-                display_dot_prefix,
-            );
-        }
-        for message in &mut file.messages {
-            match message {
-                JsonMessage::Begin(begin) => rewrite_json_data_path(
-                    &mut begin.path,
-                    current_dir,
-                    display_relative_paths,
-                    display_dot_prefix,
-                ),
-                JsonMessage::End(end) => rewrite_json_data_path(
-                    &mut end.path,
-                    current_dir,
-                    display_relative_paths,
-                    display_dot_prefix,
-                ),
-                JsonMessage::Match(matched) => rewrite_json_data_path(
-                    &mut matched.path,
-                    current_dir,
-                    display_relative_paths,
-                    display_dot_prefix,
-                ),
-                JsonMessage::Context(context) => rewrite_json_data_path(
-                    &mut context.path,
-                    current_dir,
-                    display_relative_paths,
-                    display_dot_prefix,
-                ),
-                JsonMessage::Summary(_) => {}
-            }
-        }
-    }
-}
-
-fn rewrite_json_data_path(
-    path: &mut Option<JsonData>,
-    current_dir: &Path,
-    display_relative_paths: bool,
-    display_dot_prefix: bool,
-) {
-    if let Some(JsonData::Text { text }) = path {
-        *text = format_output_path(
-            text,
-            current_dir,
-            display_relative_paths,
-            display_dot_prefix,
-        );
-    }
-}
-
-fn infer_index_path(paths: &[PathBuf], current_dir: &Path) -> PathBuf {
-    let root = common_search_root(paths).unwrap_or_else(|| current_dir.to_path_buf());
-    root.join(".bitfun-index")
-}
-
-fn common_search_root(paths: &[PathBuf]) -> Option<PathBuf> {
-    let mut roots = paths
-        .iter()
-        .map(|path| {
-            if path.is_file() {
-                path.parent().unwrap_or(path).to_path_buf()
-            } else {
-                path.to_path_buf()
-            }
-        })
-        .collect::<Vec<_>>();
-    let mut common = roots.pop()?;
-    for root in roots {
-        common = common_prefix(&common, &root)?;
-    }
-    Some(common)
-}
-
-fn common_prefix(left: &Path, right: &Path) -> Option<PathBuf> {
-    let mut prefix = PathBuf::new();
-    for (left_component, right_component) in left.components().zip(right.components()) {
-        if left_component != right_component {
-            break;
-        }
-        prefix.push(left_component.as_os_str());
-    }
-    if prefix.as_os_str().is_empty() {
-        None
-    } else {
-        Some(prefix)
-    }
 }
 
 #[cfg(test)]

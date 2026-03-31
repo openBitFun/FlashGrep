@@ -1,13 +1,17 @@
 use std::{
     collections::{HashMap, HashSet},
+    fs::File,
     path::{Path, PathBuf},
     time::Instant,
 };
 
+use aho_corasick::{AhoCorasick, MatchKind};
+use memmap2::Mmap;
+
 use crate::{
     config::{BuildConfig, QueryConfig},
     error::{AppError, Result},
-    files::scan_repository,
+    files::{resolve_repo_path, scan_repository},
     index::format::{
         read_docs_file, IndexBuildSettings, IndexLayout, IndexMetadata, LookupTable, PostingsData,
     },
@@ -29,7 +33,8 @@ mod shared;
 #[path = "searcher_verify.rs"]
 pub(crate) mod verify;
 
-use count::{DocMatchCount, VerifyPlan as CountVerifyPlan};
+use count::DocMatchCount;
+pub(crate) use count::{CountKind as CountVerifyKind, VerifyPlan as CountVerifyPlan};
 use multi_literal::{
     collect_candidates as collect_multi_literal_candidates, prepare as prepare_multi_literal,
     search as search_multi_literal,
@@ -69,11 +74,24 @@ pub struct IndexSearcher {
     docs: Vec<crate::index::format::DocMeta>,
     lookup: LookupTable,
     postings: PostingsData,
+    fallback_lookup: Option<LookupTable>,
+    fallback_postings: Option<PostingsData>,
+    repo_root: Option<PathBuf>,
     tokenizer_mode: crate::config::TokenizerMode,
     tokenizer_options: TokenizerOptions,
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct BranchLiteralDocIds {
+    pub(crate) literals: Vec<Vec<u32>>,
+}
+
 struct MultiLiteralPreparation {
+    prepared: multi_literal::PreparedMultiLiteral,
+    candidate_ids: Vec<u32>,
+}
+
+struct CountOnlyMultiLiteralPreparation {
     prepared: multi_literal::PreparedMultiLiteral,
     candidate_ids: Vec<u32>,
 }
@@ -84,6 +102,17 @@ impl IndexSearcher {
         let (metadata, docs) = read_docs_file(&layout.docs_path)?;
         let lookup = LookupTable::open(&layout.lookup_path)?;
         let postings = PostingsData::open(&layout.postings_path)?;
+        let fallback_available = layout.trigram_fallback_lookup_path.exists()
+            && layout.trigram_fallback_postings_path.exists();
+        let (fallback_lookup, fallback_postings) =
+            if metadata.fallback_trigram.is_some() && fallback_available {
+                (
+                    Some(LookupTable::open(&layout.trigram_fallback_lookup_path)?),
+                    Some(PostingsData::open(&layout.trigram_fallback_postings_path)?),
+                )
+            } else {
+                (None, None)
+            };
 
         Ok(Self {
             index_path,
@@ -91,6 +120,12 @@ impl IndexSearcher {
             docs,
             lookup,
             postings,
+            fallback_lookup,
+            fallback_postings,
+            repo_root: metadata
+                .build
+                .as_ref()
+                .map(|build| resolve_repo_path(Path::new(&build.repo_root), ".")),
             tokenizer_mode: metadata.tokenizer,
             tokenizer_options: TokenizerOptions {
                 min_sparse_len: metadata.min_sparse_len,
@@ -109,6 +144,18 @@ impl IndexSearcher {
 
     pub fn build_settings(&self) -> Option<&IndexBuildSettings> {
         self.metadata.build.as_ref()
+    }
+
+    pub fn tokenizer_mode(&self) -> crate::config::TokenizerMode {
+        self.tokenizer_mode
+    }
+
+    pub fn tokenizer_options(&self) -> &TokenizerOptions {
+        &self.tokenizer_options
+    }
+
+    pub fn doc_count(&self) -> usize {
+        self.docs.len()
     }
 
     pub fn ensure_query_scope_supported(
@@ -174,17 +221,18 @@ impl IndexSearcher {
         let indexed_paths = self
             .docs
             .iter()
-            .map(|doc| doc.path.as_str())
+            .map(|doc| self.doc_display_path(doc))
             .collect::<HashSet<_>>();
 
         let mut modified_files = Vec::new();
         let mut deleted_files = Vec::new();
         for doc in &self.docs {
-            match current.get(&doc.path) {
+            let doc_path = self.doc_display_path(doc);
+            match current.get(&doc_path) {
                 Some(&(size, mtime_nanos))
                     if size == doc.size && mtime_nanos == doc.mtime_nanos => {}
-                Some(_) => modified_files.push(doc.path.clone()),
-                None => deleted_files.push(doc.path.clone()),
+                Some(_) => modified_files.push(doc_path),
+                None => deleted_files.push(doc_path),
             }
         }
 
@@ -241,9 +289,15 @@ impl IndexSearcher {
             self.filter_candidate_ids(&preparation.candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
         let matcher = build_matcher(config, multiline_verifier)?;
+        let resolved_paths = self.resolved_doc_paths();
+        let sources = resolved_paths
+            .iter()
+            .map(|path| verify::VerifyDocSource::Path(path.as_path()))
+            .collect::<Vec<_>>();
         let outcomes = verify_candidates_json(
             &candidate_ids,
             &self.docs,
+            &sources,
             &matcher,
             multiline_verifier,
             config.search_mode,
@@ -268,7 +322,7 @@ impl IndexSearcher {
             searches_with_match += 1;
             matched_lines += task.outcome.matched_lines as u64;
             matches += task.outcome.matched_occurrences as u64;
-            let path = JsonData::from_string(doc.path.clone());
+            let path = JsonData::from_string(self.doc_display_path(doc));
             let messages = task
                 .outcome
                 .messages
@@ -345,34 +399,61 @@ impl IndexSearcher {
             && !config.word_regexp
             && !config.line_regexp
         {
-            if let Some(multi_literal) =
-                self.prepare_multi_literal_search(&plan, config.case_insensitive, &profile)?
-            {
-                let candidate_ids =
-                    self.filter_candidate_ids(&multi_literal.candidate_ids, filter, allowed_paths)?;
-                let match_started = Instant::now();
-                let results = if matches!(config.search_mode, SearchMode::CountOnly) {
-                    let regex_started = Instant::now();
-                    let verify_plan = CountVerifyPlan::compile_searcher_line(config, None)?;
-                    profile.record_regex_compile(regex_started.elapsed());
-                    let stats =
-                        verify_plan.verify_candidate_count_stats(&candidate_ids, &self.docs)?;
-                    SearchResults {
-                        candidate_docs: candidate_ids.len(),
-                        searches_with_match: stats.matched_docs,
-                        bytes_searched: self.sum_doc_sizes(&candidate_ids)?,
-                        matched_lines: stats.matched_lines,
-                        matched_occurrences: 0,
-                        hits: Vec::new(),
-                    }
-                } else {
-                    search_multi_literal(
+            if matches!(config.search_mode, SearchMode::CountOnly) {
+                if let Some(multi_literal) = self.prepare_count_only_multi_literal_search(
+                    &plan,
+                    config.case_insensitive,
+                    config.top_k_tokens,
+                    &profile,
+                )? {
+                    let resolved_paths = self.resolved_doc_paths();
+                    let candidate_ids = if filter.is_none() && allowed_paths.is_none() {
+                        multi_literal.candidate_ids
+                    } else {
+                        self.filter_candidate_ids(
+                            &multi_literal.candidate_ids,
+                            filter,
+                            allowed_paths,
+                        )?
+                    };
+                    let match_started = Instant::now();
+                    let results = search_multi_literal(
                         &self.docs,
-                        Some(&candidate_ids),
+                        &resolved_paths,
+                        Some(candidate_ids.as_slice()),
                         &multi_literal.prepared,
                         config.search_mode,
-                    )?
+                    )?;
+                    profile.record_verify(match_started.elapsed());
+                    profile.finish(
+                        total_started.elapsed(),
+                        results.candidate_docs,
+                        results.matched_lines,
+                    );
+                    return Ok(results);
+                }
+            }
+
+            if let Some(multi_literal) = self.prepare_multi_literal_search(
+                &plan,
+                config.case_insensitive,
+                config.top_k_tokens,
+                &profile,
+            )? {
+                let resolved_paths = self.resolved_doc_paths();
+                let candidate_ids = if filter.is_none() && allowed_paths.is_none() {
+                    multi_literal.candidate_ids.clone()
+                } else {
+                    self.filter_candidate_ids(&multi_literal.candidate_ids, filter, allowed_paths)?
                 };
+                let match_started = Instant::now();
+                let results = search_multi_literal(
+                    &self.docs,
+                    &resolved_paths,
+                    Some(candidate_ids.as_slice()),
+                    &multi_literal.prepared,
+                    config.search_mode,
+                )?;
                 profile.record_verify(match_started.elapsed());
                 profile.finish(
                     total_started.elapsed(),
@@ -398,10 +479,15 @@ impl IndexSearcher {
                         config,
                         multiline_verifier,
                         preparation.literal_prefilter.clone(),
+                        CountVerifyKind::Lines,
                     )?;
                     profile.record_regex_compile(regex_started.elapsed());
-                    let stats =
-                        verify_plan.verify_candidate_count_stats(&candidate_ids, &self.docs)?;
+                    let resolved_paths = self.resolved_doc_paths();
+                    let stats = verify_plan.verify_candidate_count_stats(
+                        &candidate_ids,
+                        &self.docs,
+                        &resolved_paths,
+                    )?;
                     (
                         stats.matched_lines,
                         0,
@@ -412,42 +498,36 @@ impl IndexSearcher {
                 }
                 SearchMode::CountMatches => {
                     let regex_started = Instant::now();
-                    let matcher = build_matcher(config, multiline_verifier)?;
+                    let verify_plan = CountVerifyPlan::compile(
+                        config,
+                        multiline_verifier,
+                        preparation.literal_prefilter.clone(),
+                        CountVerifyKind::Occurrences,
+                    )?;
                     profile.record_regex_compile(regex_started.elapsed());
-                    let mut matched_lines = 0usize;
-                    let mut matched_occurrences = 0usize;
-                    let mut searches_with_match = 0usize;
-                    let mut bytes_searched = 0u64;
-                    let outcomes = verify_candidates(
+                    let resolved_paths = self.resolved_doc_paths();
+                    let stats = verify_plan.verify_candidate_count_stats(
                         &candidate_ids,
                         &self.docs,
-                        &matcher,
-                        multiline_verifier,
-                        config.search_mode,
-                        config.max_count,
-                        config.before_context,
-                        config.after_context,
+                        &resolved_paths,
                     )?;
-                    for task in outcomes {
-                        matched_lines += task.outcome.matched_lines;
-                        matched_occurrences += task.outcome.matched_occurrences;
-                        bytes_searched += task.outcome.bytes_searched;
-                        if task.outcome.matched_occurrences > 0 {
-                            searches_with_match += 1;
-                        }
-                    }
                     (
-                        matched_lines,
-                        matched_occurrences,
-                        searches_with_match,
+                        stats.matched_lines,
+                        stats.matched_occurrences,
+                        stats.matched_docs,
                         Vec::new(),
-                        bytes_searched,
+                        self.sum_doc_sizes(&candidate_ids)?,
                     )
                 }
                 _ => {
                     let regex_started = Instant::now();
                     let matcher = build_matcher(config, multiline_verifier)?;
                     profile.record_regex_compile(regex_started.elapsed());
+                    let resolved_paths = self.resolved_doc_paths();
+                    let sources = resolved_paths
+                        .iter()
+                        .map(|path| verify::VerifyDocSource::Path(path.as_path()))
+                        .collect::<Vec<_>>();
                     let mut hits = Vec::new();
                     let mut matched_lines = 0usize;
                     let mut matched_occurrences = 0usize;
@@ -456,6 +536,7 @@ impl IndexSearcher {
                     let outcomes = verify_candidates(
                         &candidate_ids,
                         &self.docs,
+                        &sources,
                         &matcher,
                         multiline_verifier,
                         config.search_mode,
@@ -471,7 +552,7 @@ impl IndexSearcher {
                             searches_with_match += 1;
                             let doc = doc_by_id(&self.docs, task.doc_id)?;
                             hits.push(SearchHit {
-                                path: doc.path.clone(),
+                                path: self.doc_display_path(doc),
                                 matches: task.outcome.matches,
                                 lines: task.outcome.lines,
                             });
@@ -517,29 +598,216 @@ impl IndexSearcher {
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
     ) -> Result<Vec<String>> {
+        Ok(self
+            .candidate_docs_with_allowed_paths(config, filter, allowed_paths)?
+            .into_iter()
+            .map(|doc| self.doc_display_path(&doc))
+            .collect())
+    }
+
+    pub(crate) fn candidate_docs_with_allowed_paths(
+        &self,
+        config: &QueryConfig,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+    ) -> Result<Vec<crate::index::format::DocMeta>> {
         let profile = SearchProfile::enabled();
         let plan_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
+        self.candidate_docs_for_plan_with_allowed_paths(config, &plan, filter, allowed_paths)
+    }
 
-        let candidate_ids = if let Some(multi_literal) =
-            self.prepare_multi_literal_search(&plan, config.case_insensitive, &profile)?
-        {
-            collect_multi_literal_candidates(
-                &self.docs,
-                Some(&multi_literal.candidate_ids),
-                &multi_literal.prepared,
-            )?
-        } else {
-            self.prepare_indexed_search(config, &plan, &profile)?
-                .candidate_ids
-        };
-        let candidate_ids = self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)?;
-
+    pub(crate) fn candidate_docs_for_plan_with_allowed_paths(
+        &self,
+        config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+    ) -> Result<Vec<crate::index::format::DocMeta>> {
+        let candidate_ids = self.candidate_doc_ids_for_plan_with_allowed_paths(
+            config,
+            plan,
+            filter,
+            allowed_paths,
+        )?;
         candidate_ids
             .into_iter()
-            .map(|doc_id| Ok(doc_by_id(&self.docs, doc_id)?.path.clone()))
+            .map(|doc_id| Ok(doc_by_id(&self.docs, doc_id)?.clone()))
             .collect()
+    }
+
+    pub(crate) fn candidate_doc_ids_for_plan_with_allowed_paths(
+        &self,
+        config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+    ) -> Result<Vec<u32>> {
+        let profile = SearchProfile::enabled();
+        let candidate_ids = if let Some(multi_literal) = self.prepare_multi_literal_search(
+            plan,
+            config.case_insensitive,
+            config.top_k_tokens,
+            &profile,
+        )? {
+            multi_literal.candidate_ids
+        } else {
+            self.prepare_indexed_search(config, plan, &profile)?
+                .candidate_ids
+        };
+        self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)
+    }
+
+    pub(crate) fn candidate_doc_ids_by_branch_for_plan_with_allowed_paths(
+        &self,
+        config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+    ) -> Result<Vec<Vec<u32>>> {
+        let profile = SearchProfile::enabled();
+        let candidate_started = Instant::now();
+
+        if plan.fallback_to_scan {
+            profile.record_candidates(candidate_started.elapsed());
+            return Ok(vec![self.filter_candidate_ids(
+                &self.all_doc_ids(),
+                filter,
+                allowed_paths,
+            )?]);
+        }
+
+        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
+        let mut posting_cache = HashMap::new();
+        let mut fallback_posting_cache = HashMap::new();
+        let mut literal_scan_cache = HashMap::new();
+        let mut fallback_literal_cache = HashMap::new();
+        let mut branches = Vec::with_capacity(plan.branches.len());
+
+        for branch in &plan.branches {
+            let branch_candidate_ids = self
+                .select_branch_candidates(
+                    branch,
+                    tokenizer.as_ref(),
+                    config.top_k_tokens,
+                    true,
+                    &mut posting_cache,
+                    &mut fallback_posting_cache,
+                    &mut literal_scan_cache,
+                    &mut fallback_literal_cache,
+                )?
+                .unwrap_or_else(|| self.all_doc_ids());
+            branches.push(self.filter_candidate_ids(
+                &branch_candidate_ids,
+                filter,
+                allowed_paths,
+            )?);
+        }
+
+        profile.record_candidates(candidate_started.elapsed());
+        Ok(branches)
+    }
+
+    pub(crate) fn try_candidate_doc_ids_by_branch_without_literal_scan_for_plan_with_allowed_paths(
+        &self,
+        config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+    ) -> Result<Option<Vec<Vec<u32>>>> {
+        let profile = SearchProfile::enabled();
+        let candidate_started = Instant::now();
+
+        if plan.fallback_to_scan {
+            profile.record_candidates(candidate_started.elapsed());
+            return Ok(Some(vec![self.filter_candidate_ids(
+                &self.all_doc_ids(),
+                filter,
+                allowed_paths,
+            )?]));
+        }
+
+        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
+        let mut posting_cache = HashMap::new();
+        let mut fallback_posting_cache = HashMap::new();
+        let mut literal_scan_cache = HashMap::new();
+        let mut fallback_literal_cache = HashMap::new();
+        let mut branches = Vec::with_capacity(plan.branches.len());
+
+        for branch in &plan.branches {
+            let Some(branch_candidate_ids) = self.select_branch_candidates(
+                branch,
+                tokenizer.as_ref(),
+                config.top_k_tokens,
+                false,
+                &mut posting_cache,
+                &mut fallback_posting_cache,
+                &mut literal_scan_cache,
+                &mut fallback_literal_cache,
+            )?
+            else {
+                return Ok(None);
+            };
+            branches.push(self.filter_candidate_ids(
+                &branch_candidate_ids,
+                filter,
+                allowed_paths,
+            )?);
+        }
+
+        profile.record_candidates(candidate_started.elapsed());
+        Ok(Some(branches))
+    }
+
+    pub(crate) fn candidate_doc_ids_by_branch_and_literal_for_plan_with_allowed_paths(
+        &self,
+        _config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+    ) -> Result<Vec<BranchLiteralDocIds>> {
+        let profile = SearchProfile::enabled();
+        let candidate_started = Instant::now();
+
+        if plan.fallback_to_scan {
+            profile.record_candidates(candidate_started.elapsed());
+            return Ok(vec![BranchLiteralDocIds {
+                literals: vec![self.filter_candidate_ids(
+                    &self.all_doc_ids(),
+                    filter,
+                    allowed_paths,
+                )?],
+            }]);
+        }
+
+        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
+        let mut posting_cache = HashMap::new();
+        let mut fallback_posting_cache = HashMap::new();
+        let mut literal_scan_cache = HashMap::new();
+        let mut fallback_literal_cache = HashMap::new();
+        let mut literal_candidate_cache = HashMap::new();
+        let mut branches = Vec::with_capacity(plan.branches.len());
+
+        for branch in &plan.branches {
+            let mut literals = Vec::with_capacity(branch.literals.len());
+            for literal in &branch.literals {
+                let doc_ids = self.literal_candidate_doc_ids(
+                    literal,
+                    tokenizer.as_ref(),
+                    &mut posting_cache,
+                    &mut fallback_posting_cache,
+                    &mut literal_scan_cache,
+                    &mut fallback_literal_cache,
+                    &mut literal_candidate_cache,
+                )?;
+                literals.push(self.filter_candidate_ids(&doc_ids, filter, allowed_paths)?);
+            }
+            branches.push(BranchLiteralDocIds { literals });
+        }
+
+        profile.record_candidates(candidate_started.elapsed());
+        Ok(branches)
     }
 
     pub fn count_matches_by_file(
@@ -588,9 +856,12 @@ impl IndexSearcher {
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
 
-        let candidate_ids = if let Some(multi_literal) =
-            self.prepare_multi_literal_search(&plan, config.case_insensitive, &profile)?
-        {
+        let candidate_ids = if let Some(multi_literal) = self.prepare_multi_literal_search(
+            &plan,
+            config.case_insensitive,
+            config.top_k_tokens,
+            &profile,
+        )? {
             multi_literal.candidate_ids
         } else {
             self.prepare_indexed_search(config, &plan, &profile)?
@@ -598,8 +869,14 @@ impl IndexSearcher {
         };
         let candidate_ids = self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
-        let verify_plan = CountVerifyPlan::compile(config, multiline_verifier, None)?;
-        let counts = verify_plan.verify_candidate_counts_by_doc(&candidate_ids, &self.docs)?;
+        let verify_plan =
+            CountVerifyPlan::compile(config, multiline_verifier, None, CountVerifyKind::Lines)?;
+        let resolved_paths = self.resolved_doc_paths();
+        let counts = verify_plan.verify_candidate_counts_by_doc(
+            &candidate_ids,
+            &self.docs,
+            &resolved_paths,
+        )?;
         if include_zero {
             self.file_counts_from_doc_counts_including_zero(counts, filter, allowed_paths)
         } else {
@@ -653,33 +930,33 @@ impl IndexSearcher {
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
 
-        let candidate_ids = self
-            .prepare_indexed_search(config, &plan, &profile)?
-            .candidate_ids;
+        let preparation = self.prepare_indexed_search(config, &plan, &profile)?;
+        let candidate_ids = preparation.candidate_ids;
         let candidate_ids = self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
         let regex_started = Instant::now();
-        let matcher = build_matcher(config, multiline_verifier)?;
+        let verify_plan = CountVerifyPlan::compile(
+            config,
+            multiline_verifier,
+            preparation.literal_prefilter,
+            CountVerifyKind::Occurrences,
+        )?;
         profile.record_regex_compile(regex_started.elapsed());
         let match_started = Instant::now();
-        let outcomes = verify_candidates(
+        let resolved_paths = self.resolved_doc_paths();
+        let counts = verify_plan.verify_candidate_counts_by_doc(
             &candidate_ids,
             &self.docs,
-            &matcher,
-            multiline_verifier,
-            SearchMode::CountMatches,
-            config.max_count,
-            0,
-            0,
+            &resolved_paths,
         )?;
         profile.record_verify(match_started.elapsed());
 
-        let counts = outcomes
+        let counts = counts
             .into_iter()
             .map(|task| {
                 Ok(FileMatchCount {
-                    path: doc_by_id(&self.docs, task.doc_id)?.path.clone(),
-                    matched_occurrences: task.outcome.matched_occurrences,
+                    path: self.doc_display_path(doc_by_id(&self.docs, task.doc_id)?),
+                    matched_occurrences: task.matched_occurrences,
                 })
             })
             .collect::<Result<Vec<_>>>()?;
@@ -752,6 +1029,10 @@ impl IndexSearcher {
             })
     }
 
+    pub(crate) fn doc_display_path_by_id(&self, doc_id: u32) -> Result<String> {
+        Ok(self.doc_display_path(doc_by_id(&self.docs, doc_id)?))
+    }
+
     pub(crate) fn indexed_paths_with_allowed_paths(
         &self,
         filter: Option<&PathFilter>,
@@ -760,8 +1041,35 @@ impl IndexSearcher {
         self.docs
             .iter()
             .filter(|doc| self.doc_matches_filters(doc, filter, allowed_paths))
-            .map(|doc| doc.path.clone())
+            .map(|doc| self.doc_display_path(doc))
             .collect()
+    }
+
+    fn resolved_doc_paths(&self) -> Vec<PathBuf> {
+        self.docs
+            .iter()
+            .map(|doc| self.doc_resolved_path(doc))
+            .collect()
+    }
+
+    fn doc_display_path(&self, doc: &crate::index::format::DocMeta) -> String {
+        self.doc_resolved_path(doc).to_string_lossy().into_owned()
+    }
+
+    fn doc_resolved_path(&self, doc: &crate::index::format::DocMeta) -> PathBuf {
+        self.resolve_doc_path_str(&doc.path)
+    }
+
+    fn resolve_doc_path_str(&self, path: &str) -> PathBuf {
+        if Path::new(path).is_absolute() {
+            return PathBuf::from(path);
+        }
+
+        if let Some(repo_root) = &self.repo_root {
+            return resolve_repo_path(repo_root, path);
+        }
+
+        PathBuf::from(path)
     }
 
     fn prepare_indexed_search(
@@ -788,6 +1096,7 @@ impl IndexSearcher {
         &self,
         plan: &crate::planner::QueryPlan,
         case_insensitive: bool,
+        top_k_tokens: usize,
         profile: &SearchProfile,
     ) -> Result<Option<MultiLiteralPreparation>> {
         let Some(prepared) = plan
@@ -800,13 +1109,71 @@ impl IndexSearcher {
 
         let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
         let candidate_started = Instant::now();
-        let prefilter_ids =
-            self.collect_multi_literal_prefilter_candidates(&prepared, tokenizer.as_ref())?;
+        let prefilter_ids = if plan.fallback_to_scan {
+            None
+        } else {
+            Some(
+                self.try_collect_candidates_without_literal_scan(
+                    &plan.branches,
+                    tokenizer.as_ref(),
+                    top_k_tokens,
+                )?
+                .unwrap_or_else(|| {
+                    self.collect_candidates(&plan.branches, tokenizer.as_ref(), top_k_tokens)
+                        .expect("fallback literal scan should succeed")
+                }),
+            )
+        };
+        let resolved_paths = self.resolved_doc_paths();
+        let candidate_ids = collect_multi_literal_candidates(
+            &self.docs,
+            &resolved_paths,
+            prefilter_ids.as_deref(),
+            &prepared,
+        )?;
         profile.record_candidates(candidate_started.elapsed());
 
         Ok(Some(MultiLiteralPreparation {
             prepared,
-            candidate_ids: prefilter_ids.unwrap_or_else(|| self.all_doc_ids()),
+            candidate_ids,
+        }))
+    }
+
+    fn prepare_count_only_multi_literal_search(
+        &self,
+        plan: &crate::planner::QueryPlan,
+        case_insensitive: bool,
+        top_k_tokens: usize,
+        profile: &SearchProfile,
+    ) -> Result<Option<CountOnlyMultiLiteralPreparation>> {
+        let Some(prepared) = plan
+            .pure_literal_alternation
+            .as_ref()
+            .and_then(|alternation| prepare_multi_literal(alternation, case_insensitive))
+        else {
+            return Ok(None);
+        };
+
+        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
+        let candidate_started = Instant::now();
+        let Some(candidate_ids) = (!plan.fallback_to_scan)
+            .then(|| {
+                self.try_collect_candidates_without_literal_scan(
+                    &plan.branches,
+                    tokenizer.as_ref(),
+                    top_k_tokens,
+                )
+            })
+            .transpose()?
+            .flatten()
+        else {
+            return Ok(None);
+        };
+        profile.record_candidates(candidate_started.elapsed());
+
+        Ok(Some(CountOnlyMultiLiteralPreparation {
+            prepared,
+            candidate_ids,
         }))
     }
 
@@ -837,7 +1204,7 @@ impl IndexSearcher {
             .into_iter()
             .map(|count| {
                 Ok(FileCount {
-                    path: doc_by_id(&self.docs, count.doc_id)?.path.clone(),
+                    path: self.doc_display_path(doc_by_id(&self.docs, count.doc_id)?),
                     matched_lines: count.matched_lines,
                 })
             })
@@ -895,10 +1262,11 @@ impl IndexSearcher {
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
     ) -> bool {
-        if filter.is_some_and(|filter| !filter.matches_file(Path::new(&doc.path))) {
+        let display_path = self.doc_display_path(doc);
+        if filter.is_some_and(|filter| !filter.matches_file(Path::new(&display_path))) {
             return false;
         }
-        allowed_paths.is_none_or(|allowed_paths| allowed_paths.contains(&doc.path))
+        allowed_paths.is_none_or(|allowed_paths| allowed_paths.contains(&display_path))
     }
 
     fn sum_doc_sizes(&self, candidate_ids: &[u32]) -> Result<u64> {
@@ -909,57 +1277,70 @@ impl IndexSearcher {
         Ok(total)
     }
 
-    fn collect_multi_literal_prefilter_candidates(
-        &self,
-        prepared: &multi_literal::PreparedMultiLiteral,
-        tokenizer: &dyn crate::tokenizer::Tokenizer,
-    ) -> Result<Option<Vec<u32>>> {
-        let mut posting_cache = HashMap::new();
-        let mut any_available = false;
-        let mut union = Vec::new();
-
-        for literal in &prepared.literals {
-            let query_literal = fold_query_literal(literal);
-            let mut covering_hashes = Vec::new();
-            tokenizer.collect_query_token_hashes(&query_literal, &mut covering_hashes);
-            match self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes) {
-                LiteralCandidates::Impossible => {}
-                LiteralCandidates::Unavailable => return Ok(None),
-                LiteralCandidates::Available(candidates) => {
-                    let Some(candidate) = candidates.first() else {
-                        continue;
-                    };
-                    let docs = self.read_posting_docs(candidate.token_hash, &mut posting_cache)?;
-                    union = union_sorted(&union, &docs);
-                    any_available = true;
-                }
-            }
-        }
-
-        if any_available {
-            Ok(Some(union))
-        } else {
-            Ok(Some(Vec::new()))
-        }
-    }
-
     fn collect_candidates(
         &self,
         branches: &[QueryBranch],
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
     ) -> Result<Vec<u32>> {
+        self.collect_candidates_with_literal_scan(branches, tokenizer, top_k, true)
+    }
+
+    fn try_collect_candidates_without_literal_scan(
+        &self,
+        branches: &[QueryBranch],
+        tokenizer: &dyn crate::tokenizer::Tokenizer,
+        top_k: usize,
+    ) -> Result<Option<Vec<u32>>> {
         let mut all_candidates = Vec::new();
         let mut posting_cache = HashMap::new();
+        let mut fallback_posting_cache = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
+        let mut fallback_literal_cache = HashMap::new();
 
         for branch in branches {
             let Some(branch_candidates) = self.select_branch_candidates(
                 branch,
                 tokenizer,
                 top_k,
+                false,
                 &mut posting_cache,
+                &mut fallback_posting_cache,
                 &mut literal_scan_cache,
+                &mut fallback_literal_cache,
+            )?
+            else {
+                return Ok(None);
+            };
+            all_candidates = union_sorted(&all_candidates, &branch_candidates);
+        }
+
+        Ok(Some(all_candidates))
+    }
+
+    fn collect_candidates_with_literal_scan(
+        &self,
+        branches: &[QueryBranch],
+        tokenizer: &dyn crate::tokenizer::Tokenizer,
+        top_k: usize,
+        allow_literal_scan: bool,
+    ) -> Result<Vec<u32>> {
+        let mut all_candidates = Vec::new();
+        let mut posting_cache = HashMap::new();
+        let mut fallback_posting_cache = HashMap::new();
+        let mut literal_scan_cache = HashMap::new();
+        let mut fallback_literal_cache = HashMap::new();
+
+        for branch in branches {
+            let Some(branch_candidates) = self.select_branch_candidates(
+                branch,
+                tokenizer,
+                top_k,
+                allow_literal_scan,
+                &mut posting_cache,
+                &mut fallback_posting_cache,
+                &mut literal_scan_cache,
+                &mut fallback_literal_cache,
             )?
             else {
                 return Ok(self.all_doc_ids());
@@ -969,16 +1350,67 @@ impl IndexSearcher {
 
         Ok(all_candidates)
     }
+    fn literal_candidate_doc_ids(
+        &self,
+        literal: &str,
+        tokenizer: &dyn crate::tokenizer::Tokenizer,
+        posting_cache: &mut HashMap<u64, Vec<u32>>,
+        fallback_posting_cache: &mut HashMap<u64, Vec<u32>>,
+        literal_scan_cache: &mut HashMap<String, Vec<u32>>,
+        fallback_literal_cache: &mut HashMap<String, Vec<u32>>,
+        literal_candidate_cache: &mut HashMap<String, Vec<u32>>,
+    ) -> Result<Vec<u32>> {
+        let query_literal = fold_query_literal(literal);
+        if let Some(cached) = literal_candidate_cache.get(&query_literal) {
+            return Ok(cached.clone());
+        }
+
+        let mut covering_hashes = Vec::new();
+        tokenizer.collect_query_token_hashes(&query_literal, &mut covering_hashes);
+        let doc_ids =
+            match self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes) {
+                LiteralCandidates::Impossible => Vec::new(),
+                LiteralCandidates::Unavailable => self
+                    .fallback_literal_doc_ids(
+                        &query_literal,
+                        fallback_posting_cache,
+                        fallback_literal_cache,
+                    )?
+                    .unwrap_or_else(|| self.scan_literal_docs(&query_literal, literal_scan_cache)),
+                LiteralCandidates::Available(candidates) => {
+                    let mut docs: Option<Vec<u32>> = None;
+                    for candidate in candidates {
+                        let posting_docs =
+                            self.read_posting_docs(candidate.token_hash, posting_cache)?;
+                        docs = Some(match docs.take() {
+                            Some(existing) => intersect_sorted(&existing, &posting_docs),
+                            None => posting_docs,
+                        });
+                        if docs.as_ref().is_some_and(Vec::is_empty) {
+                            break;
+                        }
+                    }
+                    docs.unwrap_or_default()
+                }
+            };
+
+        literal_candidate_cache.insert(query_literal, doc_ids.clone());
+        Ok(doc_ids)
+    }
 
     fn select_branch_candidates(
         &self,
         branch: &QueryBranch,
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
+        allow_literal_scan: bool,
         posting_cache: &mut HashMap<u64, Vec<u32>>,
+        fallback_posting_cache: &mut HashMap<u64, Vec<u32>>,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
+        fallback_literal_cache: &mut HashMap<String, Vec<u32>>,
     ) -> Result<Option<Vec<u32>>> {
         let mut per_literal = Vec::new();
+        let mut fallback_doc_sets = Vec::new();
         let mut scanned_literals = Vec::new();
 
         for literal in &branch.literals {
@@ -989,7 +1421,17 @@ impl IndexSearcher {
                 self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes);
             match literal_candidates {
                 LiteralCandidates::Impossible => return Ok(Some(Vec::new())),
-                LiteralCandidates::Unavailable => scanned_literals.push(query_literal),
+                LiteralCandidates::Unavailable => {
+                    if let Some(docs) = self.fallback_literal_doc_ids(
+                        &query_literal,
+                        fallback_posting_cache,
+                        fallback_literal_cache,
+                    )? {
+                        fallback_doc_sets.push(docs);
+                    } else {
+                        scanned_literals.push(query_literal);
+                    }
+                }
                 LiteralCandidates::Available(candidates) => per_literal.push(candidates),
             }
         }
@@ -1000,7 +1442,11 @@ impl IndexSearcher {
                 .cmp(&right.first().map(|candidate| candidate.selection_rank()))
         });
 
-        if per_literal.is_empty() && scanned_literals.is_empty() {
+        if per_literal.is_empty() && scanned_literals.is_empty() && fallback_doc_sets.is_empty() {
+            return Ok(None);
+        }
+
+        if !allow_literal_scan && !scanned_literals.is_empty() {
             return Ok(None);
         }
 
@@ -1084,6 +1530,16 @@ impl IndexSearcher {
             }
         }
 
+        for docs in fallback_doc_sets {
+            branch_candidates = Some(match branch_candidates.take() {
+                Some(existing) => intersect_sorted(&existing, &docs),
+                None => docs,
+            });
+            if branch_candidates.as_ref().is_some_and(Vec::is_empty) {
+                return Ok(Some(Vec::new()));
+            }
+        }
+
         let Some(branch_candidates) = branch_candidates else {
             return Ok(None);
         };
@@ -1100,10 +1556,14 @@ impl IndexSearcher {
         covering_hashes.sort_unstable();
         covering_hashes.dedup();
 
+        let should_use_document_fallbacks =
+            matches!(self.tokenizer_mode, crate::config::TokenizerMode::Trigram);
         let mut fallback_hashes = Vec::new();
-        tokenizer.collect_document_token_hashes(query_literal, &mut fallback_hashes);
-        fallback_hashes.sort_unstable();
-        fallback_hashes.dedup();
+        if should_use_document_fallbacks {
+            tokenizer.collect_document_token_hashes(query_literal, &mut fallback_hashes);
+            fallback_hashes.sort_unstable();
+            fallback_hashes.dedup();
+        }
 
         let mut selected = Vec::new();
         let mut seen_hashes = HashSet::new();
@@ -1126,7 +1586,7 @@ impl IndexSearcher {
             });
         }
 
-        if selected.len() < 2 {
+        if should_use_document_fallbacks && selected.len() < 2 {
             for token_hash in fallback_hashes {
                 if !seen_hashes.insert(token_hash) {
                     continue;
@@ -1160,6 +1620,57 @@ impl IndexSearcher {
         }
     }
 
+    fn fallback_literal_doc_ids(
+        &self,
+        literal: &str,
+        posting_cache: &mut HashMap<u64, Vec<u32>>,
+        literal_cache: &mut HashMap<String, Vec<u32>>,
+    ) -> Result<Option<Vec<u32>>> {
+        if let Some(cached) = literal_cache.get(literal) {
+            return Ok(Some(cached.clone()));
+        }
+
+        let Some(lookup) = self.fallback_lookup.as_ref() else {
+            return Ok(None);
+        };
+        if self.fallback_postings.is_none() {
+            return Ok(None);
+        }
+
+        let hashes = collect_literal_fallback_trigram_hashes(literal);
+        if hashes.is_empty() {
+            return Ok(None);
+        }
+
+        let mut entries = Vec::with_capacity(hashes.len());
+        for token_hash in hashes {
+            let Some(entry) = lookup.find(token_hash) else {
+                literal_cache.insert(literal.to_string(), Vec::new());
+                return Ok(Some(Vec::new()));
+            };
+            entries.push(entry);
+        }
+
+        entries.sort_unstable_by_key(|entry| (entry.doc_freq, entry.token_hash));
+        entries.truncate(entries.len().min(2));
+
+        let mut docs: Option<Vec<u32>> = None;
+        for entry in entries {
+            let posting_docs = self.read_fallback_posting_docs(entry.token_hash, posting_cache)?;
+            docs = Some(match docs.take() {
+                Some(existing) => intersect_sorted(&existing, &posting_docs),
+                None => posting_docs,
+            });
+            if docs.as_ref().is_some_and(Vec::is_empty) {
+                break;
+            }
+        }
+
+        let docs = docs.unwrap_or_default();
+        literal_cache.insert(literal.to_string(), docs.clone());
+        Ok(Some(docs))
+    }
+
     fn read_posting_docs(
         &self,
         token_hash: u64,
@@ -1172,6 +1683,28 @@ impl IndexSearcher {
         let docs = match self.lookup.find(token_hash) {
             Some(entry) if entry.offset != u64::MAX => self.postings.decode(entry)?,
             Some(_) | None => Vec::new(),
+        };
+        posting_cache.insert(token_hash, docs.clone());
+        Ok(docs)
+    }
+
+    fn read_fallback_posting_docs(
+        &self,
+        token_hash: u64,
+        posting_cache: &mut HashMap<u64, Vec<u32>>,
+    ) -> Result<Vec<u32>> {
+        if let Some(cached) = posting_cache.get(&token_hash) {
+            return Ok(cached.clone());
+        }
+
+        let docs = match (
+            self.fallback_lookup
+                .as_ref()
+                .and_then(|lookup| lookup.find(token_hash)),
+            self.fallback_postings.as_ref(),
+        ) {
+            (Some(entry), Some(postings)) if entry.offset != u64::MAX => postings.decode(entry)?,
+            _ => Vec::new(),
         };
         posting_cache.insert(token_hash, docs.clone());
         Ok(docs)
@@ -1207,29 +1740,104 @@ impl IndexSearcher {
             return cached.clone();
         }
 
-        let mut docs = Vec::new();
-        for doc in &self.docs {
-            let path = std::path::PathBuf::from(&doc.path);
-            let Ok(text) = std::fs::read_to_string(&path) else {
-                continue;
-            };
-            let folded = if text.is_ascii() {
-                text.to_ascii_lowercase()
-            } else {
-                text.to_lowercase()
-            };
-            if folded.contains(literal) {
-                docs.push(doc.doc_id);
+        self.scan_literal_docs_batch(&[literal.to_string()], literal_scan_cache);
+        literal_scan_cache.get(literal).cloned().unwrap_or_default()
+    }
+
+    fn scan_literal_docs_batch(
+        &self,
+        literals: &[String],
+        literal_scan_cache: &mut HashMap<String, Vec<u32>>,
+    ) {
+        let missing = literals
+            .iter()
+            .filter(|literal| !literal_scan_cache.contains_key(literal.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        if missing.is_empty() {
+            return;
+        }
+
+        let (ascii_literals, unicode_literals): (Vec<_>, Vec<_>) =
+            missing.into_iter().partition(|literal| literal.is_ascii());
+
+        if !ascii_literals.is_empty() {
+            let matchers = ascii_literals
+                .iter()
+                .map(|literal| {
+                    AhoCorasick::builder()
+                        .match_kind(MatchKind::Standard)
+                        .ascii_case_insensitive(true)
+                        .build([literal.as_str()])
+                        .expect("ascii literal matcher should build")
+                })
+                .collect::<Vec<_>>();
+            let mut docs_by_literal = vec![Vec::new(); ascii_literals.len()];
+
+            for doc in &self.docs {
+                let path = self.doc_resolved_path(doc);
+                let Some(bytes) = map_doc_bytes(&path, doc.size) else {
+                    continue;
+                };
+                for (index, matcher) in matchers.iter().enumerate() {
+                    if matcher.find(&bytes).is_some() {
+                        docs_by_literal[index].push(doc.doc_id);
+                    }
+                }
+            }
+
+            for (literal, docs) in ascii_literals.into_iter().zip(docs_by_literal) {
+                literal_scan_cache.insert(literal, docs);
             }
         }
 
-        literal_scan_cache.insert(literal.to_string(), docs.clone());
-        docs
+        if !unicode_literals.is_empty() {
+            let mut docs_by_literal = vec![Vec::new(); unicode_literals.len()];
+            for doc in &self.docs {
+                let path = self.doc_resolved_path(doc);
+                let Ok(text) = std::fs::read_to_string(&path) else {
+                    continue;
+                };
+                let folded = if text.is_ascii() {
+                    text.to_ascii_lowercase()
+                } else {
+                    text.to_lowercase()
+                };
+                for (index, literal) in unicode_literals.iter().enumerate() {
+                    if folded.contains(literal) {
+                        docs_by_literal[index].push(doc.doc_id);
+                    }
+                }
+            }
+
+            for (literal, docs) in unicode_literals.into_iter().zip(docs_by_literal) {
+                literal_scan_cache.insert(literal, docs);
+            }
+        }
     }
 
     fn all_doc_ids(&self) -> Vec<u32> {
         self.docs.iter().map(|doc| doc.doc_id).collect()
     }
+}
+
+fn map_doc_bytes(path: &Path, size: u64) -> Option<Mmap> {
+    if size == 0 {
+        return None;
+    }
+    let file = File::open(path).ok()?;
+    unsafe { Mmap::map(&file).ok() }
+}
+
+fn collect_literal_fallback_trigram_hashes(literal: &str) -> Vec<u64> {
+    let mut token_hashes = literal
+        .as_bytes()
+        .windows(3)
+        .map(|window| u64::from(crc32fast::hash(window)))
+        .collect::<Vec<_>>();
+    token_hashes.sort_unstable();
+    token_hashes.dedup();
+    token_hashes
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -1540,4 +2148,5 @@ mod tests {
         )
         .is_none());
     }
+
 }

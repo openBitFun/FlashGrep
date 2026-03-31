@@ -1,6 +1,8 @@
-use bitfun_grep::{SearchBackend, SearchEngine, SearchPolicy};
+use std::process::Command;
 
-use crate::common::{query, TestRepo};
+use bitfun_grep::{BuildConfig, SearchBackend, SearchEngine, SearchPolicy, TokenizerMode};
+
+use crate::common::{count_matches_query, query, TestRepo};
 
 #[test]
 fn search_engine_uses_index_when_fresh() {
@@ -52,6 +54,44 @@ fn search_engine_scans_when_index_is_missing() {
 }
 
 #[test]
+fn search_engine_scans_count_matches_when_index_is_missing() {
+    let repo = TestRepo::new();
+    repo.write("service.rs", "PM_RESUME PM_RESUME\nPM_RESUME\n");
+
+    let engine = SearchEngine::new(repo.trigram_build_config());
+    let outcome = engine
+        .search(
+            &count_matches_query("PM_RESUME"),
+            SearchPolicy::FallbackToScan,
+        )
+        .expect("test should succeed");
+
+    assert_eq!(outcome.backend, SearchBackend::Scan);
+    assert_eq!(outcome.results.matched_lines, 2);
+    assert_eq!(outcome.results.matched_occurrences, 3);
+    assert!(outcome.results.hits.is_empty());
+}
+
+#[test]
+fn search_engine_scan_count_matches_honors_max_count_by_matching_line() {
+    let repo = TestRepo::new();
+    repo.write("service.rs", "PM_RESUME PM_RESUME\nPM_RESUME\n");
+
+    let engine = SearchEngine::new(repo.trigram_build_config());
+    let mut query = count_matches_query("PM_RESUME");
+    query.max_count = Some(1);
+
+    let outcome = engine
+        .search(&query, SearchPolicy::FallbackToScan)
+        .expect("test should succeed");
+
+    assert_eq!(outcome.backend, SearchBackend::Scan);
+    assert_eq!(outcome.results.matched_lines, 1);
+    assert_eq!(outcome.results.matched_occurrences, 2);
+    assert!(outcome.results.hits.is_empty());
+}
+
+#[test]
 fn search_engine_reports_worktree_diff_separately() {
     let repo = TestRepo::new();
     repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
@@ -82,4 +122,45 @@ fn search_engine_scans_fresh_index_when_query_cannot_use_index_effectively() {
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Scan);
+}
+
+#[test]
+fn search_engine_keeps_relative_build_paths_fresh_after_reopen() {
+    let repo = TestRepo::new();
+    let source = repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");
+    let repo_root = repo
+        .repo
+        .parent()
+        .expect("temp repo should have a parent")
+        .to_path_buf();
+    let index_path = repo_root.join("idx");
+
+    let status = Command::new(env!("CARGO_BIN_EXE_bitfun_grep"))
+        .current_dir(&repo_root)
+        .arg("build")
+        .arg("--repo")
+        .arg("repo")
+        .arg("--index")
+        .arg("idx")
+        .arg("--tokenizer")
+        .arg("trigram")
+        .status()
+        .expect("test should succeed");
+    assert!(status.success());
+
+    let engine = SearchEngine::new(BuildConfig {
+        repo_path: repo.repo.clone(),
+        index_path,
+        tokenizer: TokenizerMode::Trigram,
+        ..repo.trigram_build_config()
+    });
+    let diff = engine.diff_against_worktree().expect("test should succeed");
+    assert!(diff.is_empty());
+
+    let outcome = engine
+        .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
+        .expect("test should succeed");
+    assert_eq!(outcome.backend, SearchBackend::Index);
+    assert_eq!(outcome.results.hits.len(), 1);
+    assert_eq!(outcome.results.hits[0].path, source.to_string_lossy());
 }

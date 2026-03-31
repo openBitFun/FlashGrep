@@ -1,5 +1,6 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
+use crate::error::Result;
 use crate::search::SearchMode;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,25 @@ impl Default for BuildConfig {
     }
 }
 
+impl BuildConfig {
+    pub(crate) fn normalized(&self) -> Result<Self> {
+        Ok(Self {
+            repo_path: normalize_existing_path(&self.repo_path)?,
+            index_path: normalize_path(&self.index_path)?,
+            tokenizer: self.tokenizer,
+            corpus_mode: self.corpus_mode,
+            include_hidden: self.include_hidden,
+            max_file_size: self.max_file_size,
+            min_sparse_len: self.min_sparse_len,
+            max_sparse_len: self.max_sparse_len,
+        })
+    }
+
+    pub(crate) fn normalize_lossy(&self) -> Self {
+        self.normalized().unwrap_or_else(|_| self.clone())
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct QueryConfig {
     pub regex_pattern: String,
@@ -130,4 +150,34 @@ impl Default for QueryConfig {
             search_mode: SearchMode::MaterializeMatches,
         }
     }
+}
+
+fn normalize_existing_path(path: &Path) -> Result<PathBuf> {
+    let absolute = normalize_path(path)?;
+    Ok(std::fs::canonicalize(&absolute).unwrap_or(absolute))
+}
+
+fn normalize_path(path: &Path) -> Result<PathBuf> {
+    let absolute = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        std::env::current_dir()?.join(path)
+    };
+    Ok(normalize_lexical_path(&absolute))
+}
+
+fn normalize_lexical_path(path: &Path) -> PathBuf {
+    use std::path::Component;
+
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            _ => normalized.push(component.as_os_str()),
+        }
+    }
+    normalized
 }

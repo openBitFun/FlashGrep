@@ -103,6 +103,40 @@ impl TestRepo {
     pub fn rg(&self) -> Command {
         Command::new("rg")
     }
+
+    pub fn init_git(&self) {
+        self.run_git(["init"]);
+        self.run_git(["config", "user.name", "Test User"]);
+        self.run_git(["config", "user.email", "test@example.com"]);
+    }
+
+    pub fn commit_all(&self, message: &str) {
+        self.run_git(["add", "-A"]);
+        self.run_git(["commit", "-m", message]);
+    }
+
+    pub fn git_head(&self) -> String {
+        let output = self.run_git(["rev-parse", "HEAD"]);
+        String::from_utf8(output.stdout)
+            .expect("git stdout should be utf-8")
+            .trim()
+            .to_string()
+    }
+
+    fn run_git<const N: usize>(&self, args: [&str; N]) -> std::process::Output {
+        let output = Command::new("git")
+            .args(args)
+            .current_dir(&self.repo)
+            .output()
+            .expect("git command should run");
+        assert!(
+            output.status.success(),
+            "git {:?} failed: {}",
+            args,
+            String::from_utf8_lossy(&output.stderr)
+        );
+        output
+    }
 }
 
 pub fn query(pattern: &str) -> QueryConfig {

@@ -56,6 +56,25 @@ pub fn read_text_file(path: &std::path::Path) -> Result<Option<String>> {
     }
 }
 
+pub fn repo_relative_path(path: &Path, repo_root: &Path) -> String {
+    let normalized_path = normalize_lexical_path(path);
+    let normalized_root = normalize_lexical_path(repo_root);
+    normalized_path
+        .strip_prefix(&normalized_root)
+        .map(Path::to_path_buf)
+        .unwrap_or(normalized_path)
+        .to_string_lossy()
+        .into_owned()
+}
+
+pub fn resolve_repo_path(repo_root: &Path, path: &str) -> PathBuf {
+    let candidate = Path::new(path);
+    if candidate.is_absolute() {
+        return normalize_lexical_path(candidate);
+    }
+    normalize_lexical_path(&repo_root.join(candidate))
+}
+
 pub fn scan_paths(
     roots: &[PathBuf],
     index_path: Option<&Path>,

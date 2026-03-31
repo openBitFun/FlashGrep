@@ -1,0 +1,566 @@
+use std::fs;
+
+use tempfile::tempdir;
+
+use super::{copy_tree, parse_rg_count_output, run, BenchCacheMode, BenchConfig};
+use super::{fixtures::prepare_dirty_worktree_fixture, DirtyPattern};
+use crate::config::{CorpusMode, TokenizerMode};
+use crate::tools::bench::report::render_report;
+
+#[test]
+fn bench_runner_smoke_test() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path();
+    fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
+    fs::create_dir_all(suite_dir.join("subtitles")).expect("test should succeed");
+
+    fs::write(
+        suite_dir.join("linux").join("kernel.c"),
+        "PM_RESUME\nERR_SYS\nabc Ah\nΩHolmesΩ\n",
+    )
+    .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("en.sample.txt"),
+        "Sherlock Holmes met John Watson.\n",
+    )
+    .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("ru.txt"),
+        "Шерлок Холмс встретил Джон Уотсон.\n",
+    )
+    .expect("test should succeed");
+
+    let report = run(&BenchConfig {
+        suite_dir: suite_dir.to_path_buf(),
+        filter: Some("linux_literal".into()),
+        custom_repo: None,
+        custom_patterns: Vec::new(),
+        custom_name: None,
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: false,
+        compare_workspace: false,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    assert_eq!(report.summaries.len(), 2);
+    assert!(report
+        .summaries
+        .iter()
+        .all(|summary| summary.runners[0].sample_count == 1));
+}
+
+#[test]
+fn parse_rg_count_output_supports_single_and_multi_file_formats() {
+    assert_eq!(
+        parse_rg_count_output(b"3\n").expect("test should succeed"),
+        3
+    );
+    assert_eq!(
+        parse_rg_count_output(b"/tmp/a.rs:2\n/tmp/b.rs:5\n").expect("test should succeed"),
+        7
+    );
+}
+
+#[test]
+fn cold_bench_runs_hook_before_each_iteration() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path();
+    fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
+    fs::create_dir_all(suite_dir.join("subtitles")).expect("test should succeed");
+
+    fs::write(
+        suite_dir.join("linux").join("kernel.c"),
+        "PM_RESUME\npm_resume\n",
+    )
+    .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("en.sample.txt"),
+        "Sherlock Holmes met John Watson.\n",
+    )
+    .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("ru.txt"),
+        "Шерлок Холмс встретил Джон Уотсон.\n",
+    )
+    .expect("test should succeed");
+
+    let hook_path = suite_dir.join("cold-hook-count.txt");
+    let hook = format!("printf x >> {}", hook_path.display());
+
+    let report = run(&BenchConfig {
+        suite_dir: suite_dir.to_path_buf(),
+        filter: Some("linux_literal_casei".into()),
+        custom_repo: None,
+        custom_patterns: Vec::new(),
+        custom_name: None,
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Cold,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 1,
+        bench_iter: 2,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: false,
+        compare_workspace: false,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: Some(hook),
+    })
+    .expect("test should succeed");
+
+    assert_eq!(report.summaries.len(), 1);
+    let hook_count = fs::read_to_string(hook_path).expect("test should succeed");
+    assert_eq!(hook_count, "xxx");
+}
+
+#[test]
+fn bench_runner_supports_workspace_and_worktree_runners() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path();
+    fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
+    fs::create_dir_all(suite_dir.join("subtitles")).expect("test should succeed");
+
+    fs::write(
+        suite_dir.join("linux").join("kernel.c"),
+        "PM_RESUME\nERR_SYS\nabc Ah\nΩHolmesΩ\n",
+    )
+    .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("en.sample.txt"),
+        "Sherlock Holmes met John Watson.\n",
+    )
+    .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("ru.txt"),
+        "Шерлок Холмс встретил Джон Уотсон.\n",
+    )
+    .expect("test should succeed");
+
+    let report = run(&BenchConfig {
+        suite_dir: suite_dir.to_path_buf(),
+        filter: Some("linux_literal".into()),
+        custom_repo: None,
+        custom_patterns: Vec::new(),
+        custom_name: None,
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: true,
+        compare_workspace: true,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    assert_eq!(report.summaries.len(), 2);
+    let summary = report
+        .summaries
+        .iter()
+        .find(|summary| summary.name == "linux_literal")
+        .expect("test should succeed");
+    assert_eq!(summary.runners.len(), 4);
+    assert!(summary
+        .runners
+        .iter()
+        .any(|runner| runner.runner == "bitfun_worktree_build"));
+    assert!(summary
+        .runners
+        .iter()
+        .any(|runner| runner.runner == "bitfun_worktree"));
+    assert!(summary
+        .runners
+        .iter()
+        .any(|runner| runner.runner == "bitfun_workspace"));
+}
+
+#[cfg(unix)]
+#[test]
+fn copy_tree_dereferences_symlinked_files_for_worktree_fixtures() {
+    use std::os::unix::fs::symlink;
+
+    let temp = tempdir().expect("test should succeed");
+    let source = temp.path().join("source");
+    let target = temp.path().join("target");
+
+    fs::create_dir_all(source.join("nested")).expect("test should succeed");
+    fs::write(source.join("nested").join("real.txt"), "PM_RESUME\n").expect("test should succeed");
+    symlink("nested/real.txt", source.join("linked.txt")).expect("test should succeed");
+
+    copy_tree(&source, &target).expect("test should succeed");
+
+    let copied = target.join("linked.txt");
+    assert!(copied.is_file());
+    assert_eq!(
+        fs::read_to_string(copied).expect("test should succeed"),
+        "PM_RESUME\n"
+    );
+}
+
+#[test]
+fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path().join("suite");
+    let repo_dir = temp.path().join("repo");
+
+    fs::create_dir_all(&suite_dir).expect("test should succeed");
+    fs::create_dir_all(repo_dir.join("drivers")).expect("test should succeed");
+    fs::create_dir_all(repo_dir.join("kernel")).expect("test should succeed");
+    fs::write(repo_dir.join("drivers").join("apm.c"), "PM_RESUME\n").expect("test should succeed");
+    fs::write(repo_dir.join("kernel").join("ata.c"), "ERR_SYS\n").expect("test should succeed");
+    fs::write(repo_dir.join("misc.txt"), "unrelated\n").expect("test should succeed");
+
+    let fixture = prepare_dirty_worktree_fixture(
+        &repo_dir,
+        &suite_dir,
+        "linux-small",
+        &BenchConfig {
+            suite_dir: suite_dir.clone(),
+            filter: None,
+            custom_repo: None,
+            custom_patterns: Vec::new(),
+            custom_name: None,
+            custom_case_insensitive: false,
+            tokenizer: TokenizerMode::Trigram,
+            corpus_mode: CorpusMode::RespectIgnore,
+            cache_mode: BenchCacheMode::Warm,
+            query_mode: super::BenchQueryMode::Trace,
+            warmup_iter: 0,
+            bench_iter: 1,
+            top_k_tokens: 4,
+            compare_cli: false,
+            compare_rg: false,
+            compare_worktree: true,
+            compare_workspace: false,
+            worktree_sample_files: Some(2),
+            rebuild: true,
+            raw_output: None,
+            cold_hook: None,
+        },
+        &[
+            DirtyPattern {
+                regex_pattern: "PM_RESUME".into(),
+                case_insensitive: false,
+            },
+            DirtyPattern {
+                regex_pattern: "ERR_SYS".into(),
+                case_insensitive: false,
+            },
+        ],
+    )
+    .expect("test should succeed");
+
+    let copied = walkdir::WalkDir::new(&fixture.repo_path)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| {
+            entry
+                .path()
+                .strip_prefix(&fixture.repo_path)
+                .expect("test should succeed")
+                .to_string_lossy()
+                .into_owned()
+        })
+        .collect::<Vec<_>>();
+
+    assert_eq!(copied.len(), 2);
+    assert!(copied.iter().any(|path| path == "drivers/apm.c"));
+    assert!(copied.iter().any(|path| path == "kernel/ata.c"));
+}
+
+#[test]
+fn bench_runner_supports_custom_repo_patterns() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path().join("suite");
+    let repo_dir = temp.path().join("repo");
+
+    fs::create_dir_all(&suite_dir).expect("test should succeed");
+    fs::create_dir_all(&repo_dir).expect("test should succeed");
+    fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+
+    let report = run(&BenchConfig {
+        suite_dir,
+        filter: None,
+        custom_repo: Some(repo_dir),
+        custom_patterns: vec!["BitFun".into()],
+        custom_name: Some("bitfun-custom".into()),
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: false,
+        compare_workspace: true,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    assert_eq!(report.summaries.len(), 1);
+    let summary = &report.summaries[0];
+    assert_eq!(summary.name, "bitfun-custom");
+    assert_eq!(summary.pattern, "BitFun");
+    assert_eq!(summary.target, "bitfun-custom");
+    assert!(summary
+        .runners
+        .iter()
+        .any(|runner| runner.runner == "bitfun_grep"));
+    assert!(summary
+        .runners
+        .iter()
+        .any(|runner| runner.runner == "bitfun_workspace"));
+}
+
+#[test]
+fn bench_runner_supports_custom_worktree_build_runner() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path().join("suite");
+    let repo_dir = temp.path().join("repo");
+
+    fs::create_dir_all(&suite_dir).expect("test should succeed");
+    fs::create_dir_all(&repo_dir).expect("test should succeed");
+    fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+
+    let report = run(&BenchConfig {
+        suite_dir,
+        filter: None,
+        custom_repo: Some(repo_dir),
+        custom_patterns: vec!["BitFun".into()],
+        custom_name: Some("bitfun-worktree".into()),
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: true,
+        compare_workspace: false,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    assert_eq!(report.summaries.len(), 1);
+    let summary = &report.summaries[0];
+    assert!(summary
+        .runners
+        .iter()
+        .any(|runner| runner.runner == "bitfun_worktree_build"));
+    assert!(summary
+        .runners
+        .iter()
+        .any(|runner| runner.runner == "bitfun_worktree"));
+}
+
+#[test]
+fn bench_report_labels_worktree_runner_modes() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path();
+    fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
+    fs::create_dir_all(suite_dir.join("subtitles")).expect("test should succeed");
+
+    fs::write(suite_dir.join("linux").join("kernel.c"), "PM_RESUME\n")
+        .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("en.sample.txt"),
+        "Sherlock Holmes\n",
+    )
+    .expect("test should succeed");
+    fs::write(suite_dir.join("subtitles").join("ru.txt"), "Шерлок Холмс\n")
+        .expect("test should succeed");
+
+    let report = run(&BenchConfig {
+        suite_dir: suite_dir.to_path_buf(),
+        filter: Some("linux_literal".into()),
+        custom_repo: None,
+        custom_patterns: Vec::new(),
+        custom_name: None,
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: true,
+        compare_workspace: true,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    let rendered = render_report(&report);
+    let base = rendered
+        .find("bitfun_grep [base-index]")
+        .expect("test should succeed");
+    let workspace = rendered
+        .find("bitfun_workspace [workspace-snapshot]")
+        .expect("test should succeed");
+    let worktree_build = rendered
+        .find("bitfun_worktree_build [dirty-first-query]")
+        .expect("test should succeed");
+    let worktree_cached = rendered
+        .find("bitfun_worktree [dirty-cached-query]")
+        .expect("test should succeed");
+
+    assert!(base < workspace);
+    assert!(workspace < worktree_build);
+    assert!(worktree_build < worktree_cached);
+}
+
+#[test]
+fn bench_raw_output_includes_runner_family_and_mode() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path();
+    fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
+    fs::create_dir_all(suite_dir.join("subtitles")).expect("test should succeed");
+
+    fs::write(suite_dir.join("linux").join("kernel.c"), "PM_RESUME\n")
+        .expect("test should succeed");
+    fs::write(
+        suite_dir.join("subtitles").join("en.sample.txt"),
+        "Sherlock Holmes\n",
+    )
+    .expect("test should succeed");
+    fs::write(suite_dir.join("subtitles").join("ru.txt"), "Шерлок Холмс\n")
+        .expect("test should succeed");
+
+    let raw_output = suite_dir.join("bench.csv");
+    let _ = run(&BenchConfig {
+        suite_dir: suite_dir.to_path_buf(),
+        filter: Some("linux_literal".into()),
+        custom_repo: None,
+        custom_patterns: Vec::new(),
+        custom_name: None,
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: true,
+        compare_workspace: true,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: Some(raw_output.clone()),
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    let csv = fs::read_to_string(raw_output).expect("test should succeed");
+    let lines = csv.lines().collect::<Vec<_>>();
+    assert_eq!(
+        lines[0],
+        "benchmark,corpus,runner,runner_family,runner_mode,iteration,duration_secs,candidate_docs,match_count"
+    );
+    assert!(lines
+        .iter()
+        .any(|line| line.contains(",bitfun_grep,bitfun,base_index,")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains(",bitfun_workspace,bitfun,workspace_snapshot,")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains(",bitfun_worktree_build,bitfun,dirty_first_query,")));
+    assert!(lines
+        .iter()
+        .any(|line| line.contains(",bitfun_worktree,bitfun,dirty_cached_query,")));
+}
+
+#[test]
+fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path().join("suite");
+    let repo_dir = temp.path().join("repo");
+
+    fs::create_dir_all(&suite_dir).expect("test should succeed");
+    fs::create_dir_all(&repo_dir).expect("test should succeed");
+    fs::write(
+        repo_dir.join("main.ts"),
+        "const APP = 'BitFun';\nconst TOOL = 'Search';\n",
+    )
+    .expect("test should succeed");
+
+    let report = run(&BenchConfig {
+        suite_dir,
+        filter: None,
+        custom_repo: Some(repo_dir),
+        custom_patterns: vec!["BitFun".into(), "Search".into()],
+        custom_name: Some("bitfun-trace".into()),
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 2,
+        top_k_tokens: 4,
+        compare_cli: false,
+        compare_rg: false,
+        compare_worktree: false,
+        compare_workspace: true,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    assert_eq!(report.summaries.len(), 1);
+    let summary = &report.summaries[0];
+    assert_eq!(summary.name, "bitfun-trace");
+    assert_eq!(summary.pattern, "trace[2]");
+    assert_eq!(summary.target, "bitfun-trace");
+    assert!(summary
+        .runners
+        .iter()
+        .all(|runner| runner.sample_count == 2));
+}

@@ -1,4 +1,6 @@
 use std::{
+    collections::HashSet,
+    convert::Infallible,
     env,
     fs::File,
     io::{Read, Result as IoResult},
@@ -25,14 +27,24 @@ use crate::{
 
 use super::{
     query::LiteralPrefilter,
-    shared::{build_regex_matcher, doc_by_id, trim_line_terminator_bytes, validate_doc_ids},
+    shared::{
+        build_line_starts, build_regex_matcher, doc_by_id, line_index_for_offset,
+        trim_line_terminator_bytes, validate_doc_ids,
+    },
 };
 
+const MAX_LOOK_AHEAD: usize = 128;
 const VERIFY_PARALLEL_THRESHOLD: usize = 512;
 const VERIFY_SMALL_FILE_READ_LIMIT: u64 = 64 * 1024;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum CountKind {
+    Lines,
+    Occurrences,
+}
+
 #[derive(Debug)]
-pub(super) enum VerifyPlan {
+pub(crate) enum VerifyPlan {
     CountOnlyLineMeta(CountOnlyLineMetaPlan),
     SearcherLine(SearcherLinePlan),
     SearcherMultiline(SearcherMultilinePlan),
@@ -43,47 +55,63 @@ impl VerifyPlan {
         config: &QueryConfig,
         multiline_verifier: bool,
         literal_prefilter: Option<LiteralPrefilter>,
+        count_kind: CountKind,
     ) -> Result<Self> {
         if multiline_verifier {
             return Ok(Self::SearcherMultiline(SearcherMultilinePlan {
                 matcher: build_regex_matcher(config, true)?,
+                count_kind,
                 max_count: config.max_count,
             }));
         }
         if config.word_regexp || config.line_regexp {
-            return Self::compile_searcher_line(config, literal_prefilter);
+            return Self::compile_searcher_line(config, literal_prefilter, count_kind);
         }
 
         match env::var("BITFUN_COUNT_VERIFY_STRATEGY").ok().as_deref() {
-            Some("meta") => match CountOnlyLineMetaPlan::compile(config) {
-                Ok(plan) => Ok(Self::CountOnlyLineMeta(plan)),
-                Err(_) => Self::compile_searcher_line(config, literal_prefilter),
-            },
-            Some("searcher" | "searcher-line" | "path") => {
-                Self::compile_searcher_line(config, literal_prefilter)
+            Some("meta") if matches!(count_kind, CountKind::Lines) => {
+                match CountOnlyLineMetaPlan::compile(config) {
+                    Ok(plan) => Ok(Self::CountOnlyLineMeta(plan)),
+                    Err(_) => Self::compile_searcher_line(config, literal_prefilter, count_kind),
+                }
             }
-            None => Self::compile_searcher_line(config, literal_prefilter),
+            Some("meta") => Self::compile_searcher_line(config, literal_prefilter, count_kind),
+            Some("searcher" | "searcher-line" | "path") => {
+                Self::compile_searcher_line(config, literal_prefilter, count_kind)
+            }
+            None => Self::compile_searcher_line(config, literal_prefilter, count_kind),
             Some(other) => Err(AppError::InvalidPattern(format!(
                 "unknown BITFUN_COUNT_VERIFY_STRATEGY value: {other}"
             ))),
         }
     }
 
+    pub(crate) fn compile_without_prefilter(
+        config: &QueryConfig,
+        multiline_verifier: bool,
+        count_kind: CountKind,
+    ) -> Result<Self> {
+        Self::compile(config, multiline_verifier, None, count_kind)
+    }
+
     pub(super) fn compile_searcher_line(
         config: &QueryConfig,
         literal_prefilter: Option<LiteralPrefilter>,
+        count_kind: CountKind,
     ) -> Result<Self> {
         Ok(Self::SearcherLine(SearcherLinePlan {
             matcher: build_regex_matcher(config, false)?,
             literal_prefilter,
+            count_kind,
             max_count: config.max_count,
         }))
     }
 
-    pub(super) fn verify_candidate_count_stats(
+    pub(crate) fn verify_candidate_count_stats(
         &self,
         candidate_ids: &[u32],
         docs: &[DocMeta],
+        paths: &[std::path::PathBuf],
     ) -> Result<CountStats> {
         validate_doc_ids(docs, candidate_ids)?;
         if should_parallel_verify(candidate_ids.len()) {
@@ -92,30 +120,32 @@ impl VerifyPlan {
                 .par_chunks(chunk_size)
                 .map_init(
                     || self.create_runtime(),
-                    |runtime, chunk| runtime.verify_chunk(chunk, docs),
+                    |runtime, chunk| runtime.verify_chunk(chunk, docs, paths),
                 )
                 .try_reduce(CountStats::default, |left, right| Ok(left + right))
         } else {
             let mut runtime = self.create_runtime();
-            runtime.verify_chunk(candidate_ids, docs)
+            runtime.verify_chunk(candidate_ids, docs, paths)
         }
     }
 
-    pub(super) fn verify_candidate_counts_by_doc(
+    pub(crate) fn verify_candidate_counts_by_doc(
         &self,
         candidate_ids: &[u32],
         docs: &[DocMeta],
+        paths: &[std::path::PathBuf],
     ) -> Result<Vec<DocMatchCount>> {
         validate_doc_ids(docs, candidate_ids)?;
         let mut runtime = self.create_runtime();
         let mut counts = Vec::new();
         for &doc_id in candidate_ids {
-            let path = Path::new(doc_by_id(docs, doc_id)?.path.as_str());
-            let matched_lines = runtime.verify_path(path)?;
-            if matched_lines > 0 {
+            let _ = doc_by_id(docs, doc_id)?;
+            let stats = runtime.verify_path(path_by_id(paths, doc_id)?)?;
+            if stats.has_match() {
                 counts.push(DocMatchCount {
                     doc_id,
-                    matched_lines,
+                    matched_lines: stats.matched_lines,
+                    matched_occurrences: stats.matched_occurrences,
                 });
             }
         }
@@ -140,7 +170,7 @@ impl VerifyPlan {
 }
 
 #[derive(Debug)]
-pub(super) struct CountOnlyLineMetaPlan {
+pub(crate) struct CountOnlyLineMetaPlan {
     regex: MetaRegex,
     max_count: Option<usize>,
 }
@@ -167,15 +197,17 @@ impl CountOnlyLineMetaPlan {
 }
 
 #[derive(Debug)]
-pub(super) struct SearcherLinePlan {
+pub(crate) struct SearcherLinePlan {
     matcher: RegexMatcher,
     literal_prefilter: Option<LiteralPrefilter>,
+    count_kind: CountKind,
     max_count: Option<usize>,
 }
 
 #[derive(Debug)]
-pub(super) struct SearcherMultilinePlan {
+pub(crate) struct SearcherMultilinePlan {
     matcher: RegexMatcher,
+    count_kind: CountKind,
     max_count: Option<usize>,
 }
 
@@ -192,20 +224,26 @@ enum VerifyRuntime<'a> {
 }
 
 impl VerifyRuntime<'_> {
-    fn verify_chunk(&mut self, candidate_ids: &[u32], docs: &[DocMeta]) -> Result<CountStats> {
+    fn verify_chunk(
+        &mut self,
+        candidate_ids: &[u32],
+        docs: &[DocMeta],
+        paths: &[std::path::PathBuf],
+    ) -> Result<CountStats> {
         let mut stats = CountStats::default();
         for &doc_id in candidate_ids {
-            let path = Path::new(doc_by_id(docs, doc_id)?.path.as_str());
-            let matched_lines = self.verify_path(path)?;
-            if matched_lines > 0 {
+            let _ = doc_by_id(docs, doc_id)?;
+            let doc_stats = self.verify_path(path_by_id(paths, doc_id)?)?;
+            if doc_stats.has_match() {
                 stats.matched_docs += 1;
-                stats.matched_lines += matched_lines;
+                stats.matched_lines += doc_stats.matched_lines;
+                stats.matched_occurrences += doc_stats.matched_occurrences;
             }
         }
         Ok(stats)
     }
 
-    fn verify_path(&mut self, path: &Path) -> Result<usize> {
+    fn verify_path(&mut self, path: &Path) -> Result<DocCountStats> {
         match self {
             Self::CountOnlyLineMeta(runtime) => runtime.verify_path(path),
             Self::SearcherLine { plan, runtime } => runtime.verify_path_line(path, plan),
@@ -215,15 +253,29 @@ impl VerifyRuntime<'_> {
 }
 
 #[derive(Debug, Default, Clone, Copy)]
-pub(super) struct CountStats {
-    pub(super) matched_docs: usize,
-    pub(super) matched_lines: usize,
+pub(crate) struct CountStats {
+    pub(crate) matched_docs: usize,
+    pub(crate) matched_lines: usize,
+    pub(crate) matched_occurrences: usize,
 }
 
 #[derive(Debug, Clone, Copy)]
-pub(super) struct DocMatchCount {
-    pub(super) doc_id: u32,
-    pub(super) matched_lines: usize,
+pub(crate) struct DocMatchCount {
+    pub(crate) doc_id: u32,
+    pub(crate) matched_lines: usize,
+    pub(crate) matched_occurrences: usize,
+}
+
+#[derive(Debug, Default, Clone, Copy)]
+struct DocCountStats {
+    matched_lines: usize,
+    matched_occurrences: usize,
+}
+
+impl DocCountStats {
+    fn has_match(self) -> bool {
+        self.matched_lines > 0 || self.matched_occurrences > 0
+    }
 }
 
 impl std::ops::Add for CountStats {
@@ -233,8 +285,18 @@ impl std::ops::Add for CountStats {
         Self {
             matched_docs: self.matched_docs + rhs.matched_docs,
             matched_lines: self.matched_lines + rhs.matched_lines,
+            matched_occurrences: self.matched_occurrences + rhs.matched_occurrences,
         }
     }
+}
+
+fn path_by_id<'a>(paths: &'a [std::path::PathBuf], doc_id: u32) -> Result<&'a Path> {
+    let index = usize::try_from(doc_id)
+        .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
+    paths
+        .get(index)
+        .map(std::path::PathBuf::as_path)
+        .ok_or_else(|| AppError::InvalidIndex(format!("missing resolved path for doc id {doc_id}")))
 }
 
 struct CountOnlyLineMetaRuntime<'a> {
@@ -254,20 +316,23 @@ impl<'a> CountOnlyLineMetaRuntime<'a> {
         }
     }
 
-    fn verify_path(&mut self, path: &Path) -> Result<usize> {
+    fn verify_path(&mut self, path: &Path) -> Result<DocCountStats> {
         let Some(bytes) = load_doc_bytes(path, &mut self.scratch)? else {
-            return Ok(0);
+            return Ok(DocCountStats::default());
         };
         let visible = visible_bytes(bytes.as_ref());
         if visible.is_empty() {
-            return Ok(0);
+            return Ok(DocCountStats::default());
         }
-        Ok(count_meta_matched_lines(
-            visible,
-            self.regex,
-            self.max_count,
-            &mut self.cache,
-        ))
+        Ok(DocCountStats {
+            matched_lines: count_meta_matched_lines(
+                visible,
+                self.regex,
+                self.max_count,
+                &mut self.cache,
+            ),
+            matched_occurrences: 0,
+        })
     }
 }
 
@@ -286,33 +351,41 @@ impl<'a> SearcherRuntime<'a> {
         }
     }
 
-    fn verify_path_line(&mut self, path: &Path, plan: &SearcherLinePlan) -> Result<usize> {
+    fn verify_path_line(&mut self, path: &Path, plan: &SearcherLinePlan) -> Result<DocCountStats> {
         let Some(bytes) = load_doc_bytes(path, &mut self.scratch)? else {
-            return Ok(0);
+            return Ok(DocCountStats::default());
         };
         match plan.literal_prefilter.as_ref() {
             Some(prefilter) => {
                 let matcher = LinePrefilterMatcher::new(self.matcher, prefilter);
-                count_matches_by_line(visible_bytes(bytes.as_ref()), &matcher, plan.max_count)
+                count_match_stats_by_line(
+                    visible_bytes(bytes.as_ref()),
+                    &matcher,
+                    plan.max_count,
+                    plan.count_kind,
+                )
             }
-            None => {
-                count_matches_by_line(visible_bytes(bytes.as_ref()), self.matcher, plan.max_count)
-            }
+            None => count_match_stats_by_line(
+                visible_bytes(bytes.as_ref()),
+                self.matcher,
+                plan.max_count,
+                plan.count_kind,
+            ),
         }
     }
 
     fn verify_path_multiline(
         &mut self,
         path: &Path,
-        _plan: &SearcherMultilinePlan,
-    ) -> Result<usize> {
+        plan: &SearcherMultilinePlan,
+    ) -> Result<DocCountStats> {
         let Some(bytes) = load_doc_bytes(path, &mut self.scratch)? else {
-            return Ok(0);
+            return Ok(DocCountStats::default());
         };
-        let mut sink = CountSink::default();
+        let mut sink = CountSink::new(self.matcher, plan.count_kind);
         self.searcher
             .search_slice(self.matcher, bytes.as_ref(), &mut sink)?;
-        Ok(sink.matched_lines)
+        Ok(sink.stats)
     }
 }
 
@@ -411,33 +484,35 @@ fn count_meta_matched_lines(
     matched_lines
 }
 
-fn count_matches_by_line<M: Matcher>(
+fn count_match_stats_by_line<M: Matcher>(
     bytes: &[u8],
     matcher: &M,
     max_count: Option<usize>,
-) -> Result<usize>
+    count_kind: CountKind,
+) -> Result<DocCountStats>
 where
     M::Error: std::fmt::Display,
 {
     if matches!(max_count, Some(0)) {
-        return Ok(0);
+        return Ok(DocCountStats::default());
     }
     if is_line_by_line_fast(matcher) {
-        count_matches_by_line_fast(bytes, matcher, max_count)
+        count_match_stats_by_line_fast(bytes, matcher, max_count, count_kind)
     } else {
-        count_matches_by_line_slow(bytes, matcher, max_count)
+        count_match_stats_by_line_slow(bytes, matcher, max_count, count_kind)
     }
 }
 
-fn count_matches_by_line_fast<M: Matcher>(
+fn count_match_stats_by_line_fast<M: Matcher>(
     bytes: &[u8],
     matcher: &M,
     max_count: Option<usize>,
-) -> Result<usize>
+    count_kind: CountKind,
+) -> Result<DocCountStats>
 where
     M::Error: std::fmt::Display,
 {
-    let mut matched_lines = 0usize;
+    let mut stats = DocCountStats::default();
     let mut pos = 0usize;
 
     while pos < bytes.len() {
@@ -457,54 +532,116 @@ where
             break;
         }
 
-        let is_match = match candidate {
-            LineMatchKind::Confirmed(_) => true,
-            LineMatchKind::Candidate(_) => matcher
-                .is_match(trim_line_terminator_bytes(
-                    &bytes[absolute_start..absolute_end],
-                ))
-                .map_err(io_error_from_matcher)?,
-        };
-        if is_match {
-            matched_lines += 1;
-            if max_count.is_some_and(|limit| matched_lines >= limit) {
-                break;
+        let line = trim_line_terminator_bytes(&bytes[absolute_start..absolute_end]);
+        let line_stats = match count_kind {
+            CountKind::Lines => {
+                let is_match = match candidate {
+                    LineMatchKind::Confirmed(_) => true,
+                    LineMatchKind::Candidate(_) => {
+                        matcher.is_match(line).map_err(io_error_from_matcher)?
+                    }
+                };
+                if is_match {
+                    DocCountStats {
+                        matched_lines: 1,
+                        matched_occurrences: 0,
+                    }
+                } else {
+                    DocCountStats::default()
+                }
             }
+            CountKind::Occurrences => {
+                let matched_occurrences = count_line_occurrences(line, matcher)?;
+                if matched_occurrences > 0 {
+                    DocCountStats {
+                        matched_lines: 1,
+                        matched_occurrences,
+                    }
+                } else {
+                    DocCountStats::default()
+                }
+            }
+        };
+        stats.matched_lines += line_stats.matched_lines;
+        stats.matched_occurrences += line_stats.matched_occurrences;
+        if max_count.is_some_and(|limit| stats.matched_lines >= limit) {
+            break;
         }
         pos = absolute_end;
     }
 
-    Ok(matched_lines)
+    Ok(stats)
 }
 
-fn count_matches_by_line_slow<M: Matcher>(
+fn count_match_stats_by_line_slow<M: Matcher>(
     bytes: &[u8],
     matcher: &M,
     max_count: Option<usize>,
-) -> Result<usize>
+    count_kind: CountKind,
+) -> Result<DocCountStats>
 where
     M::Error: std::fmt::Display,
 {
-    let mut matched_lines = 0usize;
+    let mut stats = DocCountStats::default();
     let mut line_start = 0usize;
 
     while line_start < bytes.len() {
         let line_end =
             memchr(b'\n', &bytes[line_start..]).map_or(bytes.len(), |idx| line_start + idx + 1);
-        if matcher
-            .shortest_match(trim_line_terminator_bytes(&bytes[line_start..line_end]))
-            .map_err(io_error_from_matcher)?
-            .is_some()
-        {
-            matched_lines += 1;
-            if max_count.is_some_and(|limit| matched_lines >= limit) {
-                break;
+        let line = trim_line_terminator_bytes(&bytes[line_start..line_end]);
+        let line_stats = match count_kind {
+            CountKind::Lines => {
+                if matcher
+                    .shortest_match(line)
+                    .map_err(io_error_from_matcher)?
+                    .is_some()
+                {
+                    DocCountStats {
+                        matched_lines: 1,
+                        matched_occurrences: 0,
+                    }
+                } else {
+                    DocCountStats::default()
+                }
             }
+            CountKind::Occurrences => {
+                let matched_occurrences = count_line_occurrences(line, matcher)?;
+                if matched_occurrences > 0 {
+                    DocCountStats {
+                        matched_lines: 1,
+                        matched_occurrences,
+                    }
+                } else {
+                    DocCountStats::default()
+                }
+            }
+        };
+        stats.matched_lines += line_stats.matched_lines;
+        stats.matched_occurrences += line_stats.matched_occurrences;
+        if max_count.is_some_and(|limit| stats.matched_lines >= limit) {
+            break;
         }
         line_start = line_end;
     }
 
-    Ok(matched_lines)
+    Ok(stats)
+}
+
+fn count_line_occurrences<M: Matcher>(line: &[u8], matcher: &M) -> Result<usize>
+where
+    M::Error: std::fmt::Display,
+{
+    let mut matched_occurrences = 0usize;
+    let result = matcher
+        .try_find_iter(line, |_| -> std::result::Result<bool, Infallible> {
+            matched_occurrences += 1;
+            Ok(true)
+        })
+        .map_err(io_error_from_matcher)?;
+    match result {
+        Ok(()) => Ok(matched_occurrences),
+        Err(never) => match never {},
+    }
 }
 
 fn locate_line(haystack: &[u8], offset: usize) -> (usize, usize) {
@@ -529,21 +666,115 @@ fn io_error_from_matcher<E: std::fmt::Display>(error: E) -> std::io::Error {
     std::io::Error::other(error.to_string())
 }
 
-#[derive(Default)]
-struct CountSink {
-    matched_lines: usize,
+struct CountSink<'m> {
+    matcher: &'m RegexMatcher,
+    count_kind: CountKind,
+    stats: DocCountStats,
 }
 
-impl Sink for CountSink {
+impl<'m> CountSink<'m> {
+    fn new(matcher: &'m RegexMatcher, count_kind: CountKind) -> Self {
+        Self {
+            matcher,
+            count_kind,
+            stats: DocCountStats::default(),
+        }
+    }
+}
+
+impl Sink for CountSink<'_> {
     type Error = std::io::Error;
 
     fn matched(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> IoResult<bool> {
-        if searcher.multi_line() {
-            self.matched_lines += mat.lines().count().max(1);
-        } else {
-            self.matched_lines += 1;
+        match self.count_kind {
+            CountKind::Lines => {
+                if searcher.multi_line() {
+                    self.stats.matched_lines += mat.lines().count().max(1);
+                } else {
+                    self.stats.matched_lines += 1;
+                }
+            }
+            CountKind::Occurrences => {
+                let buffer = mat.buffer();
+                let range = mat.bytes_range_in_buffer();
+                let line_starts = build_line_starts(buffer);
+                let mut seen_lines = HashSet::new();
+                let mut matched_occurrences = 0usize;
+                find_iter_at_in_context(searcher, self.matcher, buffer, range, |matched| {
+                    record_line_span(&mut seen_lines, &line_starts, matched);
+                    matched_occurrences += 1;
+                    true
+                })?;
+                self.stats.matched_lines += seen_lines.len();
+                self.stats.matched_occurrences += matched_occurrences;
+            }
         }
         Ok(true)
+    }
+}
+
+fn trim_line_terminator<'b>(
+    searcher: &Searcher,
+    buf: &'b [u8],
+    line: &mut grep_matcher::Match,
+) -> &'b [u8] {
+    let line_term = searcher.line_terminator();
+    if line_term.is_suffix(&buf[*line]) {
+        let mut end = line.end() - 1;
+        if line_term.is_crlf() && end > 0 && buf.get(end - 1) == Some(&b'\r') {
+            end -= 1;
+        }
+        let orig_end = line.end();
+        *line = line.with_end(end);
+        &buf[end..orig_end]
+    } else {
+        &[]
+    }
+}
+
+fn find_iter_at_in_context<F>(
+    searcher: &Searcher,
+    matcher: &RegexMatcher,
+    mut bytes: &[u8],
+    range: std::ops::Range<usize>,
+    mut matched: F,
+) -> IoResult<()>
+where
+    F: FnMut(grep_matcher::Match) -> bool,
+{
+    if searcher.multi_line_with_matcher(matcher) {
+        if bytes[range.end..].len() >= MAX_LOOK_AHEAD {
+            bytes = &bytes[..range.end + MAX_LOOK_AHEAD];
+        }
+    } else {
+        let mut line = grep_matcher::Match::new(0, range.end);
+        trim_line_terminator(searcher, bytes, &mut line);
+        bytes = &bytes[..line.end()];
+    }
+    matcher
+        .find_iter_at(bytes, range.start, |matched_range| {
+            if matched_range.start() >= range.end {
+                return false;
+            }
+            matched(matched_range)
+        })
+        .map_err(io_error_from_matcher)
+}
+
+fn record_line_span(
+    seen_lines: &mut HashSet<usize>,
+    line_starts: &[usize],
+    matched: grep_matcher::Match,
+) {
+    let start = line_index_for_offset(matched.start(), line_starts);
+    let end_offset = if matched.is_empty() {
+        matched.start()
+    } else {
+        matched.end().saturating_sub(1)
+    };
+    let end = line_index_for_offset(end_offset, line_starts);
+    for line in start..=end {
+        seen_lines.insert(line);
     }
 }
 

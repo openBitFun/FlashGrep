@@ -151,6 +151,49 @@ fn search_can_be_restricted_to_selected_paths() {
 }
 
 #[test]
+fn search_can_be_restricted_to_exact_file_path() {
+    let repo = TestRepo::new();
+    let source = repo.write("input.txt", "abc");
+    repo.write("other.txt", "zzz");
+
+    repo.build();
+
+    let searcher = repo.searcher();
+    let cwd = std::env::current_dir().expect("test should succeed");
+    let file_filter = PathFilter::new(
+        PathFilterArgs {
+            roots: vec![source.clone()],
+            ..PathFilterArgs::default()
+        },
+        &cwd,
+    )
+    .expect("test should succeed");
+
+    assert_eq!(
+        searcher.indexed_paths(Some(&file_filter)),
+        vec![source.to_string_lossy()]
+    );
+
+    let literal = searcher
+        .search_with_filter(&query("abc"), Some(&file_filter))
+        .expect("test should succeed");
+    assert_eq!(literal.hits.len(), 1);
+    assert_eq!(literal.hits[0].path, source.to_string_lossy());
+
+    let regex = searcher
+        .search(&query("a(.*c)"))
+        .expect("test should succeed");
+    assert_eq!(regex.hits.len(), 1);
+    assert_eq!(regex.hits[0].path, source.to_string_lossy());
+
+    let regex = searcher
+        .search_with_filter(&query("a(.*c)"), Some(&file_filter))
+        .expect("test should succeed");
+    assert_eq!(regex.hits.len(), 1);
+    assert_eq!(regex.hits[0].path, source.to_string_lossy());
+}
+
+#[test]
 fn files_without_matches_are_exposed_via_searcher_api() {
     let repo = TestRepo::new();
     repo.write("matched.rs", "const NAME: &str = \"PM_RESUME\";\n");
