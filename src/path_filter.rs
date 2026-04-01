@@ -149,7 +149,8 @@ pub fn normalize_path(path: &Path, current_dir: &Path) -> PathBuf {
     } else {
         current_dir.join(path)
     };
-    normalize_lexical_path(&joined)
+    let normalized = normalize_lexical_path(&joined);
+    std::fs::canonicalize(&normalized).unwrap_or(normalized)
 }
 
 fn normalize_lexical_path(path: &Path) -> PathBuf {
@@ -178,6 +179,9 @@ mod tests {
         let temp = tempdir().expect("test should succeed");
         let current_dir = temp.path().to_path_buf();
         std::fs::create_dir_all(current_dir.join("src")).expect("test should succeed");
+        std::fs::write(current_dir.join("src/lib.rs"), "").expect("test should succeed");
+        std::fs::write(current_dir.join("src/lib.py"), "").expect("test should succeed");
+        std::fs::write(current_dir.join("generated.rs"), "").expect("test should succeed");
         let filter = PathFilter::new(
             PathFilterArgs {
                 roots: vec![current_dir.clone()],
@@ -206,6 +210,9 @@ mod tests {
     fn type_filters_select_and_negate_default_types() {
         let temp = tempdir().expect("test should succeed");
         let current_dir = temp.path().to_path_buf();
+        std::fs::create_dir_all(current_dir.join("src")).expect("test should succeed");
+        std::fs::write(current_dir.join("src/lib.rs"), "").expect("test should succeed");
+        std::fs::write(current_dir.join("Cargo.toml"), "").expect("test should succeed");
         let filter = PathFilter::new(
             PathFilterArgs {
                 roots: vec![current_dir.clone()],

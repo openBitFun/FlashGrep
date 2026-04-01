@@ -1,4 +1,4 @@
-use bitfun_grep::{PathFilter, PathFilterArgs, QueryConfig, SearchMode};
+use codgrep::{advanced::PathFilter, advanced::PathFilterArgs, QueryConfig, SearchMode};
 
 use crate::common::{count_matches_query, count_query, query, TestRepo};
 
@@ -47,8 +47,8 @@ fn build_can_disable_ignore_rules() {
     repo.write(".gitignore", "ignored.rs\n");
     let ignored = repo.write("ignored.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
-    repo.build_with(bitfun_grep::BuildConfig {
-        corpus_mode: bitfun_grep::CorpusMode::NoIgnore,
+    repo.build_with(codgrep::BuildConfig {
+        corpus_mode: codgrep::CorpusMode::NoIgnore,
         ..repo.trigram_build_config()
     });
 
@@ -87,7 +87,7 @@ fn build_can_include_hidden_files() {
     let repo = TestRepo::new();
     let hidden = repo.write(".secret.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
-    repo.build_with(bitfun_grep::BuildConfig {
+    repo.build_with(codgrep::BuildConfig {
         include_hidden: true,
         ..repo.trigram_build_config()
     });

@@ -12,6 +12,10 @@ impl SearchMode {
     }
 }
 
+/// Materialized match payload for one search request.
+///
+/// This is the primary "match body" type. For request-level execution metadata
+/// such as backend selection, use `SearchResponse`.
 #[derive(Debug, Clone)]
 pub struct SearchResults {
     pub candidate_docs: usize,

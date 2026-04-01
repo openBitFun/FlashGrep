@@ -29,7 +29,7 @@ use request::SearchRequest;
 use request::{collect_search_paths, default_print_path, infer_index_path, resolve_context_mode};
 
 #[derive(Debug, Parser)]
-#[command(name = "bitfun-grep")]
+#[command(name = "cg")]
 #[command(
     about = "Indexed recursive regex search with a ripgrep-like CLI",
     version
@@ -348,7 +348,7 @@ fn run_build(args: BuildArgs) -> Result<bool> {
     };
     let index_path = args
         .index
-        .unwrap_or_else(|| args.repo.join(".bitfun-index"));
+        .unwrap_or_else(|| args.repo.join(".codgrep-index"));
     let config = BuildConfig {
         repo_path: args.repo,
         index_path,
@@ -381,6 +381,23 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     }
 
     if request.files {
+        match request.run_ripgrep_files() {
+            Ok(output) => {
+                if !request.quiet {
+                    std::io::stdout().write_all(&output.stdout)?;
+                }
+                return if output.status.success() || output.status.code() == Some(1) {
+                    Ok(output.status.success())
+                } else {
+                    Err(AppError::InvalidIndex(format!(
+                        "rg file listing failed with status {}",
+                        output.status
+                    )))
+                };
+            }
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
         let execution = request.prepare_listing_execution()?;
         let paths = execution.paths();
         if !request.quiet {

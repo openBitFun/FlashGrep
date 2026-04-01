@@ -74,30 +74,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "843867be96c8daad0d758b57df9392b6d8d271134fce549de6ce169ff98a92af"
 
 [[package]]
-name = "bitfun_grep"
-version = "0.1.0"
-dependencies = [
- "aho-corasick",
- "clap",
- "crc32fast",
- "grep-matcher",
- "grep-regex",
- "grep-searcher",
- "ignore",
- "libc",
- "memchr",
- "memmap2",
- "rayon",
- "regex",
- "regex-automata",
- "regex-syntax",
- "serde_json",
- "tempfile",
- "thiserror",
- "walkdir",
-]
-
-[[package]]
 name = "bstr"
 version = "1.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -153,6 +129,30 @@ name = "clap_lex"
 version = "1.1.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
+
+[[package]]
+name = "codgrep"
+version = "0.1.0"
+dependencies = [
+ "aho-corasick",
+ "clap",
+ "crc32fast",
+ "grep-matcher",
+ "grep-regex",
+ "grep-searcher",
+ "ignore",
+ "libc",
+ "memchr",
+ "memmap2",
+ "rayon",
+ "regex",
+ "regex-automata",
+ "regex-syntax",
+ "serde_json",
+ "tempfile",
+ "thiserror",
+ "walkdir",
+]
 
 [[package]]
 name = "colorchoice"

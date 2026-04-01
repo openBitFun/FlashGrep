@@ -20,6 +20,8 @@ pub enum AppError {
     ValueOutOfRange(String),
     #[error("binary data is truncated")]
     TruncatedData,
+    #[error("operation cancelled")]
+    Cancelled,
     #[error("utf-8 decode failed for {path}: {source}")]
     InvalidUtf8 {
         path: PathBuf,

@@ -68,6 +68,10 @@ impl IndexWorktreeDiff {
     }
 }
 
+/// Low-level read-only index query API.
+///
+/// Prefer `SearchEngine` for product-facing integrations, and use this type
+/// for advanced scenarios that need direct control over index-level behavior.
 pub struct IndexSearcher {
     index_path: PathBuf,
     metadata: IndexMetadata,
@@ -136,10 +140,6 @@ impl IndexSearcher {
 
     pub fn search(&self, config: &QueryConfig) -> Result<SearchResults> {
         self.search_with_filter(config, None)
-    }
-
-    pub fn search_json(&self, config: &QueryConfig) -> Result<JsonSearchReport> {
-        self.search_json_with_filter(config, None)
     }
 
     pub fn build_settings(&self) -> Option<&IndexBuildSettings> {
@@ -254,6 +254,10 @@ impl IndexSearcher {
         })
     }
 
+    /// Returns the first detected human-readable stale reason, if any.
+    ///
+    /// This is a simplified explanation API. For structured freshness state,
+    /// use `WorkspaceIndex::probe_freshness`.
     pub fn stale_reason(&self) -> Result<Option<String>> {
         let diff = self.diff_against_worktree()?;
         if let Some(path) = diff.modified_files.first() {
@@ -266,14 +270,6 @@ impl IndexSearcher {
             return Ok(Some(format!("new file is missing from the index: {path}")));
         }
         Ok(None)
-    }
-
-    pub fn search_json_with_filter(
-        &self,
-        config: &QueryConfig,
-        filter: Option<&PathFilter>,
-    ) -> Result<JsonSearchReport> {
-        self.search_json_with_allowed_paths(config, filter, None)
     }
 
     pub(crate) fn search_json_with_allowed_paths(
@@ -2148,5 +2144,4 @@ mod tests {
         )
         .is_none());
     }
-
 }

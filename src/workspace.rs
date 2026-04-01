@@ -4,23 +4,25 @@ use std::{
     io::ErrorKind,
     path::PathBuf,
     sync::{Arc, Mutex},
+    time::{Duration, Instant, SystemTime},
 };
 
 use crate::{
-    build_index,
     config::BuildConfig,
     error::{AppError, Result},
     index::{
+        build_index_with_options,
         format::{read_docs_file, IndexLayout},
         overlay::{
-            current_base_snapshot_key, ensure_fresh_overlay, prune_overlay_caches,
-            read_overlay_snapshot, OverlaySnapshotInfo, OverlaySnapshotState,
+            current_base_snapshot_key, ensure_fresh_overlay_with_progress_and_cancel,
+            prune_overlay_caches, read_overlay_snapshot, read_overlay_state, OverlaySnapshotInfo,
+            OverlaySnapshotState,
         },
-        IndexSearcher, IndexWorktreeDiff,
+        IndexBuildOptions, IndexSearcher, IndexWorktreeDiff,
     },
-    json_output::JsonSearchReport,
+    progress::IndexProgress,
     search::SearchResults,
-    search_engine::{search_documents, search_json_documents},
+    search_engine::search_documents,
     QueryConfig, TokenizerMode,
 };
 
@@ -37,8 +39,11 @@ use self::runtime::{
 pub struct WorkspaceIndexOptions {
     /// Build-time/index-location configuration for the workspace.
     pub build_config: BuildConfig,
-    /// When enabled, [`WorkspaceIndex::search`] and [`WorkspaceIndex::search_json`]
-    /// try to refresh the dirty-worktree overlay before each query.
+    /// Legacy compatibility toggle.
+    ///
+    /// Query paths no longer refresh overlays automatically; callers should
+    /// invoke [`WorkspaceIndex::refresh_overlay`] explicitly when they need
+    /// fresher dirty-worktree coverage.
     pub auto_refresh_overlay: bool,
     /// Maximum number of overlay caches to retain per base snapshot.
     ///
@@ -98,8 +103,59 @@ pub struct IndexStatus {
     pub dirty_files: Option<IndexWorktreeDiff>,
 }
 
+/// High-level freshness state for the currently opened workspace index.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum WorkspaceFreshnessState {
+    /// No base snapshot exists on disk yet.
+    MissingBaseSnapshot,
+    /// Base snapshot exists and worktree currently matches it.
+    Fresh,
+    /// Base snapshot exists but worktree has drifted.
+    Stale,
+}
+
+/// Structured freshness probe result for external schedulers/orchestrators.
+#[derive(Debug, Clone)]
+pub struct WorkspaceFreshness {
+    /// Probe capture time.
+    pub checked_at: SystemTime,
+    /// High-level freshness state.
+    pub state: WorkspaceFreshnessState,
+    /// Active base snapshot key, when available.
+    pub base_snapshot_key: Option<String>,
+    /// Active overlay key, when available.
+    pub active_overlay_key: Option<String>,
+    /// Number of tracked files changed since base snapshot.
+    pub modified_files: usize,
+    /// Number of tracked files deleted since base snapshot.
+    pub deleted_files: usize,
+    /// Number of new files missing from base snapshot.
+    pub new_files: usize,
+}
+
+impl WorkspaceFreshness {
+    pub fn is_stale(&self) -> bool {
+        self.state == WorkspaceFreshnessState::Stale
+    }
+
+    pub fn needs_base_snapshot(&self) -> bool {
+        self.state == WorkspaceFreshnessState::MissingBaseSnapshot
+    }
+
+    pub fn needs_overlay_refresh(&self) -> bool {
+        self.state == WorkspaceFreshnessState::Stale
+    }
+
+    pub fn dirty_file_count(&self) -> usize {
+        self.modified_files + self.deleted_files + self.new_files
+    }
+}
+
 /// High-level workspace facade for base snapshot management, overlay refresh,
 /// and searching against the latest effective repository view.
+///
+/// Prefer this type when your integration needs freshness orchestration:
+/// base snapshot lifecycle, overlay refresh, and probe caching.
 #[derive(Clone)]
 pub struct WorkspaceIndex {
     inner: Arc<WorkspaceIndexInner>,
@@ -111,6 +167,9 @@ pub struct WorkspaceIndex {
 /// - an indexed clean base view,
 /// - an indexed dirty view backed by an overlay cache, or
 /// - a scan fallback when no index exists yet.
+///
+/// This type exists to provide a stable read view across multiple queries,
+/// even while workspace state may keep changing.
 #[derive(Clone)]
 pub struct WorkspaceSnapshot {
     workspace: Arc<WorkspaceIndexInner>,
@@ -139,12 +198,19 @@ enum WorkspaceReadView {
 struct WorkspaceIndexInner {
     options: WorkspaceIndexOptions,
     cached_searcher: Mutex<Option<CachedBaseSearcher>>,
+    cached_freshness: Mutex<Option<CachedFreshnessProbe>>,
 }
 
 #[derive(Clone)]
 struct CachedBaseSearcher {
     snapshot_key: String,
     searcher: Arc<IndexSearcher>,
+}
+
+#[derive(Clone)]
+struct CachedFreshnessProbe {
+    captured_at: Instant,
+    probe: WorkspaceFreshness,
 }
 
 impl WorkspaceIndex {
@@ -159,13 +225,22 @@ impl WorkspaceIndex {
                     overlay_cache_limit: options.overlay_cache_limit,
                 },
                 cached_searcher: Mutex::new(None),
+                cached_freshness: Mutex::new(None),
             }),
         })
     }
 
     /// Ensures that a base snapshot exists and returns its identity metadata.
     pub fn ensure_base_snapshot(&self) -> Result<BaseSnapshotInfo> {
-        build_index(&self.inner.options.build_config)?;
+        self.ensure_base_snapshot_with_options(IndexBuildOptions::default())
+    }
+
+    pub fn ensure_base_snapshot_with_options(
+        &self,
+        options: IndexBuildOptions<'_>,
+    ) -> Result<BaseSnapshotInfo> {
+        self.clear_freshness_probe_cache();
+        build_index_with_options(&self.inner.options.build_config, options)?;
         self.base_snapshot_info()
     }
 
@@ -173,8 +248,35 @@ impl WorkspaceIndex {
     ///
     /// Returns `Ok(None)` when the worktree matches the base snapshot.
     pub fn refresh_overlay(&self) -> Result<Option<OverlaySnapshotInfo>> {
+        self.refresh_overlay_with_progress(|_| {})
+    }
+
+    pub fn refresh_overlay_with_progress<F>(
+        &self,
+        on_progress: F,
+    ) -> Result<Option<OverlaySnapshotInfo>>
+    where
+        F: FnMut(IndexProgress),
+    {
+        self.refresh_overlay_with_progress_and_cancel(on_progress, || false)
+    }
+
+    pub fn refresh_overlay_with_progress_and_cancel<F, C>(
+        &self,
+        mut on_progress: F,
+        mut should_cancel: C,
+    ) -> Result<Option<OverlaySnapshotInfo>>
+    where
+        F: FnMut(IndexProgress),
+        C: FnMut() -> bool,
+    {
+        self.clear_freshness_probe_cache();
         if self.base_snapshot_info().is_err() {
-            let _ = self.ensure_base_snapshot()?;
+            let _ = self.ensure_base_snapshot_with_options(
+                IndexBuildOptions::new()
+                    .with_progress(&mut on_progress)
+                    .with_cancel(&mut should_cancel),
+            )?;
         }
 
         let searcher = self.open_searcher()?;
@@ -183,9 +285,14 @@ impl WorkspaceIndex {
             return Ok(None);
         }
 
-        let overlay = ensure_fresh_overlay(&self.inner.options.build_config, &diff)?
-            .map(|state| state.info)
-            .ok_or_else(|| crate::AppError::InvalidIndex("failed to refresh overlay".into()))?;
+        let overlay = ensure_fresh_overlay_with_progress_and_cancel(
+            &self.inner.options.build_config,
+            &diff,
+            &mut on_progress,
+            &mut should_cancel,
+        )?
+        .map(|state| state.info)
+        .ok_or_else(|| crate::AppError::InvalidIndex("failed to refresh overlay".into()))?;
         self.prune_overlay_cache_with_configured_limit()?;
         Ok(Some(overlay))
     }
@@ -221,50 +328,67 @@ impl WorkspaceIndex {
         })
     }
 
+    /// Performs a full freshness probe against the current worktree.
+    ///
+    /// This always scans current file metadata and does not mutate index state.
+    pub fn probe_freshness(&self) -> Result<WorkspaceFreshness> {
+        let probe = self.compute_freshness_probe()?;
+        self.cache_freshness_probe(probe.clone());
+        Ok(probe)
+    }
+
+    /// Returns a cached freshness probe when still within `ttl`; otherwise runs
+    /// a new full probe.
+    ///
+    /// "if due" means the previous probe age has exceeded `ttl`.
+    pub fn probe_freshness_if_due(&self, ttl: Duration) -> Result<WorkspaceFreshness> {
+        if !ttl.is_zero() {
+            let cached = match self.inner.cached_freshness.lock() {
+                Ok(guard) => guard.clone(),
+                Err(poisoned) => poisoned.into_inner().clone(),
+            };
+            if let Some(cached) = cached {
+                if cached.captured_at.elapsed() < ttl {
+                    return Ok(cached.probe);
+                }
+            }
+        }
+
+        self.probe_freshness()
+    }
+
     /// Searches the current effective workspace view.
     ///
     /// Depending on configuration and current state this may query:
     /// - the clean base index,
-    /// - a base+overlay snapshot view, or
+    /// - the currently activated base+overlay snapshot view, or
     /// - a scan fallback when no index exists.
     pub fn search(&self, query: &QueryConfig) -> Result<SearchResults> {
-        if self.inner.options.auto_refresh_overlay {
-            let _ = self.refresh_overlay();
-        }
-
         self.snapshot()?.search(query)
-    }
-
-    /// JSON variant of [`WorkspaceIndex::search`].
-    pub fn search_json(&self, query: &QueryConfig) -> Result<JsonSearchReport> {
-        if self.inner.options.auto_refresh_overlay {
-            let _ = self.refresh_overlay();
-        }
-
-        self.snapshot()?.search_json(query)
     }
 
     /// Captures a reusable read-only workspace snapshot for repeated queries.
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
         match self.open_searcher() {
             Ok(searcher) => {
-                let diff = searcher.diff_against_worktree()?;
-                let view = if diff.is_empty() {
-                    WorkspaceReadView::IndexedClean { searcher }
-                } else {
-                    let overlay = ensure_fresh_overlay(&self.inner.options.build_config, &diff)?
+                let snapshot_key = self.current_snapshot_key_on_disk()?;
+                let overlay =
+                    read_overlay_state(&self.inner.options.build_config.index_path, &snapshot_key)?
                         .map(|state| -> Result<CachedOverlay> {
                             Ok(CachedOverlay {
-                                state: state.clone(),
                                 searcher: Arc::new(IndexSearcher::open(state.data_path.clone())?),
+                                state,
                             })
                         })
                         .transpose()?;
+                let view = if let Some(overlay) = overlay {
                     WorkspaceReadView::IndexedDirty {
                         searcher,
-                        diff,
-                        overlay,
+                        diff: shadow_diff_from_overlay_state(&overlay.state),
+                        overlay: Some(overlay),
                     }
+                } else {
+                    WorkspaceReadView::IndexedClean { searcher }
                 };
                 self.prune_overlay_cache_with_configured_limit()?;
                 Ok(WorkspaceSnapshot {
@@ -358,6 +482,71 @@ impl WorkspaceIndex {
         }
         Ok(())
     }
+
+    fn compute_freshness_probe(&self) -> Result<WorkspaceFreshness> {
+        let checked_at = SystemTime::now();
+        let base = self.base_snapshot_info().ok();
+        let active_overlay_key = if let Some(base) = &base {
+            read_overlay_snapshot(
+                &self.inner.options.build_config.index_path,
+                &base.snapshot_key,
+            )?
+            .map(|overlay| overlay.overlay_key)
+        } else {
+            None
+        };
+
+        match self.open_searcher() {
+            Ok(searcher) => {
+                let diff = searcher.diff_against_worktree()?;
+                let state = if diff.is_empty() {
+                    WorkspaceFreshnessState::Fresh
+                } else {
+                    WorkspaceFreshnessState::Stale
+                };
+                Ok(WorkspaceFreshness {
+                    checked_at,
+                    state,
+                    base_snapshot_key: base.map(|base| base.snapshot_key),
+                    active_overlay_key,
+                    modified_files: diff.modified_files.len(),
+                    deleted_files: diff.deleted_files.len(),
+                    new_files: diff.new_files.len(),
+                })
+            }
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                Ok(WorkspaceFreshness {
+                    checked_at,
+                    state: WorkspaceFreshnessState::MissingBaseSnapshot,
+                    base_snapshot_key: None,
+                    active_overlay_key: None,
+                    modified_files: 0,
+                    deleted_files: 0,
+                    new_files: 0,
+                })
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    fn cache_freshness_probe(&self, probe: WorkspaceFreshness) {
+        let mut cache = match self.inner.cached_freshness.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *cache = Some(CachedFreshnessProbe {
+            captured_at: Instant::now(),
+            probe,
+        });
+    }
+
+    fn clear_freshness_probe_cache(&self) {
+        let mut cache = match self.inner.cached_freshness.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *cache = None;
+    }
 }
 
 impl WorkspaceSnapshot {
@@ -386,32 +575,6 @@ impl WorkspaceSnapshot {
             ),
         }
     }
-
-    /// JSON variant of [`WorkspaceSnapshot::search`].
-    pub fn search_json(&self, query: &QueryConfig) -> Result<JsonSearchReport> {
-        match &self.view {
-            WorkspaceReadView::IndexedClean { searcher } => searcher.search_json(query),
-            WorkspaceReadView::IndexedDirty {
-                searcher,
-                diff,
-                overlay,
-            } => {
-                let documents = workspace_candidate_documents(
-                    searcher,
-                    diff,
-                    query,
-                    &self.workspace.options.build_config,
-                    cached_overlay_ref(overlay.as_ref()),
-                )?
-                .into_documents();
-                search_json_documents(query, &documents)
-            }
-            WorkspaceReadView::ScanFallback => search_json_documents(
-                query,
-                &scan_text_repository_files(&self.workspace.options.build_config)?,
-            ),
-        }
-    }
 }
 
 fn cached_overlay_ref(overlay: Option<&CachedOverlay>) -> Option<CachedOverlayRef<'_>> {
@@ -421,13 +584,25 @@ fn cached_overlay_ref(overlay: Option<&CachedOverlay>) -> Option<CachedOverlayRe
     })
 }
 
+fn shadow_diff_from_overlay_state(state: &OverlaySnapshotState) -> IndexWorktreeDiff {
+    let mut modified_files = state.shadowed_paths.iter().cloned().collect::<Vec<_>>();
+    modified_files.sort_unstable();
+    IndexWorktreeDiff {
+        modified_files,
+        deleted_files: Vec::new(),
+        new_files: Vec::new(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use std::{fs, path::PathBuf};
+    use std::{fs, path::PathBuf, time::Duration};
 
     use tempfile::TempDir;
 
-    use super::{WorkspaceIndex, WorkspaceIndexOptions, WorkspaceReadView};
+    use super::{
+        WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions, WorkspaceReadView,
+    };
     use crate::{
         build_index,
         config::{BuildConfig, CorpusMode, TokenizerMode},
@@ -443,9 +618,10 @@ mod tests {
     impl TestRepo {
         fn new() -> Self {
             let temp = tempfile::tempdir().expect("temp dir should succeed");
-            let repo = temp.path().join("repo");
-            let index = repo.join(".bitfun-index");
-            fs::create_dir_all(&repo).expect("repo dir should succeed");
+            let repo_dir = temp.path().join("repo");
+            fs::create_dir_all(&repo_dir).expect("repo dir should succeed");
+            let repo = fs::canonicalize(&repo_dir).expect("repo dir should canonicalize");
+            let index = repo.join(".codgrep-index");
             Self {
                 _temp: temp,
                 repo,
@@ -543,7 +719,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_snapshot_uses_indexed_dirty_view_for_dirty_worktree() {
+    fn workspace_snapshot_uses_indexed_dirty_view_when_overlay_is_active() {
         let repo = TestRepo::new();
         repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
         let added = repo.write("added.rs", "const NAME: &str = \"OTHER\";\n");
@@ -556,6 +732,9 @@ mod tests {
             overlay_cache_limit: None,
         })
         .expect("workspace should open");
+        workspace
+            .refresh_overlay()
+            .expect("overlay refresh should succeed");
         let snapshot = workspace.snapshot().expect("snapshot should open");
 
         assert!(matches!(
@@ -571,5 +750,79 @@ mod tests {
             .expect("search should succeed");
         assert_eq!(results.hits.len(), 1);
         assert_eq!(results.hits[0].path, added.to_string_lossy());
+    }
+
+    #[test]
+    fn workspace_probe_freshness_reports_missing_base_snapshot() {
+        let repo = TestRepo::new();
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+            auto_refresh_overlay: false,
+            overlay_cache_limit: None,
+        })
+        .expect("workspace should open");
+
+        let probe = workspace
+            .probe_freshness()
+            .expect("freshness probe should succeed");
+        assert_eq!(probe.state, WorkspaceFreshnessState::MissingBaseSnapshot);
+        assert!(probe.base_snapshot_key.is_none());
+        assert_eq!(probe.dirty_file_count(), 0);
+        assert!(probe.needs_base_snapshot());
+    }
+
+    #[test]
+    fn workspace_probe_freshness_reports_stale_after_new_file() {
+        let repo = TestRepo::new();
+        repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
+        let _ = repo.build();
+        repo.write("added.rs", "const NAME: &str = \"DIRTY\";\n");
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+            auto_refresh_overlay: false,
+            overlay_cache_limit: None,
+        })
+        .expect("workspace should open");
+
+        let probe = workspace
+            .probe_freshness()
+            .expect("freshness probe should succeed");
+        assert_eq!(probe.state, WorkspaceFreshnessState::Stale);
+        assert_eq!(probe.new_files, 1);
+        assert_eq!(probe.dirty_file_count(), 1);
+        assert!(probe.needs_overlay_refresh());
+    }
+
+    #[test]
+    fn workspace_probe_freshness_if_due_reuses_cache_until_ttl_expires() {
+        let repo = TestRepo::new();
+        repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
+        let _ = repo.build();
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+            auto_refresh_overlay: false,
+            overlay_cache_limit: None,
+        })
+        .expect("workspace should open");
+
+        let first = workspace
+            .probe_freshness_if_due(Duration::from_secs(60))
+            .expect("freshness probe should succeed");
+        assert_eq!(first.state, WorkspaceFreshnessState::Fresh);
+
+        repo.write("added.rs", "const NAME: &str = \"DIRTY\";\n");
+
+        let cached = workspace
+            .probe_freshness_if_due(Duration::from_secs(60))
+            .expect("cached freshness probe should succeed");
+        assert_eq!(cached.state, WorkspaceFreshnessState::Fresh);
+
+        let refreshed = workspace
+            .probe_freshness_if_due(Duration::ZERO)
+            .expect("fresh freshness probe should succeed");
+        assert_eq!(refreshed.state, WorkspaceFreshnessState::Stale);
+        assert_eq!(refreshed.new_files, 1);
     }
 }

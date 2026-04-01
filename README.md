@@ -1,4 +1,4 @@
-# fast_code_search
+# codgrep
 
 本项目是一个本地 regex 预筛索引系统骨架，目标是把全库正则搜索拆成两段：
 
@@ -44,7 +44,7 @@
 
 ```bash
 cargo run -- build --repo /path/to/repo
-cargo run -- --index /path/to/repo/.bitfun-index 'foo.*bar' /path/to/repo
+cargo run -- --index /path/to/repo/.codgrep-index 'foo.*bar' /path/to/repo
 ```
 
 常用搜索示例：
@@ -130,7 +130,7 @@ CLI 退出码现在与 ripgrep 保持一致：
 - `SearchPolicy::IndexOnly`：只允许走索引；索引缺失时直接返回错误。
 - `SearchPolicy::FallbackToScan`：索引缺失，或查询本身明显更适合 scan 时走 `Scan`；否则直接走索引。
 
-如果使用方希望检查索引是否过期，可以显式调用 `IndexSearcher::diff_against_worktree()` / `stale_reason()`，或 `SearchEngine::diff_against_worktree()` / `stale_reason()`。如果使用方希望主动刷新索引，可以显式调用 `build_index` / `rebuild_index()`，或 `SearchEngine::rebuild_index()`；库本身不会在搜索后偷偷调度后台重建。
+如果使用方希望检查索引是否过期，可以显式调用 `WorkspaceIndex::probe_freshness()` / `probe_freshness_if_due(ttl)`，或更底层的 `IndexSearcher::diff_against_worktree()` / `stale_reason()`、`SearchEngine::diff_against_worktree()` / `stale_reason()`。如果使用方希望主动刷新索引，可以显式调用 `build_index` / `rebuild_index()`，或 `build_index_with_options` / `rebuild_index_with_options`（附带进度/取消钩子）；库本身不会在搜索后偷偷调度后台重建。
 
 `--json` 现在对齐 ripgrep 的基本约束：
 
@@ -139,25 +139,62 @@ CLI 退出码现在与 ripgrep 保持一致：
 
 ## 库用法
 
+当前对外 API 分三层：
+
+- 稳定层（crate 根）：
+  - `SearchEngine` / `WorkspaceIndex` / `BuildConfig` / `QueryConfig` / `SearchResults` / `SearchResponse`
+  - `build_index_with_options` / `rebuild_index_with_options` / `IndexBuildOptions`
+- 专家层（`codgrep::advanced`）：
+  - `IndexSearcher` / `WorkspaceSnapshot` / `PathFilter` / `IndexProgress*` / JSON 模型
+- 实验层（`codgrep::experimental`）：
+  - `planner`、`tokenizer`、低层 `index_format` 工具（后续可能调整）
+
+入口选择（推荐）：
+
+- 一次性脚本/工具链任务：优先用 crate 级 `build_index*` / `rebuild_index*` free functions。
+- 常驻服务 / IDE / agent 集成：优先持有 `SearchEngine` 或 `WorkspaceIndex`。
+
+核心职责边界（固定定义）：
+
+- `SearchEngine`：面向大多数调用方的统一搜索入口。
+- `WorkspaceIndex`：面向需要管理 `base snapshot` / `overlay` / `freshness` 的集成方。
+- `advanced::IndexSearcher`：面向高级场景的低层只读索引查询接口。
+
+建议新用户先掌握这组最小 API：
+
+- `BuildConfig`
+- `QueryConfig`
+- `SearchEngine`
+- `SearchResponse`
+- `SearchResults`
+- `SearchMode`
+- `WorkspaceIndex`
+- `WorkspaceIndexOptions`
+- `WorkspaceFreshness`
+- `build_index_with_options`
+- `rebuild_index_with_options`
+- `IndexBuildOptions`
+
 如果你希望把项目当成一个可复用库，而不是只走 CLI，当前推荐的接入顺序是：
 
 1. 用 `WorkspaceIndex::open(...)` 打开工作区 facade。
 2. 启动时用 `ensure_base_snapshot()` 确保 base snapshot 已存在。
-3. 需要“尽量新鲜”的工作区查询时，显式调用 `refresh_overlay()`，或者直接拿 `snapshot()`。
-4. 对同一个只读视图做多次查询时，优先复用同一个 `WorkspaceSnapshot`。
+3. 调度侧按自己的策略调用 `probe_freshness()` / `probe_freshness_if_due(ttl)` 判断是否需要刷新。
+4. 需要“尽量新鲜”的工作区查询时，显式调用 `refresh_overlay()`。
+5. 对同一个只读视图做多次查询时，优先复用同一个 `WorkspaceSnapshot`。
 
 最小示例：
 
 ```rust
-use bitfun_grep::{
+use codgrep::{
     BuildConfig, CorpusMode, QueryConfig, TokenizerMode, WorkspaceIndex, WorkspaceIndexOptions,
 };
 
-fn main() -> bitfun_grep::Result<()> {
+fn main() -> codgrep::Result<()> {
     let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
         build_config: BuildConfig {
             repo_path: "/path/to/repo".into(),
-            index_path: "/path/to/repo/.bitfun-index".into(),
+            index_path: "/path/to/repo/.codgrep-index".into(),
             tokenizer: TokenizerMode::Trigram,
             corpus_mode: CorpusMode::RespectIgnore,
             include_hidden: false,
@@ -169,8 +206,13 @@ fn main() -> bitfun_grep::Result<()> {
         overlay_cache_limit: Some(8),
     })?;
 
-    let base = workspace.ensure_base_snapshot()?;
-    let overlay = workspace.refresh_overlay()?;
+    workspace.ensure_base_snapshot()?;
+    let freshness = workspace.probe_freshness_if_due(std::time::Duration::from_secs(2))?;
+    if freshness.needs_base_snapshot() {
+        workspace.ensure_base_snapshot()?;
+    } else if freshness.needs_overlay_refresh() {
+        workspace.refresh_overlay()?;
+    }
 
     let snapshot = workspace.snapshot()?;
     let results = snapshot.search(&QueryConfig {
@@ -179,8 +221,14 @@ fn main() -> bitfun_grep::Result<()> {
         ..QueryConfig::default()
     })?;
 
-    println!("base={}", base.snapshot_key);
-    println!("overlay={}", overlay.as_ref().map(|it| it.overlay_key.as_str()).unwrap_or("<clean>"));
+    println!(
+        "base={}",
+        freshness.base_snapshot_key.as_deref().unwrap_or("<missing>")
+    );
+    println!(
+        "overlay={}",
+        freshness.active_overlay_key.as_deref().unwrap_or("<clean>")
+    );
     println!("hits={}", results.hits.len());
     Ok(())
 }
@@ -190,7 +238,12 @@ fn main() -> bitfun_grep::Result<()> {
 
 - `WorkspaceIndex::search()` 适合直接做一次性查询。
 - `WorkspaceIndex::snapshot()` 适合先固定一个只读视图，再连续跑多个 query。
-- 如果你自己控制刷新节奏，建议把 `auto_refresh_overlay` 关掉，然后在合适的时机显式 `refresh_overlay()`。
+- `SearchEngine::search_with_filter()` 是 path scope 的便捷入口，不建议继续扩展更多 `search_with_*` 变体。
+- 如果需要 JSON 结构，可在搜索后做适配：`codgrep::advanced::json::JsonSearchReport::from_search_results(&results)`。
+- `advanced::json` 主要用于 CLI/集成输出适配，当前不承诺长期 schema 完全稳定。
+- `WorkspaceIndex::probe_freshness()` 每次都做一次真实 freshness 检查。
+- `WorkspaceIndex::probe_freshness_if_due(ttl)` 适合调度层限频检查；`if_due` 表示“上次 probe 超过 `ttl` 才重新探测”。
+- 建议把 `auto_refresh_overlay` 关掉，然后在合适的时机显式 `refresh_overlay()`。
 - `snapshot_key` / `base_snapshot_key` / `overlay_key` 是应该对外缓存或记录的稳定身份；不要依赖内部目录命名。
 
 ## Benchmark
@@ -206,20 +259,20 @@ fn main() -> bitfun_grep::Result<()> {
 运行示例：
 
 ```bash
-cargo run -- bench --suite-dir /Users/user/workspace/bitfun_grep/bench_data --filter linux_literal --rebuild
+cargo run -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter linux_literal --rebuild
 ```
 
 如果希望顺带对比 `rg`：
 
 ```bash
-cargo run -- bench --suite-dir /Users/user/workspace/bitfun_grep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
+cargo run -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
 ```
 
 如果希望额外测库层 facade 和 dirty worktree 路径：
 
 ```bash
 cargo run -- bench \
-  --suite-dir /Users/user/workspace/bitfun_grep/bench_data \
+  --suite-dir /Users/user/workspace/codgrep/bench_data \
   --filter linux_literal \
   --compare-worktree \
   --compare-workspace \
@@ -230,7 +283,7 @@ cargo run -- bench \
 
 ```bash
 cargo run -- bench \
-  --suite-dir /Users/user/workspace/bitfun_grep/bench_data \
+  --suite-dir /Users/user/workspace/codgrep/bench_data \
   --filter linux_literal \
   --compare-worktree \
   --worktree-sample-files 32 \
@@ -241,7 +294,7 @@ cargo run -- bench \
 
 ```bash
 cargo run -- bench \
-  --suite-dir /Users/user/workspace/bitfun_grep/bench_data \
+  --suite-dir /Users/user/workspace/codgrep/bench_data \
   --filter linux_literal \
   --compare-rg \
   --cache-mode cold \
@@ -251,8 +304,8 @@ cargo run -- bench \
 
 说明：
 
-- `bitfun_grep` 的 benchmark 会单独统计索引构建时间和查询时间。
-- `--compare-worktree` 会额外跑两条 dirty worktree 路径：`bitfun_worktree_build` 会在每个 sample 前清掉 overlay cache，再测一次“首次 `refresh_overlay() + snapshot().search()`”；`bitfun_worktree` 则保留已有 overlay cache，用来测 dirty state 稳定后的显式保鲜查询路径。
+- `codgrep` 的 benchmark 会单独统计索引构建时间和查询时间。
+- `--compare-worktree` 会额外跑两条 dirty worktree 路径：`codgrep_worktree_build` 会在每个 sample 前清掉 overlay cache，再测一次“首次 `refresh_overlay() + snapshot().search()`”；`codgrep_worktree` 则保留已有 overlay cache，用来测 dirty state 稳定后的显式保鲜查询路径。
 - `--worktree-sample-files <N>` 只影响 `--compare-worktree` 的 fixture 构造：不再复制完整目录，而是抽一个最多 `N` 个文本文件的小型真实子仓库。这个模式更适合测“少量 dirty 文件”的真实查询成本；不传时仍然保留完整仓库 worst-case。
 - `--compare-workspace` 会额外跑 clean workspace facade 路径；每个 sample 都会重新走一次 `snapshot().search()`，用于把工作区读视图构造成本也计入结果，而不是只测固定 snapshot 上的纯查询。
 - `rg` 对比项只统计直接搜索耗时，不包含任何建索引步骤。
@@ -298,6 +351,8 @@ cargo run -- bench \
 另外还可以直接调用：
 
 - `WorkspaceIndex::prune_overlay_cache(keep_per_base)`
+- `WorkspaceIndex::probe_freshness()`
+- `WorkspaceIndex::probe_freshness_if_due(ttl)`
 
 这里的 `snapshot_key` / `base_snapshot_key` / `overlay_key` 才是外部库应该依赖的稳定身份；内部 overlay 目录层级仍可继续沿用 generation 命名，但已经不再暴露给库 API。
 

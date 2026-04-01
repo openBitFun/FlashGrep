@@ -1,5 +1,4 @@
 use std::{
-    fs::File,
     path::{Path, PathBuf},
     process::Command,
 };
@@ -126,7 +125,7 @@ where
         use std::os::fd::AsRawFd;
 
         for path in paths {
-            let file = File::open(path)?;
+            let file = std::fs::File::open(path)?;
             let status =
                 unsafe { libc::posix_fadvise(file.as_raw_fd(), 0, 0, libc::POSIX_FADV_DONTNEED) };
             if status != 0 {

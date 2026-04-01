@@ -4,8 +4,9 @@ use std::{
     process::Command,
 };
 
-use bitfun_grep::{
-    build_index, BuildConfig, CorpusMode, IndexSearcher, QueryConfig, SearchMode, TokenizerMode,
+use codgrep::{
+    advanced::IndexSearcher, build_index, BuildConfig, CorpusMode, QueryConfig, SearchMode,
+    TokenizerMode,
 };
 use tempfile::{tempdir, TempDir};
 
@@ -27,9 +28,10 @@ pub struct TestRepo {
 impl TestRepo {
     pub fn new() -> Self {
         let temp = tempdir().expect("test should succeed");
-        let repo = temp.path().join("repo");
-        let index = repo.join(".bitfun-index");
-        fs::create_dir_all(&repo).expect("test should succeed");
+        let repo_dir = temp.path().join("repo");
+        fs::create_dir_all(&repo_dir).expect("test should succeed");
+        let repo = fs::canonicalize(&repo_dir).expect("test should succeed");
+        let index = repo.join(".codgrep-index");
         Self {
             _temp: temp,
             repo,
@@ -95,7 +97,7 @@ impl TestRepo {
     }
 
     pub fn cli(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_bitfun_grep"));
+        let mut command = Command::new(env!("CARGO_BIN_EXE_cg"));
         command.arg("--index").arg(&self.index);
         command
     }
@@ -121,6 +123,26 @@ impl TestRepo {
             .expect("git stdout should be utf-8")
             .trim()
             .to_string()
+    }
+
+    pub fn seed_mock_git_repo(&self, module_count: usize, files_per_module: usize) -> Vec<PathBuf> {
+        self.init_git();
+        let mut created = Vec::new();
+        self.write(
+            "README.md",
+            "# Mock Repo\n\nSynthetic repository fixture for e2e coverage.\n",
+        );
+        for module in 0..module_count {
+            for file in 0..files_per_module {
+                let relative = format!("src/module_{module:02}/file_{file:03}.rs");
+                let contents = format!(
+                    "pub const MODULE_{module:02}_FILE_{file:03}: &str = \"token_{module}_{file}\";\n"
+                );
+                created.push(self.write(relative, &contents));
+            }
+        }
+        self.commit_all("seed mock repo");
+        created
     }
 
     fn run_git<const N: usize>(&self, args: [&str; N]) -> std::process::Output {

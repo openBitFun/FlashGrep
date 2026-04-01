@@ -7,7 +7,7 @@ use super::{
 
 #[test]
 fn parse_root_search_request() {
-    let cli = Cli::try_parse_from(["bitfun-grep", "-n", "--column", "needle", "src"])
+    let cli = Cli::try_parse_from(["cg", "-n", "--column", "needle", "src"])
         .expect("test should succeed");
 
     assert!(cli.command.is_none());
@@ -45,7 +45,7 @@ fn infer_index_path_uses_common_search_root() {
     ];
 
     let index = infer_index_path(&paths, &cwd);
-    assert_eq!(index, std::path::PathBuf::from("/repo/.bitfun-index"));
+    assert_eq!(index, std::path::PathBuf::from("/repo/.codgrep-index"));
 }
 
 #[test]
@@ -70,7 +70,7 @@ fn files_mode_treats_positional_as_path() {
 
 #[test]
 fn parse_files_mode_without_pattern_requirement() {
-    let cli = Cli::try_parse_from(["bitfun-grep", "--files", "src"]).expect("test should succeed");
+    let cli = Cli::try_parse_from(["cg", "--files", "src"]).expect("test should succeed");
 
     assert!(cli.command.is_none());
     assert!(cli.search.files);
@@ -119,11 +119,11 @@ fn before_and_after_context_override_context_flag() {
 
 #[test]
 fn case_mode_flags_conflict_like_ripgrep() {
-    let error = Cli::try_parse_from(["bitfun-grep", "--smart-case", "--case-sensitive", "test"])
+    let error = Cli::try_parse_from(["cg", "--smart-case", "--case-sensitive", "test"])
         .expect_err("test should fail");
     assert!(error.to_string().contains("--case-sensitive"));
 
-    let error = Cli::try_parse_from(["bitfun-grep", "--ignore-case", "--case-sensitive", "test"])
+    let error = Cli::try_parse_from(["cg", "--ignore-case", "--case-sensitive", "test"])
         .expect_err("test should fail");
     assert!(error.to_string().contains("--case-sensitive"));
 }

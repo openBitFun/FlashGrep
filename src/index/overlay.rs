@@ -23,6 +23,7 @@ use crate::{
         },
         searcher::IndexWorktreeDiff,
     },
+    progress::{IndexProgress, IndexProgressPhase},
     tokenizer::{create, TokenizerOptions},
 };
 
@@ -132,24 +133,86 @@ pub(crate) fn ensure_fresh_overlay(
     config: &BuildConfig,
     diff: &IndexWorktreeDiff,
 ) -> Result<Option<OverlaySnapshotState>> {
+    ensure_fresh_overlay_with_progress(config, diff, &mut |_| {})
+}
+
+pub(crate) fn ensure_fresh_overlay_with_progress(
+    config: &BuildConfig,
+    diff: &IndexWorktreeDiff,
+    on_progress: &mut impl FnMut(IndexProgress),
+) -> Result<Option<OverlaySnapshotState>> {
+    ensure_fresh_overlay_with_progress_and_cancel(config, diff, on_progress, &mut || false)
+}
+
+pub(crate) fn ensure_fresh_overlay_with_progress_and_cancel(
+    config: &BuildConfig,
+    diff: &IndexWorktreeDiff,
+    on_progress: &mut impl FnMut(IndexProgress),
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Option<OverlaySnapshotState>> {
     if diff.is_empty() {
         return Ok(None);
     }
+
+    check_cancel(should_cancel)?;
+    let dirty_total = diff.modified_files.len() + diff.deleted_files.len() + diff.new_files.len();
+    report_progress(
+        on_progress,
+        IndexProgressPhase::RefreshingOverlay,
+        "Refreshing dirty worktree overlay",
+        0,
+        Some(dirty_total),
+    );
 
     let Some(base_snapshot_key) = current_base_snapshot_key(&config.index_path)? else {
         return Ok(None);
     };
 
+    check_cancel(should_cancel)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Scanning,
+        "Scanning dirty worktree files for overlay refresh",
+        0,
+        Some(dirty_total),
+    );
     let current_files = scan_existing_overlay_files(config, diff)?;
+    check_cancel(should_cancel)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Scanning,
+        format!(
+            "Scanned overlay inputs ({} existing, {} deleted)",
+            current_files.len(),
+            diff.deleted_files.len()
+        ),
+        current_files.len() + diff.deleted_files.len(),
+        Some(dirty_total),
+    );
     let overlay_key = compute_overlay_key(config, &base_snapshot_key, diff, &current_files);
     if let Some(state) =
         read_overlay_state_by_key(&config.index_path, &base_snapshot_key, &overlay_key)?
     {
+        check_cancel(should_cancel)?;
         activate_overlay_key(&config.index_path, &base_snapshot_key, &overlay_key)?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::RefreshingOverlay,
+            "Reused matching overlay cache",
+            dirty_total,
+            Some(dirty_total),
+        );
         return Ok(Some(state));
     }
     if let Some(state) = read_overlay_state(&config.index_path, &base_snapshot_key)? {
         if overlay_matches_diff(&state, diff, &current_files) {
+            report_progress(
+                on_progress,
+                IndexProgressPhase::RefreshingOverlay,
+                "Reused current overlay cache",
+                dirty_total,
+                Some(dirty_total),
+            );
             return Ok(Some(state));
         }
     }
@@ -160,8 +223,18 @@ pub(crate) fn ensure_fresh_overlay(
         &overlay_key,
         diff,
         &current_files,
+        on_progress,
+        should_cancel,
     )?;
-    read_overlay_state_by_key(&config.index_path, &base_snapshot_key, &overlay_key)
+    let state = read_overlay_state_by_key(&config.index_path, &base_snapshot_key, &overlay_key)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::RefreshingOverlay,
+        "Finished overlay refresh",
+        dirty_total,
+        Some(dirty_total),
+    );
+    Ok(state)
 }
 
 pub(crate) fn read_overlay_state(
@@ -232,7 +305,17 @@ fn build_overlay_index(
     overlay_key: &str,
     diff: &IndexWorktreeDiff,
     files: &[RepositoryFile],
+    on_progress: &mut impl FnMut(IndexProgress),
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<OverlaySnapshotInfo> {
+    check_cancel(should_cancel)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::RefreshingOverlay,
+        "Writing overlay manifest",
+        0,
+        Some(4),
+    );
     let info = write_overlay_snapshot(
         &config.index_path,
         base_snapshot_key,
@@ -249,12 +332,22 @@ fn build_overlay_index(
         max_sparse_len: config.max_sparse_len,
     };
     let cached_docs = load_overlay_cached_docs(config, base_snapshot_key);
+    check_cancel(should_cancel)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::RefreshingOverlay,
+        "Prepared overlay cache inputs",
+        1,
+        Some(4),
+    );
     let mut indexed_files = process_overlay_files(
         files,
         &config.repo_path,
         config.tokenizer,
         tokenizer_options,
         &cached_docs,
+        on_progress,
+        should_cancel,
     )?;
     sort_overlay_files_in_stable_order(
         &mut indexed_files,
@@ -288,6 +381,14 @@ fn build_overlay_index(
         .then(|| compute_high_freq_doc_threshold(docs.len()));
 
     let layout = IndexLayout::new(&generation_dir);
+    check_cancel(should_cancel)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Writing,
+        "Writing overlay docs and doc terms",
+        2,
+        Some(4),
+    );
     write_docs_file(
         &layout.docs_path,
         IndexMetadata {
@@ -321,7 +422,15 @@ fn build_overlay_index(
         write_postings_file(&layout.postings_path, &postings, high_freq_doc_threshold)?
     };
     write_lookup_file(&layout.lookup_path, &lookup_entries)?;
+    check_cancel(should_cancel)?;
     activate_overlay_key(&config.index_path, base_snapshot_key, &info.overlay_key)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::RefreshingOverlay,
+        "Activated overlay snapshot",
+        4,
+        Some(4),
+    );
 
     Ok(info)
 }
@@ -383,10 +492,14 @@ fn process_overlay_files(
     tokenizer_mode: crate::config::TokenizerMode,
     tokenizer_options: TokenizerOptions,
     cached_docs: &HashMap<String, CachedOverlayDoc>,
+    on_progress: &mut impl FnMut(IndexProgress),
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<Vec<IndexedOverlayFile>> {
     let tokenizer = create(tokenizer_mode, tokenizer_options);
     let mut docs = Vec::with_capacity(files.len());
-    for file in files {
+    let total_files = files.len();
+    for (index, file) in files.iter().enumerate() {
+        check_cancel(should_cancel)?;
         let logical_path = repo_relative_path(&file.path, repo_root);
         if let Some(cached) = cached_docs.get(&logical_path) {
             if cached.size == file.size && cached.mtime_nanos == file.mtime_nanos {
@@ -396,10 +509,24 @@ fn process_overlay_files(
                     mtime_nanos: file.mtime_nanos,
                     token_hashes: cached.token_hashes.clone(),
                 });
+                report_progress(
+                    on_progress,
+                    IndexProgressPhase::Tokenizing,
+                    format!("Prepared {}/{} overlay files", index + 1, total_files),
+                    index + 1,
+                    Some(total_files),
+                );
                 continue;
             }
         }
         let Some(text) = read_text_file(&file.path)? else {
+            report_progress(
+                on_progress,
+                IndexProgressPhase::Tokenizing,
+                format!("Prepared {}/{} overlay files", index + 1, total_files),
+                index + 1,
+                Some(total_files),
+            );
             continue;
         };
         let folded = fold_for_index(text);
@@ -414,6 +541,13 @@ fn process_overlay_files(
             mtime_nanos: file.mtime_nanos,
             token_hashes,
         });
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Tokenizing,
+            format!("Prepared {}/{} overlay files", index + 1, total_files),
+            index + 1,
+            Some(total_files),
+        );
     }
     Ok(docs)
 }
@@ -926,6 +1060,23 @@ fn previous_overlay_path_order(index_root: &Path, base_snapshot_key: &str) -> Re
     }
     let (_, docs) = read_docs_file(&docs_path)?;
     Ok(docs.into_iter().map(|doc| doc.path).collect())
+}
+
+fn report_progress(
+    on_progress: &mut impl FnMut(IndexProgress),
+    phase: IndexProgressPhase,
+    message: impl Into<String>,
+    processed: usize,
+    total: Option<usize>,
+) {
+    on_progress(IndexProgress::new(phase, message, processed, total));
+}
+
+fn check_cancel(should_cancel: &mut impl FnMut() -> bool) -> Result<()> {
+    if should_cancel() {
+        return Err(AppError::Cancelled);
+    }
+    Ok(())
 }
 
 fn overlay_build_settings_match(build: Option<&IndexBuildSettings>, config: &BuildConfig) -> bool {

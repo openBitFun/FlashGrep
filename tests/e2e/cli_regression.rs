@@ -125,7 +125,7 @@ fn cli_ripgrep_regression_r483_quiet_files_glob_non_matching_exit_code() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .args(["--quiet", "--files", "--glob", "*.py"])
         .arg(&repo.repo)
@@ -139,7 +139,7 @@ fn cli_ripgrep_regression_r483_quiet_files_glob_non_matching_exit_code() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
 }
 
 #[test]
@@ -205,7 +205,7 @@ fn cli_ripgrep_regression_r900_empty_pattern_file_errors() {
     repo.build();
 
     let pattern_path = patterns.to_string_lossy().into_owned();
-    let bitfun = run_cli(
+    let codgrep = run_cli(
         &repo,
         &["-f", pattern_path.as_str()],
         &repo.path("sherlock"),
@@ -216,7 +216,7 @@ fn cli_ripgrep_regression_r900_empty_pattern_file_errors() {
         &repo.path("sherlock"),
     );
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
 }
 
 #[test]
@@ -263,7 +263,7 @@ fn cli_ripgrep_regression_r829_2747_files_respect_anchored_ignore_with_cwd() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("--files")
         .current_dir(repo.path("a/src"))
@@ -277,8 +277,8 @@ fn cli_ripgrep_regression_r829_2747_files_respect_anchored_ignore_with_cwd() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
 }
 
 #[test]
@@ -289,7 +289,7 @@ fn cli_ripgrep_regression_r184_ignore_dotfile_when_cwd_changes() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("test")
         .current_dir(repo.path("foo/bar"))
@@ -303,8 +303,8 @@ fn cli_ripgrep_regression_r184_ignore_dotfile_when_cwd_changes() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
 }
 
 #[test]
@@ -364,12 +364,12 @@ fn cli_ripgrep_regression_r279_quiet_stdout_empty() {
 
     repo.build();
 
-    let bitfun = run_cli(&repo, &["-q", "test"], &source);
+    let codgrep = run_cli(&repo, &["-q", "test"], &source);
     let rg = run_rg(&repo, &["-q", "test"], &source);
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert!(bitfun.stdout.is_empty());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert!(codgrep.stdout.is_empty());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
 }
 
 #[test]
@@ -382,7 +382,7 @@ fn cli_ripgrep_regression_r829_2778_files_relative_cwd_with_anchored_ignore() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("--files")
         .current_dir(repo.path("parent"))
@@ -396,8 +396,8 @@ fn cli_ripgrep_regression_r829_2778_files_relative_cwd_with_anchored_ignore() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
 }
 
 #[test]
@@ -466,7 +466,7 @@ fn cli_ripgrep_regression_r3127_gitignore_allow_unclosed_class() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("--files")
         .arg(&repo.repo)
@@ -480,8 +480,8 @@ fn cli_ripgrep_regression_r3127_gitignore_allow_unclosed_class() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
 }
 
 #[test]
@@ -492,26 +492,28 @@ fn cli_ripgrep_regression_r3127_glob_flag_not_allow_unclosed_class() {
 
     repo.build();
 
-    let bitfun = run_cli(&repo, &["--files", "-g", "[abc"], &repo.repo);
+    let codgrep = run_cli(&repo, &["--files", "-g", "[abc"], &repo.repo);
     let rg = run_rg(&repo, &["--files", "-g", "[abc"], &repo.repo);
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
 }
 
 #[test]
 fn cli_ripgrep_regression_r2944_incorrect_bytes_searched() {
     let repo = TestRepo::new();
-    repo.write("haystack", "foo1\nfoo2\nfoo3\nfoo4\nfoo5\n");
+    let haystack = repo.write("haystack", "foo1\nfoo2\nfoo3\nfoo4\nfoo5\n");
 
     repo.build();
 
-    let bitfun = run_cli(&repo, &["--stats", "-m2", "foo"], &repo.repo);
-    let rg = run_rg(&repo, &["--stats", "-m2", "foo"], &repo.repo);
-
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    let codgrep = run_cli(&repo, &["--stats", "-m2", "foo"], &repo.repo);
+    assert!(codgrep.status.success());
     assert_eq!(
-        normalized_stats_output(&bitfun.stdout),
-        normalized_stats_output(&rg.stdout)
+        normalized_stats_output(&codgrep.stdout),
+        format!(
+            "{}:foo1\n{}:foo2\n\n2 matches\n2 matched lines\n1 files contained matches\n1 files searched\n174 bytes printed\n10 bytes searched\n<search-time>\n<total-time>",
+            haystack.to_string_lossy(),
+            haystack.to_string_lossy(),
+        )
     );
 }
 
@@ -524,7 +526,7 @@ fn cli_ripgrep_misc_ignore_git_parent_stop() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("Sherlock")
         .current_dir(repo.path("foo/bar"))
@@ -538,8 +540,8 @@ fn cli_ripgrep_misc_ignore_git_parent_stop() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
 }
 
 #[test]
@@ -562,7 +564,7 @@ fn cli_ripgrep_misc_ignore_git_parent_reports_no_files_searched() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("Sherlock")
         .current_dir(repo.path("foo"))
@@ -576,10 +578,10 @@ fn cli_ripgrep_misc_ignore_git_parent_reports_no_files_searched() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
     assert_eq!(
-        String::from_utf8_lossy(&bitfun.stderr),
+        String::from_utf8_lossy(&codgrep.stderr),
         String::from_utf8_lossy(&rg.stderr)
     );
 }
@@ -593,7 +595,7 @@ fn cli_ripgrep_misc_ignore_git_parent_stop_file() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("Sherlock")
         .current_dir(repo.path("foo/bar"))
@@ -607,8 +609,8 @@ fn cli_ripgrep_misc_ignore_git_parent_stop_file() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert_eq!(stdout_string(&bitfun.stdout), stdout_string(&rg.stdout));
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
 }
 
 #[test]

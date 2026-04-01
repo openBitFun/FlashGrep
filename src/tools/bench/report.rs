@@ -170,11 +170,11 @@ pub(super) struct RawSample<'a> {
 
 fn runner_sort_key(runner: &str) -> usize {
     match runner {
-        "bitfun_grep" => 0,
-        "bitfun_cli" => 1,
-        "bitfun_workspace" => 2,
-        "bitfun_worktree_build" => 3,
-        "bitfun_worktree" => 4,
+        "codgrep" => 0,
+        "codgrep_cli" => 1,
+        "codgrep_workspace" => 2,
+        "codgrep_worktree_build" => 3,
+        "codgrep_worktree" => 4,
         "rg" => 5,
         _ => 6,
     }
@@ -186,29 +186,29 @@ fn runner_display_name(runner: &str) -> &'static str {
 
 fn classify_runner(runner: &str) -> RunnerLabel {
     match runner {
-        "bitfun_grep" => RunnerLabel {
-            display: "bitfun_grep [base-index]",
-            family: "bitfun",
+        "codgrep" => RunnerLabel {
+            display: "codgrep [base-index]",
+            family: "codgrep",
             mode: "base_index",
         },
-        "bitfun_cli" => RunnerLabel {
-            display: "bitfun_cli [cli-fallback-aware]",
-            family: "bitfun",
+        "codgrep_cli" => RunnerLabel {
+            display: "codgrep_cli [cli-fallback-aware]",
+            family: "codgrep",
             mode: "cli_fallback",
         },
-        "bitfun_workspace" => RunnerLabel {
-            display: "bitfun_workspace [workspace-snapshot]",
-            family: "bitfun",
+        "codgrep_workspace" => RunnerLabel {
+            display: "codgrep_workspace [workspace-snapshot]",
+            family: "codgrep",
             mode: "workspace_snapshot",
         },
-        "bitfun_worktree_build" => RunnerLabel {
-            display: "bitfun_worktree_build [dirty-first-query]",
-            family: "bitfun",
+        "codgrep_worktree_build" => RunnerLabel {
+            display: "codgrep_worktree_build [dirty-first-query]",
+            family: "codgrep",
             mode: "dirty_first_query",
         },
-        "bitfun_worktree" => RunnerLabel {
-            display: "bitfun_worktree [dirty-cached-query]",
-            family: "bitfun",
+        "codgrep_worktree" => RunnerLabel {
+            display: "codgrep_worktree [dirty-cached-query]",
+            family: "codgrep",
             mode: "dirty_cached_query",
         },
         "rg" => RunnerLabel {

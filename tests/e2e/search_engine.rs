@@ -1,6 +1,6 @@
 use std::process::Command;
 
-use bitfun_grep::{BuildConfig, SearchBackend, SearchEngine, SearchPolicy, TokenizerMode};
+use codgrep::{BuildConfig, SearchBackend, SearchEngine, SearchPolicy, TokenizerMode};
 
 use crate::common::{count_matches_query, query, TestRepo};
 
@@ -135,7 +135,7 @@ fn search_engine_keeps_relative_build_paths_fresh_after_reopen() {
         .to_path_buf();
     let index_path = repo_root.join("idx");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_bitfun_grep"))
+    let status = Command::new(env!("CARGO_BIN_EXE_cg"))
         .current_dir(&repo_root)
         .arg("build")
         .arg("--repo")

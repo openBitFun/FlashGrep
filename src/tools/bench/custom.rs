@@ -107,7 +107,7 @@ pub(super) fn run_custom(
             case_insensitive: config.custom_case_insensitive,
         };
 
-        let mut runners = vec![run_bitfun_custom_trace_benchmark(
+        let mut runners = vec![run_codgrep_custom_trace_benchmark(
             &benchmark,
             &index_path,
             cache_paths.as_ref(),
@@ -171,7 +171,7 @@ pub(super) fn run_custom(
                 case_insensitive: config.custom_case_insensitive,
             };
 
-            let mut runners = vec![run_bitfun_custom_benchmark(
+            let mut runners = vec![run_codgrep_custom_benchmark(
                 &benchmark,
                 &index_path,
                 cache_paths.as_ref(),
@@ -235,7 +235,7 @@ pub(super) fn index_exists(index_path: &Path) -> bool {
 }
 
 fn custom_index_path(suite_dir: &Path, target_label: &str, config: &BenchConfig) -> PathBuf {
-    suite_dir.join(".bitfun-bench").join(format!(
+    suite_dir.join(".codgrep-bench").join(format!(
         "custom-{}-{}-{}",
         sanitize_benchmark_name(target_label),
         config.corpus_mode.as_str(),
@@ -243,7 +243,7 @@ fn custom_index_path(suite_dir: &Path, target_label: &str, config: &BenchConfig)
     ))
 }
 
-fn run_bitfun_custom_benchmark(
+fn run_codgrep_custom_benchmark(
     benchmark: &CustomBenchmarkCase,
     index_path: &Path,
     cache_paths: Option<&BenchCachePaths>,
@@ -257,7 +257,7 @@ fn run_bitfun_custom_benchmark(
 
     for _ in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_bitfun_custom_once(
+        let _ = run_codgrep_custom_once(
             &searcher,
             &benchmark.pattern,
             benchmark.case_insensitive,
@@ -268,7 +268,7 @@ fn run_bitfun_custom_benchmark(
     for iter in 0..config.bench_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
-        let outcome = run_bitfun_custom_once(
+        let outcome = run_codgrep_custom_once(
             &searcher,
             &benchmark.pattern,
             benchmark.case_insensitive,
@@ -283,7 +283,7 @@ fn run_bitfun_custom_benchmark(
             writer.write_sample(RawSample {
                 benchmark: &benchmark.name,
                 corpus: &benchmark.target,
-                runner: "bitfun_grep",
+                runner: "codgrep",
                 iteration: iter,
                 duration_secs,
                 candidate_docs,
@@ -293,14 +293,14 @@ fn run_bitfun_custom_benchmark(
     }
 
     Ok(build_summary(
-        "bitfun_grep".into(),
+        "codgrep".into(),
         durations,
         candidate_docs,
         match_count,
     ))
 }
 
-fn run_bitfun_custom_trace_benchmark(
+fn run_codgrep_custom_trace_benchmark(
     benchmark: &CustomBenchmarkTrace,
     index_path: &Path,
     cache_paths: Option<&BenchCachePaths>,
@@ -315,7 +315,7 @@ fn run_bitfun_custom_trace_benchmark(
     for iter in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let pattern = benchmark.pattern_at(iter);
-        let _ = run_bitfun_custom_once(&searcher, pattern, benchmark.case_insensitive, config)?;
+        let _ = run_codgrep_custom_once(&searcher, pattern, benchmark.case_insensitive, config)?;
     }
 
     for iter in 0..config.bench_iter {
@@ -323,7 +323,7 @@ fn run_bitfun_custom_trace_benchmark(
         let pattern = benchmark.pattern_at(iter);
         let started = Instant::now();
         let outcome =
-            run_bitfun_custom_once(&searcher, pattern, benchmark.case_insensitive, config)?;
+            run_codgrep_custom_once(&searcher, pattern, benchmark.case_insensitive, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
         total_candidate_docs += outcome.candidate_docs;
         total_match_count += outcome.match_count;
@@ -332,7 +332,7 @@ fn run_bitfun_custom_trace_benchmark(
             writer.write_sample(RawSample {
                 benchmark: &benchmark.name,
                 corpus: &benchmark.target,
-                runner: "bitfun_grep",
+                runner: "codgrep",
                 iteration: iter,
                 duration_secs,
                 candidate_docs: Some(outcome.candidate_docs),
@@ -342,14 +342,14 @@ fn run_bitfun_custom_trace_benchmark(
     }
 
     Ok(build_summary(
-        "bitfun_grep".into(),
+        "codgrep".into(),
         durations,
         Some(mean_usize(total_candidate_docs, config.bench_iter)),
         mean_usize(total_match_count, config.bench_iter),
     ))
 }
 
-fn run_bitfun_custom_once(
+fn run_codgrep_custom_once(
     searcher: &IndexSearcher,
     pattern: &str,
     case_insensitive: bool,
@@ -499,9 +499,9 @@ fn run_worktree_custom_benchmark(
         &benchmark.name,
         &benchmark.target,
         if build_overlay_each_sample {
-            "bitfun_worktree_build"
+            "codgrep_worktree_build"
         } else {
-            "bitfun_worktree"
+            "codgrep_worktree"
         },
         Some(&benchmark.pattern),
         benchmark.case_insensitive,
@@ -525,9 +525,9 @@ fn run_worktree_custom_trace_benchmark(
         &workspace,
         benchmark,
         if build_overlay_each_sample {
-            "bitfun_worktree_build"
+            "codgrep_worktree_build"
         } else {
-            "bitfun_worktree"
+            "codgrep_worktree"
         },
         Some(&fixture.index_path),
         build_overlay_each_sample,
@@ -549,7 +549,7 @@ fn run_workspace_custom_benchmark(
         &workspace,
         &benchmark.name,
         &benchmark.target,
-        "bitfun_workspace",
+        "codgrep_workspace",
         Some(&benchmark.pattern),
         benchmark.case_insensitive,
         None,
@@ -571,7 +571,7 @@ fn run_workspace_custom_trace_benchmark(
     run_workspace_trace_benchmark(
         &workspace,
         benchmark,
-        "bitfun_workspace",
+        "codgrep_workspace",
         None,
         false,
         cache_paths,

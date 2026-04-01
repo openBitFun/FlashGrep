@@ -526,7 +526,8 @@ mod tests {
     use crate::{
         build_index,
         config::{BuildConfig, CorpusMode, TokenizerMode},
-        IndexSearcher, QueryConfig,
+        index::IndexSearcher,
+        QueryConfig,
     };
 
     struct RuntimeRepo {
@@ -538,9 +539,10 @@ mod tests {
     impl RuntimeRepo {
         fn new() -> Self {
             let temp = tempfile::tempdir().expect("temp dir should succeed");
-            let repo = temp.path().join("repo");
-            let index = repo.join(".bitfun-index");
-            fs::create_dir_all(&repo).expect("repo dir should succeed");
+            let repo_dir = temp.path().join("repo");
+            fs::create_dir_all(&repo_dir).expect("repo dir should succeed");
+            let repo = fs::canonicalize(&repo_dir).expect("repo dir should canonicalize");
+            let index = repo.join(".codgrep-index");
             Self {
                 _temp: temp,
                 repo,

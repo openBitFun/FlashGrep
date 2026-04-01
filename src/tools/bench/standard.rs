@@ -18,7 +18,7 @@ use super::{
     BenchCachePaths, BenchConfig, BenchmarkCase, BitfunOutcome, CacheRunner, RunnerSummary,
 };
 
-pub(super) fn run_bitfun_benchmark(
+pub(super) fn run_codgrep_benchmark(
     benchmark: BenchmarkCase,
     index_path: &Path,
     cache_paths: Option<&BenchCachePaths>,
@@ -32,13 +32,13 @@ pub(super) fn run_bitfun_benchmark(
 
     for _ in 0..config.warmup_iter {
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_bitfun_once(&searcher, benchmark, config)?;
+        let _ = run_codgrep_once(&searcher, benchmark, config)?;
     }
 
     for iter in 0..config.bench_iter {
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
-        let outcome = run_bitfun_once(&searcher, benchmark, config)?;
+        let outcome = run_codgrep_once(&searcher, benchmark, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
         candidate_docs = Some(outcome.candidate_docs);
         match_count = outcome.match_count;
@@ -48,7 +48,7 @@ pub(super) fn run_bitfun_benchmark(
             writer.write_sample(RawSample {
                 benchmark: benchmark.name,
                 corpus: benchmark.corpus.label(),
-                runner: "bitfun_grep",
+                runner: "codgrep",
                 iteration: iter,
                 duration_secs,
                 candidate_docs,
@@ -58,14 +58,14 @@ pub(super) fn run_bitfun_benchmark(
     }
 
     Ok(build_summary(
-        "bitfun_grep".into(),
+        "codgrep".into(),
         durations,
         candidate_docs,
         match_count,
     ))
 }
 
-pub(super) fn run_bitfun_cli_benchmark(
+pub(super) fn run_codgrep_cli_benchmark(
     benchmark: BenchmarkCase,
     index_path: &Path,
     suite_dir: &Path,
@@ -79,13 +79,13 @@ pub(super) fn run_bitfun_cli_benchmark(
 
     for _ in 0..config.warmup_iter {
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_bitfun_cli_once(benchmark, index_path, &target, config)?;
+        let _ = run_codgrep_cli_once(benchmark, index_path, &target, config)?;
     }
 
     for iter in 0..config.bench_iter {
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
-        let matches = run_bitfun_cli_once(benchmark, index_path, &target, config)?;
+        let matches = run_codgrep_cli_once(benchmark, index_path, &target, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
         match_count = matches;
         durations.push(duration_secs);
@@ -94,7 +94,7 @@ pub(super) fn run_bitfun_cli_benchmark(
             writer.write_sample(RawSample {
                 benchmark: benchmark.name,
                 corpus: benchmark.corpus.label(),
-                runner: "bitfun_cli",
+                runner: "codgrep_cli",
                 iteration: iter,
                 duration_secs,
                 candidate_docs: None,
@@ -104,7 +104,7 @@ pub(super) fn run_bitfun_cli_benchmark(
     }
 
     Ok(build_summary(
-        "bitfun_cli".into(),
+        "codgrep_cli".into(),
         durations,
         None,
         match_count,
@@ -198,9 +198,9 @@ pub(super) fn run_worktree_benchmark(
                 benchmark: benchmark.name,
                 corpus: benchmark.corpus.label(),
                 runner: if build_overlay_each_sample {
-                    "bitfun_worktree_build"
+                    "codgrep_worktree_build"
                 } else {
-                    "bitfun_worktree"
+                    "codgrep_worktree"
                 },
                 iteration: iter,
                 duration_secs,
@@ -212,9 +212,9 @@ pub(super) fn run_worktree_benchmark(
 
     Ok(build_summary(
         if build_overlay_each_sample {
-            "bitfun_worktree_build".into()
+            "codgrep_worktree_build".into()
         } else {
-            "bitfun_worktree".into()
+            "codgrep_worktree".into()
         },
         durations,
         candidate_docs,
@@ -266,7 +266,7 @@ pub(super) fn run_workspace_benchmark(
             writer.write_sample(RawSample {
                 benchmark: benchmark.name,
                 corpus: benchmark.corpus.label(),
-                runner: "bitfun_workspace",
+                runner: "codgrep_workspace",
                 iteration: iter,
                 duration_secs,
                 candidate_docs,
@@ -276,14 +276,14 @@ pub(super) fn run_workspace_benchmark(
     }
 
     Ok(build_summary(
-        "bitfun_workspace".into(),
+        "codgrep_workspace".into(),
         durations,
         candidate_docs,
         match_count,
     ))
 }
 
-fn run_bitfun_once(
+fn run_codgrep_once(
     searcher: &IndexSearcher,
     benchmark: BenchmarkCase,
     config: &BenchConfig,
@@ -329,7 +329,7 @@ fn run_rg_once(benchmark: BenchmarkCase, target: &Path, config: &BenchConfig) ->
     super::parse_rg_count_output(&output.stdout)
 }
 
-fn run_bitfun_cli_once(
+fn run_codgrep_cli_once(
     benchmark: BenchmarkCase,
     index_path: &Path,
     target: &Path,
@@ -352,7 +352,7 @@ fn run_bitfun_cli_once(
     let output = command.output()?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err(AppError::InvalidIndex(format!(
-            "bitfun cli failed for benchmark {} with status {}",
+            "codgrep cli failed for benchmark {} with status {}",
             benchmark.name, output.status
         )));
     }
@@ -360,7 +360,7 @@ fn run_bitfun_cli_once(
 }
 
 fn run_snapshot_once(
-    snapshot: &crate::WorkspaceSnapshot,
+    snapshot: &crate::workspace::WorkspaceSnapshot,
     pattern: &str,
     case_insensitive: bool,
     config: &BenchConfig,

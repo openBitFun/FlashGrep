@@ -19,6 +19,7 @@ use crate::{
         DocMeta, DocTermsWriter, DocsWriter, IndexBuildSettings, IndexLayout, IndexMetadata,
         LookupEntry, PostingsWriter,
     },
+    progress::{IndexProgress, IndexProgressPhase},
     tokenizer::{create, TokenizerOptions},
 };
 
@@ -26,8 +27,76 @@ const INDEX_BUILD_BATCH_SIZE: usize = 512;
 const INDEX_BUILD_BUCKET_COUNT: usize = 256;
 const BUCKET_RECORD_BYTES: usize = 12;
 
+/// Build-time hooks for optional progress reporting and cancellation.
+///
+/// This keeps the public build API stable while allowing callers to opt into
+/// richer orchestration behavior.
+pub struct IndexBuildOptions<'a> {
+    pub progress: Option<&'a mut dyn FnMut(IndexProgress)>,
+    pub should_cancel: Option<&'a mut dyn FnMut() -> bool>,
+}
+
+impl<'a> Default for IndexBuildOptions<'a> {
+    fn default() -> Self {
+        Self {
+            progress: None,
+            should_cancel: None,
+        }
+    }
+}
+
+impl<'a> IndexBuildOptions<'a> {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    pub fn with_progress(mut self, progress: &'a mut dyn FnMut(IndexProgress)) -> Self {
+        self.progress = Some(progress);
+        self
+    }
+
+    pub fn with_cancel(mut self, should_cancel: &'a mut dyn FnMut() -> bool) -> Self {
+        self.should_cancel = Some(should_cancel);
+        self
+    }
+}
+
 pub fn build_index(config: &BuildConfig) -> Result<usize> {
+    build_index_with_options(config, IndexBuildOptions::default())
+}
+
+pub fn build_index_with_options(
+    config: &BuildConfig,
+    mut options: IndexBuildOptions<'_>,
+) -> Result<usize> {
+    let mut noop_progress = |_event: IndexProgress| {};
+    let mut noop_cancel = || false;
+    let on_progress = options.progress.take().unwrap_or(&mut noop_progress);
+    let should_cancel = options.should_cancel.take().unwrap_or(&mut noop_cancel);
+
+    build_index_internal(config, |event| on_progress(event), || should_cancel())
+}
+
+fn build_index_internal<F, C>(
+    config: &BuildConfig,
+    on_progress: F,
+    should_cancel: C,
+) -> Result<usize>
+where
+    F: FnMut(IndexProgress),
+    C: FnMut() -> bool,
+{
+    let mut on_progress = on_progress;
+    let mut should_cancel = should_cancel;
     let config = config.normalized()?;
+    check_cancel(&mut should_cancel)?;
+    report_progress(
+        &mut on_progress,
+        IndexProgressPhase::Scanning,
+        "Resolving base snapshot",
+        0,
+        None,
+    );
     let snapshot = resolve_base_snapshot(&config)?;
     ensure_dir(&config.index_path)?;
     ensure_dir(&IndexLayout::generations_dir(&config.index_path))?;
@@ -35,8 +104,17 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
     let layout = IndexLayout::for_generation(&config.index_path, &snapshot.generation);
     if snapshot.git_worktree_dirty {
         if layout.docs_path.exists() {
+            check_cancel(&mut should_cancel)?;
             activate_generation(&config.index_path, &snapshot.generation)?;
-            return existing_doc_count(&layout);
+            let doc_count = existing_doc_count(&layout)?;
+            report_progress(
+                &mut on_progress,
+                IndexProgressPhase::Finalizing,
+                "Reused existing dirty worktree snapshot",
+                1,
+                Some(1),
+            );
+            return Ok(doc_count);
         }
     }
 
@@ -46,6 +124,7 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
     };
     ensure_dir(&layout.data_path)?;
     cleanup_build_artifacts(&layout)?;
+    check_cancel(&mut should_cancel)?;
 
     let mut builder = StreamingIndexBuilder::new(&config, &snapshot, &layout)?;
     let cached_docs = load_cached_docs(&config, &snapshot);
@@ -58,36 +137,94 @@ pub fn build_index(config: &BuildConfig) -> Result<usize> {
                 &mut builder,
                 head_commit,
                 tokenizer_options,
+                &mut on_progress,
+                &mut should_cancel,
             )?;
         } else {
+            check_cancel(&mut should_cancel)?;
+            report_progress(
+                &mut on_progress,
+                IndexProgressPhase::Scanning,
+                "Scanning repository files",
+                0,
+                None,
+            );
             let files = scan_repository(&config)?;
+            check_cancel(&mut should_cancel)?;
+            report_progress(
+                &mut on_progress,
+                IndexProgressPhase::Scanning,
+                "Scanned repository files",
+                files.len(),
+                Some(files.len()),
+            );
             build_clean_index(
                 &files,
                 config.tokenizer,
                 tokenizer_options,
                 &cached_docs,
                 &mut builder,
+                &mut on_progress,
+                &mut should_cancel,
             )?;
         }
     } else {
+        check_cancel(&mut should_cancel)?;
+        report_progress(
+            &mut on_progress,
+            IndexProgressPhase::Scanning,
+            "Scanning repository files",
+            0,
+            None,
+        );
         let files = scan_repository(&config)?;
+        check_cancel(&mut should_cancel)?;
+        report_progress(
+            &mut on_progress,
+            IndexProgressPhase::Scanning,
+            "Scanned repository files",
+            files.len(),
+            Some(files.len()),
+        );
         build_clean_index(
             &files,
             config.tokenizer,
             tokenizer_options,
             &cached_docs,
             &mut builder,
+            &mut on_progress,
+            &mut should_cancel,
         )?;
     }
 
-    let doc_count = builder.finish(config.tokenizer, &layout)?;
+    let doc_count = builder.finish_with_progress(
+        config.tokenizer,
+        &layout,
+        &mut on_progress,
+        &mut should_cancel,
+    )?;
+    check_cancel(&mut should_cancel)?;
     activate_generation(&config.index_path, &snapshot.generation)?;
+    report_progress(
+        &mut on_progress,
+        IndexProgressPhase::Finalizing,
+        "Activated base snapshot",
+        1,
+        Some(1),
+    );
 
     Ok(doc_count)
 }
 
 pub fn rebuild_index(config: &BuildConfig) -> Result<usize> {
-    build_index(config)
+    rebuild_index_with_options(config, IndexBuildOptions::default())
+}
+
+pub fn rebuild_index_with_options(
+    config: &BuildConfig,
+    options: IndexBuildOptions<'_>,
+) -> Result<usize> {
+    build_index_with_options(config, options)
 }
 
 fn compute_high_freq_doc_threshold(doc_count: usize) -> usize {
@@ -100,16 +237,37 @@ fn build_clean_index(
     tokenizer_options: TokenizerOptions,
     cached_docs: &HashMap<String, CachedDoc>,
     builder: &mut StreamingIndexBuilder,
+    on_progress: &mut impl FnMut(IndexProgress),
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<()> {
+    let total_files = files.len();
+    let mut processed_files = 0usize;
     for batch in files.chunks(INDEX_BUILD_BATCH_SIZE) {
+        check_cancel(should_cancel)?;
         let mut indexed_files = process_file_batch_in_parallel(
             batch,
             tokenizer_mode,
             tokenizer_options.clone(),
             cached_docs,
         )?;
+        processed_files += batch.len();
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Tokenizing,
+            format!("Tokenized {processed_files}/{total_files} files"),
+            processed_files,
+            Some(total_files),
+        );
         indexed_files.sort_unstable_by_key(|doc| doc.ordinal);
         builder.write_batch(indexed_files)?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Writing,
+            format!("Wrote {processed_files}/{total_files} documents"),
+            processed_files,
+            Some(total_files),
+        );
+        check_cancel(should_cancel)?;
     }
     Ok(())
 }
@@ -120,9 +278,19 @@ fn build_dirty_head_index(
     builder: &mut StreamingIndexBuilder,
     head_commit: &str,
     tokenizer_options: TokenizerOptions,
+    on_progress: &mut impl FnMut(IndexProgress),
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<()> {
+    check_cancel(should_cancel)?;
     let checkout = materialize_head_checkout(&config.repo_path, head_commit)?;
     let dirty_paths = dirty_tracked_paths(&config.repo_path, &config.index_path, head_commit)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Scanning,
+        "Scanning HEAD snapshot files for dirty worktree build",
+        0,
+        None,
+    );
     let files = scan_repository(&BuildConfig {
         repo_path: checkout.root.clone(),
         index_path: layout.root_path.join(".head-snapshot-index"),
@@ -133,22 +301,52 @@ fn build_dirty_head_index(
         min_sparse_len: config.min_sparse_len,
         max_sparse_len: config.max_sparse_len,
     })?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Scanning,
+        format!(
+            "Scanned HEAD snapshot files ({} files, {} dirty paths)",
+            files.len(),
+            dirty_paths.len()
+        ),
+        files.len(),
+        Some(files.len()),
+    );
 
     let context = HeadSnapshotContext {
         checkout_root: &checkout.root,
         repo_root: &config.repo_path,
         dirty_paths: &dirty_paths,
     };
+    let total_files = files.len();
+    let mut processed_files = 0usize;
     for batch in files.chunks(INDEX_BUILD_BATCH_SIZE) {
+        check_cancel(should_cancel)?;
         let mut indexed_files = process_file_batch_in_parallel(
             batch,
             config.tokenizer,
             tokenizer_options.clone(),
             &HashMap::new(),
         )?;
+        processed_files += batch.len();
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Tokenizing,
+            format!("Tokenized {processed_files}/{total_files} HEAD snapshot files"),
+            processed_files,
+            Some(total_files),
+        );
         rewrite_head_snapshot_batch(&mut indexed_files, &context)?;
         indexed_files.sort_unstable_by_key(|doc| doc.ordinal);
         builder.write_batch(indexed_files)?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Writing,
+            format!("Wrote {processed_files}/{total_files} HEAD snapshot documents"),
+            processed_files,
+            Some(total_files),
+        );
+        check_cancel(should_cancel)?;
     }
     Ok(())
 }
@@ -351,14 +549,38 @@ impl StreamingIndexBuilder {
         Ok(())
     }
 
-    fn finish(
+    fn finish_with_progress(
         mut self,
         tokenizer: crate::config::TokenizerMode,
         layout: &IndexLayout,
+        on_progress: &mut impl FnMut(IndexProgress),
+        should_cancel: &mut impl FnMut() -> bool,
     ) -> Result<usize> {
+        check_cancel(should_cancel)?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Finalizing,
+            "Flushing streamed index metadata",
+            0,
+            Some(3),
+        );
         self.bucket_spiller.finish()?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Finalizing,
+            "Flushed postings spill buckets",
+            1,
+            Some(3),
+        );
         let docs_count = self.docs_writer.finish()?;
         let doc_terms_count = self.doc_terms_writer.finish()?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Finalizing,
+            "Flushed docs and doc terms",
+            2,
+            Some(3),
+        );
         if docs_count != self.doc_count || doc_terms_count != self.doc_count {
             return Err(AppError::InvalidIndex(format!(
                 "streamed doc count mismatch: docs={docs_count}, doc_terms={doc_terms_count}, expected={}",
@@ -368,16 +590,25 @@ impl StreamingIndexBuilder {
 
         let high_freq_doc_threshold = (tokenizer == crate::config::TokenizerMode::SparseNgram)
             .then(|| compute_high_freq_doc_threshold(self.doc_count));
-        let mut lookup_entries = merge_postings_from_bucket_files(
+        let mut lookup_entries = merge_postings_from_bucket_files_with_progress(
             &self.spill_dir,
             &layout.postings_path,
             high_freq_doc_threshold,
+            on_progress,
+            should_cancel,
         )?;
         lookup_entries.sort_unstable_by_key(|entry| entry.token_hash);
         write_lookup_file(&layout.lookup_path, &lookup_entries)?;
         if self.spill_dir.exists() {
             fs::remove_dir_all(&self.spill_dir)?;
         }
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Finalizing,
+            "Finished base snapshot index",
+            3,
+            Some(3),
+        );
         Ok(self.doc_count)
     }
 }
@@ -423,13 +654,27 @@ struct BucketRecord {
     doc_id: u32,
 }
 
-fn merge_postings_from_bucket_files(
+fn merge_postings_from_bucket_files_with_progress(
     spill_dir: &Path,
     postings_path: &Path,
     high_freq_doc_threshold: Option<usize>,
+    on_progress: &mut impl FnMut(IndexProgress),
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<Vec<LookupEntry>> {
     let mut postings_writer = PostingsWriter::create_streaming(postings_path)?;
     for bucket in 0..INDEX_BUILD_BUCKET_COUNT {
+        check_cancel(should_cancel)?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Writing,
+            format!(
+                "Merging postings bucket {}/{}",
+                bucket + 1,
+                INDEX_BUILD_BUCKET_COUNT
+            ),
+            bucket,
+            Some(INDEX_BUILD_BUCKET_COUNT),
+        );
         let mut records = read_bucket_records(&bucket_path(spill_dir, bucket))?;
         records.sort_unstable_by_key(|record| (record.token_hash, record.doc_id));
 
@@ -449,7 +694,15 @@ fn merge_postings_from_bucket_files(
             postings_writer.write_posting_list(token_hash, &doc_ids, high_freq_doc_threshold)?;
         }
     }
-    postings_writer.finish()
+    let entries = postings_writer.finish()?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Writing,
+        "Merged postings buckets",
+        INDEX_BUILD_BUCKET_COUNT,
+        Some(INDEX_BUILD_BUCKET_COUNT),
+    );
+    Ok(entries)
 }
 
 fn read_bucket_records(path: &Path) -> Result<Vec<BucketRecord>> {
@@ -491,6 +744,23 @@ fn bucket_path(dir: &Path, bucket: usize) -> PathBuf {
 
 fn bucket_for(token_hash: u64) -> usize {
     (token_hash as usize) & (INDEX_BUILD_BUCKET_COUNT - 1)
+}
+
+fn report_progress(
+    on_progress: &mut impl FnMut(IndexProgress),
+    phase: IndexProgressPhase,
+    message: impl Into<String>,
+    processed: usize,
+    total: Option<usize>,
+) {
+    on_progress(IndexProgress::new(phase, message, processed, total));
+}
+
+fn check_cancel(should_cancel: &mut impl FnMut() -> bool) -> Result<()> {
+    if should_cancel() {
+        return Err(AppError::Cancelled);
+    }
+    Ok(())
 }
 
 fn load_cached_docs(config: &BuildConfig, snapshot: &BaseSnapshot) -> HashMap<String, CachedDoc> {
@@ -774,14 +1044,16 @@ fn is_ignored_untracked_artifact(path: &str, repo_root: &Path, index_path: &Path
     let normalized = path.replace('\\', "/");
     if let Some(relative_index_path) = index_path.strip_prefix(repo_root).ok() {
         let relative_index_path = relative_index_path.to_string_lossy().replace('\\', "/");
-        if normalized == relative_index_path || normalized.starts_with(&format!("{relative_index_path}/")) {
+        if normalized == relative_index_path
+            || normalized.starts_with(&format!("{relative_index_path}/"))
+        {
             return true;
         }
     }
 
     normalized
         .split('/')
-        .any(|component| component == ".bitfun-index" || component == ".bitfun-bench")
+        .any(|component| component == ".codgrep-index" || component == ".codgrep-bench")
 }
 
 struct BaseSnapshot {
@@ -816,7 +1088,7 @@ impl MaterializedHeadCheckout {
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default();
         let root = std::env::temp_dir().join(format!(
-            "bitfun-grep-head-{}-{}-{}",
+            "codgrep-head-{}-{}-{}",
             std::process::id(),
             now.as_secs(),
             now.subsec_nanos()

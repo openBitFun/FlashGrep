@@ -1,14 +1,21 @@
 use std::{
+    cell::Cell,
     collections::BTreeMap,
     fs,
     path::Path,
+    rc::Rc,
     thread,
     time::{Duration, SystemTime},
 };
 
-use bitfun_grep::{
-    index::format::{read_doc_terms_file, read_docs_file},
-    BaseSnapshotKind, JsonData, QueryConfig, SearchMode, WorkspaceIndex, WorkspaceIndexOptions,
+use codgrep::{
+    advanced::{
+        json::{JsonData, JsonSearchReport},
+        BaseSnapshotKind, IndexProgressPhase,
+    },
+    build_index_with_options,
+    experimental::index_format::{read_doc_terms_file, read_docs_file},
+    AppError, IndexBuildOptions, QueryConfig, SearchMode, WorkspaceIndex, WorkspaceIndexOptions,
 };
 
 use crate::common::{count_query, query, TestRepo};
@@ -94,7 +101,7 @@ fn overlay_generations(repo: &TestRepo, base_snapshot_key: &str) -> Vec<String> 
     generations
 }
 
-fn hit_paths(results: bitfun_grep::SearchResults) -> Vec<String> {
+fn hit_paths(results: codgrep::SearchResults) -> Vec<String> {
     results.hits.into_iter().map(|hit| hit.path).collect()
 }
 
@@ -103,6 +110,204 @@ fn json_text(data: &JsonData) -> &str {
         JsonData::Text { text } => text,
         JsonData::Bytes { .. } => panic!("test expected utf-8 json payload"),
     }
+}
+
+#[test]
+fn build_index_with_progress_emits_index_build_phases() {
+    let repo = TestRepo::new();
+    repo.write("src/main.rs", "fn main() { println!(\"hello\"); }\n");
+    repo.write("src/lib.rs", "pub const NAME: &str = \"progress\";\n");
+
+    let mut events = Vec::new();
+    {
+        let mut on_progress = |event| events.push(event);
+        build_index_with_options(
+            &repo.trigram_build_config(),
+            IndexBuildOptions::new().with_progress(&mut on_progress),
+        )
+        .expect("test should succeed");
+    }
+
+    assert!(!events.is_empty());
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::Scanning));
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::Tokenizing));
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::Writing));
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::Finalizing));
+    assert_eq!(
+        events.last().map(|event| event.phase),
+        Some(IndexProgressPhase::Finalizing)
+    );
+    assert!(events.last().is_some_and(|event| event.is_complete()));
+}
+
+#[test]
+fn workspace_refresh_overlay_with_progress_emits_overlay_phases() {
+    let repo = TestRepo::new();
+    let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE_NAME\";\n");
+    repo.build();
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_NAME\";\n");
+    repo.write("added.rs", "const NAME: &str = \"DIRTY_NAME\";\n");
+
+    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+        auto_refresh_overlay: false,
+        overlay_cache_limit: None,
+    })
+    .expect("test should succeed");
+
+    let mut events = Vec::new();
+    let overlay = workspace
+        .refresh_overlay_with_progress(|event| events.push(event))
+        .expect("test should succeed");
+
+    assert!(overlay.is_some());
+    assert!(!events.is_empty());
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::RefreshingOverlay));
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::Scanning));
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::Tokenizing));
+    assert_eq!(
+        events.last().map(|event| event.phase),
+        Some(IndexProgressPhase::RefreshingOverlay)
+    );
+    assert!(events.last().is_some_and(|event| event.is_complete()));
+}
+
+#[test]
+fn build_index_with_progress_and_cancel_stops_before_writing_index() {
+    let repo = TestRepo::new();
+    repo.write("src/main.rs", "fn main() { println!(\"hello\"); }\n");
+    repo.write("src/lib.rs", "pub const NAME: &str = \"progress\";\n");
+
+    let mut on_progress = |_| {};
+    let mut should_cancel = || true;
+    let result = codgrep::build_index_with_options(
+        &repo.trigram_build_config(),
+        IndexBuildOptions::new()
+            .with_progress(&mut on_progress)
+            .with_cancel(&mut should_cancel),
+    );
+
+    assert!(matches!(result, Err(AppError::Cancelled)));
+    assert!(!repo.index.exists());
+}
+
+#[test]
+fn workspace_refresh_overlay_with_progress_and_cancel_returns_cancelled() {
+    let repo = TestRepo::new();
+    let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE_NAME\";\n");
+    repo.build();
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_NAME\";\n");
+
+    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+        auto_refresh_overlay: false,
+        overlay_cache_limit: None,
+    })
+    .expect("test should succeed");
+
+    let result = workspace.refresh_overlay_with_progress_and_cancel(|_| {}, || true);
+
+    assert!(matches!(result, Err(AppError::Cancelled)));
+}
+
+#[test]
+fn build_index_with_progress_and_cancel_can_stop_after_progress_starts_in_mock_git_repo() {
+    let repo = TestRepo::new();
+    repo.seed_mock_git_repo(6, 24);
+
+    let should_cancel = Rc::new(Cell::new(false));
+    let cancel_in_progress = Rc::clone(&should_cancel);
+    let cancel_for_check = Rc::clone(&should_cancel);
+
+    let mut on_progress = move |event: codgrep::advanced::IndexProgress| {
+        if event.phase == IndexProgressPhase::Tokenizing && event.processed >= 8 {
+            cancel_in_progress.set(true);
+        }
+    };
+    let mut should_cancel = move || cancel_for_check.get();
+    let result = codgrep::build_index_with_options(
+        &repo.trigram_build_config(),
+        IndexBuildOptions::new()
+            .with_progress(&mut on_progress)
+            .with_cancel(&mut should_cancel),
+    );
+
+    assert!(matches!(result, Err(AppError::Cancelled)));
+    assert!(!repo.index.join("CURRENT").exists());
+}
+
+#[test]
+fn workspace_refresh_overlay_with_progress_and_cancel_keeps_previous_overlay_active() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE_NAME\";\n");
+    repo.commit_all("initial");
+    repo.build();
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"FIRST_DIRTY\";\n");
+
+    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+        auto_refresh_overlay: false,
+        overlay_cache_limit: None,
+    })
+    .expect("test should succeed");
+
+    let first_overlay = workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
+    let base = workspace
+        .status()
+        .expect("test should succeed")
+        .base
+        .expect("base should exist");
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"SECOND_DIRTY\";\n");
+
+    let should_cancel = Rc::new(Cell::new(false));
+    let cancel_in_progress = Rc::clone(&should_cancel);
+    let cancel_for_check = Rc::clone(&should_cancel);
+    let result = workspace.refresh_overlay_with_progress_and_cancel(
+        move |event| {
+            if event.phase == IndexProgressPhase::Tokenizing && event.processed >= 1 {
+                cancel_in_progress.set(true);
+            }
+        },
+        move || cancel_for_check.get(),
+    );
+
+    assert!(matches!(result, Err(AppError::Cancelled)));
+
+    let current_overlay = workspace
+        .status()
+        .expect("test should succeed")
+        .overlay
+        .expect("previous overlay should remain active");
+    assert_eq!(current_overlay.overlay_key, first_overlay.overlay_key);
+
+    let current_pointer = fs::read_to_string(
+        repo.index
+            .join("overlays")
+            .join(&base.snapshot_key)
+            .join("CURRENT"),
+    )
+    .expect("test should succeed");
+    assert_eq!(current_pointer.trim(), first_overlay.overlay_key);
 }
 
 #[test]
@@ -471,6 +676,10 @@ fn workspace_index_rebuilds_overlay_when_same_dirty_path_changes_again() {
         overlay_cache_limit: None,
     })
     .expect("test should succeed");
+    workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
 
     let first_results = workspace
         .search(&query("FIRST_NAME"))
@@ -478,6 +687,10 @@ fn workspace_index_rebuilds_overlay_when_same_dirty_path_changes_again() {
     assert_eq!(first_results.hits.len(), 1);
 
     rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"SECOND_NAME\";\n");
+    workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
 
     let second_results = workspace
         .search(&query("SECOND_NAME"))
@@ -558,6 +771,10 @@ fn workspace_snapshot_on_dirty_git_repo_tracks_modified_deleted_and_new_files() 
         overlay_cache_limit: None,
     })
     .expect("test should succeed");
+    workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
     let snapshot = workspace.snapshot().expect("test should succeed");
 
     let dirty_paths = hit_paths(
@@ -586,7 +803,7 @@ fn workspace_snapshot_on_dirty_git_repo_tracks_modified_deleted_and_new_files() 
 }
 
 #[test]
-fn workspace_index_auto_refresh_overlay_handles_dirty_git_worktree() {
+fn workspace_index_search_requires_explicit_refresh_for_dirty_git_worktree() {
     let repo = TestRepo::new();
     repo.init_git();
     let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE_NAME\";\n");
@@ -602,6 +819,16 @@ fn workspace_index_auto_refresh_overlay_handles_dirty_git_worktree() {
         overlay_cache_limit: None,
     })
     .expect("test should succeed");
+
+    let stale = workspace
+        .search(&count_query("AUTO_DIRTY"))
+        .expect("test should succeed");
+    assert_eq!(stale.matched_lines, 0);
+
+    workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
 
     let paths = hit_paths(
         workspace
@@ -644,6 +871,10 @@ fn workspace_snapshot_reuses_dirty_git_overlay_for_multiple_queries() {
     let base = workspace
         .ensure_base_snapshot()
         .expect("test should succeed");
+    workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
     let snapshot = workspace.snapshot().expect("test should succeed");
 
     let first_paths = hit_paths(
@@ -776,6 +1007,10 @@ fn workspace_snapshot_handles_complex_git_worktree_with_ignore_and_rename_like_c
         overlay_cache_limit: None,
     })
     .expect("test should succeed");
+    workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
     let snapshot = workspace.snapshot().expect("test should succeed");
 
     let account_paths = hit_paths(
@@ -914,14 +1149,20 @@ fn workspace_search_json_reports_effective_dirty_git_view() {
 
     let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
         build_config: repo.trigram_build_config(),
-        auto_refresh_overlay: true,
+        auto_refresh_overlay: false,
         overlay_cache_limit: None,
     })
     .expect("test should succeed");
+    workspace
+        .refresh_overlay()
+        .expect("test should succeed")
+        .expect("dirty worktree should produce overlay");
 
-    let report = workspace
-        .search_json(&query("LIVE_JSON"))
-        .expect("test should succeed");
+    let report = JsonSearchReport::from_search_results(
+        &workspace
+            .search(&query("LIVE_JSON"))
+            .expect("test should succeed"),
+    );
     let mut matched_paths = report
         .files
         .iter()
@@ -941,17 +1182,21 @@ fn workspace_search_json_reports_effective_dirty_git_view() {
     assert_eq!(report.summary.matched_lines, 2);
     assert_eq!(report.summary.matches, 2);
 
-    let deleted = workspace
-        .search_json(&query("REMOVED_JSON"))
-        .expect("test should succeed");
+    let deleted = JsonSearchReport::from_search_results(
+        &workspace
+            .search(&query("REMOVED_JSON"))
+            .expect("test should succeed"),
+    );
     assert!(!deleted.has_match());
     assert!(deleted.files.is_empty());
     assert_eq!(deleted.summary.matched_lines, 0);
     assert_eq!(deleted.summary.matches, 0);
 
-    let stale_base = workspace
-        .search_json(&query("BASE_JSON"))
-        .expect("test should succeed");
+    let stale_base = JsonSearchReport::from_search_results(
+        &workspace
+            .search(&query("BASE_JSON"))
+            .expect("test should succeed"),
+    );
     assert!(!stale_base.has_match());
     assert!(stale_base.files.is_empty());
 }

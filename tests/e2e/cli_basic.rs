@@ -14,7 +14,7 @@ fn cli_files_matches_ripgrep_output() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .arg("--files")
         .current_dir(&repo.repo)
@@ -28,9 +28,9 @@ fn cli_files_matches_ripgrep_output() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
     assert_eq!(
-        crate::common::sort_lines(&stdout_string(&bitfun.stdout)),
+        crate::common::sort_lines(&stdout_string(&codgrep.stdout)),
         crate::common::sort_lines(&stdout_string(&rg.stdout))
     );
 }
@@ -43,7 +43,7 @@ fn cli_files_relative_root_matches_ripgrep_output() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .args(["--files", "foo"])
         .current_dir(&repo.repo)
@@ -57,9 +57,9 @@ fn cli_files_relative_root_matches_ripgrep_output() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
     assert_eq!(
-        crate::common::sort_lines(&stdout_string(&bitfun.stdout)),
+        crate::common::sort_lines(&stdout_string(&codgrep.stdout)),
         crate::common::sort_lines(&stdout_string(&rg.stdout))
     );
 }
@@ -72,7 +72,7 @@ fn cli_files_dot_matches_ripgrep_output() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .args(["--files", "."])
         .current_dir(&repo.repo)
@@ -86,9 +86,9 @@ fn cli_files_dot_matches_ripgrep_output() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
     assert_eq!(
-        crate::common::sort_lines(&stdout_string(&bitfun.stdout)),
+        crate::common::sort_lines(&stdout_string(&codgrep.stdout)),
         crate::common::sort_lines(&stdout_string(&rg.stdout))
     );
 }
@@ -333,7 +333,7 @@ fn cli_hidden_matches_ripgrep_output_when_index_supports_it() {
     let repo = TestRepo::new();
     repo.write(".hidden.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
-    repo.build_with(bitfun_grep::BuildConfig {
+    repo.build_with(codgrep::BuildConfig {
         include_hidden: true,
         ..repo.trigram_build_config()
     });
@@ -348,8 +348,8 @@ fn cli_no_ignore_matches_ripgrep_output_when_index_supports_it() {
     repo.write(".gitignore", "ignored.rs\n");
     repo.write("ignored.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
-    repo.build_with(bitfun_grep::BuildConfig {
-        corpus_mode: bitfun_grep::CorpusMode::NoIgnore,
+    repo.build_with(codgrep::BuildConfig {
+        corpus_mode: codgrep::CorpusMode::NoIgnore,
         ..repo.trigram_build_config()
     });
 
@@ -392,8 +392,8 @@ fn cli_no_ignore_still_respects_ignore_file() {
     repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
     let ignore = repo.write("extra.ignore", "tracked.rs\n");
 
-    repo.build_with(bitfun_grep::BuildConfig {
-        corpus_mode: bitfun_grep::CorpusMode::NoIgnore,
+    repo.build_with(codgrep::BuildConfig {
+        corpus_mode: codgrep::CorpusMode::NoIgnore,
         ..repo.trigram_build_config()
     });
 
@@ -678,12 +678,12 @@ fn cli_stats_matches_ripgrep_aggregate_lines() {
 
     repo.build();
 
-    let bitfun = run_cli(&repo, &["-H", "--stats", "foo"], &source);
+    let codgrep = run_cli(&repo, &["-H", "--stats", "foo"], &source);
     let rg = run_rg(&repo, &["-H", "--stats", "foo"], &source);
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
     assert_eq!(
-        normalized_stats_output(&bitfun.stdout),
+        normalized_stats_output(&codgrep.stdout),
         normalized_stats_output(&rg.stdout)
     );
 }
@@ -695,12 +695,12 @@ fn cli_quiet_stats_matches_ripgrep_aggregate_lines() {
 
     repo.build();
 
-    let bitfun = run_cli(&repo, &["-q", "--stats", "foo"], &source);
+    let codgrep = run_cli(&repo, &["-q", "--stats", "foo"], &source);
     let rg = run_rg(&repo, &["-q", "--stats", "foo"], &source);
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
     assert_eq!(
-        normalized_stats_output(&bitfun.stdout),
+        normalized_stats_output(&codgrep.stdout),
         normalized_stats_output(&rg.stdout)
     );
 }
@@ -722,12 +722,12 @@ fn cli_count_stats_matches_ripgrep_aggregate_lines() {
 
     repo.build();
 
-    let bitfun = run_cli(&repo, &["-c", "--stats", "-H", "foo"], &source);
+    let codgrep = run_cli(&repo, &["-c", "--stats", "-H", "foo"], &source);
     let rg = run_rg(&repo, &["-c", "--stats", "-H", "foo"], &source);
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
+    assert_eq!(codgrep.status.code(), rg.status.code());
     assert_eq!(
-        normalized_stats_output(&bitfun.stdout),
+        normalized_stats_output(&codgrep.stdout),
         normalized_stats_output(&rg.stdout)
     );
 }
@@ -865,7 +865,7 @@ fn cli_type_clear_matches_ripgrep_error_status() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .args(["--type-clear", "rust", "-t", "rust", "Sherlock"])
         .arg(&repo.repo)
@@ -879,8 +879,8 @@ fn cli_type_clear_matches_ripgrep_error_status() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert!(!bitfun.stderr.is_empty());
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert!(!codgrep.stderr.is_empty());
 }
 
 #[test]
@@ -902,8 +902,8 @@ fn cli_pattern_file_stdin_matches_ripgrep_output() {
 
     repo.build();
 
-    let mut bitfun = repo.cli();
-    bitfun
+    let mut codgrep = repo.cli();
+    codgrep
         .arg("-f-")
         .arg(&source)
         .stdin(Stdio::piped())
@@ -915,11 +915,11 @@ fn cli_pattern_file_stdin_matches_ripgrep_output() {
         .stdin(Stdio::piped())
         .stdout(Stdio::piped());
 
-    let mut bitfun_child = bitfun.spawn().expect("test should succeed");
+    let mut codgrep_child = codgrep.spawn().expect("test should succeed");
     let mut rg_child = rg.spawn().expect("test should succeed");
 
     use std::io::Write;
-    bitfun_child
+    codgrep_child
         .stdin
         .take()
         .expect("stdin")
@@ -932,14 +932,14 @@ fn cli_pattern_file_stdin_matches_ripgrep_output() {
         .write_all(b"Sherlock\n")
         .expect("test should succeed");
 
-    let bitfun_output = bitfun_child
+    let codgrep_output = codgrep_child
         .wait_with_output()
         .expect("test should succeed");
     let rg_output = rg_child.wait_with_output().expect("test should succeed");
 
-    assert_eq!(bitfun_output.status.code(), rg_output.status.code());
+    assert_eq!(codgrep_output.status.code(), rg_output.status.code());
     assert_eq!(
-        stdout_string(&bitfun_output.stdout),
+        stdout_string(&codgrep_output.stdout),
         stdout_string(&rg_output.stdout)
     );
 }
@@ -951,7 +951,7 @@ fn cli_quiet_files_glob_matches_ripgrep_exit_code() {
 
     repo.build();
 
-    let bitfun = repo
+    let codgrep = repo
         .cli()
         .args(["--quiet", "--files", "--glob", "*.py"])
         .arg(&repo.repo)
@@ -965,6 +965,6 @@ fn cli_quiet_files_glob_matches_ripgrep_exit_code() {
         .output()
         .expect("test should succeed");
 
-    assert_eq!(bitfun.status.code(), rg.status.code());
-    assert!(bitfun.stdout.is_empty());
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert!(codgrep.stdout.is_empty());
 }

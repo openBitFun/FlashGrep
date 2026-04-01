@@ -1,6 +1,7 @@
 use std::{io::Write, time::Duration};
 
 use crate::error::Result;
+use crate::search::{SearchHit, SearchLine, SearchResults};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JsonMessage {
@@ -108,6 +109,10 @@ impl JsonDuration {
         }
     }
 
+    pub fn zero() -> Self {
+        Self::from_duration(Duration::ZERO)
+    }
+
     fn write_json(&self, out: &mut String) {
         out.push('{');
         out.push_str("\"secs\":");
@@ -168,6 +173,31 @@ pub struct JsonSearchReport {
 }
 
 impl JsonSearchReport {
+    /// Converts structured search results into a JSON report shape.
+    ///
+    /// This projection preserves aggregate statistics and line-level snippets,
+    /// but does not retain byte-accurate absolute offsets.
+    pub fn from_search_results(results: &SearchResults) -> Self {
+        let files = results
+            .hits
+            .iter()
+            .map(json_file_from_search_hit)
+            .collect::<Vec<_>>();
+        Self {
+            files,
+            summary: JsonStats {
+                elapsed: JsonDuration::zero(),
+                searches: results.candidate_docs as u64,
+                searches_with_match: results.searches_with_match as u64,
+                bytes_searched: results.bytes_searched,
+                bytes_printed: 0,
+                matched_lines: results.matched_lines as u64,
+                matches: results.matched_occurrences as u64,
+            },
+            elapsed_total: JsonDuration::zero(),
+        }
+    }
+
     pub fn has_match(&self) -> bool {
         self.summary.searches_with_match > 0
     }
@@ -368,6 +398,60 @@ fn write_optional_u64(out: &mut String, value: Option<u64>) {
     }
 }
 
+fn json_file_from_search_hit(hit: &SearchHit) -> JsonSearchFile {
+    let path = JsonData::from_string(hit.path.clone());
+    let mut messages = Vec::new();
+    let mut matched_lines = 0u64;
+    let mut matches = 0u64;
+
+    for line in &hit.lines {
+        match line {
+            SearchLine::Match(file_match) => {
+                matched_lines += 1;
+                matches += 1;
+                let start = file_match.location.column.saturating_sub(1);
+                let end = start.saturating_add(file_match.matched_text.len());
+                messages.push(JsonMessage::Match(JsonMatch {
+                    path: Some(path.clone()),
+                    lines: JsonData::from_string(file_match.snippet.clone()),
+                    line_number: Some(file_match.location.line as u64),
+                    absolute_offset: 0,
+                    submatches: vec![JsonSubmatch {
+                        m: JsonData::from_string(file_match.matched_text.clone()),
+                        start,
+                        end,
+                    }],
+                }));
+            }
+            SearchLine::Context(context) => {
+                messages.push(JsonMessage::Context(JsonContext {
+                    path: Some(path.clone()),
+                    lines: JsonData::from_string(context.snippet.clone()),
+                    line_number: Some(context.line_number as u64),
+                    absolute_offset: 0,
+                    submatches: Vec::new(),
+                }));
+            }
+            SearchLine::ContextBreak => {}
+        }
+    }
+
+    JsonSearchFile {
+        path,
+        messages,
+        binary_offset: None,
+        stats: JsonStats {
+            elapsed: JsonDuration::zero(),
+            searches: 1,
+            searches_with_match: u64::from(matches > 0),
+            bytes_searched: 0,
+            bytes_printed: 0,
+            matched_lines,
+            matches,
+        },
+    }
+}
+
 fn message_len(message: &JsonMessage) -> u64 {
     message.to_line().len() as u64 + 1
 }
@@ -437,4 +521,71 @@ fn base64_standard(bytes: &[u8]) -> String {
         _ => unreachable!("chunks_exact remainder length is at most 2"),
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{JsonMessage, JsonSearchReport};
+    use crate::search::{
+        FileContext, FileMatch, MatchLocation, SearchHit, SearchLine, SearchResults,
+    };
+
+    #[test]
+    fn from_search_results_projects_summary_stats() {
+        let results = SearchResults {
+            candidate_docs: 7,
+            searches_with_match: 2,
+            bytes_searched: 1234,
+            matched_lines: 3,
+            matched_occurrences: 4,
+            hits: Vec::new(),
+        };
+
+        let report = JsonSearchReport::from_search_results(&results);
+        assert_eq!(report.summary.searches, 7);
+        assert_eq!(report.summary.searches_with_match, 2);
+        assert_eq!(report.summary.bytes_searched, 1234);
+        assert_eq!(report.summary.matched_lines, 3);
+        assert_eq!(report.summary.matches, 4);
+    }
+
+    #[test]
+    fn from_search_results_projects_lines_into_file_messages() {
+        let results = SearchResults {
+            candidate_docs: 1,
+            searches_with_match: 1,
+            bytes_searched: 10,
+            matched_lines: 1,
+            matched_occurrences: 1,
+            hits: vec![SearchHit {
+                path: "src/main.rs".into(),
+                matches: vec![FileMatch {
+                    location: MatchLocation { line: 3, column: 5 },
+                    snippet: "let answer = value;".into(),
+                    matched_text: "answer".into(),
+                }],
+                lines: vec![
+                    SearchLine::Match(FileMatch {
+                        location: MatchLocation { line: 3, column: 5 },
+                        snippet: "let answer = value;".into(),
+                        matched_text: "answer".into(),
+                    }),
+                    SearchLine::Context(FileContext {
+                        line_number: 2,
+                        snippet: "fn main() {".into(),
+                    }),
+                    SearchLine::ContextBreak,
+                ],
+            }],
+        };
+
+        let report = JsonSearchReport::from_search_results(&results);
+        assert_eq!(report.files.len(), 1);
+        assert_eq!(report.files[0].messages.len(), 2);
+        assert!(matches!(report.files[0].messages[0], JsonMessage::Match(_)));
+        assert!(matches!(
+            report.files[0].messages[1],
+            JsonMessage::Context(_)
+        ));
+    }
 }

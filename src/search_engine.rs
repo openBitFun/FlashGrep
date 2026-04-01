@@ -9,8 +9,9 @@ use crate::{
     error::{AppError, Result},
     files::{read_text_file, scan_paths, RepositoryFile, ScanOptions},
     index::{
-        build_index,
+        build_index_with_options,
         format::DocMeta,
+        rebuild_index_with_options,
         searcher::{
             verify::{
                 build_matcher, requires_multiline_verification, verify_candidate_sources,
@@ -18,6 +19,7 @@ use crate::{
             },
             CountVerifyKind, CountVerifyPlan, IndexSearcher, IndexWorktreeDiff,
         },
+        IndexBuildOptions,
     },
     json_output::{JsonDuration, JsonSearchFile, JsonSearchReport, JsonStats},
     path_filter::PathFilter,
@@ -43,8 +45,12 @@ pub enum SearchBackend {
     Scan,
 }
 
+/// Complete response for one `SearchEngine` query invocation.
+///
+/// - `backend` records which execution backend was used.
+/// - `results` contains the match payload for that execution.
 #[derive(Debug, Clone)]
-pub struct SearchOutcome {
+pub struct SearchResponse {
     pub backend: SearchBackend,
     pub results: SearchResults,
 }
@@ -73,6 +79,11 @@ impl SearchDocument {
     }
 }
 
+/// Product-facing search facade.
+///
+/// Prefer this type for long-lived service/IDE/agent integrations.
+/// For one-off scripts, crate-level `build_index*`/`rebuild_index*` helpers are
+/// also available.
 #[derive(Debug, Clone)]
 pub struct SearchEngine {
     build_config: BuildConfig,
@@ -86,31 +97,46 @@ impl SearchEngine {
     }
 
     pub fn build_index(&self) -> Result<usize> {
-        build_index(&self.build_config)
+        self.build_index_with_options(IndexBuildOptions::default())
+    }
+
+    pub fn build_index_with_options(&self, options: IndexBuildOptions<'_>) -> Result<usize> {
+        build_index_with_options(&self.build_config, options)
     }
 
     pub fn rebuild_index(&self) -> Result<usize> {
-        build_index(&self.build_config)
+        self.rebuild_index_with_options(IndexBuildOptions::default())
+    }
+
+    pub fn rebuild_index_with_options(&self, options: IndexBuildOptions<'_>) -> Result<usize> {
+        rebuild_index_with_options(&self.build_config, options)
     }
 
     pub fn diff_against_worktree(&self) -> Result<IndexWorktreeDiff> {
         self.open_searcher()?.diff_against_worktree()
     }
 
+    /// Returns a simplified human-readable stale reason, if any.
+    ///
+    /// For structured freshness state, prefer `WorkspaceIndex::probe_freshness`.
     pub fn stale_reason(&self) -> Result<Option<String>> {
         self.open_searcher()?.stale_reason()
     }
 
-    pub fn search(&self, config: &QueryConfig, policy: SearchPolicy) -> Result<SearchOutcome> {
+    pub fn search(&self, config: &QueryConfig, policy: SearchPolicy) -> Result<SearchResponse> {
         self.search_with_filter(config, None, policy)
     }
 
+    /// Convenience search entry with an optional external path filter.
+    ///
+    /// This keeps path-scoping opt-in without introducing additional
+    /// `search_with_*` API variants.
     pub fn search_with_filter(
         &self,
         config: &QueryConfig,
         filter: Option<&PathFilter>,
         policy: SearchPolicy,
-    ) -> Result<SearchOutcome> {
+    ) -> Result<SearchResponse> {
         match self.open_searcher() {
             Ok(searcher) => {
                 let query_prefers_scan = query_prefers_scan(
@@ -134,16 +160,16 @@ impl SearchEngine {
         filter: Option<&PathFilter>,
         policy: SearchPolicy,
         query_prefers_scan: bool,
-    ) -> Result<SearchOutcome> {
+    ) -> Result<SearchResponse> {
         if matches!(policy, SearchPolicy::FallbackToScan) && query_prefers_scan {
             let files = self.scan_repo_files(filter)?;
-            return Ok(SearchOutcome {
+            return Ok(SearchResponse {
                 backend: SearchBackend::Scan,
                 results: search_scanned_files(config, &files)?,
             });
         }
 
-        Ok(SearchOutcome {
+        Ok(SearchResponse {
             backend: SearchBackend::Index,
             results: searcher.search_with_filter(config, filter)?,
         })
@@ -154,7 +180,7 @@ impl SearchEngine {
         config: &QueryConfig,
         filter: Option<&PathFilter>,
         policy: SearchPolicy,
-    ) -> Result<SearchOutcome> {
+    ) -> Result<SearchResponse> {
         match policy {
             SearchPolicy::IndexOnly => Err(AppError::InvalidIndex(format!(
                 "index does not exist at {}",
@@ -162,7 +188,7 @@ impl SearchEngine {
             ))),
             SearchPolicy::FallbackToScan => {
                 let files = self.scan_repo_files(filter)?;
-                Ok(SearchOutcome {
+                Ok(SearchResponse {
                     backend: SearchBackend::Scan,
                     results: search_scanned_files(config, &files)?,
                 })

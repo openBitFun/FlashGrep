@@ -1,5 +1,5 @@
 fn main() {
-    match bitfun_grep::run_cli() {
+    match codgrep::run_cli() {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(error) => {

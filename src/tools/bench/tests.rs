@@ -74,6 +74,7 @@ fn parse_rg_count_output_supports_single_and_multi_file_formats() {
     );
 }
 
+#[cfg(target_os = "linux")]
 #[test]
 fn cold_bench_runs_hook_before_each_iteration() {
     let temp = tempdir().expect("test should succeed");
@@ -188,15 +189,15 @@ fn bench_runner_supports_workspace_and_worktree_runners() {
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "bitfun_worktree_build"));
+        .any(|runner| runner.runner == "codgrep_worktree_build"));
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "bitfun_worktree"));
+        .any(|runner| runner.runner == "codgrep_worktree"));
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "bitfun_workspace"));
+        .any(|runner| runner.runner == "codgrep_workspace"));
 }
 
 #[cfg(unix)]
@@ -309,7 +310,7 @@ fn bench_runner_supports_custom_repo_patterns() {
         filter: None,
         custom_repo: Some(repo_dir),
         custom_patterns: vec!["BitFun".into()],
-        custom_name: Some("bitfun-custom".into()),
+        custom_name: Some("codgrep-custom".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -331,17 +332,17 @@ fn bench_runner_supports_custom_repo_patterns() {
 
     assert_eq!(report.summaries.len(), 1);
     let summary = &report.summaries[0];
-    assert_eq!(summary.name, "bitfun-custom");
+    assert_eq!(summary.name, "codgrep-custom");
     assert_eq!(summary.pattern, "BitFun");
-    assert_eq!(summary.target, "bitfun-custom");
+    assert_eq!(summary.target, "codgrep-custom");
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "bitfun_grep"));
+        .any(|runner| runner.runner == "codgrep"));
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "bitfun_workspace"));
+        .any(|runner| runner.runner == "codgrep_workspace"));
 }
 
 #[test]
@@ -359,7 +360,7 @@ fn bench_runner_supports_custom_worktree_build_runner() {
         filter: None,
         custom_repo: Some(repo_dir),
         custom_patterns: vec!["BitFun".into()],
-        custom_name: Some("bitfun-worktree".into()),
+        custom_name: Some("codgrep-worktree".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -384,11 +385,11 @@ fn bench_runner_supports_custom_worktree_build_runner() {
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "bitfun_worktree_build"));
+        .any(|runner| runner.runner == "codgrep_worktree_build"));
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "bitfun_worktree"));
+        .any(|runner| runner.runner == "codgrep_worktree"));
 }
 
 #[test]
@@ -435,16 +436,16 @@ fn bench_report_labels_worktree_runner_modes() {
 
     let rendered = render_report(&report);
     let base = rendered
-        .find("bitfun_grep [base-index]")
+        .find("codgrep [base-index]")
         .expect("test should succeed");
     let workspace = rendered
-        .find("bitfun_workspace [workspace-snapshot]")
+        .find("codgrep_workspace [workspace-snapshot]")
         .expect("test should succeed");
     let worktree_build = rendered
-        .find("bitfun_worktree_build [dirty-first-query]")
+        .find("codgrep_worktree_build [dirty-first-query]")
         .expect("test should succeed");
     let worktree_cached = rendered
-        .find("bitfun_worktree [dirty-cached-query]")
+        .find("codgrep_worktree [dirty-cached-query]")
         .expect("test should succeed");
 
     assert!(base < workspace);
@@ -503,16 +504,16 @@ fn bench_raw_output_includes_runner_family_and_mode() {
     );
     assert!(lines
         .iter()
-        .any(|line| line.contains(",bitfun_grep,bitfun,base_index,")));
+        .any(|line| line.contains(",codgrep,codgrep,base_index,")));
     assert!(lines
         .iter()
-        .any(|line| line.contains(",bitfun_workspace,bitfun,workspace_snapshot,")));
+        .any(|line| line.contains(",codgrep_workspace,codgrep,workspace_snapshot,")));
     assert!(lines
         .iter()
-        .any(|line| line.contains(",bitfun_worktree_build,bitfun,dirty_first_query,")));
+        .any(|line| line.contains(",codgrep_worktree_build,codgrep,dirty_first_query,")));
     assert!(lines
         .iter()
-        .any(|line| line.contains(",bitfun_worktree,bitfun,dirty_cached_query,")));
+        .any(|line| line.contains(",codgrep_worktree,codgrep,dirty_cached_query,")));
 }
 
 #[test]
@@ -534,7 +535,7 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
         filter: None,
         custom_repo: Some(repo_dir),
         custom_patterns: vec!["BitFun".into(), "Search".into()],
-        custom_name: Some("bitfun-trace".into()),
+        custom_name: Some("codgrep-trace".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -556,9 +557,9 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
 
     assert_eq!(report.summaries.len(), 1);
     let summary = &report.summaries[0];
-    assert_eq!(summary.name, "bitfun-trace");
+    assert_eq!(summary.name, "codgrep-trace");
     assert_eq!(summary.pattern, "trace[2]");
-    assert_eq!(summary.target, "bitfun-trace");
+    assert_eq!(summary.target, "codgrep-trace");
     assert!(summary
         .runners
         .iter()

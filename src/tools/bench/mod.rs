@@ -24,7 +24,7 @@ use self::{
     fixtures::prepare_dirty_worktree_fixture,
     report::{print_report as print_report_impl, RawWriter},
     standard::{
-        run_bitfun_benchmark, run_bitfun_cli_benchmark, run_rg_benchmark, run_workspace_benchmark,
+        run_codgrep_benchmark, run_codgrep_cli_benchmark, run_rg_benchmark, run_workspace_benchmark,
         run_worktree_benchmark,
     },
 };
@@ -374,7 +374,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
     for corpus in corpora {
         ensure_corpus_exists(corpus, &config.suite_dir)?;
         let repo_path = corpus.repo_path(&config.suite_dir);
-        let index_path = config.suite_dir.join(".bitfun-bench").join(format!(
+        let index_path = config.suite_dir.join(".codgrep-bench").join(format!(
             "{}-{}-{}",
             corpus.label(),
             config.corpus_mode.as_str(),
@@ -449,7 +449,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             ))
         })?;
         let cache_paths = cache_paths.get(&benchmark.corpus);
-        let mut runners = vec![run_bitfun_benchmark(
+        let mut runners = vec![run_codgrep_benchmark(
             benchmark,
             index_path,
             cache_paths,
@@ -458,7 +458,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
         )?];
 
         if config.compare_cli {
-            runners.push(run_bitfun_cli_benchmark(
+            runners.push(run_codgrep_cli_benchmark(
                 benchmark,
                 index_path,
                 &config.suite_dir,

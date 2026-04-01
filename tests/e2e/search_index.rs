@@ -7,10 +7,11 @@ use std::{
     time::{Duration, SystemTime},
 };
 
-use bitfun_grep::{
-    files::repo_relative_path,
-    index::format::{read_doc_terms_file, read_docs_file, IndexLayout},
-    build_index, IndexSearcher, BuildConfig, QueryConfig, SearchMode, TokenizerMode,
+use codgrep::{
+    advanced::{repo_relative_path, IndexSearcher},
+    build_index,
+    experimental::index_format::{read_doc_terms_file, read_docs_file, IndexLayout},
+    BuildConfig, QueryConfig, SearchMode, TokenizerMode,
 };
 use tempfile::tempdir;
 
@@ -228,7 +229,7 @@ fn build_keeps_commit_snapshot_when_git_worktree_is_dirty() {
 }
 
 #[test]
-fn build_ignores_untracked_bitfun_artifacts_when_detecting_dirty_worktree() {
+fn build_ignores_untracked_codgrep_artifacts_when_detecting_dirty_worktree() {
     let repo = TestRepo::new();
     repo.init_git();
     repo.write("root.txt", "const ROOT: &str = \"ROOT\";\n");
@@ -236,7 +237,10 @@ fn build_ignores_untracked_bitfun_artifacts_when_detecting_dirty_worktree() {
 
     let nested_source = tempdir().expect("test should succeed");
     run_git_in(nested_source.path(), &["init"]);
-    run_git_in(nested_source.path(), &["config", "user.name", "Nested User"]);
+    run_git_in(
+        nested_source.path(),
+        &["config", "user.name", "Nested User"],
+    );
     run_git_in(
         nested_source.path(),
         &["config", "user.email", "nested@example.com"],
@@ -269,7 +273,7 @@ fn build_ignores_untracked_bitfun_artifacts_when_detecting_dirty_worktree() {
     );
     repo.commit_all("add nested submodule");
 
-    repo.write(".bitfun-index/CURRENT", "stale\n");
+    repo.write(".codgrep-index/CURRENT", "stale\n");
 
     let external_index = tempdir().expect("test should succeed");
     let index_path = external_index.path().join("index");

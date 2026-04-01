@@ -2,6 +2,7 @@ use std::{
     fs::File,
     io::{self, BufRead, BufReader},
     path::{Path, PathBuf},
+    process::Output,
 };
 
 use crate::{
@@ -17,6 +18,7 @@ use super::SearchArgs;
 pub(super) struct SearchRequest {
     pub(super) index_path: PathBuf,
     pub(super) current_dir: PathBuf,
+    pub(super) raw_search_paths: Vec<PathBuf>,
     pub(super) search_paths: Vec<PathBuf>,
     pub(super) used_default_search_path: bool,
     pub(super) path_filter: PathFilter,
@@ -171,6 +173,7 @@ impl SearchRequest {
         Ok(Self {
             index_path,
             current_dir,
+            raw_search_paths: paths,
             search_paths: normalized_paths,
             used_default_search_path,
             path_filter,
@@ -203,6 +206,52 @@ impl SearchRequest {
             max_depth: args.max_depth,
             max_file_size: args.max_filesize,
         })
+    }
+
+    pub(super) fn run_ripgrep_files(&self) -> Result<Output> {
+        let mut command = std::process::Command::new("rg");
+        command.current_dir(&self.current_dir);
+        command.arg("--color=never");
+        command.arg("--files");
+        if self.include_hidden {
+            command.arg("--hidden");
+        }
+        if self.no_ignore {
+            command.arg("--no-ignore");
+        }
+        if let Some(max_depth) = self.max_depth {
+            command.arg("--max-depth").arg(max_depth.to_string());
+        }
+        if let Some(max_file_size) = self.max_file_size {
+            command.arg("--max-filesize").arg(max_file_size.to_string());
+        }
+        for glob in &self.globs {
+            command.arg("-g").arg(glob);
+        }
+        for iglob in &self.iglobs {
+            command.arg("--iglob").arg(iglob);
+        }
+        for definition in &self.type_add {
+            command.arg("--type-add").arg(definition);
+        }
+        for name in &self.type_clear {
+            command.arg("--type-clear").arg(name);
+        }
+        for name in &self.types {
+            command.arg("-t").arg(name);
+        }
+        for name in &self.type_not {
+            command.arg("-T").arg(name);
+        }
+        for ignore_file in &self.ignore_files {
+            command.arg("--ignore-file").arg(ignore_file);
+        }
+        if !self.used_default_search_path {
+            for root in &self.raw_search_paths {
+                command.arg(root);
+            }
+        }
+        Ok(command.output()?)
     }
 }
 
@@ -336,7 +385,7 @@ pub(super) fn default_print_path(paths: &[PathBuf]) -> bool {
 
 pub(super) fn infer_index_path(paths: &[PathBuf], current_dir: &Path) -> PathBuf {
     let root = common_search_root(paths).unwrap_or_else(|| current_dir.to_path_buf());
-    root.join(".bitfun-index")
+    root.join(".codgrep-index")
 }
 
 fn common_search_root(paths: &[PathBuf]) -> Option<PathBuf> {

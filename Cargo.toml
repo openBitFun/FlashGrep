@@ -1,7 +1,11 @@
 [package]
-name = "bitfun_grep"
+name = "codgrep"
 version = "0.1.0"
 edition = "2021"
+
+[[bin]]
+name = "cg"
+path = "src/main.rs"
 
 [dependencies]
 aho-corasick = "1.1.4"
