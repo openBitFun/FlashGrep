@@ -1,6 +1,7 @@
 mod runtime;
 
 use std::{
+    fs,
     io::ErrorKind,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -13,14 +14,8 @@ use crate::{
     index::{
         build_index_with_options,
         format::{read_docs_file, IndexLayout},
-        overlay::{
-            current_base_snapshot_key, ensure_fresh_overlay_with_progress_and_cancel,
-            prune_overlay_caches, read_overlay_snapshot, read_overlay_state, OverlaySnapshotInfo,
-            OverlaySnapshotState,
-        },
         IndexBuildOptions, IndexSearcher, IndexWorktreeDiff,
     },
-    progress::IndexProgress,
     search::SearchResults,
     search_engine::search_documents,
     QueryConfig, TokenizerMode,
@@ -28,36 +23,20 @@ use crate::{
 
 use self::runtime::{
     candidate_documents as workspace_candidate_documents, scan_text_repository_files,
-    CachedOverlayRef,
 };
 
 /// Options for opening a [`WorkspaceIndex`].
 ///
-/// This facade exposes a two-layer view over an indexed repository:
-/// a stable base snapshot plus an optional dirty-worktree overlay.
+/// This facade exposes the current workspace view over a stable base snapshot.
 #[derive(Debug, Clone)]
 pub struct WorkspaceIndexOptions {
     /// Build-time/index-location configuration for the workspace.
     pub build_config: BuildConfig,
-    /// Legacy compatibility toggle.
-    ///
-    /// Query paths no longer refresh overlays automatically; callers should
-    /// invoke [`WorkspaceIndex::refresh_overlay`] explicitly when they need
-    /// fresher dirty-worktree coverage.
-    pub auto_refresh_overlay: bool,
-    /// Maximum number of overlay caches to retain per base snapshot.
-    ///
-    /// `None` disables automatic pruning.
-    pub overlay_cache_limit: Option<usize>,
 }
 
 impl From<BuildConfig> for WorkspaceIndexOptions {
     fn from(build_config: BuildConfig) -> Self {
-        Self {
-            build_config,
-            auto_refresh_overlay: false,
-            overlay_cache_limit: Some(8),
-        }
+        Self { build_config }
     }
 }
 
@@ -66,7 +45,7 @@ impl From<BuildConfig> for WorkspaceIndexOptions {
 pub struct BaseSnapshotInfo {
     /// Stable cache key for the base snapshot.
     pub snapshot_key: String,
-    /// Root directory that stores base and overlay index data.
+    /// Root directory that stores base snapshot index data.
     pub index_path: PathBuf,
     /// Repository root for this workspace.
     pub repo_path: PathBuf,
@@ -84,11 +63,8 @@ pub struct BaseSnapshotInfo {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BaseSnapshotKind {
-    /// Snapshot materialized from a concrete Git commit.
     GitCommit,
-    /// Snapshot materialized from a non-Git repository fingerprint.
     RepositoryFallback,
-    /// Older on-disk snapshot that predates the current identity model.
     Legacy,
 }
 
@@ -97,8 +73,6 @@ pub enum BaseSnapshotKind {
 pub struct IndexStatus {
     /// Metadata for the current base snapshot, if one exists on disk.
     pub base: Option<BaseSnapshotInfo>,
-    /// Metadata for the currently active overlay cache, if one exists.
-    pub overlay: Option<OverlaySnapshotInfo>,
     /// Worktree diff against the base snapshot, if the base index can be opened.
     pub dirty_files: Option<IndexWorktreeDiff>,
 }
@@ -106,11 +80,8 @@ pub struct IndexStatus {
 /// High-level freshness state for the currently opened workspace index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum WorkspaceFreshnessState {
-    /// No base snapshot exists on disk yet.
     MissingBaseSnapshot,
-    /// Base snapshot exists and worktree currently matches it.
     Fresh,
-    /// Base snapshot exists but worktree has drifted.
     Stale,
 }
 
@@ -123,8 +94,6 @@ pub struct WorkspaceFreshness {
     pub state: WorkspaceFreshnessState,
     /// Active base snapshot key, when available.
     pub base_snapshot_key: Option<String>,
-    /// Active overlay key, when available.
-    pub active_overlay_key: Option<String>,
     /// Number of tracked files changed since base snapshot.
     pub modified_files: usize,
     /// Number of tracked files deleted since base snapshot.
@@ -142,44 +111,23 @@ impl WorkspaceFreshness {
         self.state == WorkspaceFreshnessState::MissingBaseSnapshot
     }
 
-    pub fn needs_overlay_refresh(&self) -> bool {
-        self.state == WorkspaceFreshnessState::Stale
-    }
-
     pub fn dirty_file_count(&self) -> usize {
         self.modified_files + self.deleted_files + self.new_files
     }
 }
 
-/// High-level workspace facade for base snapshot management, overlay refresh,
-/// and searching against the latest effective repository view.
-///
-/// Prefer this type when your integration needs freshness orchestration:
-/// base snapshot lifecycle, overlay refresh, and probe caching.
+/// High-level workspace facade for base snapshot management and searching
+/// against the current effective repository view.
 #[derive(Clone)]
 pub struct WorkspaceIndex {
     inner: Arc<WorkspaceIndexInner>,
 }
 
 /// Reusable read-only workspace view captured at a point in time.
-///
-/// A snapshot may resolve to:
-/// - an indexed clean base view,
-/// - an indexed dirty view backed by an overlay cache, or
-/// - a scan fallback when no index exists yet.
-///
-/// This type exists to provide a stable read view across multiple queries,
-/// even while workspace state may keep changing.
 #[derive(Clone)]
 pub struct WorkspaceSnapshot {
     workspace: Arc<WorkspaceIndexInner>,
     view: WorkspaceReadView,
-}
-
-#[derive(Clone)]
-struct CachedOverlay {
-    state: OverlaySnapshotState,
-    searcher: Arc<IndexSearcher>,
 }
 
 #[derive(Clone)]
@@ -190,7 +138,6 @@ enum WorkspaceReadView {
     IndexedDirty {
         searcher: Arc<IndexSearcher>,
         diff: IndexWorktreeDiff,
-        overlay: Option<CachedOverlay>,
     },
     ScanFallback,
 }
@@ -216,13 +163,10 @@ struct CachedFreshnessProbe {
 impl WorkspaceIndex {
     /// Opens a workspace facade over the configured repository and index root.
     pub fn open(options: WorkspaceIndexOptions) -> Result<Self> {
-        let build_config = options.build_config.normalized()?;
         Ok(Self {
             inner: Arc::new(WorkspaceIndexInner {
                 options: WorkspaceIndexOptions {
-                    build_config,
-                    auto_refresh_overlay: options.auto_refresh_overlay,
-                    overlay_cache_limit: options.overlay_cache_limit,
+                    build_config: options.build_config.normalized()?,
                 },
                 cached_searcher: Mutex::new(None),
                 cached_freshness: Mutex::new(None),
@@ -244,93 +188,18 @@ impl WorkspaceIndex {
         self.base_snapshot_info()
     }
 
-    /// Refreshes the dirty-worktree overlay cache if the worktree is dirty.
-    ///
-    /// Returns `Ok(None)` when the worktree matches the base snapshot.
-    pub fn refresh_overlay(&self) -> Result<Option<OverlaySnapshotInfo>> {
-        self.refresh_overlay_with_progress(|_| {})
-    }
-
-    pub fn refresh_overlay_with_progress<F>(
-        &self,
-        on_progress: F,
-    ) -> Result<Option<OverlaySnapshotInfo>>
-    where
-        F: FnMut(IndexProgress),
-    {
-        self.refresh_overlay_with_progress_and_cancel(on_progress, || false)
-    }
-
-    pub fn refresh_overlay_with_progress_and_cancel<F, C>(
-        &self,
-        mut on_progress: F,
-        mut should_cancel: C,
-    ) -> Result<Option<OverlaySnapshotInfo>>
-    where
-        F: FnMut(IndexProgress),
-        C: FnMut() -> bool,
-    {
-        self.clear_freshness_probe_cache();
-        if self.base_snapshot_info().is_err() {
-            let _ = self.ensure_base_snapshot_with_options(
-                IndexBuildOptions::new()
-                    .with_progress(&mut on_progress)
-                    .with_cancel(&mut should_cancel),
-            )?;
-        }
-
-        let searcher = self.open_searcher()?;
-        let diff = searcher.diff_against_worktree()?;
-        if diff.is_empty() {
-            return Ok(None);
-        }
-
-        let overlay = ensure_fresh_overlay_with_progress_and_cancel(
-            &self.inner.options.build_config,
-            &diff,
-            &mut on_progress,
-            &mut should_cancel,
-        )?
-        .map(|state| state.info)
-        .ok_or_else(|| crate::AppError::InvalidIndex("failed to refresh overlay".into()))?;
-        self.prune_overlay_cache_with_configured_limit()?;
-        Ok(Some(overlay))
-    }
-
-    /// Prunes cached overlay generations under the configured index root.
-    ///
-    /// The `keep_per_base` limit is applied independently per base snapshot.
-    pub fn prune_overlay_cache(&self, keep_per_base: usize) -> Result<usize> {
-        prune_overlay_caches(&self.inner.options.build_config.index_path, keep_per_base)
-    }
-
-    /// Reports the current base snapshot, active overlay, and worktree diff state.
+    /// Reports the current base snapshot and worktree diff state.
     pub fn status(&self) -> Result<IndexStatus> {
         let base = self.base_snapshot_info().ok();
         let dirty_files = match self.open_searcher() {
             Ok(searcher) => Some(searcher.diff_against_worktree()?),
-            Err(crate::AppError::Io(error)) if error.kind() == ErrorKind::NotFound => None,
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
-        let overlay = if let Some(base) = &base {
-            read_overlay_snapshot(
-                &self.inner.options.build_config.index_path,
-                &base.snapshot_key,
-            )?
-        } else {
-            None
-        };
-
-        Ok(IndexStatus {
-            base,
-            overlay,
-            dirty_files,
-        })
+        Ok(IndexStatus { base, dirty_files })
     }
 
     /// Performs a full freshness probe against the current worktree.
-    ///
-    /// This always scans current file metadata and does not mutate index state.
     pub fn probe_freshness(&self) -> Result<WorkspaceFreshness> {
         let probe = self.compute_freshness_probe()?;
         self.cache_freshness_probe(probe.clone());
@@ -339,8 +208,6 @@ impl WorkspaceIndex {
 
     /// Returns a cached freshness probe when still within `ttl`; otherwise runs
     /// a new full probe.
-    ///
-    /// "if due" means the previous probe age has exceeded `ttl`.
     pub fn probe_freshness_if_due(&self, ttl: Duration) -> Result<WorkspaceFreshness> {
         if !ttl.is_zero() {
             let cached = match self.inner.cached_freshness.lock() {
@@ -358,11 +225,6 @@ impl WorkspaceIndex {
     }
 
     /// Searches the current effective workspace view.
-    ///
-    /// Depending on configuration and current state this may query:
-    /// - the clean base index,
-    /// - the currently activated base+overlay snapshot view, or
-    /// - a scan fallback when no index exists.
     pub fn search(&self, query: &QueryConfig) -> Result<SearchResults> {
         self.snapshot()?.search(query)
     }
@@ -371,26 +233,12 @@ impl WorkspaceIndex {
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
         match self.open_searcher() {
             Ok(searcher) => {
-                let snapshot_key = self.current_snapshot_key_on_disk()?;
-                let overlay =
-                    read_overlay_state(&self.inner.options.build_config.index_path, &snapshot_key)?
-                        .map(|state| -> Result<CachedOverlay> {
-                            Ok(CachedOverlay {
-                                searcher: Arc::new(IndexSearcher::open(state.data_path.clone())?),
-                                state,
-                            })
-                        })
-                        .transpose()?;
-                let view = if let Some(overlay) = overlay {
-                    WorkspaceReadView::IndexedDirty {
-                        searcher,
-                        diff: shadow_diff_from_overlay_state(&overlay.state),
-                        overlay: Some(overlay),
-                    }
-                } else {
+                let diff = searcher.diff_against_worktree()?;
+                let view = if diff.is_empty() {
                     WorkspaceReadView::IndexedClean { searcher }
+                } else {
+                    WorkspaceReadView::IndexedDirty { searcher, diff }
                 };
-                self.prune_overlay_cache_with_configured_limit()?;
                 Ok(WorkspaceSnapshot {
                     workspace: Arc::clone(&self.inner),
                     view,
@@ -408,14 +256,7 @@ impl WorkspaceIndex {
 
     fn base_snapshot_info(&self) -> Result<BaseSnapshotInfo> {
         let layout = IndexLayout::resolve(&self.inner.options.build_config.index_path)?;
-        let snapshot_key = current_base_snapshot_key(&self.inner.options.build_config.index_path)?
-            .or_else(|| {
-                layout
-                    .data_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .ok_or_else(|| crate::AppError::InvalidIndex("base generation is missing".into()))?;
+        let snapshot_key = self.current_snapshot_key_on_disk()?;
         let (metadata, docs) = read_docs_file(&layout.docs_path)?;
         let snapshot_kind = if snapshot_key.starts_with("base-git-") {
             BaseSnapshotKind::GitCommit
@@ -466,35 +307,27 @@ impl WorkspaceIndex {
 
     fn current_snapshot_key_on_disk(&self) -> Result<String> {
         let layout = IndexLayout::resolve(&self.inner.options.build_config.index_path)?;
-        current_base_snapshot_key(&self.inner.options.build_config.index_path)?
-            .or_else(|| {
-                layout
-                    .data_path
-                    .file_name()
-                    .map(|name| name.to_string_lossy().into_owned())
-            })
-            .ok_or_else(|| crate::AppError::InvalidIndex("base generation is missing".into()))
-    }
-
-    fn prune_overlay_cache_with_configured_limit(&self) -> Result<()> {
-        if let Some(limit) = self.inner.options.overlay_cache_limit {
-            let _ = self.prune_overlay_cache(limit)?;
+        let current_path = IndexLayout::current_path(&self.inner.options.build_config.index_path);
+        if current_path.exists() {
+            let generation = fs::read_to_string(current_path)?;
+            let generation = generation.trim();
+            if generation.is_empty() {
+                return Err(AppError::InvalidIndex(
+                    "base generation is missing from CURRENT".into(),
+                ));
+            }
+            return Ok(generation.to_string());
         }
-        Ok(())
+        layout
+            .data_path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .ok_or_else(|| AppError::InvalidIndex("base generation is missing".into()))
     }
 
     fn compute_freshness_probe(&self) -> Result<WorkspaceFreshness> {
         let checked_at = SystemTime::now();
         let base = self.base_snapshot_info().ok();
-        let active_overlay_key = if let Some(base) = &base {
-            read_overlay_snapshot(
-                &self.inner.options.build_config.index_path,
-                &base.snapshot_key,
-            )?
-            .map(|overlay| overlay.overlay_key)
-        } else {
-            None
-        };
 
         match self.open_searcher() {
             Ok(searcher) => {
@@ -508,7 +341,6 @@ impl WorkspaceIndex {
                     checked_at,
                     state,
                     base_snapshot_key: base.map(|base| base.snapshot_key),
-                    active_overlay_key,
                     modified_files: diff.modified_files.len(),
                     deleted_files: diff.deleted_files.len(),
                     new_files: diff.new_files.len(),
@@ -519,7 +351,6 @@ impl WorkspaceIndex {
                     checked_at,
                     state: WorkspaceFreshnessState::MissingBaseSnapshot,
                     base_snapshot_key: None,
-                    active_overlay_key: None,
                     modified_files: 0,
                     deleted_files: 0,
                     new_files: 0,
@@ -554,19 +385,9 @@ impl WorkspaceSnapshot {
     pub fn search(&self, query: &QueryConfig) -> Result<SearchResults> {
         match &self.view {
             WorkspaceReadView::IndexedClean { searcher } => searcher.search(query),
-            WorkspaceReadView::IndexedDirty {
-                searcher,
-                diff,
-                overlay,
-            } => {
-                let documents = workspace_candidate_documents(
-                    searcher,
-                    diff,
-                    query,
-                    &self.workspace.options.build_config,
-                    cached_overlay_ref(overlay.as_ref()),
-                )?
-                .into_documents();
+            WorkspaceReadView::IndexedDirty { searcher, diff } => {
+                let documents =
+                    workspace_candidate_documents(searcher, diff, query)?.into_documents();
                 search_documents(query, &documents)
             }
             WorkspaceReadView::ScanFallback => search_documents(
@@ -577,23 +398,6 @@ impl WorkspaceSnapshot {
     }
 }
 
-fn cached_overlay_ref(overlay: Option<&CachedOverlay>) -> Option<CachedOverlayRef<'_>> {
-    overlay.map(|overlay| CachedOverlayRef {
-        state: &overlay.state,
-        searcher: overlay.searcher.as_ref(),
-    })
-}
-
-fn shadow_diff_from_overlay_state(state: &OverlaySnapshotState) -> IndexWorktreeDiff {
-    let mut modified_files = state.shadowed_paths.iter().cloned().collect::<Vec<_>>();
-    modified_files.sort_unstable();
-    IndexWorktreeDiff {
-        modified_files,
-        deleted_files: Vec::new(),
-        new_files: Vec::new(),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf, time::Duration};
@@ -601,7 +405,8 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions, WorkspaceReadView,
+        BaseSnapshotKind, WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions,
+        WorkspaceReadView,
     };
     use crate::{
         build_index,
@@ -629,12 +434,8 @@ mod tests {
             }
         }
 
-        fn path(&self, relative: &str) -> PathBuf {
-            self.repo.join(relative)
-        }
-
         fn write(&self, relative: &str, contents: &str) -> PathBuf {
-            let path = self.path(relative);
+            let path = self.repo.join(relative);
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent).expect("parent dir should succeed");
             }
@@ -655,10 +456,8 @@ mod tests {
             }
         }
 
-        fn build(&self) -> BuildConfig {
-            let config = self.build_config();
-            build_index(&config).expect("build should succeed");
-            config
+        fn build(&self) {
+            build_index(&self.build_config()).expect("build should succeed");
         }
     }
 
@@ -671,37 +470,13 @@ mod tests {
     }
 
     #[test]
-    fn workspace_snapshot_uses_scan_fallback_view_when_index_is_missing() {
+    fn workspace_snapshot_uses_indexed_clean_view_when_worktree_matches_base() {
         let repo = TestRepo::new();
-        let source = repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");
+        let source = repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
+        repo.build();
 
         let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
             build_config: repo.build_config(),
-            auto_refresh_overlay: false,
-            overlay_cache_limit: None,
-        })
-        .expect("workspace should open");
-        let snapshot = workspace.snapshot().expect("snapshot should open");
-
-        assert!(matches!(snapshot.view, WorkspaceReadView::ScanFallback));
-
-        let results = snapshot
-            .search(&query("PM_RESUME"))
-            .expect("search should succeed");
-        assert_eq!(results.hits.len(), 1);
-        assert_eq!(results.hits[0].path, source.to_string_lossy());
-    }
-
-    #[test]
-    fn workspace_snapshot_uses_indexed_clean_view_for_clean_worktree() {
-        let repo = TestRepo::new();
-        let source = repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");
-        let _ = repo.build();
-
-        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
-            build_config: repo.build_config(),
-            auto_refresh_overlay: false,
-            overlay_cache_limit: None,
         })
         .expect("workspace should open");
         let snapshot = workspace.snapshot().expect("snapshot should open");
@@ -719,30 +494,22 @@ mod tests {
     }
 
     #[test]
-    fn workspace_snapshot_uses_indexed_dirty_view_when_overlay_is_active() {
+    fn workspace_snapshot_uses_indexed_dirty_view_when_worktree_is_dirty() {
         let repo = TestRepo::new();
         repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
         let added = repo.write("added.rs", "const NAME: &str = \"OTHER\";\n");
-        let _ = repo.build();
+        repo.build();
         repo.write("added.rs", "const NAME: &str = \"DIRTY\";\n");
 
         let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
             build_config: repo.build_config(),
-            auto_refresh_overlay: false,
-            overlay_cache_limit: None,
         })
         .expect("workspace should open");
-        workspace
-            .refresh_overlay()
-            .expect("overlay refresh should succeed");
         let snapshot = workspace.snapshot().expect("snapshot should open");
 
         assert!(matches!(
             snapshot.view,
-            WorkspaceReadView::IndexedDirty {
-                overlay: Some(_),
-                ..
-            }
+            WorkspaceReadView::IndexedDirty { .. }
         ));
 
         let results = snapshot
@@ -757,8 +524,6 @@ mod tests {
         let repo = TestRepo::new();
         let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
             build_config: repo.build_config(),
-            auto_refresh_overlay: false,
-            overlay_cache_limit: None,
         })
         .expect("workspace should open");
 
@@ -775,13 +540,11 @@ mod tests {
     fn workspace_probe_freshness_reports_stale_after_new_file() {
         let repo = TestRepo::new();
         repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
-        let _ = repo.build();
+        repo.build();
         repo.write("added.rs", "const NAME: &str = \"DIRTY\";\n");
 
         let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
             build_config: repo.build_config(),
-            auto_refresh_overlay: false,
-            overlay_cache_limit: None,
         })
         .expect("workspace should open");
 
@@ -791,19 +554,16 @@ mod tests {
         assert_eq!(probe.state, WorkspaceFreshnessState::Stale);
         assert_eq!(probe.new_files, 1);
         assert_eq!(probe.dirty_file_count(), 1);
-        assert!(probe.needs_overlay_refresh());
     }
 
     #[test]
     fn workspace_probe_freshness_if_due_reuses_cache_until_ttl_expires() {
         let repo = TestRepo::new();
         repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
-        let _ = repo.build();
+        repo.build();
 
         let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
             build_config: repo.build_config(),
-            auto_refresh_overlay: false,
-            overlay_cache_limit: None,
         })
         .expect("workspace should open");
 
@@ -824,5 +584,55 @@ mod tests {
             .expect("fresh freshness probe should succeed");
         assert_eq!(refreshed.state, WorkspaceFreshnessState::Stale);
         assert_eq!(refreshed.new_files, 1);
+    }
+
+    #[test]
+    fn workspace_exposes_git_snapshot_identity() {
+        let repo = TestRepo::new();
+        let git_repo = repo.repo.clone();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .expect("git config should succeed");
+        repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["add", "."])
+            .status()
+            .expect("git add should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["commit", "-qm", "initial"])
+            .status()
+            .expect("git commit should succeed");
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+
+        let base = workspace
+            .ensure_base_snapshot()
+            .expect("base snapshot should build");
+        assert_eq!(base.snapshot_kind, BaseSnapshotKind::GitCommit);
+        assert!(base.snapshot_key.starts_with("base-git-"));
+        assert!(base.head_commit.is_some());
+        assert!(base.config_fingerprint.is_some());
     }
 }

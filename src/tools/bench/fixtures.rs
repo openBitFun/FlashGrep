@@ -13,7 +13,6 @@ use crate::{
     error::{AppError, Result},
     files::{read_text_file, scan_paths, ScanOptions},
     index::build_index,
-    WorkspaceIndex, WorkspaceIndexOptions,
 };
 
 use super::{
@@ -90,13 +89,6 @@ pub(super) fn prepare_dirty_worktree_fixture(
     } else {
         None
     };
-
-    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
-        build_config: build_config.clone(),
-        auto_refresh_overlay: false,
-        overlay_cache_limit: None,
-    })?;
-    let _ = workspace.refresh_overlay()?;
 
     let cache_paths = if config.cache_mode.is_cold() {
         Some(collect_cache_paths_for_target(

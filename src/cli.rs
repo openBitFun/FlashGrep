@@ -8,7 +8,7 @@ mod output;
 mod request;
 
 use crate::{
-    config::{BuildConfig, CorpusMode, TokenizerMode},
+    config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
     error::{AppError, Result},
     index::build_index,
     search::FileCount,
@@ -17,7 +17,8 @@ use crate::{
 };
 use execution::{
     execute_count_matches, execute_count_total_matches, execute_files_with_matches,
-    execute_files_without_matches, execute_search, execute_search_json,
+    execute_files_without_matches, execute_has_match, execute_search, execute_search_json,
+    SearchExecution,
 };
 use output::{
     format_output_path, print_counts, print_output_line, print_paths, print_stats,
@@ -98,9 +99,9 @@ struct BenchArgs {
     bench_iter: usize,
     #[arg(long, default_value_t = 6)]
     top_k_tokens: usize,
+    #[arg(long = "compare-index", alias = "compare-cli", default_value_t = false)]
+    compare_index: bool,
     #[arg(long, action = ArgAction::Set, default_value_t = true)]
-    compare_cli: bool,
-    #[arg(long, default_value_t = false)]
     compare_rg: bool,
     #[arg(long, default_value_t = false)]
     compare_worktree: bool,
@@ -327,7 +328,7 @@ pub(crate) fn run() -> Result<bool> {
             warmup_iter: args.warmup_iter,
             bench_iter: args.bench_iter,
             top_k_tokens: args.top_k_tokens,
-            compare_cli: args.compare_cli,
+            compare_index: args.compare_index,
             compare_rg: args.compare_rg,
             compare_worktree: args.compare_worktree,
             compare_workspace: args.compare_workspace,
@@ -418,12 +419,15 @@ fn run_search(args: SearchArgs) -> Result<bool> {
     };
 
     let execution = request.prepare_query_execution(config)?;
+    if matches!(execution, SearchExecution::Ripgrep { .. }) {
+        return passthrough_ripgrep_query(&request, config);
+    }
 
     if request.quiet && !request.files_without_match && !request.stats {
         if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        return Ok(execute_search(&execution, config, request.filter())?.has_match());
+        return Ok(execute_has_match(&execution, config, request.filter())?);
     }
 
     if request.json {
@@ -666,6 +670,27 @@ fn run_bench(config: BenchConfig) -> Result<bool> {
     let report = bench::run(&config)?;
     bench::print_report(&report);
     Ok(true)
+}
+
+fn passthrough_ripgrep_query(request: &SearchRequest, config: &QueryConfig) -> Result<bool> {
+    let output = request.run_ripgrep_query(config)?;
+    if output.status.success() || output.status.code() == Some(1) {
+        std::io::stdout().write_all(&output.stdout)?;
+        std::io::stderr().write_all(&output.stderr)?;
+        return Ok(output.status.success());
+    }
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if stderr.contains("No files were searched") {
+        return Err(AppError::NoFilesSearched);
+    }
+    if stderr.trim().is_empty() {
+        return Err(AppError::InvalidIndex(format!(
+            "rg fallback failed with status {}",
+            output.status
+        )));
+    }
+    Err(AppError::InvalidIndex(stderr.trim_end().to_string()))
 }
 
 #[cfg(test)]

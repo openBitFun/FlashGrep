@@ -8,6 +8,7 @@ mod tests;
 
 use std::{
     collections::BTreeMap,
+    env,
     path::{Path, PathBuf},
 };
 
@@ -24,8 +25,8 @@ use self::{
     fixtures::prepare_dirty_worktree_fixture,
     report::{print_report as print_report_impl, RawWriter},
     standard::{
-        run_codgrep_benchmark, run_codgrep_cli_benchmark, run_rg_benchmark, run_workspace_benchmark,
-        run_worktree_benchmark,
+        run_codgrep_benchmark, run_codgrep_index_benchmark, run_rg_benchmark,
+        run_workspace_benchmark, run_worktree_benchmark,
     },
 };
 
@@ -44,7 +45,7 @@ pub(crate) struct BenchConfig {
     pub(crate) warmup_iter: usize,
     pub(crate) bench_iter: usize,
     pub(crate) top_k_tokens: usize,
-    pub(crate) compare_cli: bool,
+    pub(crate) compare_index: bool,
     pub(crate) compare_rg: bool,
     pub(crate) compare_worktree: bool,
     pub(crate) compare_workspace: bool,
@@ -452,16 +453,16 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
         let mut runners = vec![run_codgrep_benchmark(
             benchmark,
             index_path,
+            &config.suite_dir,
             cache_paths,
             config,
             raw_writer.as_mut(),
         )?];
 
-        if config.compare_cli {
-            runners.push(run_codgrep_cli_benchmark(
+        if config.compare_index {
+            runners.push(run_codgrep_index_benchmark(
                 benchmark,
                 index_path,
-                &config.suite_dir,
                 cache_paths,
                 config,
                 raw_writer.as_mut(),
@@ -617,6 +618,42 @@ fn parse_rg_count_output(stdout: &[u8]) -> Result<usize> {
         total += count;
     }
     Ok(total)
+}
+
+fn codgrep_executable() -> Result<PathBuf> {
+    if let Ok(path) = env::var("CARGO_BIN_EXE_cg") {
+        let candidate = PathBuf::from(path);
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    let current = env::current_exe()?;
+    if current
+        .file_stem()
+        .is_some_and(|stem| stem == std::ffi::OsStr::new("cg"))
+    {
+        return Ok(current);
+    }
+
+    let candidates = [
+        current
+            .parent()
+            .map(|parent| parent.join("cg"))
+            .unwrap_or_else(|| PathBuf::from("cg")),
+        current
+            .parent()
+            .and_then(Path::parent)
+            .map(|parent| parent.join("cg"))
+            .unwrap_or_else(|| PathBuf::from("cg")),
+    ];
+    for candidate in candidates {
+        if candidate.exists() {
+            return Ok(candidate);
+        }
+    }
+
+    Ok(PathBuf::from("cg"))
 }
 
 fn custom_query_config(pattern: &str, case_insensitive: bool, config: &BenchConfig) -> QueryConfig {

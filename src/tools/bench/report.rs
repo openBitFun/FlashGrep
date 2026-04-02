@@ -171,11 +171,11 @@ pub(super) struct RawSample<'a> {
 fn runner_sort_key(runner: &str) -> usize {
     match runner {
         "codgrep" => 0,
-        "codgrep_cli" => 1,
-        "codgrep_workspace" => 2,
-        "codgrep_worktree_build" => 3,
-        "codgrep_worktree" => 4,
-        "rg" => 5,
+        "rg" => 1,
+        "codgrep_index" => 2,
+        "codgrep_workspace" => 3,
+        "codgrep_worktree_build" => 4,
+        "codgrep_worktree" => 5,
         _ => 6,
     }
 }
@@ -187,14 +187,14 @@ fn runner_display_name(runner: &str) -> &'static str {
 fn classify_runner(runner: &str) -> RunnerLabel {
     match runner {
         "codgrep" => RunnerLabel {
-            display: "codgrep [base-index]",
-            family: "codgrep",
-            mode: "base_index",
-        },
-        "codgrep_cli" => RunnerLabel {
-            display: "codgrep_cli [cli-fallback-aware]",
+            display: "codgrep [cli-fallback-aware]",
             family: "codgrep",
             mode: "cli_fallback",
+        },
+        "codgrep_index" => RunnerLabel {
+            display: "codgrep_index [raw-base-index]",
+            family: "codgrep",
+            mode: "base_index",
         },
         "codgrep_workspace" => RunnerLabel {
             display: "codgrep_workspace [workspace-snapshot]",

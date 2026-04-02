@@ -18,7 +18,7 @@ use super::{
     BenchCachePaths, BenchConfig, BenchmarkCase, BitfunOutcome, CacheRunner, RunnerSummary,
 };
 
-pub(super) fn run_codgrep_benchmark(
+pub(super) fn run_codgrep_index_benchmark(
     benchmark: BenchmarkCase,
     index_path: &Path,
     cache_paths: Option<&BenchCachePaths>,
@@ -48,7 +48,7 @@ pub(super) fn run_codgrep_benchmark(
             writer.write_sample(RawSample {
                 benchmark: benchmark.name,
                 corpus: benchmark.corpus.label(),
-                runner: "codgrep",
+                runner: "codgrep_index",
                 iteration: iter,
                 duration_secs,
                 candidate_docs,
@@ -58,14 +58,14 @@ pub(super) fn run_codgrep_benchmark(
     }
 
     Ok(build_summary(
-        "codgrep".into(),
+        "codgrep_index".into(),
         durations,
         candidate_docs,
         match_count,
     ))
 }
 
-pub(super) fn run_codgrep_cli_benchmark(
+pub(super) fn run_codgrep_benchmark(
     benchmark: BenchmarkCase,
     index_path: &Path,
     suite_dir: &Path,
@@ -94,7 +94,7 @@ pub(super) fn run_codgrep_cli_benchmark(
             writer.write_sample(RawSample {
                 benchmark: benchmark.name,
                 corpus: benchmark.corpus.label(),
-                runner: "codgrep_cli",
+                runner: "codgrep",
                 iteration: iter,
                 duration_secs,
                 candidate_docs: None,
@@ -104,7 +104,7 @@ pub(super) fn run_codgrep_cli_benchmark(
     }
 
     Ok(build_summary(
-        "codgrep_cli".into(),
+        "codgrep".into(),
         durations,
         None,
         match_count,
@@ -335,7 +335,7 @@ fn run_codgrep_cli_once(
     target: &Path,
     config: &BenchConfig,
 ) -> Result<usize> {
-    let mut command = Command::new(std::env::current_exe()?);
+    let mut command = Command::new(super::codgrep_executable()?);
     command.arg("--index").arg(index_path);
     command.arg("-c");
     if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
@@ -397,8 +397,6 @@ fn open_workspace(
             min_sparse_len: 5,
             max_sparse_len: 16,
         },
-        auto_refresh_overlay: false,
-        overlay_cache_limit: None,
     })
 }
 
@@ -414,24 +412,12 @@ fn run_workspace_once(
 
 fn run_worktree_once(
     workspace: &WorkspaceIndex,
-    index_path: &Path,
+    _index_path: &Path,
     pattern: &str,
     case_insensitive: bool,
-    build_overlay_each_sample: bool,
+    _build_overlay_each_sample: bool,
     config: &BenchConfig,
 ) -> Result<BitfunOutcome> {
-    if build_overlay_each_sample {
-        reset_overlay_cache(index_path)?;
-    }
-    let _ = workspace.refresh_overlay()?;
     let snapshot = workspace.snapshot()?;
     run_snapshot_once(&snapshot, pattern, case_insensitive, config)
-}
-
-fn reset_overlay_cache(index_path: &Path) -> Result<()> {
-    let overlays_dir = index_path.join("overlays");
-    if overlays_dir.exists() {
-        std::fs::remove_dir_all(&overlays_dir)?;
-    }
-    Ok(())
 }

@@ -85,11 +85,6 @@ pub struct IndexSearcher {
     tokenizer_options: TokenizerOptions,
 }
 
-#[derive(Debug, Clone)]
-pub(crate) struct BranchLiteralDocIds {
-    pub(crate) literals: Vec<Vec<u32>>,
-}
-
 struct MultiLiteralPreparation {
     prepared: multi_literal::PreparedMultiLiteral,
     candidate_ids: Vec<u32>,
@@ -280,7 +275,13 @@ impl IndexSearcher {
     ) -> Result<JsonSearchReport> {
         let total_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
-        let preparation = self.prepare_indexed_search(config, &plan, &SearchProfile::disabled())?;
+        let preparation = self.prepare_indexed_search(
+            config,
+            &plan,
+            filter,
+            allowed_paths,
+            &SearchProfile::disabled(),
+        )?;
         let candidate_ids =
             self.filter_candidate_ids(&preparation.candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
@@ -400,6 +401,8 @@ impl IndexSearcher {
                     &plan,
                     config.case_insensitive,
                     config.top_k_tokens,
+                    filter,
+                    allowed_paths,
                     &profile,
                 )? {
                     let resolved_paths = self.resolved_doc_paths();
@@ -434,6 +437,8 @@ impl IndexSearcher {
                 &plan,
                 config.case_insensitive,
                 config.top_k_tokens,
+                filter,
+                allowed_paths,
                 &profile,
             )? {
                 let resolved_paths = self.resolved_doc_paths();
@@ -460,7 +465,8 @@ impl IndexSearcher {
             }
         }
 
-        let preparation = self.prepare_indexed_search(config, &plan, &profile)?;
+        let preparation =
+            self.prepare_indexed_search(config, &plan, filter, allowed_paths, &profile)?;
         let candidate_ids =
             self.filter_candidate_ids(&preparation.candidate_ids, filter, allowed_paths)?;
         let candidate_doc_count = candidate_ids.len();
@@ -645,11 +651,13 @@ impl IndexSearcher {
             plan,
             config.case_insensitive,
             config.top_k_tokens,
+            filter,
+            allowed_paths,
             &profile,
         )? {
             multi_literal.candidate_ids
         } else {
-            self.prepare_indexed_search(config, plan, &profile)?
+            self.prepare_indexed_search(config, plan, filter, allowed_paths, &profile)?
                 .candidate_ids
         };
         self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)
@@ -688,6 +696,8 @@ impl IndexSearcher {
                     tokenizer.as_ref(),
                     config.top_k_tokens,
                     true,
+                    filter,
+                    allowed_paths,
                     &mut posting_cache,
                     &mut fallback_posting_cache,
                     &mut literal_scan_cache,
@@ -737,6 +747,8 @@ impl IndexSearcher {
                 tokenizer.as_ref(),
                 config.top_k_tokens,
                 false,
+                filter,
+                allowed_paths,
                 &mut posting_cache,
                 &mut fallback_posting_cache,
                 &mut literal_scan_cache,
@@ -754,56 +766,6 @@ impl IndexSearcher {
 
         profile.record_candidates(candidate_started.elapsed());
         Ok(Some(branches))
-    }
-
-    pub(crate) fn candidate_doc_ids_by_branch_and_literal_for_plan_with_allowed_paths(
-        &self,
-        _config: &QueryConfig,
-        plan: &crate::planner::QueryPlan,
-        filter: Option<&PathFilter>,
-        allowed_paths: Option<&HashSet<String>>,
-    ) -> Result<Vec<BranchLiteralDocIds>> {
-        let profile = SearchProfile::enabled();
-        let candidate_started = Instant::now();
-
-        if plan.fallback_to_scan {
-            profile.record_candidates(candidate_started.elapsed());
-            return Ok(vec![BranchLiteralDocIds {
-                literals: vec![self.filter_candidate_ids(
-                    &self.all_doc_ids(),
-                    filter,
-                    allowed_paths,
-                )?],
-            }]);
-        }
-
-        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
-        let mut posting_cache = HashMap::new();
-        let mut fallback_posting_cache = HashMap::new();
-        let mut literal_scan_cache = HashMap::new();
-        let mut fallback_literal_cache = HashMap::new();
-        let mut literal_candidate_cache = HashMap::new();
-        let mut branches = Vec::with_capacity(plan.branches.len());
-
-        for branch in &plan.branches {
-            let mut literals = Vec::with_capacity(branch.literals.len());
-            for literal in &branch.literals {
-                let doc_ids = self.literal_candidate_doc_ids(
-                    literal,
-                    tokenizer.as_ref(),
-                    &mut posting_cache,
-                    &mut fallback_posting_cache,
-                    &mut literal_scan_cache,
-                    &mut fallback_literal_cache,
-                    &mut literal_candidate_cache,
-                )?;
-                literals.push(self.filter_candidate_ids(&doc_ids, filter, allowed_paths)?);
-            }
-            branches.push(BranchLiteralDocIds { literals });
-        }
-
-        profile.record_candidates(candidate_started.elapsed());
-        Ok(branches)
     }
 
     pub fn count_matches_by_file(
@@ -856,11 +818,13 @@ impl IndexSearcher {
             &plan,
             config.case_insensitive,
             config.top_k_tokens,
+            filter,
+            allowed_paths,
             &profile,
         )? {
             multi_literal.candidate_ids
         } else {
-            self.prepare_indexed_search(config, &plan, &profile)?
+            self.prepare_indexed_search(config, &plan, filter, allowed_paths, &profile)?
                 .candidate_ids
         };
         let candidate_ids = self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)?;
@@ -926,7 +890,8 @@ impl IndexSearcher {
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
 
-        let preparation = self.prepare_indexed_search(config, &plan, &profile)?;
+        let preparation =
+            self.prepare_indexed_search(config, &plan, filter, allowed_paths, &profile)?;
         let candidate_ids = preparation.candidate_ids;
         let candidate_ids = self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
@@ -1072,6 +1037,8 @@ impl IndexSearcher {
         &self,
         config: &QueryConfig,
         plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
         profile: &SearchProfile,
     ) -> Result<SearchPreparation> {
         let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
@@ -1079,7 +1046,13 @@ impl IndexSearcher {
         let candidate_ids = if plan.fallback_to_scan {
             self.all_doc_ids()
         } else {
-            self.collect_candidates(&plan.branches, tokenizer.as_ref(), config.top_k_tokens)?
+            self.collect_candidates(
+                &plan.branches,
+                tokenizer.as_ref(),
+                config.top_k_tokens,
+                filter,
+                allowed_paths,
+            )?
         };
         profile.record_candidates(candidate_started.elapsed());
         Ok(SearchPreparation {
@@ -1093,6 +1066,8 @@ impl IndexSearcher {
         plan: &crate::planner::QueryPlan,
         case_insensitive: bool,
         top_k_tokens: usize,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
         profile: &SearchProfile,
     ) -> Result<Option<MultiLiteralPreparation>> {
         let Some(prepared) = plan
@@ -1113,10 +1088,18 @@ impl IndexSearcher {
                     &plan.branches,
                     tokenizer.as_ref(),
                     top_k_tokens,
+                    filter,
+                    allowed_paths,
                 )?
                 .unwrap_or_else(|| {
-                    self.collect_candidates(&plan.branches, tokenizer.as_ref(), top_k_tokens)
-                        .expect("fallback literal scan should succeed")
+                    self.collect_candidates(
+                        &plan.branches,
+                        tokenizer.as_ref(),
+                        top_k_tokens,
+                        filter,
+                        allowed_paths,
+                    )
+                    .expect("fallback literal scan should succeed")
                 }),
             )
         };
@@ -1140,6 +1123,8 @@ impl IndexSearcher {
         plan: &crate::planner::QueryPlan,
         case_insensitive: bool,
         top_k_tokens: usize,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
         profile: &SearchProfile,
     ) -> Result<Option<CountOnlyMultiLiteralPreparation>> {
         let Some(prepared) = plan
@@ -1158,6 +1143,8 @@ impl IndexSearcher {
                     &plan.branches,
                     tokenizer.as_ref(),
                     top_k_tokens,
+                    filter,
+                    allowed_paths,
                 )
             })
             .transpose()?
@@ -1265,7 +1252,7 @@ impl IndexSearcher {
         allowed_paths.is_none_or(|allowed_paths| allowed_paths.contains(&display_path))
     }
 
-    fn sum_doc_sizes(&self, candidate_ids: &[u32]) -> Result<u64> {
+    pub(crate) fn sum_doc_sizes(&self, candidate_ids: &[u32]) -> Result<u64> {
         let mut total = 0u64;
         for &doc_id in candidate_ids {
             total += doc_by_id(&self.docs, doc_id)?.size;
@@ -1278,8 +1265,17 @@ impl IndexSearcher {
         branches: &[QueryBranch],
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
     ) -> Result<Vec<u32>> {
-        self.collect_candidates_with_literal_scan(branches, tokenizer, top_k, true)
+        self.collect_candidates_with_literal_scan(
+            branches,
+            tokenizer,
+            top_k,
+            true,
+            filter,
+            allowed_paths,
+        )
     }
 
     fn try_collect_candidates_without_literal_scan(
@@ -1287,6 +1283,8 @@ impl IndexSearcher {
         branches: &[QueryBranch],
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
     ) -> Result<Option<Vec<u32>>> {
         let mut all_candidates = Vec::new();
         let mut posting_cache = HashMap::new();
@@ -1300,6 +1298,8 @@ impl IndexSearcher {
                 tokenizer,
                 top_k,
                 false,
+                filter,
+                allowed_paths,
                 &mut posting_cache,
                 &mut fallback_posting_cache,
                 &mut literal_scan_cache,
@@ -1320,6 +1320,8 @@ impl IndexSearcher {
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
         allow_literal_scan: bool,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
     ) -> Result<Vec<u32>> {
         let mut all_candidates = Vec::new();
         let mut posting_cache = HashMap::new();
@@ -1333,6 +1335,8 @@ impl IndexSearcher {
                 tokenizer,
                 top_k,
                 allow_literal_scan,
+                filter,
+                allowed_paths,
                 &mut posting_cache,
                 &mut fallback_posting_cache,
                 &mut literal_scan_cache,
@@ -1346,60 +1350,14 @@ impl IndexSearcher {
 
         Ok(all_candidates)
     }
-    fn literal_candidate_doc_ids(
-        &self,
-        literal: &str,
-        tokenizer: &dyn crate::tokenizer::Tokenizer,
-        posting_cache: &mut HashMap<u64, Vec<u32>>,
-        fallback_posting_cache: &mut HashMap<u64, Vec<u32>>,
-        literal_scan_cache: &mut HashMap<String, Vec<u32>>,
-        fallback_literal_cache: &mut HashMap<String, Vec<u32>>,
-        literal_candidate_cache: &mut HashMap<String, Vec<u32>>,
-    ) -> Result<Vec<u32>> {
-        let query_literal = fold_query_literal(literal);
-        if let Some(cached) = literal_candidate_cache.get(&query_literal) {
-            return Ok(cached.clone());
-        }
-
-        let mut covering_hashes = Vec::new();
-        tokenizer.collect_query_token_hashes(&query_literal, &mut covering_hashes);
-        let doc_ids =
-            match self.collect_literal_candidates(tokenizer, &query_literal, covering_hashes) {
-                LiteralCandidates::Impossible => Vec::new(),
-                LiteralCandidates::Unavailable => self
-                    .fallback_literal_doc_ids(
-                        &query_literal,
-                        fallback_posting_cache,
-                        fallback_literal_cache,
-                    )?
-                    .unwrap_or_else(|| self.scan_literal_docs(&query_literal, literal_scan_cache)),
-                LiteralCandidates::Available(candidates) => {
-                    let mut docs: Option<Vec<u32>> = None;
-                    for candidate in candidates {
-                        let posting_docs =
-                            self.read_posting_docs(candidate.token_hash, posting_cache)?;
-                        docs = Some(match docs.take() {
-                            Some(existing) => intersect_sorted(&existing, &posting_docs),
-                            None => posting_docs,
-                        });
-                        if docs.as_ref().is_some_and(Vec::is_empty) {
-                            break;
-                        }
-                    }
-                    docs.unwrap_or_default()
-                }
-            };
-
-        literal_candidate_cache.insert(query_literal, doc_ids.clone());
-        Ok(doc_ids)
-    }
-
     fn select_branch_candidates(
         &self,
         branch: &QueryBranch,
         tokenizer: &dyn crate::tokenizer::Tokenizer,
         top_k: usize,
         allow_literal_scan: bool,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
         posting_cache: &mut HashMap<u64, Vec<u32>>,
         fallback_posting_cache: &mut HashMap<u64, Vec<u32>>,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
@@ -1516,7 +1474,7 @@ impl IndexSearcher {
         }
 
         for literal in scanned_literals {
-            let docs = self.scan_literal_docs(&literal, literal_scan_cache);
+            let docs = self.scan_literal_docs(&literal, filter, allowed_paths, literal_scan_cache);
             branch_candidates = Some(match branch_candidates.take() {
                 Some(existing) => intersect_sorted(&existing, &docs),
                 None => docs,
@@ -1730,19 +1688,28 @@ impl IndexSearcher {
     fn scan_literal_docs(
         &self,
         literal: &str,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
     ) -> Vec<u32> {
         if let Some(cached) = literal_scan_cache.get(literal) {
             return cached.clone();
         }
 
-        self.scan_literal_docs_batch(&[literal.to_string()], literal_scan_cache);
+        self.scan_literal_docs_batch(
+            &[literal.to_string()],
+            filter,
+            allowed_paths,
+            literal_scan_cache,
+        );
         literal_scan_cache.get(literal).cloned().unwrap_or_default()
     }
 
     fn scan_literal_docs_batch(
         &self,
         literals: &[String],
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
     ) {
         let missing = literals
@@ -1770,7 +1737,11 @@ impl IndexSearcher {
                 .collect::<Vec<_>>();
             let mut docs_by_literal = vec![Vec::new(); ascii_literals.len()];
 
-            for doc in &self.docs {
+            for doc in self
+                .docs
+                .iter()
+                .filter(|doc| self.doc_matches_filters(doc, filter, allowed_paths))
+            {
                 let path = self.doc_resolved_path(doc);
                 let Some(bytes) = map_doc_bytes(&path, doc.size) else {
                     continue;
@@ -1789,7 +1760,11 @@ impl IndexSearcher {
 
         if !unicode_literals.is_empty() {
             let mut docs_by_literal = vec![Vec::new(); unicode_literals.len()];
-            for doc in &self.docs {
+            for doc in self
+                .docs
+                .iter()
+                .filter(|doc| self.doc_matches_filters(doc, filter, allowed_paths))
+            {
                 let path = self.doc_resolved_path(doc);
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;

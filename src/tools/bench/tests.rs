@@ -44,7 +44,7 @@ fn bench_runner_smoke_test() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
         compare_workspace: false,
@@ -115,7 +115,7 @@ fn cold_bench_runs_hook_before_each_iteration() {
         warmup_iter: 1,
         bench_iter: 2,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
         compare_workspace: false,
@@ -168,7 +168,7 @@ fn bench_runner_supports_workspace_and_worktree_runners() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
         compare_workspace: true,
@@ -254,7 +254,7 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
             warmup_iter: 0,
             bench_iter: 1,
             top_k_tokens: 4,
-            compare_cli: false,
+            compare_index: false,
             compare_rg: false,
             compare_worktree: true,
             compare_workspace: false,
@@ -319,7 +319,7 @@ fn bench_runner_supports_custom_repo_patterns() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
         compare_workspace: true,
@@ -369,7 +369,7 @@ fn bench_runner_supports_custom_worktree_build_runner() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
         compare_workspace: false,
@@ -423,7 +423,7 @@ fn bench_report_labels_worktree_runner_modes() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
         compare_workspace: true,
@@ -436,7 +436,7 @@ fn bench_report_labels_worktree_runner_modes() {
 
     let rendered = render_report(&report);
     let base = rendered
-        .find("codgrep [base-index]")
+        .find("codgrep [cli-fallback-aware]")
         .expect("test should succeed");
     let workspace = rendered
         .find("codgrep_workspace [workspace-snapshot]")
@@ -485,7 +485,7 @@ fn bench_raw_output_includes_runner_family_and_mode() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
         compare_workspace: true,
@@ -504,7 +504,7 @@ fn bench_raw_output_includes_runner_family_and_mode() {
     );
     assert!(lines
         .iter()
-        .any(|line| line.contains(",codgrep,codgrep,base_index,")));
+        .any(|line| line.contains(",codgrep,codgrep,cli_fallback,")));
     assert!(lines
         .iter()
         .any(|line| line.contains(",codgrep_workspace,codgrep,workspace_snapshot,")));
@@ -544,7 +544,7 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
         warmup_iter: 0,
         bench_iter: 2,
         top_k_tokens: 4,
-        compare_cli: false,
+        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
         compare_workspace: true,

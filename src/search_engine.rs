@@ -5,7 +5,7 @@ use memmap2::Mmap;
 use rayon::prelude::*;
 
 use crate::{
-    config::{BuildConfig, QueryConfig, TokenizerMode},
+    config::{BuildConfig, QueryConfig},
     error::{AppError, Result},
     files::{read_text_file, scan_paths, RepositoryFile, ScanOptions},
     index::{
@@ -24,10 +24,10 @@ use crate::{
     json_output::{JsonDuration, JsonSearchFile, JsonSearchReport, JsonStats},
     path_filter::PathFilter,
     planner::plan,
+    query_preflight::evaluate_index_query_preflight,
     search::{
         FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine, SearchResults,
     },
-    tokenizer::{create, TokenizerOptions},
 };
 
 const PARALLEL_DOC_THRESHOLD: usize = 16;
@@ -139,12 +139,14 @@ impl SearchEngine {
     ) -> Result<SearchResponse> {
         match self.open_searcher() {
             Ok(searcher) => {
-                let query_prefers_scan = query_prefers_scan(
+                let preflight = evaluate_index_query_preflight(&searcher, config, filter, None)?;
+                self.search_with_searcher(
+                    searcher,
                     config,
-                    searcher.tokenizer_mode(),
-                    searcher.tokenizer_options(),
-                )?;
-                self.search_with_searcher(searcher, config, filter, policy, query_prefers_scan)
+                    filter,
+                    policy,
+                    preflight.reason.requires_scan_backend(),
+                )
             }
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 self.search_without_index(config, filter, policy)
@@ -769,137 +771,7 @@ fn scan_text_files(files: Vec<RepositoryFile>) -> Result<Vec<RepositoryFile>> {
     Ok(text_files)
 }
 
-pub(crate) fn query_prefers_scan(
-    config: &QueryConfig,
-    tokenizer_mode: TokenizerMode,
-    tokenizer_options: &TokenizerOptions,
-) -> Result<bool> {
-    let plan = plan(&config.regex_pattern)?;
-    if plan.fallback_to_scan {
-        return Ok(true);
-    }
-
-    if tokenizer_mode != TokenizerMode::SparseNgram {
-        return Ok(false);
-    }
-
-    if config.case_insensitive {
-        return Ok(false);
-    }
-
-    let Some(alternation) = plan.pure_literal_alternation.as_ref() else {
-        return Ok(false);
-    };
-
-    let tokenizer = create(tokenizer_mode, tokenizer_options.clone());
-    for literal in &alternation.literals {
-        let folded = fold_query_prefilter_literal(literal, config.case_insensitive);
-        let mut token_hashes = Vec::new();
-        tokenizer.collect_query_token_hashes(&folded, &mut token_hashes);
-        if token_hashes.is_empty() {
-            return Ok(true);
-        }
-    }
-
-    Ok(false)
-}
-
-fn fold_query_prefilter_literal(literal: &str, case_insensitive: bool) -> String {
-    if !case_insensitive {
-        return literal.to_string();
-    }
-
-    if literal.is_ascii() {
-        literal.to_ascii_lowercase()
-    } else {
-        literal.to_lowercase()
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use super::query_prefers_scan;
-    use crate::{
-        config::{QueryConfig, TokenizerMode},
-        tokenizer::TokenizerOptions,
-    };
-
-    fn query(pattern: &str) -> QueryConfig {
-        QueryConfig {
-            regex_pattern: pattern.to_string(),
-            patterns: vec![pattern.to_string()],
-            ..QueryConfig::default()
-        }
-    }
-
-    #[test]
-    fn sparse_bad_alternation_prefers_scan() {
-        let config = query("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT");
-        assert!(query_prefers_scan(
-            &config,
-            TokenizerMode::SparseNgram,
-            &TokenizerOptions {
-                min_sparse_len: 5,
-                max_sparse_len: 16,
-            },
-        )
-        .expect("test should succeed"));
-    }
-
-    #[test]
-    fn sparse_good_alternation_stays_indexed() {
-        let config = query("getUserById|setUserById");
-        assert!(!query_prefers_scan(
-            &config,
-            TokenizerMode::SparseNgram,
-            &TokenizerOptions {
-                min_sparse_len: 5,
-                max_sparse_len: 16,
-            },
-        )
-        .expect("test should succeed"));
-    }
-
-    #[test]
-    fn trigram_bad_alternation_does_not_force_scan() {
-        let config = query("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT");
-        assert!(!query_prefers_scan(
-            &config,
-            TokenizerMode::Trigram,
-            &TokenizerOptions {
-                min_sparse_len: 5,
-                max_sparse_len: 16,
-            },
-        )
-        .expect("test should succeed"));
-    }
-
-    #[test]
-    fn case_insensitive_bad_alternation_stays_indexed() {
-        let mut config = query("ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT");
-        config.case_insensitive = true;
-        assert!(!query_prefers_scan(
-            &config,
-            TokenizerMode::SparseNgram,
-            &TokenizerOptions {
-                min_sparse_len: 5,
-                max_sparse_len: 16,
-            },
-        )
-        .expect("test should succeed"));
-    }
-
-    #[test]
-    fn fallback_plan_still_prefers_scan() {
-        let config = query(r"\p{Greek}");
-        assert!(query_prefers_scan(
-            &config,
-            TokenizerMode::SparseNgram,
-            &TokenizerOptions {
-                min_sparse_len: 5,
-                max_sparse_len: 16,
-            },
-        )
-        .expect("test should succeed"));
-    }
+    // SearchEngine-specific fallback behavior is covered by e2e tests.
 }

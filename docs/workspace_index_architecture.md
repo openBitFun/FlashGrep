@@ -2,16 +2,18 @@
 
 ## Goal
 
-`codgrep` 的终态需要从“单层只读索引 + 手动 stale 检查”演进到一个可直接作为外部库使用的两层检索架构：
+`codgrep` 当前采用面向 agent 代码搜索的两层检索架构：
 
 1. `base snapshot`
-   对应某个 Git commit 的只读稳定索引。
-2. `worktree overlay`
-   对应磁盘工作树相对 base 的增量索引。
+   对应某个 Git commit 或 repo fingerprint 的稳定只读索引。
+2. `dirty worktree repair`
+   对当前工作区里相对 base 已变更的少量文件做查询期修补。
 
-查询时永远针对一个统一的 `EffectiveIndexView`：
+设计目标不是持续维护一套实时增量倒排，而是：
 
-`worktree overlay > base snapshot`
+- 对当前 workspace view 不漏召回。
+- 保持搜索热路径简单。
+- 把复杂度留给真正有收益的场景。
 
 ## Layering
 
@@ -27,31 +29,21 @@ Base snapshot 继续复用当前工程已有的 generation 目录布局：
 它是只读、可复用、按 `snapshot_key = HEAD commit + config fingerprint` 缓存的主索引层。
 在非 Git 目录下，会退化为稳定的 repo-scoped fallback snapshot key。
 
-### Worktree Overlay
+### Dirty Worktree Repair
 
-Worktree overlay 和 base 尽量同构，但只覆盖 dirty subset：
+当前实现不再维护持久化 overlay cache，也不再把 dirty subset 预先物化成另一份倒排。
 
-- `docs.bin`
-- `doc_terms.bin`
-- `lookup.bin`
-- `postings.bin`
-- `tombstones.bin`
+查询时直接做两件事：
+
+1. 用 base snapshot 对 clean files 做候选召回。
+2. 对 dirty files 直接走 query-time repair。
 
 语义：
 
-- `Modified(path)` 等价于 `shadow base[path] + add overlay[path]`
-- `Deleted(path)` 只记录 tombstone
-- `Added(path)` 只存在于 overlay
-- `Renamed(old, new)` 拆成 `delete old + add new`
-
-当前实现里，overlay 也已经有稳定身份：
-
-- `overlay_key = base snapshot + dirty worktree fingerprint`
-- 同一个 dirty state 直接命中已有 overlay cache
-- 不同 dirty state 可以在同一个 base 下并存多份 overlay cache
-- 新 overlay 构建会尝试复用旧 overlay cache 中 `size + mtime` 未变化文件的 `doc_terms`
-- 连续 overlay 之间会尽量保持未变化 dirty 文件的文档顺序和 `doc_id` 稳定
-- 新 overlay 构建会基于上一份 overlay 只重写受影响 token 的 postings，其余 posting bytes 直接复用
+- `Modified(path)` 等价于 `shadow base[path] + scan current[path]`
+- `Deleted(path)` 等价于 `shadow base[path]`
+- `Added(path)` 等价于 `scan current[path]`
+- `Renamed(old, new)` 等价于 `delete old + add new`
 
 ## Effective View
 
@@ -59,69 +51,50 @@ Worktree overlay 和 base 尽量同构，但只覆盖 dirty subset：
 
 对任一路径 `path`：
 
-1. 如果 worktree overlay 有 `Upsert(path)`，使用 overlay 内容。
-2. 如果 worktree overlay 有 `Delete(path)`，路径不存在。
+1. 如果 `path` 在 dirty 集里，使用当前工作区内容。
+2. 如果 `path` 在 dirty 集里且文件已删除，路径不存在。
 3. 否则回退到 base snapshot。
 
 查询时的候选集合：
 
 ```text
 EffectiveCandidates =
-    (BaseCandidates - ShadowedByOverlay)
-    UNION OverlayCandidates
+    (BaseCandidates - ShadowedDirtyPaths)
+    UNION DirtyExistingPaths
 ```
 
-最终 verify 永远读取“当前生效内容”，而不是 base commit 中的旧内容。
+最终 verify 永远读取当前有效路径上的真实内容。
 
 ## Runtime Modules
 
-建议的终态模块划分：
+当前实现建议关注下面几个模块：
 
 ```text
 src/index/
-  base/
-    builder.rs
-    reader.rs
-    registry.rs
-
-  overlay/
-    detector.rs
-    builder.rs
-    reader.rs
-    tombstone.rs
-
-  runtime/
-    effective_view.rs
-    candidate_merge.rs
-    resolver.rs
-    searcher.rs
-    verifier.rs
+  builder.rs
+  format.rs
+  searcher.rs
 
 src/workspace.rs
+src/workspace/runtime.rs
 ```
 
 职责：
 
-- `base/*`
+- `builder.rs`
   构建和复用 commit-addressed base snapshot。
-- `overlay/*`
-  发现 worktree diff，构建并复用 overlay cache。
-- `runtime/*`
-  合并 base / overlay，并执行查询。
+- `searcher.rs`
+  提供 base snapshot 的倒排查询与 stale/worktree diff 检测。
+- `workspace/runtime.rs`
+  合并 base 候选与 dirty 文件集合，并解析当前工作区文档。
 - `workspace.rs`
-  对外暴露稳定的库 API。
+  对外暴露稳定的 workspace facade。
 
 ## Public Library API
-
-对外建议暴露两层 facade。
-
-### WorkspaceIndex
 
 ```rust
 pub struct WorkspaceIndexOptions {
     pub build_config: BuildConfig,
-    pub auto_refresh_overlay: bool,
-    pub overlay_cache_limit: Option<usize>,
 }
 
 pub struct WorkspaceIndex;
@@ -129,53 +102,38 @@ pub struct WorkspaceIndex;
 impl WorkspaceIndex {
     pub fn open(options: WorkspaceIndexOptions) -> Result<Self>;
     pub fn ensure_base_snapshot(&self) -> Result<BaseSnapshotInfo>;
-    pub fn refresh_overlay(&self) -> Result<Option<OverlaySnapshotInfo>>;
-    pub fn prune_overlay_cache(&self, keep_per_base: usize) -> Result<usize>;
     pub fn status(&self) -> Result<IndexStatus>;
+    pub fn probe_freshness(&self) -> Result<WorkspaceFreshness>;
+    pub fn probe_freshness_if_due(&self, ttl: Duration) -> Result<WorkspaceFreshness>;
     pub fn search(&self, query: &QueryConfig) -> Result<SearchResults>;
-    pub fn search_json(&self, query: &QueryConfig) -> Result<JsonSearchReport>;
-}
-
-pub struct BaseSnapshotInfo {
-    pub snapshot_key: String,
-    pub snapshot_kind: BaseSnapshotKind,
-    pub head_commit: Option<String>,
-    pub config_fingerprint: Option<String>,
-    pub index_path: PathBuf,
-    pub repo_path: PathBuf,
-    pub tokenizer: TokenizerMode,
-    pub doc_count: usize,
-}
-
-pub struct OverlaySnapshotInfo {
-    pub base_snapshot_key: String,
-    pub overlay_key: String,
-    pub modified_files: usize,
-    pub deleted_files: usize,
-    pub new_files: usize,
+    pub fn snapshot(&self) -> Result<WorkspaceSnapshot>;
 }
 ```
 
-## Current Implementation Status
+## Query Semantics
 
-当前代码已经具备：
+`WorkspaceIndex::search()` / `WorkspaceSnapshot::search()` 默认返回的是：
 
-- commit-addressed base snapshot
-- key-addressed overlay cache
-- `doc_terms` 级缓存复用
-- 跨 overlay generation 的 `doc_terms` 复用
-- 受影响 token 级 postings 重写
-- overlay cache lifecycle management
-- workspace 查询路径上的 base/overlay 候选合并
-- stale / worktree diff 检测
+`base snapshot + current dirty files repaired`
 
-当前缺口：
+这意味着调用方不再需要显式 refresh 某个 overlay cache；只要 base snapshot 已存在，workspace 查询就会直接以当前工作区视图为准。
 
-- overlay 还没有演进到更细粒度的字节级 patch 和跨 base 复用
-- overlay manifest / 目录层级内部仍可沿用 generation 命名，但对外库 API 已统一为 `snapshot_key` / `base_snapshot_key` / `overlay_key`
+## Current Limits
 
-因此当前仓库的改造原则是：
+- dirty files 当前按 `size + mtime` 检测，不是 content hash。
+- dirty files 当前统一走 query-time repair，还没有阈值 sidecar。
+- `WorkspaceSnapshot` 会固定 dirty path 集合，但最终 verify 仍然读取真实文件路径。
+- `lookup.bin` 已做 `mmap`，`postings.bin` 仍是按 offset 解码读取。
 
-1. 先把外部库 facade 和 runtime 视图抽象稳定下来。
-2. 查询结果优先保证最新视图正确。
-3. 在此基础上逐步把 worktree 从 scan fallback 替换为真正的 overlay postings。
+## Migration Note
+
+旧的持久化 overlay cache 方案已经移除：
+
+- 不再有 `overlay_key`
+- 不再有 `refresh_overlay()`
+- 不再有 `prune_overlay_cache()`
+- 不再保留 overlay manifest / tombstones / postings 复用路径
+
+当前架构默认采用：
+
+`Base Snapshot + Query-time Dirty Repair`

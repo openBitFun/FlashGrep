@@ -7,6 +7,7 @@ mod json_output;
 mod path_filter;
 mod planner;
 mod progress;
+mod query_preflight;
 mod search;
 mod search_engine;
 mod tokenizer;
@@ -31,7 +32,7 @@ pub mod advanced {
         read_text_file, repo_relative_path, resolve_repo_path, scan_paths, scan_repository,
         RepositoryFile, ScanOptions,
     };
-    pub use crate::index::{IndexSearcher, IndexWorktreeDiff, OverlaySnapshotInfo};
+    pub use crate::index::{IndexSearcher, IndexWorktreeDiff};
     pub use crate::path_filter::{normalize_path, PathFilter, PathFilterArgs};
     pub use crate::progress::{IndexProgress, IndexProgressPhase};
     pub use crate::search::{

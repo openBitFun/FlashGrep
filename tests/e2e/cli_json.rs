@@ -1,6 +1,6 @@
 use crate::{
     cli_support::assert_cli_json_matches_rg,
-    common::{json_lines, json_values, normalize_json_messages, TestRepo, SHERLOCK},
+    common::{json_lines, json_values, normalize_json_messages, stderr_string, TestRepo, SHERLOCK},
 };
 
 #[test]
@@ -163,4 +163,37 @@ fn cli_json_uses_index_without_checking_freshness() {
     assert!(lines
         .last()
         .is_some_and(|line| line.contains("\"searches\":1") && line.contains("\"matches\":1")));
+}
+
+#[test]
+fn cli_sparse_short_literal_json_falls_back_to_ripgrep() {
+    let repo = TestRepo::new();
+    repo.write("defs/matched.td", "defm Match : Something;\n");
+    repo.write("defs/other.td", "defm Other : Something;\n");
+
+    repo.build_sparse();
+
+    let codgrep = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["--json", "-F", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg = repo
+        .rg()
+        .arg("--json")
+        .arg("--color=never")
+        .args(["-F", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    let mut codgrep_json = json_values(&codgrep.stdout);
+    let mut rg_json = json_values(&rg.stdout);
+    normalize_json_messages(&mut codgrep_json);
+    normalize_json_messages(&mut rg_json);
+    assert_eq!(codgrep_json, rg_json);
+    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }

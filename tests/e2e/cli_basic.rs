@@ -3,7 +3,7 @@ use crate::{
         assert_cli_matches_rg, assert_cli_matches_rg_sorted, normalized_stats_output, run_cli,
         run_rg,
     },
-    common::{stderr_string, stdout_string, TestRepo, SHERLOCK},
+    common::{sort_lines, stderr_string, stdout_string, TestRepo, SHERLOCK},
 };
 
 #[test]
@@ -244,6 +244,181 @@ fn cli_supports_count_matches_mode() {
         stdout_string(&output.stdout),
         format!("{}:3\n", source.to_string_lossy())
     );
+}
+
+#[test]
+fn cli_sparse_short_literal_count_falls_back_to_ripgrep() {
+    let repo = TestRepo::new();
+    repo.write("defs/first.td", "defm Foo : Something;\n");
+    repo.write(
+        "defs/second.td",
+        "defm Bar : Something;\ndefm Baz : Something;\n",
+    );
+    repo.write("src/other.rs", "const WORD: &str = \"defm\";\n");
+
+    repo.build_sparse();
+
+    let codgrep = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["-F", "-c", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg = repo
+        .rg()
+        .arg("--color=never")
+        .args(["-F", "-c", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(
+        sort_lines(&stdout_string(&codgrep.stdout)),
+        sort_lines(&stdout_string(&rg.stdout))
+    );
+    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+}
+
+#[test]
+fn cli_sparse_short_literal_standard_search_matches_ripgrep() {
+    let repo = TestRepo::new();
+    repo.write("defs/matched.td", "defm Match : Something;\n");
+    repo.write("defs/missed.td", "def Missing;\n");
+    repo.write("src/ignored.rs", "const WORD: &str = \"defm\";\n");
+
+    repo.build_sparse();
+
+    let codgrep = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["-F", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg = repo
+        .rg()
+        .arg("--color=never")
+        .args(["-F", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(
+        sort_lines(&stdout_string(&codgrep.stdout)),
+        sort_lines(&stdout_string(&rg.stdout))
+    );
+    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+}
+
+#[test]
+fn cli_sparse_short_literal_files_with_matches_fall_back_to_ripgrep() {
+    let repo = TestRepo::new();
+    repo.write("defs/matched.td", "defm Match : Something;\n");
+    repo.write("defs/missed.td", "def Missing;\n");
+    repo.write("src/matched.rs", "const WORD: &str = \"defm\";\n");
+
+    repo.build_sparse();
+
+    let codgrep = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["-F", "-l", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg = repo
+        .rg()
+        .arg("--color=never")
+        .args(["-F", "-l", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(
+        sort_lines(&stdout_string(&codgrep.stdout)),
+        sort_lines(&stdout_string(&rg.stdout))
+    );
+    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+}
+
+#[test]
+fn cli_sparse_short_literal_files_without_match_fall_back_to_ripgrep() {
+    let repo = TestRepo::new();
+    repo.write("defs/matched.td", "defm Match : Something;\n");
+    repo.write("defs/missed.td", "def Missing;\n");
+    repo.write("src/ignored.rs", "const WORD: &str = \"defm\";\n");
+
+    repo.build_sparse();
+
+    let codgrep = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["-F", "--files-without-match", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg = repo
+        .rg()
+        .arg("--color=never")
+        .args(["-F", "--files-without-match", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(
+        sort_lines(&stdout_string(&codgrep.stdout)),
+        sort_lines(&stdout_string(&rg.stdout))
+    );
+    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+}
+
+#[test]
+fn cli_sparse_short_literal_quiet_falls_back_to_ripgrep() {
+    let repo = TestRepo::new();
+    repo.write("defs/matched.td", "defm Match : Something;\n");
+
+    repo.build_sparse();
+
+    let matched = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["-q", "-F", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg_matched = repo
+        .rg()
+        .arg("--color=never")
+        .args(["-q", "-F", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(matched.status.code(), rg_matched.status.code());
+    assert!(stderr_string(&matched.stderr).contains("fallback rg=true"));
+
+    let missed = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["-q", "-F", "none"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg_missed = repo
+        .rg()
+        .arg("--color=never")
+        .args(["-q", "-F", "none"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(missed.status.code(), rg_missed.status.code());
+    assert!(stderr_string(&missed.stderr).contains("fallback rg=true"));
 }
 
 #[test]
@@ -730,6 +905,76 @@ fn cli_count_stats_matches_ripgrep_aggregate_lines() {
         normalized_stats_output(&codgrep.stdout),
         normalized_stats_output(&rg.stdout)
     );
+}
+
+#[test]
+fn cli_sparse_short_literal_stats_fall_back_to_ripgrep() {
+    let repo = TestRepo::new();
+    repo.write("defs/matched.td", "defm Match : Something;\n");
+    repo.write("defs/other.td", "defm Other : Something;\n");
+
+    repo.build_sparse();
+
+    let codgrep = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["-F", "--stats", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg = repo
+        .rg()
+        .arg("--color=never")
+        .args(["-F", "--stats", "-g", "*.td", "defm"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(
+        normalized_stats_output(&codgrep.stdout),
+        normalized_stats_output(&rg.stdout)
+    );
+    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+}
+
+#[test]
+fn cli_max_depth_scope_resolution_falls_back_to_ripgrep() {
+    let repo = TestRepo::new();
+    let matched = repo.write("matched.rs", "const NAME: &str = \"PM_RESUME\";\n");
+    repo.write(
+        "nested/deeper/ignored.rs",
+        "const NAME: &str = \"PM_RESUME\";\n",
+    );
+
+    repo.build();
+
+    let codgrep = repo
+        .cli()
+        .env("BITFUN_TRACE_FALLBACK", "1")
+        .args(["--max-depth", "1", "PM_RESUME"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+    let rg = repo
+        .rg()
+        .arg("--color=never")
+        .args(["--max-depth", "1", "PM_RESUME"])
+        .arg(&repo.repo)
+        .output()
+        .expect("test should succeed");
+
+    assert_eq!(codgrep.status.code(), rg.status.code());
+    assert_eq!(stdout_string(&codgrep.stdout), stdout_string(&rg.stdout));
+    assert_eq!(
+        stdout_string(&codgrep.stdout),
+        format!(
+            "{}:const NAME: &str = \"PM_RESUME\";\n",
+            matched.to_string_lossy()
+        )
+    );
+    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+    assert!(stderr_string(&codgrep.stderr).contains("filesystem scope resolution required"));
 }
 
 #[test]
