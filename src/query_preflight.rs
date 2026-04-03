@@ -146,6 +146,12 @@ pub(crate) fn evaluate_index_query_preflight(
     Ok(evaluate_metrics(metrics, config.search_mode))
 }
 
+pub(crate) fn preflight_enabled() -> bool {
+    env::var("BITFUN_ENABLE_PREFLIGHT")
+        .map(|value| !value.is_empty() && value != "0")
+        .unwrap_or(false)
+}
+
 fn evaluate_metrics(
     metrics: QueryPreflightMetrics,
     search_mode: crate::search::SearchMode,

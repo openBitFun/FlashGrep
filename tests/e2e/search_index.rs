@@ -466,7 +466,7 @@ fn sparse_literal_query_matches_substrings_inside_longer_identifiers() {
 }
 
 #[test]
-fn sparse_build_skips_trigram_fallback_sidecar() {
+fn sparse_build_writes_trigram_fallback_sidecar() {
     let repo = TestRepo::new();
     repo.write("match.rs", "const NAME: &str = \"AC_ERR_SYSTEM\";\n");
 
@@ -474,14 +474,19 @@ fn sparse_build_skips_trigram_fallback_sidecar() {
 
     let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
     let (metadata, _) = read_docs_file(&layout.docs_path).expect("test should succeed");
-    assert!(metadata.fallback_trigram.is_none());
-    assert!(!layout.trigram_fallback_lookup_path.exists());
-    assert!(!layout.trigram_fallback_postings_path.exists());
-    assert!(!layout.trigram_fallback_doc_terms_path.exists());
+    let fallback = metadata
+        .fallback_trigram
+        .as_ref()
+        .expect("sparse index should record trigram fallback metadata");
+    assert_eq!(fallback.doc_count, 1);
+    assert!(fallback.key_count > 0);
+    assert!(layout.trigram_fallback_lookup_path.exists());
+    assert!(layout.trigram_fallback_postings_path.exists());
+    assert!(layout.trigram_fallback_doc_terms_path.exists());
 }
 
 #[test]
-fn sparse_search_works_without_trigram_sidecar() {
+fn sparse_search_uses_trigram_fallback_sidecar_for_identifier_substrings() {
     let repo = TestRepo::new();
     repo.write("match.rs", "const NAME: &str = \"AC_ERR_SYSTEM\";\n");
 

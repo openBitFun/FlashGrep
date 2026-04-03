@@ -3,6 +3,17 @@ use crate::{
     common::{json_lines, json_values, normalize_json_messages, stderr_string, TestRepo, SHERLOCK},
 };
 
+fn sorted_normalized_json(output: &[u8]) -> Vec<String> {
+    let mut values = json_values(output);
+    normalize_json_messages(&mut values);
+    let mut lines = values
+        .into_iter()
+        .map(|value| serde_json::to_string(&value).expect("json value should serialize"))
+        .collect::<Vec<_>>();
+    lines.sort_unstable();
+    lines
+}
+
 #[test]
 fn cli_json_emits_ripgrep_style_message_sequence() {
     let repo = TestRepo::new();
@@ -166,7 +177,7 @@ fn cli_json_uses_index_without_checking_freshness() {
 }
 
 #[test]
-fn cli_sparse_short_literal_json_falls_back_to_ripgrep() {
+fn cli_sparse_short_literal_json_matches_ripgrep_via_index() {
     let repo = TestRepo::new();
     repo.write("defs/matched.td", "defm Match : Something;\n");
     repo.write("defs/other.td", "defm Other : Something;\n");
@@ -176,6 +187,7 @@ fn cli_sparse_short_literal_json_falls_back_to_ripgrep() {
     let codgrep = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["--json", "-F", "-g", "*.td", "defm"])
         .arg(&repo.repo)
         .output()
@@ -190,10 +202,6 @@ fn cli_sparse_short_literal_json_falls_back_to_ripgrep() {
         .expect("test should succeed");
 
     assert_eq!(codgrep.status.code(), rg.status.code());
-    let mut codgrep_json = json_values(&codgrep.stdout);
-    let mut rg_json = json_values(&rg.stdout);
-    normalize_json_messages(&mut codgrep_json);
-    normalize_json_messages(&mut rg_json);
-    assert_eq!(codgrep_json, rg_json);
-    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+    assert_eq!(sorted_normalized_json(&codgrep.stdout), sorted_normalized_json(&rg.stdout));
+    assert!(!stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }

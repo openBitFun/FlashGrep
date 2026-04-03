@@ -12,7 +12,7 @@ use crate::{
     files::{resolve_repo_path, scan_paths, RepositoryFile, ScanOptions},
     index::IndexSearcher,
     path_filter::PathFilter,
-    query_preflight::evaluate_index_query_preflight,
+    query_preflight::{evaluate_index_query_preflight, preflight_enabled},
     search::{FileCount, FileMatchCount, SearchResults},
     search_engine::{
         count_scanned_files, count_total_scanned_files, search_json_scanned_files,
@@ -606,30 +606,32 @@ impl SearchRequest {
                     return Ok(SearchExecution::Scan { files });
                 }
 
-                let preflight_started = Instant::now();
-                let preflight =
-                    evaluate_index_query_preflight(&searcher, config, self.filter(), None)?;
-                trace_cli_profile("prepare_query.preflight", preflight_started.elapsed());
-                if !preflight.reason.keep_indexed() {
-                    if let Some(plan) = ripgrep_plan.clone() {
-                        trace_ripgrep_fallback(&config.regex_pattern, true, &preflight.detail);
-                        trace_cli_profile("prepare_query.total", prepare_started.elapsed());
-                        return Ok(ripgrep_execution(plan));
+                if preflight_enabled() {
+                    let preflight_started = Instant::now();
+                    let preflight =
+                        evaluate_index_query_preflight(&searcher, config, self.filter(), None)?;
+                    trace_cli_profile("prepare_query.preflight", preflight_started.elapsed());
+                    if !preflight.reason.keep_indexed() {
+                        if let Some(plan) = ripgrep_plan.clone() {
+                            trace_ripgrep_fallback(&config.regex_pattern, true, &preflight.detail);
+                            trace_cli_profile("prepare_query.total", prepare_started.elapsed());
+                            return Ok(ripgrep_execution(plan));
+                        }
+                        trace_ripgrep_fallback(
+                            &config.regex_pattern,
+                            false,
+                            &format!("{}; rg unavailable", preflight.detail),
+                        );
+                        if preflight.reason.requires_scan_backend() {
+                            let scan_started = Instant::now();
+                            let files = self.scan_requested_files(indexed_max_file_size)?;
+                            trace_cli_profile("prepare_query.scan_files", scan_started.elapsed());
+                            trace_cli_profile("prepare_query.total", prepare_started.elapsed());
+                            return Ok(SearchExecution::Scan { files });
+                        }
+                    } else {
+                        trace_ripgrep_fallback(&config.regex_pattern, false, &preflight.detail);
                     }
-                    trace_ripgrep_fallback(
-                        &config.regex_pattern,
-                        false,
-                        &format!("{}; rg unavailable", preflight.detail),
-                    );
-                    if preflight.reason.requires_scan_backend() {
-                        let scan_started = Instant::now();
-                        let files = self.scan_requested_files(indexed_max_file_size)?;
-                        trace_cli_profile("prepare_query.scan_files", scan_started.elapsed());
-                        trace_cli_profile("prepare_query.total", prepare_started.elapsed());
-                        return Ok(SearchExecution::Scan { files });
-                    }
-                } else {
-                    trace_ripgrep_fallback(&config.regex_pattern, false, &preflight.detail);
                 }
 
                 let path_count_started = Instant::now();

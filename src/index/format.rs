@@ -226,6 +226,7 @@ pub fn write_docs_file(path: &Path, metadata: IndexMetadata, docs: &[DocMeta]) -
 pub struct DocsWriter {
     file: File,
     doc_count_offset: u64,
+    fallback_trigram_offsets: Option<(u64, u64)>,
     doc_count: usize,
 }
 
@@ -247,16 +248,21 @@ impl DocsWriter {
             AppError::InvalidIndex("missing build metadata when writing docs file".into())
         })?;
         file.write_all(&[u8::from(metadata.fallback_trigram.is_some())])?;
-        if let Some(fallback) = metadata.fallback_trigram {
+        let fallback_trigram_offsets = if let Some(fallback) = metadata.fallback_trigram {
+            let doc_count_offset = file.stream_position()?;
             write_u32(
                 &mut file,
                 usize_to_u32(fallback.doc_count, "fallback trigram doc count")?,
             )?;
+            let key_count_offset = file.stream_position()?;
             write_u32(
                 &mut file,
                 usize_to_u32(fallback.key_count, "fallback trigram key count")?,
             )?;
-        }
+            Some((doc_count_offset, key_count_offset))
+        } else {
+            None
+        };
         file.write_all(&[build.corpus_mode.to_byte()])?;
         file.write_all(&[u8::from(build.include_hidden)])?;
         write_u64(&mut file, build.max_file_size)?;
@@ -288,8 +294,28 @@ impl DocsWriter {
         Ok(Self {
             file,
             doc_count_offset,
+            fallback_trigram_offsets,
             doc_count: 0,
         })
+    }
+
+    pub fn update_fallback_trigram(&mut self, fallback: FallbackTrigramSettings) -> Result<()> {
+        let Some((doc_count_offset, key_count_offset)) = self.fallback_trigram_offsets else {
+            return Ok(());
+        };
+        let end_offset = self.file.stream_position()?;
+        self.file.seek(SeekFrom::Start(doc_count_offset))?;
+        write_u32(
+            &mut self.file,
+            usize_to_u32(fallback.doc_count, "fallback trigram doc count")?,
+        )?;
+        self.file.seek(SeekFrom::Start(key_count_offset))?;
+        write_u32(
+            &mut self.file,
+            usize_to_u32(fallback.key_count, "fallback trigram key count")?,
+        )?;
+        self.file.seek(SeekFrom::Start(end_offset))?;
+        Ok(())
     }
 
     pub fn write_doc(&mut self, doc: &DocMeta) -> Result<()> {

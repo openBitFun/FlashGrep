@@ -24,7 +24,7 @@ use crate::{
     json_output::{JsonDuration, JsonSearchFile, JsonSearchReport, JsonStats},
     path_filter::PathFilter,
     planner::plan,
-    query_preflight::evaluate_index_query_preflight,
+    query_preflight::{evaluate_index_query_preflight, preflight_enabled},
     search::{
         FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine, SearchResults,
     },
@@ -139,14 +139,14 @@ impl SearchEngine {
     ) -> Result<SearchResponse> {
         match self.open_searcher() {
             Ok(searcher) => {
-                let preflight = evaluate_index_query_preflight(&searcher, config, filter, None)?;
-                self.search_with_searcher(
-                    searcher,
-                    config,
-                    filter,
-                    policy,
-                    preflight.reason.requires_scan_backend(),
-                )
+                let query_prefers_scan = if preflight_enabled() {
+                    let preflight =
+                        evaluate_index_query_preflight(&searcher, config, filter, None)?;
+                    preflight.reason.requires_scan_backend()
+                } else {
+                    false
+                };
+                self.search_with_searcher(searcher, config, filter, policy, query_prefers_scan)
             }
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 self.search_without_index(config, filter, policy)

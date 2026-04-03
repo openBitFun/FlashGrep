@@ -111,7 +111,7 @@ fn search_engine_reports_worktree_diff_separately() {
 }
 
 #[test]
-fn search_engine_scans_fresh_index_when_query_cannot_use_index_effectively() {
+fn search_engine_uses_index_by_default_when_preflight_is_disabled() {
     let repo = TestRepo::new();
     repo.write("words.txt", "alpha beta gamma\n");
     repo.build();
@@ -121,7 +121,8 @@ fn search_engine_scans_fresh_index_when_query_cannot_use_index_effectively() {
         .search(&query("\\w+\\s+\\w+"), SearchPolicy::FallbackToScan)
         .expect("test should succeed");
 
-    assert_eq!(outcome.backend, SearchBackend::Scan);
+    assert_eq!(outcome.backend, SearchBackend::Index);
+    assert_eq!(outcome.results.hits.len(), 1);
 }
 
 #[test]

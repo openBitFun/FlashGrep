@@ -502,6 +502,12 @@ fn cli_ripgrep_regression_r3127_glob_flag_not_allow_unclosed_class() {
 fn cli_ripgrep_regression_r2944_incorrect_bytes_searched() {
     let repo = TestRepo::new();
     let haystack = repo.write("haystack", "foo1\nfoo2\nfoo3\nfoo4\nfoo5\n");
+    let bytes_printed = format!(
+        "{}:foo1\n{}:foo2\n",
+        haystack.to_string_lossy(),
+        haystack.to_string_lossy(),
+    )
+    .len();
 
     repo.build();
 
@@ -510,9 +516,10 @@ fn cli_ripgrep_regression_r2944_incorrect_bytes_searched() {
     assert_eq!(
         normalized_stats_output(&codgrep.stdout),
         format!(
-            "{}:foo1\n{}:foo2\n\n2 matches\n2 matched lines\n1 files contained matches\n1 files searched\n174 bytes printed\n10 bytes searched\n<search-time>\n<total-time>",
+            "{}:foo1\n{}:foo2\n\n2 matches\n2 matched lines\n1 files contained matches\n1 files searched\n{} bytes printed\n10 bytes searched\n<search-time>\n<total-time>",
             haystack.to_string_lossy(),
             haystack.to_string_lossy(),
+            bytes_printed,
         )
     );
 }

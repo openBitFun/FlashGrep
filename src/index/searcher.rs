@@ -807,6 +807,7 @@ impl IndexSearcher {
         let plan_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
+        let literal_prefilter = LiteralPrefilter::new(&plan, config.case_insensitive);
 
         let candidate_ids = if let Some(multi_literal) = self.prepare_multi_literal_search(
             &plan,
@@ -823,14 +824,22 @@ impl IndexSearcher {
         };
         let candidate_ids = self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
-        let verify_plan =
-            CountVerifyPlan::compile(config, multiline_verifier, None, CountVerifyKind::Lines)?;
+        let regex_started = Instant::now();
+        let verify_plan = CountVerifyPlan::compile(
+            config,
+            multiline_verifier,
+            literal_prefilter,
+            CountVerifyKind::Lines,
+        )?;
+        profile.record_regex_compile(regex_started.elapsed());
         let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
+        let match_started = Instant::now();
         let counts = verify_plan.verify_candidate_counts_by_doc(
             &candidate_ids,
             self.docs.len(),
             &resolve_path,
         )?;
+        profile.record_verify(match_started.elapsed());
         if include_zero {
             self.file_counts_from_doc_counts_including_zero(counts, filter, allowed_paths)
         } else {
@@ -1615,7 +1624,7 @@ impl IndexSearcher {
         }
 
         entries.sort_unstable_by_key(|entry| (entry.doc_freq, entry.token_hash));
-        entries.truncate(entries.len().min(2));
+        entries.truncate(entries.len().min(3));
 
         let mut docs: Option<Vec<u32>> = None;
         for entry in entries {

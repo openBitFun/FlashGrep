@@ -6,6 +6,18 @@ use crate::{
     common::{sort_lines, stderr_string, stdout_string, TestRepo, SHERLOCK},
 };
 
+fn sort_stats_match_lines(output: &[u8]) -> String {
+    let normalized = normalized_stats_output(output);
+    let mut parts = normalized.splitn(2, "\n\n");
+    let matches = parts.next().unwrap_or_default();
+    let summary = parts.next().unwrap_or_default();
+    if summary.is_empty() {
+        sort_lines(matches)
+    } else {
+        format!("{}\n\n{}", sort_lines(matches), summary)
+    }
+}
+
 #[test]
 fn cli_files_matches_ripgrep_output() {
     let repo = TestRepo::new();
@@ -247,7 +259,7 @@ fn cli_supports_count_matches_mode() {
 }
 
 #[test]
-fn cli_sparse_short_literal_count_falls_back_to_ripgrep() {
+fn cli_sparse_short_literal_count_uses_index_when_fallback_sidecar_exists() {
     let repo = TestRepo::new();
     repo.write("defs/first.td", "defm Foo : Something;\n");
     repo.write(
@@ -261,6 +273,7 @@ fn cli_sparse_short_literal_count_falls_back_to_ripgrep() {
     let codgrep = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["-F", "-c", "defm"])
         .arg(&repo.repo)
         .output()
@@ -278,11 +291,11 @@ fn cli_sparse_short_literal_count_falls_back_to_ripgrep() {
         sort_lines(&stdout_string(&codgrep.stdout)),
         sort_lines(&stdout_string(&rg.stdout))
     );
-    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+    assert!(!stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }
 
 #[test]
-fn cli_sparse_short_literal_standard_search_matches_ripgrep() {
+fn cli_sparse_short_literal_standard_search_matches_ripgrep_via_index() {
     let repo = TestRepo::new();
     repo.write("defs/matched.td", "defm Match : Something;\n");
     repo.write("defs/missed.td", "def Missing;\n");
@@ -293,6 +306,7 @@ fn cli_sparse_short_literal_standard_search_matches_ripgrep() {
     let codgrep = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["-F", "-g", "*.td", "defm"])
         .arg(&repo.repo)
         .output()
@@ -310,11 +324,11 @@ fn cli_sparse_short_literal_standard_search_matches_ripgrep() {
         sort_lines(&stdout_string(&codgrep.stdout)),
         sort_lines(&stdout_string(&rg.stdout))
     );
-    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+    assert!(!stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }
 
 #[test]
-fn cli_sparse_short_literal_files_with_matches_fall_back_to_ripgrep() {
+fn cli_sparse_short_literal_files_with_matches_use_index() {
     let repo = TestRepo::new();
     repo.write("defs/matched.td", "defm Match : Something;\n");
     repo.write("defs/missed.td", "def Missing;\n");
@@ -325,6 +339,7 @@ fn cli_sparse_short_literal_files_with_matches_fall_back_to_ripgrep() {
     let codgrep = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["-F", "-l", "-g", "*.td", "defm"])
         .arg(&repo.repo)
         .output()
@@ -342,11 +357,11 @@ fn cli_sparse_short_literal_files_with_matches_fall_back_to_ripgrep() {
         sort_lines(&stdout_string(&codgrep.stdout)),
         sort_lines(&stdout_string(&rg.stdout))
     );
-    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+    assert!(!stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }
 
 #[test]
-fn cli_sparse_short_literal_files_without_match_fall_back_to_ripgrep() {
+fn cli_sparse_short_literal_files_without_match_use_index() {
     let repo = TestRepo::new();
     repo.write("defs/matched.td", "defm Match : Something;\n");
     repo.write("defs/missed.td", "def Missing;\n");
@@ -357,6 +372,7 @@ fn cli_sparse_short_literal_files_without_match_fall_back_to_ripgrep() {
     let codgrep = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["-F", "--files-without-match", "-g", "*.td", "defm"])
         .arg(&repo.repo)
         .output()
@@ -374,11 +390,11 @@ fn cli_sparse_short_literal_files_without_match_fall_back_to_ripgrep() {
         sort_lines(&stdout_string(&codgrep.stdout)),
         sort_lines(&stdout_string(&rg.stdout))
     );
-    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+    assert!(!stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }
 
 #[test]
-fn cli_sparse_short_literal_quiet_falls_back_to_ripgrep() {
+fn cli_sparse_short_literal_quiet_uses_index() {
     let repo = TestRepo::new();
     repo.write("defs/matched.td", "defm Match : Something;\n");
 
@@ -387,6 +403,7 @@ fn cli_sparse_short_literal_quiet_falls_back_to_ripgrep() {
     let matched = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["-q", "-F", "defm"])
         .arg(&repo.repo)
         .output()
@@ -400,11 +417,12 @@ fn cli_sparse_short_literal_quiet_falls_back_to_ripgrep() {
         .expect("test should succeed");
 
     assert_eq!(matched.status.code(), rg_matched.status.code());
-    assert!(stderr_string(&matched.stderr).contains("fallback rg=true"));
+    assert!(!stderr_string(&matched.stderr).contains("fallback rg=true"));
 
     let missed = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["-q", "-F", "none"])
         .arg(&repo.repo)
         .output()
@@ -418,7 +436,7 @@ fn cli_sparse_short_literal_quiet_falls_back_to_ripgrep() {
         .expect("test should succeed");
 
     assert_eq!(missed.status.code(), rg_missed.status.code());
-    assert!(stderr_string(&missed.stderr).contains("fallback rg=true"));
+    assert!(!stderr_string(&missed.stderr).contains("fallback rg=true"));
 }
 
 #[test]
@@ -908,7 +926,7 @@ fn cli_count_stats_matches_ripgrep_aggregate_lines() {
 }
 
 #[test]
-fn cli_sparse_short_literal_stats_fall_back_to_ripgrep() {
+fn cli_sparse_short_literal_stats_match_ripgrep_via_index() {
     let repo = TestRepo::new();
     repo.write("defs/matched.td", "defm Match : Something;\n");
     repo.write("defs/other.td", "defm Other : Something;\n");
@@ -918,6 +936,7 @@ fn cli_sparse_short_literal_stats_fall_back_to_ripgrep() {
     let codgrep = repo
         .cli()
         .env("BITFUN_TRACE_FALLBACK", "1")
+        .env("BITFUN_ENABLE_PREFLIGHT", "1")
         .args(["-F", "--stats", "-g", "*.td", "defm"])
         .arg(&repo.repo)
         .output()
@@ -932,10 +951,10 @@ fn cli_sparse_short_literal_stats_fall_back_to_ripgrep() {
 
     assert_eq!(codgrep.status.code(), rg.status.code());
     assert_eq!(
-        normalized_stats_output(&codgrep.stdout),
-        normalized_stats_output(&rg.stdout)
+        sort_stats_match_lines(&codgrep.stdout),
+        sort_stats_match_lines(&rg.stdout)
     );
-    assert!(stderr_string(&codgrep.stderr).contains("fallback rg=true"));
+    assert!(!stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }
 
 #[test]

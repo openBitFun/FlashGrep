@@ -16,8 +16,8 @@ use crate::{
     files::{read_text_file, repo_relative_path, scan_repository, RepositoryFile},
     index::format::{
         activate_generation, ensure_dir, read_doc_terms_file, read_docs_file, write_lookup_file,
-        DocMeta, DocTermsWriter, DocsWriter, IndexBuildSettings, IndexLayout, IndexMetadata,
-        LookupEntry, PostingsWriter,
+        DocMeta, DocTermsWriter, DocsWriter, FallbackTrigramSettings, IndexBuildSettings,
+        IndexLayout, IndexMetadata, LookupEntry, PostingsWriter,
     },
     progress::{IndexProgress, IndexProgressPhase},
     tokenizer::{create, TokenizerOptions},
@@ -370,6 +370,7 @@ fn process_file_batch_in_parallel(
                     size: file.size,
                     mtime_nanos: file.mtime_nanos,
                     token_hashes: cached.token_hashes.clone(),
+                    fallback_token_hashes: cached.fallback_token_hashes.clone(),
                 });
                 continue;
             }
@@ -424,6 +425,7 @@ fn process_chunk(
         tokenizer.collect_document_token_hashes(&folded, &mut token_hashes);
         token_hashes.sort_unstable();
         token_hashes.dedup();
+        let fallback_token_hashes = collect_fallback_trigram_hashes(tokenizer_mode, &folded);
 
         docs.push(IndexedFile {
             ordinal: file.ordinal,
@@ -431,6 +433,7 @@ fn process_chunk(
             size: file.size,
             mtime_nanos: file.mtime_nanos,
             token_hashes,
+            fallback_token_hashes,
         });
     }
 
@@ -503,31 +506,54 @@ struct StreamingIndexBuilder {
     docs_writer: DocsWriter,
     doc_terms_writer: DocTermsWriter,
     bucket_spiller: BucketSpiller,
-    spill_dir: PathBuf,
+    fallback_doc_terms_writer: Option<DocTermsWriter>,
+    fallback_bucket_spiller: Option<BucketSpiller>,
+    base_spill_dir: PathBuf,
+    fallback_spill_dir: Option<PathBuf>,
     doc_count: usize,
 }
 
 impl StreamingIndexBuilder {
     fn new(config: &BuildConfig, snapshot: &BaseSnapshot, layout: &IndexLayout) -> Result<Self> {
+        let build_fallback_trigram =
+            config.tokenizer == crate::config::TokenizerMode::SparseNgram;
         let docs_writer = DocsWriter::create(
             &layout.docs_path,
             IndexMetadata {
                 tokenizer: config.tokenizer,
                 min_sparse_len: config.min_sparse_len,
                 max_sparse_len: config.max_sparse_len,
-                fallback_trigram: None,
+                fallback_trigram: build_fallback_trigram.then_some(FallbackTrigramSettings {
+                    doc_count: 0,
+                    key_count: 0,
+                }),
                 build: Some(snapshot.build_settings(config)),
             },
         )?;
         let doc_terms_writer = DocTermsWriter::create(&layout.doc_terms_path)?;
-        let spill_dir = spill_dir_path(layout);
-        let bucket_spiller = BucketSpiller::create(&spill_dir)?;
+        let spill_root = spill_dir_path(layout);
+        let base_spill_dir = spill_root.join("base");
+        let bucket_spiller = BucketSpiller::create(&base_spill_dir)?;
+        let (fallback_doc_terms_writer, fallback_bucket_spiller, fallback_spill_dir) =
+            if build_fallback_trigram {
+                let fallback_spill_dir = spill_root.join("fallback");
+                (
+                    Some(DocTermsWriter::create(&layout.trigram_fallback_doc_terms_path)?),
+                    Some(BucketSpiller::create(&fallback_spill_dir)?),
+                    Some(fallback_spill_dir),
+                )
+            } else {
+                (None, None, None)
+            };
         Ok(Self {
             repo_path: config.repo_path.clone(),
             docs_writer,
             doc_terms_writer,
             bucket_spiller,
-            spill_dir,
+            fallback_doc_terms_writer,
+            fallback_bucket_spiller,
+            base_spill_dir,
+            fallback_spill_dir,
             doc_count: 0,
         })
     }
@@ -544,6 +570,12 @@ impl StreamingIndexBuilder {
             self.doc_terms_writer.write_doc_terms(&file.token_hashes)?;
             self.bucket_spiller
                 .write_doc_terms(&file.token_hashes, doc_id)?;
+            if let Some(writer) = self.fallback_doc_terms_writer.as_mut() {
+                writer.write_doc_terms(&file.fallback_token_hashes)?;
+            }
+            if let Some(spiller) = self.fallback_bucket_spiller.as_mut() {
+                spiller.write_doc_terms(&file.fallback_token_hashes, doc_id)?;
+            }
             self.doc_count += 1;
         }
         Ok(())
@@ -562,36 +594,47 @@ impl StreamingIndexBuilder {
             IndexProgressPhase::Finalizing,
             "Flushing streamed index metadata",
             0,
-            Some(3),
+            Some(4),
         );
         self.bucket_spiller.finish()?;
+        if let Some(spiller) = self.fallback_bucket_spiller.as_mut() {
+            spiller.finish()?;
+        }
         report_progress(
             on_progress,
             IndexProgressPhase::Finalizing,
             "Flushed postings spill buckets",
             1,
-            Some(3),
+            Some(4),
         );
-        let docs_count = self.docs_writer.finish()?;
+        let docs_count = self.doc_count;
         let doc_terms_count = self.doc_terms_writer.finish()?;
+        let fallback_doc_terms_count = if let Some(writer) = self.fallback_doc_terms_writer.take() {
+            writer.finish()?
+        } else {
+            docs_count
+        };
         report_progress(
             on_progress,
             IndexProgressPhase::Finalizing,
             "Flushed docs and doc terms",
             2,
-            Some(3),
+            Some(4),
         );
-        if docs_count != self.doc_count || doc_terms_count != self.doc_count {
+        if docs_count != self.doc_count
+            || doc_terms_count != self.doc_count
+            || fallback_doc_terms_count != self.doc_count
+        {
             return Err(AppError::InvalidIndex(format!(
-                "streamed doc count mismatch: docs={docs_count}, doc_terms={doc_terms_count}, expected={}",
-                self.doc_count
+                "streamed doc count mismatch: docs={docs_count}, doc_terms={doc_terms_count}, fallback_doc_terms={fallback_doc_terms_count}, expected={}",
+                self.doc_count,
             )));
         }
 
         let high_freq_doc_threshold = (tokenizer == crate::config::TokenizerMode::SparseNgram)
             .then(|| compute_high_freq_doc_threshold(self.doc_count));
         let mut lookup_entries = merge_postings_from_bucket_files_with_progress(
-            &self.spill_dir,
+            &self.base_spill_dir,
             &layout.postings_path,
             high_freq_doc_threshold,
             on_progress,
@@ -599,17 +642,35 @@ impl StreamingIndexBuilder {
         )?;
         lookup_entries.sort_unstable_by_key(|entry| entry.token_hash);
         write_lookup_file(&layout.lookup_path, &lookup_entries)?;
-        if self.spill_dir.exists() {
-            fs::remove_dir_all(&self.spill_dir)?;
+        if let Some(fallback_spill_dir) = self.fallback_spill_dir.as_ref() {
+            let mut fallback_lookup_entries = merge_postings_from_bucket_files_with_progress(
+                fallback_spill_dir,
+                &layout.trigram_fallback_postings_path,
+                None,
+                on_progress,
+                should_cancel,
+            )?;
+            fallback_lookup_entries.sort_unstable_by_key(|entry| entry.token_hash);
+            write_lookup_file(&layout.trigram_fallback_lookup_path, &fallback_lookup_entries)?;
+            self.docs_writer
+                .update_fallback_trigram(FallbackTrigramSettings {
+                    doc_count: self.doc_count,
+                    key_count: fallback_lookup_entries.len(),
+                })?;
+        }
+        let docs_count = self.docs_writer.finish()?;
+        let spill_root = spill_dir_path(layout);
+        if spill_root.exists() {
+            fs::remove_dir_all(&spill_root)?;
         }
         report_progress(
             on_progress,
             IndexProgressPhase::Finalizing,
             "Finished base snapshot index",
-            3,
-            Some(3),
+            4,
+            Some(4),
         );
-        Ok(self.doc_count)
+        Ok(docs_count)
     }
 }
 
@@ -787,7 +848,18 @@ fn load_cached_docs(config: &BuildConfig, snapshot: &BaseSnapshot) -> HashMap<St
     let Ok(doc_terms) = read_doc_terms_file(&layout.doc_terms_path) else {
         return HashMap::new();
     };
-    if docs.len() != doc_terms.len() {
+    let fallback_doc_terms = if config.tokenizer == crate::config::TokenizerMode::SparseNgram {
+        if metadata.fallback_trigram.is_none() {
+            return HashMap::new();
+        }
+        let Ok(doc_terms) = read_doc_terms_file(&layout.trigram_fallback_doc_terms_path) else {
+            return HashMap::new();
+        };
+        doc_terms
+    } else {
+        vec![Vec::new(); docs.len()]
+    };
+    if docs.len() != doc_terms.len() || docs.len() != fallback_doc_terms.len() {
         return HashMap::new();
     }
 
@@ -800,10 +872,49 @@ fn load_cached_docs(config: &BuildConfig, snapshot: &BaseSnapshot) -> HashMap<St
                     size: doc.size,
                     mtime_nanos: doc.mtime_nanos,
                     token_hashes: doc_terms[index].clone(),
+                    fallback_token_hashes: fallback_doc_terms[index].clone(),
                 },
             )
         })
         .collect()
+}
+
+fn collect_fallback_trigram_hashes(
+    tokenizer_mode: crate::config::TokenizerMode,
+    text: &str,
+) -> Vec<u64> {
+    if tokenizer_mode != crate::config::TokenizerMode::SparseNgram {
+        return Vec::new();
+    }
+
+    let bytes = text.as_bytes();
+    let mut token_hashes = Vec::new();
+    let mut start = 0usize;
+    while start < bytes.len() {
+        while start < bytes.len() && !is_ascii_token_byte(bytes[start]) {
+            start += 1;
+        }
+        if start >= bytes.len() {
+            break;
+        }
+
+        let mut end = start;
+        while end < bytes.len() && is_ascii_token_byte(bytes[end]) {
+            end += 1;
+        }
+        for window in bytes[start..end].windows(3) {
+            token_hashes.push(u64::from(crc32fast::hash(window)));
+        }
+        start = end;
+    }
+
+    token_hashes.sort_unstable();
+    token_hashes.dedup();
+    token_hashes
+}
+
+fn is_ascii_token_byte(byte: u8) -> bool {
+    byte.is_ascii_alphanumeric() || byte == b'_'
 }
 
 fn build_settings_match(
@@ -1117,10 +1228,12 @@ struct IndexedFile {
     size: u64,
     mtime_nanos: u64,
     token_hashes: Vec<u64>,
+    fallback_token_hashes: Vec<u64>,
 }
 
 struct CachedDoc {
     size: u64,
     mtime_nanos: u64,
     token_hashes: Vec<u64>,
+    fallback_token_hashes: Vec<u64>,
 }
