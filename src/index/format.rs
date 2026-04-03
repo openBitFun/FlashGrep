@@ -347,8 +347,9 @@ impl DocsData {
     }
 
     pub fn get(&self, doc_id: u32) -> Result<DocMetaRef<'_>> {
-        let index = usize::try_from(doc_id)
-            .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
+        let index = usize::try_from(doc_id).map_err(|_| {
+            AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range"))
+        })?;
         let record = self.docs.get(index).ok_or_else(|| {
             AppError::InvalidIndex(format!(
                 "doc id {doc_id} is out of bounds for {} docs",

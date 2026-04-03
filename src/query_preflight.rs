@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::{collections::HashSet, env};
 
 use crate::{
     config::{QueryConfig, TokenizerMode},
@@ -143,14 +143,17 @@ pub(crate) fn evaluate_index_query_preflight(
     };
 
     let metrics = QueryPreflightMetrics::from_branch_candidates(searcher, &branch_candidates)?;
-    Ok(evaluate_metrics(metrics))
+    Ok(evaluate_metrics(metrics, config.search_mode))
 }
 
-fn evaluate_metrics(metrics: QueryPreflightMetrics) -> QueryPreflightDecision {
+fn evaluate_metrics(
+    metrics: QueryPreflightMetrics,
+    search_mode: crate::search::SearchMode,
+) -> QueryPreflightDecision {
     let branch_limit = preflight_branch_limit(metrics.doc_count);
     let union_limit = preflight_union_limit(metrics.doc_count);
-    let branch_byte_limit = preflight_branch_byte_limit();
-    let union_byte_limit = preflight_union_byte_limit();
+    let branch_byte_limit = preflight_branch_byte_limit(search_mode);
+    let union_byte_limit = preflight_union_byte_limit(search_mode);
 
     for (index, candidate_count) in metrics.branch_candidate_counts.iter().enumerate() {
         if *candidate_count > branch_limit {
@@ -228,27 +231,52 @@ fn preflight_union_limit(doc_count: usize) -> usize {
     (doc_count / 28).max(5_000)
 }
 
-fn preflight_branch_byte_limit() -> u64 {
-    64 * 1024 * 1024
+fn preflight_branch_byte_limit(search_mode: crate::search::SearchMode) -> u64 {
+    preflight_limit_from_env(
+        "BITFUN_PREFLIGHT_BRANCH_BYTES",
+        if search_mode.materializes_matches() {
+            64 * 1024 * 1024
+        } else {
+            128 * 1024 * 1024
+        },
+    )
 }
 
-fn preflight_union_byte_limit() -> u64 {
-    96 * 1024 * 1024
+fn preflight_union_byte_limit(search_mode: crate::search::SearchMode) -> u64 {
+    preflight_limit_from_env(
+        "BITFUN_PREFLIGHT_UNION_BYTES",
+        if search_mode.materializes_matches() {
+            96 * 1024 * 1024
+        } else {
+            192 * 1024 * 1024
+        },
+    )
+}
+
+fn preflight_limit_from_env(name: &str, default: u64) -> u64 {
+    env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(default)
 }
 
 #[cfg(test)]
 mod tests {
     use super::{evaluate_metrics, QueryPreflightMetrics, QueryPreflightReason};
+    use crate::search::SearchMode;
 
     #[test]
     fn preflight_uses_branch_candidate_limit() {
-        let decision = evaluate_metrics(QueryPreflightMetrics {
-            doc_count: 120_000,
-            branch_candidate_counts: vec![7_089, 6_461, 40_796],
-            union_candidate_count: 54_346,
-            branch_candidate_bytes: vec![4, 5, 6],
-            union_candidate_bytes: 15,
-        });
+        let decision = evaluate_metrics(
+            QueryPreflightMetrics {
+                doc_count: 120_000,
+                branch_candidate_counts: vec![7_089, 6_461, 40_796],
+                union_candidate_count: 54_346,
+                branch_candidate_bytes: vec![4, 5, 6],
+                union_candidate_bytes: 15,
+            },
+            SearchMode::MaterializeMatches,
+        );
 
         assert_eq!(
             decision.reason,
@@ -262,13 +290,16 @@ mod tests {
 
     #[test]
     fn preflight_uses_union_candidate_limit() {
-        let decision = evaluate_metrics(QueryPreflightMetrics {
-            doc_count: 120_000,
-            branch_candidate_counts: vec![8_000, 9_001, 7_000],
-            union_candidate_count: 5_001,
-            branch_candidate_bytes: vec![4, 5, 6],
-            union_candidate_bytes: 15,
-        });
+        let decision = evaluate_metrics(
+            QueryPreflightMetrics {
+                doc_count: 120_000,
+                branch_candidate_counts: vec![8_000, 9_001, 7_000],
+                union_candidate_count: 5_001,
+                branch_candidate_bytes: vec![4, 5, 6],
+                union_candidate_bytes: 15,
+            },
+            SearchMode::MaterializeMatches,
+        );
 
         assert_eq!(
             decision.reason,
@@ -282,13 +313,16 @@ mod tests {
 
     #[test]
     fn preflight_uses_branch_byte_limit() {
-        let decision = evaluate_metrics(QueryPreflightMetrics {
-            doc_count: 1_000,
-            branch_candidate_counts: vec![200],
-            union_candidate_count: 200,
-            branch_candidate_bytes: vec![64 * 1024 * 1024 + 1],
-            union_candidate_bytes: 64 * 1024 * 1024 + 1,
-        });
+        let decision = evaluate_metrics(
+            QueryPreflightMetrics {
+                doc_count: 1_000,
+                branch_candidate_counts: vec![200],
+                union_candidate_count: 200,
+                branch_candidate_bytes: vec![64 * 1024 * 1024 + 1],
+                union_candidate_bytes: 64 * 1024 * 1024 + 1,
+            },
+            SearchMode::MaterializeMatches,
+        );
 
         assert_eq!(decision.reason, QueryPreflightReason::BranchBytesExceeded);
         assert!(decision
@@ -298,18 +332,41 @@ mod tests {
 
     #[test]
     fn preflight_keeps_indexed_for_narrow_candidate_sets() {
-        let decision = evaluate_metrics(QueryPreflightMetrics {
-            doc_count: 120_000,
-            branch_candidate_counts: vec![2_182, 3_126, 3],
-            union_candidate_count: 4_628,
-            branch_candidate_bytes: vec![12, 23, 34],
-            union_candidate_bytes: 56,
-        });
+        let decision = evaluate_metrics(
+            QueryPreflightMetrics {
+                doc_count: 120_000,
+                branch_candidate_counts: vec![2_182, 3_126, 3],
+                union_candidate_count: 4_628,
+                branch_candidate_bytes: vec![12, 23, 34],
+                union_candidate_bytes: 56,
+            },
+            SearchMode::MaterializeMatches,
+        );
 
         assert_eq!(
             decision.reason,
             QueryPreflightReason::CandidatesWithinLimits
         );
         assert!(decision.detail.contains("union_size=4628"));
+    }
+
+    #[test]
+    fn preflight_uses_higher_byte_limit_for_non_materializing_modes() {
+        let decision = evaluate_metrics(
+            QueryPreflightMetrics {
+                doc_count: 1_000,
+                branch_candidate_counts: vec![200],
+                union_candidate_count: 200,
+                branch_candidate_bytes: vec![64 * 1024 * 1024 + 1],
+                union_candidate_bytes: 64 * 1024 * 1024 + 1,
+            },
+            SearchMode::CountMatches,
+        );
+
+        assert_eq!(
+            decision.reason,
+            QueryPreflightReason::CandidatesWithinLimits
+        );
+        assert!(decision.detail.contains("branch_bytes<="));
     }
 }

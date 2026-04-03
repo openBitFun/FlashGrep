@@ -518,6 +518,9 @@ fn resolve_search_mode(args: &SearchArgs, stats: bool) -> Result<SearchMode> {
     if args.quiet && !stats {
         return Ok(SearchMode::FirstHitOnly);
     }
+    if args.quiet && stats {
+        return Ok(SearchMode::CountMatches);
+    }
     if args.files_with_matches {
         return Ok(SearchMode::FirstHitOnly);
     }

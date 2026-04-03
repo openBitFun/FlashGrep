@@ -984,6 +984,13 @@ impl IndexSearcher {
             })
     }
 
+    pub fn indexed_path_count(&self, filter: Option<&PathFilter>) -> usize {
+        self.docs
+            .iter()
+            .filter(|doc| self.doc_matches_filters(*doc, filter, None))
+            .count()
+    }
+
     pub(crate) fn doc_display_path_by_id(&self, doc_id: u32) -> Result<String> {
         Ok(self.doc_display_path_ref(doc_by_id(&self.docs, doc_id)?))
     }
@@ -1001,7 +1008,9 @@ impl IndexSearcher {
     }
 
     fn doc_display_path_ref(&self, doc: DocMetaRef<'_>) -> String {
-        self.doc_resolved_path_ref(doc).to_string_lossy().into_owned()
+        self.doc_resolved_path_ref(doc)
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn doc_resolved_path_ref(&self, doc: DocMetaRef<'_>) -> PathBuf {
@@ -1017,7 +1026,9 @@ impl IndexSearcher {
     }
 
     fn doc_display_path_str(&self, path: &str) -> String {
-        self.resolve_doc_path_str(path).to_string_lossy().into_owned()
+        self.resolve_doc_path_str(path)
+            .to_string_lossy()
+            .into_owned()
     }
 
     fn resolve_doc_path_str(&self, path: &str) -> PathBuf {

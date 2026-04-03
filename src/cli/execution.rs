@@ -1,9 +1,15 @@
-use std::{collections::HashSet, env, io, path::PathBuf, process::Command};
+use std::{
+    collections::HashSet,
+    env, io,
+    path::PathBuf,
+    process::Command,
+    time::{Duration, Instant},
+};
 
 use crate::{
     config::QueryConfig,
     error::{AppError, Result},
-    files::{scan_paths, RepositoryFile, ScanOptions},
+    files::{resolve_repo_path, scan_paths, RepositoryFile, ScanOptions},
     index::IndexSearcher,
     path_filter::PathFilter,
     query_preflight::evaluate_index_query_preflight,
@@ -22,6 +28,7 @@ pub(super) enum SearchExecution {
         searcher: IndexSearcher,
         allowed_paths: Option<HashSet<String>>,
         paths: Vec<String>,
+        path_count: usize,
     },
     Ripgrep {
         plan: RipgrepPlan,
@@ -51,7 +58,7 @@ pub(super) struct RipgrepPlan {
 impl SearchExecution {
     pub(super) fn is_empty(&self) -> bool {
         match self {
-            Self::Indexed { paths, .. } => paths.is_empty(),
+            Self::Indexed { path_count, .. } => *path_count == 0,
             Self::Ripgrep { paths, .. } => paths.is_empty(),
             Self::Scan { files } => files.is_empty(),
         }
@@ -477,36 +484,46 @@ impl SearchRequest {
     }
 
     pub(super) fn prepare_listing_execution(&self) -> Result<SearchExecution> {
+        let prepare_started = Instant::now();
         let searcher = match IndexSearcher::open(self.index_path.clone()) {
             Ok(searcher) => Some(searcher),
             Err(AppError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
+        trace_cli_profile("prepare_listing.open_index", prepare_started.elapsed());
 
         let Some(searcher) = searcher else {
-            return Ok(SearchExecution::Scan {
-                files: self.scan_requested_files(None)?,
-            });
+            let scan_started = Instant::now();
+            let files = self.scan_requested_files(None)?;
+            trace_cli_profile("prepare_listing.scan_files", scan_started.elapsed());
+            trace_cli_profile("prepare_listing.total", prepare_started.elapsed());
+            return Ok(SearchExecution::Scan { files });
         };
 
+        let scope_started = Instant::now();
         match searcher.ensure_query_scope_supported(
             self.include_hidden,
             self.no_ignore,
             self.max_file_size,
         ) {
             Ok(()) => {
+                trace_cli_profile("prepare_listing.ensure_scope", scope_started.elapsed());
                 let indexed_max_file_size = searcher
                     .build_settings()
                     .map(|settings| settings.max_file_size);
                 if self.requires_filesystem_scope_resolution(indexed_max_file_size) {
+                    let scan_started = Instant::now();
                     let files = self.scan_requested_files(indexed_max_file_size)?;
+                    trace_cli_profile("prepare_listing.scan_files", scan_started.elapsed());
                     let allowed_paths = files
                         .iter()
                         .map(|file| file.path.to_string_lossy().into_owned())
                         .collect();
+                    trace_cli_profile("prepare_listing.total", prepare_started.elapsed());
                     return Ok(SearchExecution::Indexed {
                         searcher,
                         allowed_paths: Some(allowed_paths),
+                        path_count: files.len(),
                         paths: files
                             .iter()
                             .map(|file| file.path.to_string_lossy().into_owned())
@@ -514,43 +531,61 @@ impl SearchRequest {
                     });
                 }
 
+                let paths_started = Instant::now();
+                let paths = searcher.indexed_paths(self.filter());
+                trace_cli_profile("prepare_listing.indexed_paths", paths_started.elapsed());
+                trace_cli_profile("prepare_listing.total", prepare_started.elapsed());
                 Ok(SearchExecution::Indexed {
-                    paths: searcher.indexed_paths(self.filter()),
+                    path_count: paths.len(),
+                    paths,
                     searcher,
                     allowed_paths: None,
                 })
             }
-            Err(AppError::InvalidIndex(_)) => Ok(SearchExecution::Scan {
-                files: self.scan_requested_files(None)?,
-            }),
+            Err(AppError::InvalidIndex(_)) => {
+                trace_cli_profile("prepare_listing.ensure_scope", scope_started.elapsed());
+                let scan_started = Instant::now();
+                let files = self.scan_requested_files(None)?;
+                trace_cli_profile("prepare_listing.scan_files", scan_started.elapsed());
+                trace_cli_profile("prepare_listing.total", prepare_started.elapsed());
+                Ok(SearchExecution::Scan { files })
+            }
             Err(error) => Err(error),
         }
     }
 
     pub(super) fn prepare_query_execution(&self, config: &QueryConfig) -> Result<SearchExecution> {
+        let prepare_started = Instant::now();
         let ripgrep_plan = ripgrep_is_available().then(|| self.ripgrep_fallback_plan());
+        let open_started = Instant::now();
         let searcher = match IndexSearcher::open(self.index_path.clone()) {
             Ok(searcher) => Some(searcher),
             Err(AppError::Io(error)) if error.kind() == io::ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
+        trace_cli_profile("prepare_query.open_index", open_started.elapsed());
 
         let Some(searcher) = searcher else {
             if let Some(plan) = ripgrep_plan.clone() {
                 trace_ripgrep_fallback(&config.regex_pattern, true, "index does not exist");
+                trace_cli_profile("prepare_query.total", prepare_started.elapsed());
                 return Ok(ripgrep_execution(plan));
             }
-            return Ok(SearchExecution::Scan {
-                files: self.scan_requested_files(None)?,
-            });
+            let scan_started = Instant::now();
+            let files = self.scan_requested_files(None)?;
+            trace_cli_profile("prepare_query.scan_files", scan_started.elapsed());
+            trace_cli_profile("prepare_query.total", prepare_started.elapsed());
+            return Ok(SearchExecution::Scan { files });
         };
 
+        let scope_started = Instant::now();
         match searcher.ensure_query_scope_supported(
             self.include_hidden,
             self.no_ignore,
             self.max_file_size,
         ) {
             Ok(()) => {
+                trace_cli_profile("prepare_query.ensure_scope", scope_started.elapsed());
                 let indexed_max_file_size = searcher
                     .build_settings()
                     .map(|settings| settings.max_file_size);
@@ -561,18 +596,24 @@ impl SearchRequest {
                             true,
                             "filesystem scope resolution required",
                         );
+                        trace_cli_profile("prepare_query.total", prepare_started.elapsed());
                         return Ok(ripgrep_execution(plan));
                     }
-                    return Ok(SearchExecution::Scan {
-                        files: self.scan_requested_files(indexed_max_file_size)?,
-                    });
+                    let scan_started = Instant::now();
+                    let files = self.scan_requested_files(indexed_max_file_size)?;
+                    trace_cli_profile("prepare_query.scan_files", scan_started.elapsed());
+                    trace_cli_profile("prepare_query.total", prepare_started.elapsed());
+                    return Ok(SearchExecution::Scan { files });
                 }
 
+                let preflight_started = Instant::now();
                 let preflight =
                     evaluate_index_query_preflight(&searcher, config, self.filter(), None)?;
+                trace_cli_profile("prepare_query.preflight", preflight_started.elapsed());
                 if !preflight.reason.keep_indexed() {
                     if let Some(plan) = ripgrep_plan.clone() {
                         trace_ripgrep_fallback(&config.regex_pattern, true, &preflight.detail);
+                        trace_cli_profile("prepare_query.total", prepare_started.elapsed());
                         return Ok(ripgrep_execution(plan));
                     }
                     trace_ripgrep_fallback(
@@ -581,28 +622,39 @@ impl SearchRequest {
                         &format!("{}; rg unavailable", preflight.detail),
                     );
                     if preflight.reason.requires_scan_backend() {
-                        return Ok(SearchExecution::Scan {
-                            files: self.scan_requested_files(indexed_max_file_size)?,
-                        });
+                        let scan_started = Instant::now();
+                        let files = self.scan_requested_files(indexed_max_file_size)?;
+                        trace_cli_profile("prepare_query.scan_files", scan_started.elapsed());
+                        trace_cli_profile("prepare_query.total", prepare_started.elapsed());
+                        return Ok(SearchExecution::Scan { files });
                     }
                 } else {
                     trace_ripgrep_fallback(&config.regex_pattern, false, &preflight.detail);
                 }
 
+                let path_count_started = Instant::now();
+                let path_count = self.indexed_query_path_count(&searcher);
+                trace_cli_profile("prepare_query.path_count", path_count_started.elapsed());
+                trace_cli_profile("prepare_query.total", prepare_started.elapsed());
                 Ok(SearchExecution::Indexed {
-                    paths: searcher.indexed_paths(self.filter()),
+                    path_count,
+                    paths: Vec::new(),
                     searcher,
                     allowed_paths: None,
                 })
             }
             Err(AppError::InvalidIndex(reason)) => {
+                trace_cli_profile("prepare_query.ensure_scope", scope_started.elapsed());
                 if let Some(plan) = ripgrep_plan {
                     trace_ripgrep_fallback(&config.regex_pattern, true, &reason);
+                    trace_cli_profile("prepare_query.total", prepare_started.elapsed());
                     Ok(ripgrep_execution(plan))
                 } else {
-                    Ok(SearchExecution::Scan {
-                        files: self.scan_requested_files(None)?,
-                    })
+                    let scan_started = Instant::now();
+                    let files = self.scan_requested_files(None)?;
+                    trace_cli_profile("prepare_query.scan_files", scan_started.elapsed());
+                    trace_cli_profile("prepare_query.total", prepare_started.elapsed());
+                    Ok(SearchExecution::Scan { files })
                 }
             }
             Err(error) => Err(error),
@@ -639,6 +691,34 @@ impl SearchRequest {
             .zip(indexed_max_file_size)
             .is_some_and(|(requested, indexed)| requested < indexed)
     }
+
+    fn indexed_query_path_count(&self, searcher: &IndexSearcher) -> usize {
+        if self.uses_full_index_scope(searcher) {
+            return searcher.doc_count();
+        }
+        searcher.indexed_path_count(self.filter())
+    }
+
+    fn uses_full_index_scope(&self, searcher: &IndexSearcher) -> bool {
+        if !self.globs.is_empty()
+            || !self.iglobs.is_empty()
+            || !self.type_add.is_empty()
+            || !self.type_clear.is_empty()
+            || !self.types.is_empty()
+            || !self.type_not.is_empty()
+        {
+            return false;
+        }
+
+        if self.search_paths.len() != 1 {
+            return false;
+        }
+
+        let Some(build) = searcher.build_settings() else {
+            return false;
+        };
+        self.search_paths[0] == resolve_repo_path(std::path::Path::new(&build.repo_root), ".")
+    }
 }
 
 fn ripgrep_execution(plan: RipgrepPlan) -> SearchExecution {
@@ -658,5 +738,16 @@ fn trace_ripgrep_fallback(pattern: &str, use_ripgrep: bool, reason: &str) {
     eprintln!(
         "fallback rg={} pattern={:?} reason={}",
         use_ripgrep, pattern, reason
+    );
+}
+
+fn trace_cli_profile(phase: &str, duration: Duration) {
+    if env::var_os("BITFUN_PROFILE_CLI").is_none() {
+        return;
+    }
+
+    eprintln!(
+        "cli_profile phase={phase} secs={:.6}",
+        duration.as_secs_f64()
     );
 }

@@ -398,7 +398,7 @@ mod tests {
     use super::*;
     use crate::{
         config::{CorpusMode, TokenizerMode},
-        index::format::{DocsData, IndexBuildSettings, IndexMetadata, write_docs_file},
+        index::format::{write_docs_file, DocsData, IndexBuildSettings, IndexMetadata},
     };
 
     fn docs_data(root: &std::path::Path, paths: &[&std::path::Path]) -> DocsData {
@@ -445,9 +445,8 @@ mod tests {
 
         let docs = docs_data(temp.path(), &[matched.as_path(), missed.as_path()]);
         let paths = vec![matched, missed];
-        let resolve_path = |doc_id| {
-            Ok(paths[usize::try_from(doc_id).expect("doc id should fit usize")].clone())
-        };
+        let resolve_path =
+            |doc_id| Ok(paths[usize::try_from(doc_id).expect("doc id should fit usize")].clone());
         let prepared = PreparedMultiLiteral {
             literals: vec!["ERR_SYS".into()],
             case_insensitive: false,
@@ -477,9 +476,8 @@ mod tests {
 
         let docs = docs_data(temp.path(), &[matched.as_path(), missed.as_path()]);
         let paths = vec![matched, missed];
-        let resolve_path = |doc_id| {
-            Ok(paths[usize::try_from(doc_id).expect("doc id should fit usize")].clone())
-        };
+        let resolve_path =
+            |doc_id| Ok(paths[usize::try_from(doc_id).expect("doc id should fit usize")].clone());
         let prepared = PreparedMultiLiteral {
             literals: vec!["ERR_SYS".into()],
             case_insensitive: false,

@@ -1,5 +1,6 @@
 use std::{
-    fs,
+    fs::{self, File},
+    io::Read,
     path::{Path, PathBuf},
     time::UNIX_EPOCH,
 };
@@ -54,6 +55,13 @@ pub fn read_text_file(path: &std::path::Path) -> Result<Option<String>> {
         Ok(text) => Ok(Some(text)),
         Err(_) => Ok(None),
     }
+}
+
+pub fn is_text_file(path: &Path) -> Result<bool> {
+    let mut file = File::open(path)?;
+    let mut probe = [0u8; 8 * 1024];
+    let read = file.read(&mut probe)?;
+    Ok(looks_like_text_prefix(&probe[..read]))
 }
 
 pub fn repo_relative_path(path: &Path, repo_root: &Path) -> String {
@@ -187,6 +195,17 @@ fn looks_binary(bytes: &[u8]) -> bool {
     bytes[..probe_len].contains(&0)
 }
 
+fn looks_like_text_prefix(bytes: &[u8]) -> bool {
+    if looks_binary(bytes) {
+        return false;
+    }
+
+    match std::str::from_utf8(bytes) {
+        Ok(_) => true,
+        Err(error) => error.error_len().is_none(),
+    }
+}
+
 fn normalize_lexical_path(path: &Path) -> PathBuf {
     use std::path::Component;
 
@@ -201,4 +220,31 @@ fn normalize_lexical_path(path: &Path) -> PathBuf {
         }
     }
     normalized
+}
+
+#[cfg(test)]
+mod tests {
+    use super::looks_like_text_prefix;
+
+    #[test]
+    fn text_prefix_accepts_utf8() {
+        assert!(looks_like_text_prefix("hello\nworld".as_bytes()));
+    }
+
+    #[test]
+    fn text_prefix_rejects_nul() {
+        assert!(!looks_like_text_prefix(b"hello\0world"));
+    }
+
+    #[test]
+    fn text_prefix_accepts_truncated_utf8_tail() {
+        let mut bytes = vec![b'a'; 8 * 1024 - 1];
+        bytes.push(0xE4);
+        assert!(looks_like_text_prefix(&bytes));
+    }
+
+    #[test]
+    fn text_prefix_rejects_invalid_utf8() {
+        assert!(!looks_like_text_prefix(&[0xFF, b'a']));
+    }
 }

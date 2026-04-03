@@ -1,5 +1,6 @@
 use std::io::Write;
 use std::path::PathBuf;
+use std::time::{Duration, Instant};
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
@@ -369,8 +370,12 @@ fn run_build(args: BuildArgs) -> Result<bool> {
 }
 
 fn run_search(args: SearchArgs) -> Result<bool> {
-    let process_started = std::time::Instant::now();
+    let process_started = Instant::now();
+    let cli_profile = CliProfile::enabled();
+
+    let request_started = Instant::now();
     let request = SearchRequest::from_args(args)?;
+    cli_profile.record("request_from_args", request_started.elapsed());
     if request.type_list {
         let defs = request.path_filter.type_definitions();
         if !request.quiet {
@@ -418,23 +423,35 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         ));
     };
 
+    let execution_started = Instant::now();
     let execution = request.prepare_query_execution(config)?;
+    cli_profile.record("resolve_execution", execution_started.elapsed());
     if matches!(execution, SearchExecution::Ripgrep { .. }) {
-        return passthrough_ripgrep_query(&request, config);
+        let rg_started = Instant::now();
+        let result = passthrough_ripgrep_query(&request, config);
+        cli_profile.record("rg_execute", rg_started.elapsed());
+        cli_profile.finish(process_started.elapsed());
+        return result;
     }
 
     if request.quiet && !request.files_without_match && !request.stats {
         if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        return Ok(execute_has_match(&execution, config, request.filter())?);
+        let search_started = Instant::now();
+        let matched = execute_has_match(&execution, config, request.filter())?;
+        cli_profile.record("search_execute", search_started.elapsed());
+        cli_profile.finish(process_started.elapsed());
+        return Ok(matched);
     }
 
     if request.json {
         if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
+        let search_started = Instant::now();
         let mut report = execute_search_json(&execution, config, request.filter())?;
+        cli_profile.record("search_execute", search_started.elapsed());
         rewrite_json_paths(
             &mut report,
             &request.current_dir,
@@ -451,6 +468,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             let mut stdout = std::io::stdout().lock();
             report.write(&mut stdout)?;
         }
+        cli_profile.finish(process_started.elapsed());
         return Ok(report.has_match());
     }
 
@@ -458,7 +476,9 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
+        let search_started = Instant::now();
         let paths = execute_files_with_matches(&execution, config, request.filter())?;
+        cli_profile.record("search_execute", search_started.elapsed());
         if !request.quiet {
             print_paths(
                 &paths,
@@ -467,6 +487,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                 request.display_dot_prefix,
             );
         }
+        cli_profile.finish(process_started.elapsed());
         return Ok(!paths.is_empty());
     }
 
@@ -474,7 +495,9 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
+        let search_started = Instant::now();
         let paths = execute_files_without_matches(&execution, config, request.filter())?;
+        cli_profile.record("search_execute", search_started.elapsed());
         if !request.quiet {
             print_paths(
                 &paths,
@@ -483,6 +506,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                 request.display_dot_prefix,
             );
         }
+        cli_profile.finish(process_started.elapsed());
         return Ok(!paths.is_empty());
     }
 
@@ -490,7 +514,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        let search_started = std::time::Instant::now();
+        let search_started = Instant::now();
         let counts = if request.only_matching {
             if request.include_zero {
                 execute_count_total_matches(&execution, config, request.filter(), true)?
@@ -515,6 +539,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             execute_count_matches(&execution, config, request.filter(), false)?
         };
         let search_elapsed = search_started.elapsed();
+        cli_profile.record("search_execute", search_elapsed);
         if !request.quiet {
             print_counts(
                 &counts,
@@ -525,7 +550,9 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             );
         }
         if request.stats {
+            let summary_started = Instant::now();
             let summary = execute_search(&execution, config, request.filter())?;
+            cli_profile.record("stats_summary", summary_started.elapsed());
             print_stats(
                 SearchStats {
                     matches: if request.only_matching {
@@ -543,6 +570,7 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                 process_started.elapsed(),
             );
         }
+        cli_profile.finish(process_started.elapsed());
         return Ok(counts.iter().any(FileCount::has_match));
     }
 
@@ -550,13 +578,14 @@ fn run_search(args: SearchArgs) -> Result<bool> {
         if request.used_default_search_path && execution.is_empty() {
             return Err(AppError::NoFilesSearched);
         }
-        let search_started = std::time::Instant::now();
+        let search_started = Instant::now();
         let counts = if request.include_zero {
             execute_count_total_matches(&execution, config, request.filter(), true)?
         } else {
             execute_count_total_matches(&execution, config, request.filter(), false)?
         };
         let search_elapsed = search_started.elapsed();
+        cli_profile.record("search_execute", search_elapsed);
         if !request.quiet {
             print_total_counts(
                 &counts,
@@ -567,7 +596,9 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             );
         }
         if request.stats {
+            let summary_started = Instant::now();
             let summary = execute_search(&execution, config, request.filter())?;
+            cli_profile.record("stats_summary", summary_started.elapsed());
             print_stats(
                 SearchStats {
                     matches: summary.matched_occurrences,
@@ -581,15 +612,17 @@ fn run_search(args: SearchArgs) -> Result<bool> {
                 process_started.elapsed(),
             );
         }
+        cli_profile.finish(process_started.elapsed());
         return Ok(counts.iter().any(crate::search::FileMatchCount::has_match));
     }
 
     if request.used_default_search_path && execution.is_empty() {
         return Err(AppError::NoFilesSearched);
     }
-    let search_started = std::time::Instant::now();
+    let search_started = Instant::now();
     let results = execute_search(&execution, config, request.filter())?;
     let search_elapsed = search_started.elapsed();
+    cli_profile.record("search_execute", search_elapsed);
     let mut bytes_printed = 0u64;
     if !request.quiet {
         for hit in &results.hits {
@@ -663,7 +696,35 @@ fn run_search(args: SearchArgs) -> Result<bool> {
             process_started.elapsed(),
         );
     }
+    cli_profile.finish(process_started.elapsed());
     Ok(results.has_match())
+}
+
+struct CliProfile {
+    enabled: bool,
+}
+
+impl CliProfile {
+    fn enabled() -> Self {
+        Self {
+            enabled: std::env::var_os("BITFUN_PROFILE_CLI").is_some(),
+        }
+    }
+
+    fn record(&self, phase: &str, duration: Duration) {
+        if self.enabled {
+            eprintln!(
+                "cli_profile phase={phase} secs={:.6}",
+                duration.as_secs_f64()
+            );
+        }
+    }
+
+    fn finish(&self, total: Duration) {
+        if self.enabled {
+            eprintln!("cli_profile phase=total secs={:.6}", total.as_secs_f64());
+        }
+    }
 }
 
 fn run_bench(config: BenchConfig) -> Result<bool> {

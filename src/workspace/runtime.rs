@@ -8,7 +8,7 @@ use std::{
 use crate::{
     config::BuildConfig,
     error::Result,
-    files::{read_text_file, scan_repository},
+    files::{is_text_file, scan_repository},
     index::{IndexSearcher, IndexWorktreeDiff},
     planner::QueryPlan,
     search_engine::{SearchDocument, SearchDocumentSource},
@@ -43,7 +43,7 @@ pub(super) fn scan_text_repository_files(
 ) -> Result<Vec<SearchDocument>> {
     let mut files = Vec::new();
     for file in scan_repository(build_config)? {
-        if read_text_file(&file.path)?.is_none() {
+        if !is_text_file(&file.path)? {
             continue;
         }
         files.push(SearchDocument::from_repository_file(&file));
@@ -186,7 +186,7 @@ fn resolve_documents(candidates: EffectiveCandidateSet) -> Result<ResolvedDocume
     let mut documents = Vec::new();
     for candidate in candidates.into_ordered() {
         let path = PathBuf::from(&candidate.path);
-        if !path.exists() || read_text_file(&path)?.is_none() {
+        if !path.exists() || !is_text_file(&path)? {
             continue;
         }
         documents.push(search_document_from_path(candidate.path, path)?);

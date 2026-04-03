@@ -7,7 +7,7 @@ use rayon::prelude::*;
 use crate::{
     config::{BuildConfig, QueryConfig},
     error::{AppError, Result},
-    files::{read_text_file, scan_paths, RepositoryFile, ScanOptions},
+    files::{is_text_file, scan_paths, RepositoryFile, ScanOptions},
     index::{
         build_index_with_options,
         format::DocMeta,
@@ -246,8 +246,11 @@ pub(crate) fn search_documents(
                 },
             )?;
             let resolve_path = |doc_id| scan_doc_path(documents, doc_id);
-            let stats =
-                verify_plan.verify_candidate_count_stats(&candidate_ids, docs.len(), &resolve_path)?;
+            let stats = verify_plan.verify_candidate_count_stats(
+                &candidate_ids,
+                docs.len(),
+                &resolve_path,
+            )?;
             Ok(SearchResults {
                 candidate_docs: docs.len(),
                 searches_with_match: stats.matched_docs,
@@ -762,7 +765,7 @@ fn scan_options(config: &BuildConfig) -> ScanOptions {
 fn scan_text_files(files: Vec<RepositoryFile>) -> Result<Vec<RepositoryFile>> {
     let mut text_files = Vec::with_capacity(files.len());
     for file in files {
-        if read_text_file(Path::new(&file.path))?.is_some() {
+        if is_text_file(Path::new(&file.path))? {
             text_files.push(file);
         }
     }
