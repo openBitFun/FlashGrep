@@ -13,7 +13,8 @@ use crate::{
     error::{AppError, Result},
     files::{resolve_repo_path, scan_repository},
     index::format::{
-        read_docs_file, IndexBuildSettings, IndexLayout, IndexMetadata, LookupTable, PostingsData,
+        DocMetaRef, DocsData, IndexBuildSettings, IndexLayout, IndexMetadata, LookupTable,
+        PostingsData,
     },
     json_output::{JsonData, JsonDuration, JsonSearchFile, JsonSearchReport, JsonStats},
     path_filter::PathFilter,
@@ -75,7 +76,7 @@ impl IndexWorktreeDiff {
 pub struct IndexSearcher {
     index_path: PathBuf,
     metadata: IndexMetadata,
-    docs: Vec<crate::index::format::DocMeta>,
+    docs: DocsData,
     lookup: LookupTable,
     postings: PostingsData,
     fallback_lookup: Option<LookupTable>,
@@ -98,7 +99,8 @@ struct CountOnlyMultiLiteralPreparation {
 impl IndexSearcher {
     pub fn open(index_path: PathBuf) -> Result<Self> {
         let layout = IndexLayout::resolve(&index_path)?;
-        let (metadata, docs) = read_docs_file(&layout.docs_path)?;
+        let docs = DocsData::open(&layout.docs_path)?;
+        let metadata = docs.metadata().clone();
         let lookup = LookupTable::open(&layout.lookup_path)?;
         let postings = PostingsData::open(&layout.postings_path)?;
         let fallback_available = layout.trigram_fallback_lookup_path.exists()
@@ -216,16 +218,16 @@ impl IndexSearcher {
         let indexed_paths = self
             .docs
             .iter()
-            .map(|doc| self.doc_display_path(doc))
+            .map(|doc| self.doc_display_path_ref(doc))
             .collect::<HashSet<_>>();
 
         let mut modified_files = Vec::new();
         let mut deleted_files = Vec::new();
-        for doc in &self.docs {
-            let doc_path = self.doc_display_path(doc);
+        for doc in self.docs.iter() {
+            let doc_path = self.doc_display_path_ref(doc);
             match current.get(&doc_path) {
                 Some(&(size, mtime_nanos))
-                    if size == doc.size && mtime_nanos == doc.mtime_nanos => {}
+                    if size == doc.size() && mtime_nanos == doc.mtime_nanos() => {}
                 Some(_) => modified_files.push(doc_path),
                 None => deleted_files.push(doc_path),
             }
@@ -286,15 +288,11 @@ impl IndexSearcher {
             self.filter_candidate_ids(&preparation.candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
         let matcher = build_matcher(config, multiline_verifier)?;
-        let resolved_paths = self.resolved_doc_paths();
-        let sources = resolved_paths
-            .iter()
-            .map(|path| verify::VerifyDocSource::Path(path.as_path()))
-            .collect::<Vec<_>>();
+        let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
         let outcomes = verify_candidates_json(
             &candidate_ids,
-            &self.docs,
-            &sources,
+            self.docs.len(),
+            &resolve_path,
             &matcher,
             multiline_verifier,
             config.search_mode,
@@ -319,7 +317,7 @@ impl IndexSearcher {
             searches_with_match += 1;
             matched_lines += task.outcome.matched_lines as u64;
             matches += task.outcome.matched_occurrences as u64;
-            let path = JsonData::from_string(self.doc_display_path(doc));
+            let path = JsonData::from_string(self.doc_display_path_ref(doc));
             let messages = task
                 .outcome
                 .messages
@@ -405,7 +403,7 @@ impl IndexSearcher {
                     allowed_paths,
                     &profile,
                 )? {
-                    let resolved_paths = self.resolved_doc_paths();
+                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
                     let candidate_ids = if filter.is_none() && allowed_paths.is_none() {
                         multi_literal.candidate_ids
                     } else {
@@ -418,10 +416,10 @@ impl IndexSearcher {
                     let match_started = Instant::now();
                     let results = search_multi_literal(
                         &self.docs,
-                        &resolved_paths,
                         Some(candidate_ids.as_slice()),
                         &multi_literal.prepared,
                         config.search_mode,
+                        &resolve_path,
                     )?;
                     profile.record_verify(match_started.elapsed());
                     profile.finish(
@@ -441,7 +439,7 @@ impl IndexSearcher {
                 allowed_paths,
                 &profile,
             )? {
-                let resolved_paths = self.resolved_doc_paths();
+                let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
                 let candidate_ids = if filter.is_none() && allowed_paths.is_none() {
                     multi_literal.candidate_ids.clone()
                 } else {
@@ -450,10 +448,10 @@ impl IndexSearcher {
                 let match_started = Instant::now();
                 let results = search_multi_literal(
                     &self.docs,
-                    &resolved_paths,
                     Some(candidate_ids.as_slice()),
                     &multi_literal.prepared,
                     config.search_mode,
+                    &resolve_path,
                 )?;
                 profile.record_verify(match_started.elapsed());
                 profile.finish(
@@ -484,11 +482,11 @@ impl IndexSearcher {
                         CountVerifyKind::Lines,
                     )?;
                     profile.record_regex_compile(regex_started.elapsed());
-                    let resolved_paths = self.resolved_doc_paths();
+                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
                     let stats = verify_plan.verify_candidate_count_stats(
                         &candidate_ids,
-                        &self.docs,
-                        &resolved_paths,
+                        self.docs.len(),
+                        &resolve_path,
                     )?;
                     (
                         stats.matched_lines,
@@ -507,11 +505,11 @@ impl IndexSearcher {
                         CountVerifyKind::Occurrences,
                     )?;
                     profile.record_regex_compile(regex_started.elapsed());
-                    let resolved_paths = self.resolved_doc_paths();
+                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
                     let stats = verify_plan.verify_candidate_count_stats(
                         &candidate_ids,
-                        &self.docs,
-                        &resolved_paths,
+                        self.docs.len(),
+                        &resolve_path,
                     )?;
                     (
                         stats.matched_lines,
@@ -525,11 +523,7 @@ impl IndexSearcher {
                     let regex_started = Instant::now();
                     let matcher = build_matcher(config, multiline_verifier)?;
                     profile.record_regex_compile(regex_started.elapsed());
-                    let resolved_paths = self.resolved_doc_paths();
-                    let sources = resolved_paths
-                        .iter()
-                        .map(|path| verify::VerifyDocSource::Path(path.as_path()))
-                        .collect::<Vec<_>>();
+                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
                     let mut hits = Vec::new();
                     let mut matched_lines = 0usize;
                     let mut matched_occurrences = 0usize;
@@ -537,8 +531,8 @@ impl IndexSearcher {
                     let mut bytes_searched = 0u64;
                     let outcomes = verify_candidates(
                         &candidate_ids,
-                        &self.docs,
-                        &sources,
+                        self.docs.len(),
+                        &resolve_path,
                         &matcher,
                         multiline_verifier,
                         config.search_mode,
@@ -554,7 +548,7 @@ impl IndexSearcher {
                             searches_with_match += 1;
                             let doc = doc_by_id(&self.docs, task.doc_id)?;
                             hits.push(SearchHit {
-                                path: self.doc_display_path(doc),
+                                path: self.doc_display_path_ref(doc),
                                 matches: task.outcome.matches,
                                 lines: task.outcome.lines,
                             });
@@ -635,7 +629,7 @@ impl IndexSearcher {
         )?;
         candidate_ids
             .into_iter()
-            .map(|doc_id| Ok(doc_by_id(&self.docs, doc_id)?.clone()))
+            .map(|doc_id| Ok(doc_by_id(&self.docs, doc_id)?.to_owned()))
             .collect()
     }
 
@@ -831,11 +825,11 @@ impl IndexSearcher {
         let multiline_verifier = requires_multiline_verification(config)?;
         let verify_plan =
             CountVerifyPlan::compile(config, multiline_verifier, None, CountVerifyKind::Lines)?;
-        let resolved_paths = self.resolved_doc_paths();
+        let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
         let counts = verify_plan.verify_candidate_counts_by_doc(
             &candidate_ids,
-            &self.docs,
-            &resolved_paths,
+            self.docs.len(),
+            &resolve_path,
         )?;
         if include_zero {
             self.file_counts_from_doc_counts_including_zero(counts, filter, allowed_paths)
@@ -904,11 +898,11 @@ impl IndexSearcher {
         )?;
         profile.record_regex_compile(regex_started.elapsed());
         let match_started = Instant::now();
-        let resolved_paths = self.resolved_doc_paths();
+        let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
         let counts = verify_plan.verify_candidate_counts_by_doc(
             &candidate_ids,
-            &self.docs,
-            &resolved_paths,
+            self.docs.len(),
+            &resolve_path,
         )?;
         profile.record_verify(match_started.elapsed());
 
@@ -916,7 +910,7 @@ impl IndexSearcher {
             .into_iter()
             .map(|task| {
                 Ok(FileMatchCount {
-                    path: self.doc_display_path(doc_by_id(&self.docs, task.doc_id)?),
+                    path: self.doc_display_path_ref(doc_by_id(&self.docs, task.doc_id)?),
                     matched_occurrences: task.matched_occurrences,
                 })
             })
@@ -984,14 +978,14 @@ impl IndexSearcher {
     pub fn indexed_doc_stats(&self, filter: Option<&PathFilter>) -> (usize, u64) {
         self.docs
             .iter()
-            .filter(|doc| self.doc_matches_filters(doc, filter, None))
+            .filter(|doc| self.doc_matches_filters(*doc, filter, None))
             .fold((0usize, 0u64), |(count, bytes), doc| {
-                (count + 1, bytes + doc.size)
+                (count + 1, bytes + doc.size())
             })
     }
 
     pub(crate) fn doc_display_path_by_id(&self, doc_id: u32) -> Result<String> {
-        Ok(self.doc_display_path(doc_by_id(&self.docs, doc_id)?))
+        Ok(self.doc_display_path_ref(doc_by_id(&self.docs, doc_id)?))
     }
 
     pub(crate) fn indexed_paths_with_allowed_paths(
@@ -1001,24 +995,29 @@ impl IndexSearcher {
     ) -> Vec<String> {
         self.docs
             .iter()
-            .filter(|doc| self.doc_matches_filters(doc, filter, allowed_paths))
-            .map(|doc| self.doc_display_path(doc))
+            .filter(|doc| self.doc_matches_filters(*doc, filter, allowed_paths))
+            .map(|doc| self.doc_display_path_ref(doc))
             .collect()
     }
 
-    fn resolved_doc_paths(&self) -> Vec<PathBuf> {
-        self.docs
-            .iter()
-            .map(|doc| self.doc_resolved_path(doc))
-            .collect()
+    fn doc_display_path_ref(&self, doc: DocMetaRef<'_>) -> String {
+        self.doc_resolved_path_ref(doc).to_string_lossy().into_owned()
+    }
+
+    fn doc_resolved_path_ref(&self, doc: DocMetaRef<'_>) -> PathBuf {
+        self.resolve_doc_path_str(doc.path())
+    }
+
+    fn resolve_doc_path_by_id(&self, doc_id: u32) -> Result<PathBuf> {
+        Ok(self.doc_resolved_path_ref(doc_by_id(&self.docs, doc_id)?))
     }
 
     fn doc_display_path(&self, doc: &crate::index::format::DocMeta) -> String {
-        self.doc_resolved_path(doc).to_string_lossy().into_owned()
+        self.doc_display_path_str(&doc.path)
     }
 
-    fn doc_resolved_path(&self, doc: &crate::index::format::DocMeta) -> PathBuf {
-        self.resolve_doc_path_str(&doc.path)
+    fn doc_display_path_str(&self, path: &str) -> String {
+        self.resolve_doc_path_str(path).to_string_lossy().into_owned()
     }
 
     fn resolve_doc_path_str(&self, path: &str) -> PathBuf {
@@ -1103,12 +1102,11 @@ impl IndexSearcher {
                 }),
             )
         };
-        let resolved_paths = self.resolved_doc_paths();
         let candidate_ids = collect_multi_literal_candidates(
             &self.docs,
-            &resolved_paths,
             prefilter_ids.as_deref(),
             &prepared,
+            &|doc_id| self.resolve_doc_path_by_id(doc_id),
         )?;
         profile.record_candidates(candidate_started.elapsed());
 
@@ -1187,7 +1185,7 @@ impl IndexSearcher {
             .into_iter()
             .map(|count| {
                 Ok(FileCount {
-                    path: self.doc_display_path(doc_by_id(&self.docs, count.doc_id)?),
+                    path: self.doc_display_path_ref(doc_by_id(&self.docs, count.doc_id)?),
                     matched_lines: count.matched_lines,
                 })
             })
@@ -1241,11 +1239,11 @@ impl IndexSearcher {
 
     fn doc_matches_filters(
         &self,
-        doc: &crate::index::format::DocMeta,
+        doc: DocMetaRef<'_>,
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
     ) -> bool {
-        let display_path = self.doc_display_path(doc);
+        let display_path = self.doc_display_path_ref(doc);
         if filter.is_some_and(|filter| !filter.matches_file(Path::new(&display_path))) {
             return false;
         }
@@ -1255,7 +1253,7 @@ impl IndexSearcher {
     pub(crate) fn sum_doc_sizes(&self, candidate_ids: &[u32]) -> Result<u64> {
         let mut total = 0u64;
         for &doc_id in candidate_ids {
-            total += doc_by_id(&self.docs, doc_id)?.size;
+            total += doc_by_id(&self.docs, doc_id)?.size();
         }
         Ok(total)
     }
@@ -1740,15 +1738,15 @@ impl IndexSearcher {
             for doc in self
                 .docs
                 .iter()
-                .filter(|doc| self.doc_matches_filters(doc, filter, allowed_paths))
+                .filter(|doc| self.doc_matches_filters(*doc, filter, allowed_paths))
             {
-                let path = self.doc_resolved_path(doc);
-                let Some(bytes) = map_doc_bytes(&path, doc.size) else {
+                let path = self.doc_resolved_path_ref(doc);
+                let Some(bytes) = map_doc_bytes(&path, doc.size()) else {
                     continue;
                 };
                 for (index, matcher) in matchers.iter().enumerate() {
                     if matcher.find(&bytes).is_some() {
-                        docs_by_literal[index].push(doc.doc_id);
+                        docs_by_literal[index].push(doc.doc_id());
                     }
                 }
             }
@@ -1763,9 +1761,9 @@ impl IndexSearcher {
             for doc in self
                 .docs
                 .iter()
-                .filter(|doc| self.doc_matches_filters(doc, filter, allowed_paths))
+                .filter(|doc| self.doc_matches_filters(*doc, filter, allowed_paths))
             {
-                let path = self.doc_resolved_path(doc);
+                let path = self.doc_resolved_path_ref(doc);
                 let Ok(text) = std::fs::read_to_string(&path) else {
                     continue;
                 };
@@ -1776,7 +1774,7 @@ impl IndexSearcher {
                 };
                 for (index, literal) in unicode_literals.iter().enumerate() {
                     if folded.contains(literal) {
-                        docs_by_literal[index].push(doc.doc_id);
+                        docs_by_literal[index].push(doc.doc_id());
                     }
                 }
             }
@@ -1788,7 +1786,7 @@ impl IndexSearcher {
     }
 
     fn all_doc_ids(&self) -> Vec<u32> {
-        self.docs.iter().map(|doc| doc.doc_id).collect()
+        self.docs.iter().map(|doc| doc.doc_id()).collect()
     }
 }
 

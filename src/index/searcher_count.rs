@@ -4,7 +4,7 @@ use std::{
     env,
     fs::File,
     io::{Read, Result as IoResult},
-    path::Path,
+    path::{Path, PathBuf},
 };
 
 use grep_matcher::{LineMatchKind, Match, Matcher, NoError};
@@ -22,14 +22,13 @@ use regex_automata::{
 use crate::{
     config::QueryConfig,
     error::{AppError, Result},
-    index::format::DocMeta,
 };
 
 use super::{
     query::LiteralPrefilter,
     shared::{
-        build_line_starts, build_regex_matcher, doc_by_id, line_index_for_offset,
-        trim_line_terminator_bytes, validate_doc_ids,
+        build_line_starts, build_regex_matcher, line_index_for_offset, trim_line_terminator_bytes,
+        validate_doc_id, validate_doc_ids,
     },
 };
 
@@ -107,40 +106,47 @@ impl VerifyPlan {
         }))
     }
 
-    pub(crate) fn verify_candidate_count_stats(
+    pub(crate) fn verify_candidate_count_stats<F>(
         &self,
         candidate_ids: &[u32],
-        docs: &[DocMeta],
-        paths: &[std::path::PathBuf],
-    ) -> Result<CountStats> {
-        validate_doc_ids(docs, candidate_ids)?;
+        doc_count: usize,
+        resolve_path: &F,
+    ) -> Result<CountStats>
+    where
+        F: Fn(u32) -> Result<PathBuf> + Sync,
+    {
+        validate_doc_ids(doc_count, candidate_ids)?;
         if should_parallel_verify(candidate_ids.len()) {
             let chunk_size = verify_chunk_size(candidate_ids.len());
             candidate_ids
                 .par_chunks(chunk_size)
                 .map_init(
                     || self.create_runtime(),
-                    |runtime, chunk| runtime.verify_chunk(chunk, docs, paths),
+                    |runtime, chunk| runtime.verify_chunk(chunk, doc_count, resolve_path),
                 )
                 .try_reduce(CountStats::default, |left, right| Ok(left + right))
         } else {
             let mut runtime = self.create_runtime();
-            runtime.verify_chunk(candidate_ids, docs, paths)
+            runtime.verify_chunk(candidate_ids, doc_count, resolve_path)
         }
     }
 
-    pub(crate) fn verify_candidate_counts_by_doc(
+    pub(crate) fn verify_candidate_counts_by_doc<F>(
         &self,
         candidate_ids: &[u32],
-        docs: &[DocMeta],
-        paths: &[std::path::PathBuf],
-    ) -> Result<Vec<DocMatchCount>> {
-        validate_doc_ids(docs, candidate_ids)?;
+        doc_count: usize,
+        resolve_path: &F,
+    ) -> Result<Vec<DocMatchCount>>
+    where
+        F: Fn(u32) -> Result<PathBuf> + Sync,
+    {
+        validate_doc_ids(doc_count, candidate_ids)?;
         let mut runtime = self.create_runtime();
         let mut counts = Vec::new();
         for &doc_id in candidate_ids {
-            let _ = doc_by_id(docs, doc_id)?;
-            let stats = runtime.verify_path(path_by_id(paths, doc_id)?)?;
+            validate_doc_id(doc_count, doc_id)?;
+            let path = resolve_path(doc_id)?;
+            let stats = runtime.verify_path(&path)?;
             if stats.has_match() {
                 counts.push(DocMatchCount {
                     doc_id,
@@ -224,16 +230,20 @@ enum VerifyRuntime<'a> {
 }
 
 impl VerifyRuntime<'_> {
-    fn verify_chunk(
+    fn verify_chunk<F>(
         &mut self,
         candidate_ids: &[u32],
-        docs: &[DocMeta],
-        paths: &[std::path::PathBuf],
-    ) -> Result<CountStats> {
+        doc_count: usize,
+        resolve_path: &F,
+    ) -> Result<CountStats>
+    where
+        F: Fn(u32) -> Result<PathBuf> + Sync,
+    {
         let mut stats = CountStats::default();
         for &doc_id in candidate_ids {
-            let _ = doc_by_id(docs, doc_id)?;
-            let doc_stats = self.verify_path(path_by_id(paths, doc_id)?)?;
+            validate_doc_id(doc_count, doc_id)?;
+            let path = resolve_path(doc_id)?;
+            let doc_stats = self.verify_path(&path)?;
             if doc_stats.has_match() {
                 stats.matched_docs += 1;
                 stats.matched_lines += doc_stats.matched_lines;
@@ -288,15 +298,6 @@ impl std::ops::Add for CountStats {
             matched_occurrences: self.matched_occurrences + rhs.matched_occurrences,
         }
     }
-}
-
-fn path_by_id<'a>(paths: &'a [std::path::PathBuf], doc_id: u32) -> Result<&'a Path> {
-    let index = usize::try_from(doc_id)
-        .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
-    paths
-        .get(index)
-        .map(std::path::PathBuf::as_path)
-        .ok_or_else(|| AppError::InvalidIndex(format!("missing resolved path for doc id {doc_id}")))
 }
 
 struct CountOnlyLineMetaRuntime<'a> {

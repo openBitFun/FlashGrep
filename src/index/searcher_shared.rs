@@ -3,7 +3,7 @@ use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 use crate::{
     config::QueryConfig,
     error::{AppError, Result},
-    index::format::DocMeta,
+    index::format::{DocMetaRef, DocsData},
 };
 
 pub(crate) fn build_regex_matcher(
@@ -58,35 +58,32 @@ pub(super) fn trim_line_terminator_bytes(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
 
-pub(super) fn doc_by_id(docs: &[DocMeta], doc_id: u32) -> Result<&DocMeta> {
-    let index = usize::try_from(doc_id)
-        .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
-    let doc = docs.get(index).ok_or_else(|| {
-        AppError::InvalidIndex(format!(
-            "doc id {doc_id} is out of bounds for {} docs",
-            docs.len()
-        ))
-    })?;
-    if doc.doc_id != doc_id {
-        return Err(AppError::InvalidIndex(format!(
-            "doc table mismatch at slot {index}: expected doc id {doc_id}, found {}",
-            doc.doc_id
-        )));
-    }
-    Ok(doc)
+pub(super) fn doc_by_id(docs: &DocsData, doc_id: u32) -> Result<DocMetaRef<'_>> {
+    docs.get(doc_id)
 }
 
-pub(super) fn validate_doc_ids(docs: &[DocMeta], doc_ids: &[u32]) -> Result<()> {
+pub(super) fn validate_doc_ids(doc_count: usize, doc_ids: &[u32]) -> Result<()> {
     for &doc_id in doc_ids {
-        let _ = doc_by_id(docs, doc_id)?;
+        validate_doc_id(doc_count, doc_id)?;
+    }
+    Ok(())
+}
+
+pub(super) fn validate_doc_id(doc_count: usize, doc_id: u32) -> Result<()> {
+    let index = usize::try_from(doc_id)
+        .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
+    if index >= doc_count {
+        return Err(AppError::InvalidIndex(format!(
+            "doc id {doc_id} is out of bounds for {doc_count} docs"
+        )));
     }
     Ok(())
 }
 
 pub(super) fn resolve_candidate_docs<'a>(
-    docs: &'a [DocMeta],
+    docs: &'a DocsData,
     doc_ids: &[u32],
-) -> Result<Vec<&'a DocMeta>> {
+) -> Result<Vec<DocMetaRef<'a>>> {
     doc_ids
         .iter()
         .map(|&doc_id| doc_by_id(docs, doc_id))

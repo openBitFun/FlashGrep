@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Read, Seek, SeekFrom, Write},
+    io::{Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -31,6 +31,57 @@ pub struct DocMeta {
     pub path: String,
     pub size: u64,
     pub mtime_nanos: u64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct DocRecord {
+    doc_id: u32,
+    size: u64,
+    mtime_nanos: u64,
+    path_start: usize,
+    path_len: usize,
+}
+
+#[derive(Debug)]
+pub struct DocsData {
+    mmap: Mmap,
+    docs: Vec<DocRecord>,
+    metadata: IndexMetadata,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct DocMetaRef<'a> {
+    doc_id: u32,
+    path: &'a str,
+    size: u64,
+    mtime_nanos: u64,
+}
+
+impl<'a> DocMetaRef<'a> {
+    pub fn doc_id(self) -> u32 {
+        self.doc_id
+    }
+
+    pub fn path(self) -> &'a str {
+        self.path
+    }
+
+    pub fn size(self) -> u64 {
+        self.size
+    }
+
+    pub fn mtime_nanos(self) -> u64 {
+        self.mtime_nanos
+    }
+
+    pub fn to_owned(self) -> DocMeta {
+        DocMeta {
+            doc_id: self.doc_id,
+            path: self.path.to_string(),
+            size: self.size,
+            mtime_nanos: self.mtime_nanos,
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -266,9 +317,75 @@ impl DocsWriter {
 }
 
 pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    let mut cursor = Cursor::new(&bytes);
+    let docs = DocsData::open(path)?;
+    let metadata = docs.metadata().clone();
+    let materialized = docs.iter().map(DocMetaRef::to_owned).collect();
+    Ok((metadata, materialized))
+}
+
+impl DocsData {
+    pub fn open(path: &Path) -> Result<Self> {
+        let mmap = open_readonly_mmap(path)?;
+        let (metadata, docs) = parse_docs_data(&mmap)?;
+        Ok(Self {
+            mmap,
+            docs,
+            metadata,
+        })
+    }
+
+    pub fn metadata(&self) -> &IndexMetadata {
+        &self.metadata
+    }
+
+    pub fn len(&self) -> usize {
+        self.docs.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.docs.is_empty()
+    }
+
+    pub fn get(&self, doc_id: u32) -> Result<DocMetaRef<'_>> {
+        let index = usize::try_from(doc_id)
+            .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
+        let record = self.docs.get(index).ok_or_else(|| {
+            AppError::InvalidIndex(format!(
+                "doc id {doc_id} is out of bounds for {} docs",
+                self.docs.len()
+            ))
+        })?;
+        if record.doc_id != doc_id {
+            return Err(AppError::InvalidIndex(format!(
+                "doc table mismatch at slot {index}: expected doc id {doc_id}, found {}",
+                record.doc_id
+            )));
+        }
+        Ok(self.doc_ref(record))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = DocMetaRef<'_>> + '_ {
+        self.docs.iter().map(|record| self.doc_ref(record))
+    }
+
+    fn doc_ref(&self, record: &DocRecord) -> DocMetaRef<'_> {
+        let end = record
+            .path_start
+            .checked_add(record.path_len)
+            .expect("doc path range should not overflow");
+        let path = std::str::from_utf8(&self.mmap[record.path_start..end])
+            .expect("validated doc path should remain utf-8");
+        DocMetaRef {
+            doc_id: record.doc_id,
+            path,
+            size: record.size,
+            mtime_nanos: record.mtime_nanos,
+        }
+    }
+}
+
+fn parse_docs_data(bytes: &[u8]) -> Result<(IndexMetadata, Vec<DocRecord>)> {
+    let mut cursor = Cursor::new(bytes);
 
     cursor.expect_magic(DOCS_MAGIC)?;
     let version = cursor.read_u32()?;
@@ -342,13 +459,18 @@ pub fn read_docs_file(path: &Path) -> Result<(IndexMetadata, Vec<DocMeta>)> {
         let size = cursor.read_u64()?;
         let mtime_nanos = cursor.read_u64()?;
         let path_len = u32_to_usize(cursor.read_u32()?, "path length")?;
-        let path = cursor.read_string(path_len)?;
+        let path_start = cursor.position;
+        let path_bytes = cursor.read_exact(path_len)?;
+        std::str::from_utf8(path_bytes).map_err(|source| {
+            AppError::InvalidIndex(format!("docs path entry was not utf-8: {source}"))
+        })?;
 
-        docs.push(DocMeta {
+        docs.push(DocRecord {
             doc_id,
-            path,
             size,
             mtime_nanos,
+            path_start,
+            path_len,
         });
     }
 
@@ -416,9 +538,8 @@ impl DocTermsWriter {
 }
 
 pub fn read_doc_terms_file(path: &Path) -> Result<Vec<Vec<u64>>> {
-    let mut bytes = Vec::new();
-    File::open(path)?.read_to_end(&mut bytes)?;
-    let mut cursor = Cursor::new(&bytes);
+    let mmap = open_readonly_mmap(path)?;
+    let mut cursor = Cursor::new(&mmap);
 
     cursor.expect_magic(DOC_TERMS_MAGIC)?;
     let version = cursor.read_u32()?;
@@ -440,7 +561,7 @@ pub fn read_doc_terms_file(path: &Path) -> Result<Vec<Vec<u64>>> {
         doc_terms.push(token_hashes);
     }
 
-    if cursor.position != bytes.len() {
+    if cursor.position != mmap.len() {
         return Err(AppError::InvalidIndex(
             "doc terms file has trailing bytes".into(),
         ));
@@ -746,6 +867,11 @@ impl<'a> Cursor<'a> {
         self.position += len;
         Ok(slice)
     }
+}
+
+fn open_readonly_mmap(path: &Path) -> Result<Mmap> {
+    let file = File::open(path)?;
+    Ok(unsafe { Mmap::map(&file)? })
 }
 
 fn write_u32(writer: &mut File, value: u32) -> Result<()> {

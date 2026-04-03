@@ -15,7 +15,7 @@ use crate::{
         searcher::{
             verify::{
                 build_matcher, requires_multiline_verification, verify_candidate_sources,
-                verify_candidate_sources_json, VerifyDocSource,
+                verify_candidate_sources_json,
             },
             CountVerifyKind, CountVerifyPlan, IndexSearcher, IndexWorktreeDiff,
         },
@@ -245,8 +245,9 @@ pub(crate) fn search_documents(
                     CountVerifyKind::Occurrences
                 },
             )?;
-            let paths = verify_doc_paths(documents);
-            let stats = verify_plan.verify_candidate_count_stats(&candidate_ids, &docs, &paths)?;
+            let resolve_path = |doc_id| scan_doc_path(documents, doc_id);
+            let stats =
+                verify_plan.verify_candidate_count_stats(&candidate_ids, docs.len(), &resolve_path)?;
             Ok(SearchResults {
                 candidate_docs: docs.len(),
                 searches_with_match: stats.matched_docs,
@@ -257,12 +258,12 @@ pub(crate) fn search_documents(
             })
         }
         _ => {
-            let sources = verify_doc_sources(documents);
             let matcher = build_matcher(config, multiline_verifier)?;
+            let resolve_path = |doc_id| scan_doc_path(documents, doc_id);
             let outcomes = verify_candidate_sources(
                 &candidate_ids,
-                &docs,
-                &sources,
+                docs.len(),
+                &resolve_path,
                 &matcher,
                 multiline_verifier,
                 config.search_mode,
@@ -410,8 +411,9 @@ pub(crate) fn count_scanned_files(
         multiline_verifier,
         CountVerifyKind::Lines,
     )?;
-    let paths = verify_doc_paths(&documents);
-    let outcomes = verify_plan.verify_candidate_counts_by_doc(&candidate_ids, &docs, &paths)?;
+    let resolve_path = |doc_id| scan_doc_path(&documents, doc_id);
+    let outcomes =
+        verify_plan.verify_candidate_counts_by_doc(&candidate_ids, docs.len(), &resolve_path)?;
     let mut counts = Vec::with_capacity(outcomes.len());
     for task in outcomes {
         let doc = &docs[usize::try_from(task.doc_id).map_err(|_| {
@@ -446,8 +448,9 @@ pub(crate) fn count_total_scanned_files(
         multiline_verifier,
         CountVerifyKind::Occurrences,
     )?;
-    let paths = verify_doc_paths(&documents);
-    let outcomes = verify_plan.verify_candidate_counts_by_doc(&candidate_ids, &docs, &paths)?;
+    let resolve_path = |doc_id| scan_doc_path(&documents, doc_id);
+    let outcomes =
+        verify_plan.verify_candidate_counts_by_doc(&candidate_ids, docs.len(), &resolve_path)?;
     let mut counts = Vec::with_capacity(outcomes.len());
     for task in outcomes {
         let doc = &docs[usize::try_from(task.doc_id).map_err(|_| {
@@ -485,14 +488,14 @@ pub(crate) fn search_json_documents(
 ) -> Result<JsonSearchReport> {
     let total_started = std::time::Instant::now();
     let docs = repository_docs(documents)?;
-    let sources = verify_doc_sources(documents);
     let candidate_ids = docs.iter().map(|doc| doc.doc_id).collect::<Vec<_>>();
     let multiline_verifier = requires_multiline_verification(config)?;
     let matcher = build_matcher(config, multiline_verifier)?;
+    let resolve_path = |doc_id| scan_doc_path(documents, doc_id);
     let outcomes = verify_candidate_sources_json(
         &candidate_ids,
-        &docs,
-        &sources,
+        docs.len(),
+        &resolve_path,
         &matcher,
         multiline_verifier,
         config.search_mode,
@@ -733,22 +736,17 @@ fn repository_docs(documents: &[SearchDocument]) -> Result<Vec<DocMeta>> {
         .collect()
 }
 
-fn verify_doc_sources(documents: &[SearchDocument]) -> Vec<VerifyDocSource<'_>> {
+fn scan_doc_path(documents: &[SearchDocument], doc_id: u32) -> Result<std::path::PathBuf> {
+    let index = usize::try_from(doc_id)
+        .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
     documents
-        .iter()
-        .map(|document| match &document.source {
-            SearchDocumentSource::Path(path) => VerifyDocSource::Path(path.as_path()),
-        })
-        .collect()
-}
-
-fn verify_doc_paths(documents: &[SearchDocument]) -> Vec<std::path::PathBuf> {
-    documents
-        .iter()
+        .get(index)
         .map(|document| match &document.source {
             SearchDocumentSource::Path(path) => path.clone(),
         })
-        .collect()
+        .ok_or_else(|| {
+            AppError::InvalidIndex(format!("doc id {doc_id} is missing from scan documents"))
+        })
 }
 
 fn scan_options(config: &BuildConfig) -> ScanOptions {

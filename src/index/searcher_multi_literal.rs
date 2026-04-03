@@ -1,4 +1,8 @@
-use std::{collections::HashSet, fs::File, path::Path};
+use std::{
+    collections::HashSet,
+    fs::File,
+    path::{Path, PathBuf},
+};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use memchr::memchr;
@@ -7,7 +11,7 @@ use rayon::prelude::*;
 
 use crate::{
     error::{AppError, Result},
-    index::format::DocMeta,
+    index::format::{DocMetaRef, DocsData},
     planner::PureLiteralAlternation,
     search::{FileMatch, MatchLocation, SearchHit, SearchLine, SearchMode, SearchResults},
 };
@@ -43,50 +47,58 @@ pub(super) fn prepare(
     })
 }
 
-pub(super) fn collect_candidates(
-    docs: &[DocMeta],
-    paths: &[std::path::PathBuf],
+pub(super) fn collect_candidates<F>(
+    docs: &DocsData,
     candidate_ids: Option<&[u32]>,
     prepared: &PreparedMultiLiteral,
-) -> Result<Vec<u32>> {
+    resolve_path: &F,
+) -> Result<Vec<u32>>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
     let matcher = build_fast_matcher(prepared)?;
     let candidates = if let Some(candidate_ids) = candidate_ids {
         let candidate_docs = resolve_candidate_docs(docs, candidate_ids)?;
         if should_parallel_scan(
             candidate_docs.len(),
-            candidate_docs.iter().map(|doc| doc.size).sum(),
+            candidate_docs.iter().map(|doc| doc.size()).sum(),
         ) {
             candidate_docs
                 .par_iter()
-                .map(|doc| scan_doc_id(doc, path_by_id(paths, doc.doc_id), &matcher))
+                .map(|doc| scan_doc_id(*doc, resolve_path, &matcher))
                 .collect::<Vec<_>>()
         } else {
             candidate_docs
                 .iter()
-                .map(|doc| scan_doc_id(doc, path_by_id(paths, doc.doc_id), &matcher))
+                .map(|doc| scan_doc_id(*doc, resolve_path, &matcher))
                 .collect::<Vec<_>>()
         }
-    } else if should_parallel_scan(docs.len(), docs.iter().map(|doc| doc.size).sum()) {
-        docs.par_iter()
-            .map(|doc| scan_doc_id(doc, path_by_id(paths, doc.doc_id), &matcher))
+    } else if should_parallel_scan(docs.len(), docs.iter().map(|doc| doc.size()).sum()) {
+        docs.iter()
+            .collect::<Vec<_>>()
+            .par_iter()
+            .map(|doc| scan_doc_id(*doc, resolve_path, &matcher))
             .collect::<Vec<_>>()
     } else {
         docs.iter()
-            .map(|doc| scan_doc_id(doc, path_by_id(paths, doc.doc_id), &matcher))
+            .map(|doc| scan_doc_id(doc, resolve_path, &matcher))
             .collect::<Vec<_>>()
     };
     Ok(candidates.into_iter().flatten().collect())
 }
 
-pub(super) fn search(
-    docs: &[DocMeta],
-    paths: &[std::path::PathBuf],
+pub(super) fn search<F>(
+    docs: &DocsData,
     candidate_ids: Option<&[u32]>,
     prepared: &PreparedMultiLiteral,
     mode: SearchMode,
-) -> Result<SearchResults> {
+    resolve_path: &F,
+) -> Result<SearchResults>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
     if matches!(mode, SearchMode::CountOnly) {
-        return search_count_only(docs, paths, candidate_ids, prepared);
+        return search_count_only(docs, candidate_ids, prepared, resolve_path);
     }
 
     let matcher = build_semantic_matcher(prepared)?;
@@ -95,25 +107,27 @@ pub(super) fn search(
         let candidate_docs = resolve_candidate_docs(docs, candidate_ids)?;
         if should_parallel_scan(
             candidate_docs.len(),
-            candidate_docs.iter().map(|doc| doc.size).sum(),
+            candidate_docs.iter().map(|doc| doc.size()).sum(),
         ) {
             candidate_docs
                 .par_iter()
-                .map(|doc| scan_doc(doc, path_by_id(paths, doc.doc_id), &matcher, mode))
+                .map(|doc| scan_doc(*doc, resolve_path, &matcher, mode))
                 .collect::<Vec<_>>()
         } else {
             candidate_docs
                 .iter()
-                .map(|doc| scan_doc(doc, path_by_id(paths, doc.doc_id), &matcher, mode))
+                .map(|doc| scan_doc(*doc, resolve_path, &matcher, mode))
                 .collect::<Vec<_>>()
         }
-    } else if should_parallel_scan(docs.len(), docs.iter().map(|doc| doc.size).sum()) {
-        docs.par_iter()
-            .map(|doc| scan_doc(doc, path_by_id(paths, doc.doc_id), &matcher, mode))
+    } else if should_parallel_scan(docs.len(), docs.iter().map(|doc| doc.size()).sum()) {
+        docs.iter()
+            .collect::<Vec<_>>()
+            .par_iter()
+            .map(|doc| scan_doc(*doc, resolve_path, &matcher, mode))
             .collect::<Vec<_>>()
     } else {
         docs.iter()
-            .map(|doc| scan_doc(doc, path_by_id(paths, doc.doc_id), &matcher, mode))
+            .map(|doc| scan_doc(doc, resolve_path, &matcher, mode))
             .collect::<Vec<_>>()
     };
 
@@ -165,37 +179,42 @@ fn build_matcher(prepared: &PreparedMultiLiteral, match_kind: MatchKind) -> Resu
         .map_err(|error| AppError::InvalidPattern(error.to_string()))
 }
 
-fn search_count_only(
-    docs: &[DocMeta],
-    paths: &[std::path::PathBuf],
+fn search_count_only<F>(
+    docs: &DocsData,
     candidate_ids: Option<&[u32]>,
     prepared: &PreparedMultiLiteral,
-) -> Result<SearchResults> {
+    resolve_path: &F,
+) -> Result<SearchResults>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
     let matcher = build_fast_matcher(prepared)?;
     let candidate_doc_count = candidate_ids.map_or(docs.len(), <[u32]>::len);
     let (searches_with_match, matched_lines) = if let Some(candidate_ids) = candidate_ids {
         let candidate_docs = resolve_candidate_docs(docs, candidate_ids)?;
         if should_parallel_scan(
             candidate_docs.len(),
-            candidate_docs.iter().map(|doc| doc.size).sum(),
+            candidate_docs.iter().map(|doc| doc.size()).sum(),
         ) {
             candidate_docs
                 .par_iter()
-                .map(|doc| count_doc(path_by_id(paths, doc.doc_id), doc.size, &matcher))
+                .map(|doc| count_doc(*doc, resolve_path, &matcher))
                 .reduce(|| (0usize, 0usize), reduce_counts)
         } else {
             candidate_docs
                 .iter()
-                .map(|doc| count_doc(path_by_id(paths, doc.doc_id), doc.size, &matcher))
+                .map(|doc| count_doc(*doc, resolve_path, &matcher))
                 .fold((0usize, 0usize), reduce_counts)
         }
-    } else if should_parallel_scan(docs.len(), docs.iter().map(|doc| doc.size).sum()) {
-        docs.par_iter()
-            .map(|doc| count_doc(path_by_id(paths, doc.doc_id), doc.size, &matcher))
+    } else if should_parallel_scan(docs.len(), docs.iter().map(|doc| doc.size()).sum()) {
+        docs.iter()
+            .collect::<Vec<_>>()
+            .par_iter()
+            .map(|doc| count_doc(*doc, resolve_path, &matcher))
             .reduce(|| (0usize, 0usize), reduce_counts)
     } else {
         docs.iter()
-            .map(|doc| count_doc(path_by_id(paths, doc.doc_id), doc.size, &matcher))
+            .map(|doc| count_doc(doc, resolve_path, &matcher))
             .fold((0usize, 0usize), reduce_counts)
     };
 
@@ -219,18 +238,26 @@ fn should_parallel_scan(doc_count: usize, total_bytes: u64) -> bool {
 
 type FastMatcher = AhoCorasick;
 
-fn scan_doc_id(doc: &DocMeta, path: &Path, matcher: &FastMatcher) -> Option<u32> {
-    let bytes = map_doc_bytes(path, doc.size)?;
-    matcher.find(&bytes).map(|_| doc.doc_id)
+fn scan_doc_id<F>(doc: DocMetaRef<'_>, resolve_path: &F, matcher: &FastMatcher) -> Option<u32>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
+    let path = resolve_path(doc.doc_id()).ok()?;
+    let bytes = map_doc_bytes(&path, doc.size())?;
+    matcher.find(&bytes).map(|_| doc.doc_id())
 }
 
-fn scan_doc(
-    doc: &DocMeta,
-    path: &Path,
+fn scan_doc<F>(
+    doc: DocMetaRef<'_>,
+    resolve_path: &F,
     matcher: &AhoCorasick,
     mode: SearchMode,
-) -> Option<Outcome> {
-    let bytes = map_doc_bytes(path, doc.size)?;
+) -> Option<Outcome>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
+    let path = resolve_path(doc.doc_id()).ok()?;
+    let bytes = map_doc_bytes(&path, doc.size())?;
     let outcome = match mode {
         SearchMode::CountOnly => unreachable!("count-only uses search_count_only"),
         SearchMode::CountMatches => unreachable!("count-matches uses regex verification"),
@@ -246,8 +273,14 @@ fn scan_doc(
     }
 }
 
-fn count_doc(path: &Path, size: u64, matcher: &FastMatcher) -> (usize, usize) {
-    let Some(bytes) = map_doc_bytes(path, size) else {
+fn count_doc<F>(doc: DocMetaRef<'_>, resolve_path: &F, matcher: &FastMatcher) -> (usize, usize)
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
+    let Ok(path) = resolve_path(doc.doc_id()) else {
+        return (0, 0);
+    };
+    let Some(bytes) = map_doc_bytes(&path, doc.size()) else {
         return (0, 0);
     };
     let matched_lines = count_matched_lines(&bytes, matcher);
@@ -268,10 +301,6 @@ fn map_doc_bytes(path: &Path, size: u64) -> Option<Mmap> {
     }
     let file = File::open(path).ok()?;
     unsafe { Mmap::map(&file).ok() }
-}
-
-fn path_by_id<'a>(paths: &'a [std::path::PathBuf], doc_id: u32) -> &'a Path {
-    paths[usize::try_from(doc_id).expect("doc id should fit usize")].as_path()
 }
 
 fn count_matched_lines(bytes: &[u8], matcher: &FastMatcher) -> usize {
@@ -367,14 +396,43 @@ mod tests {
     use tempfile::tempdir;
 
     use super::*;
+    use crate::{
+        config::{CorpusMode, TokenizerMode},
+        index::format::{DocsData, IndexBuildSettings, IndexMetadata, write_docs_file},
+    };
 
-    fn doc(doc_id: u32, path: &std::path::Path) -> DocMeta {
-        DocMeta {
-            doc_id,
-            path: path.to_string_lossy().into_owned(),
-            size: fs::metadata(path).expect("test should succeed").len(),
-            mtime_nanos: 0,
-        }
+    fn docs_data(root: &std::path::Path, paths: &[&std::path::Path]) -> DocsData {
+        let docs_path = root.join("docs.bin");
+        let docs = paths
+            .iter()
+            .enumerate()
+            .map(|(doc_id, path)| crate::index::format::DocMeta {
+                doc_id: u32::try_from(doc_id).expect("test doc id should fit"),
+                path: path.to_string_lossy().into_owned(),
+                size: fs::metadata(path).expect("test should succeed").len(),
+                mtime_nanos: 0,
+            })
+            .collect::<Vec<_>>();
+        write_docs_file(
+            &docs_path,
+            IndexMetadata {
+                tokenizer: TokenizerMode::Trigram,
+                min_sparse_len: 3,
+                max_sparse_len: 32,
+                fallback_trigram: None,
+                build: Some(IndexBuildSettings {
+                    repo_root: root.to_string_lossy().into_owned(),
+                    corpus_mode: CorpusMode::RespectIgnore,
+                    include_hidden: false,
+                    max_file_size: 1024 * 1024,
+                    head_commit: None,
+                    config_fingerprint: None,
+                }),
+            },
+            &docs,
+        )
+        .expect("test should succeed");
+        DocsData::open(&docs_path).expect("test should succeed")
     }
 
     #[test]
@@ -385,8 +443,11 @@ mod tests {
         fs::write(&matched, "ERR_SYS\n").expect("test should succeed");
         fs::write(&missed, "UNRELATED\n").expect("test should succeed");
 
-        let docs = vec![doc(0, &matched), doc(1, &missed)];
+        let docs = docs_data(temp.path(), &[matched.as_path(), missed.as_path()]);
         let paths = vec![matched, missed];
+        let resolve_path = |doc_id| {
+            Ok(paths[usize::try_from(doc_id).expect("doc id should fit usize")].clone())
+        };
         let prepared = PreparedMultiLiteral {
             literals: vec!["ERR_SYS".into()],
             case_insensitive: false,
@@ -394,10 +455,10 @@ mod tests {
 
         let results = search(
             &docs,
-            &paths,
             Some(&[0, 1]),
             &prepared,
             SearchMode::CountOnly,
+            &resolve_path,
         )
         .expect("test should succeed");
 
@@ -414,8 +475,11 @@ mod tests {
         fs::write(&matched, "ERR_SYS\n").expect("test should succeed");
         fs::write(&missed, "UNRELATED\n").expect("test should succeed");
 
-        let docs = vec![doc(0, &matched), doc(1, &missed)];
+        let docs = docs_data(temp.path(), &[matched.as_path(), missed.as_path()]);
         let paths = vec![matched, missed];
+        let resolve_path = |doc_id| {
+            Ok(paths[usize::try_from(doc_id).expect("doc id should fit usize")].clone())
+        };
         let prepared = PreparedMultiLiteral {
             literals: vec!["ERR_SYS".into()],
             case_insensitive: false,
@@ -423,10 +487,10 @@ mod tests {
 
         let results = search(
             &docs,
-            &paths,
             Some(&[0, 1]),
             &prepared,
             SearchMode::MaterializeMatches,
+            &resolve_path,
         )
         .expect("test should succeed");
 

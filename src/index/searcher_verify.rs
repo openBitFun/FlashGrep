@@ -1,7 +1,7 @@
 use std::{
     collections::HashSet,
     env, io,
-    path::Path,
+    path::{Path, PathBuf},
     time::{Duration, Instant},
 };
 
@@ -18,15 +18,14 @@ use regex_syntax::{
 
 use crate::{
     config::QueryConfig,
-    error::{AppError, Result},
-    index::format::DocMeta,
+    error::Result,
     json_output::{JsonContext, JsonData, JsonMatch, JsonMessage, JsonSubmatch},
     search::{FileContext, FileMatch, MatchLocation, SearchLine, SearchMode},
 };
 
 pub(crate) use super::shared::build_regex_matcher as build_matcher;
 use super::shared::{
-    build_line_starts, doc_by_id, line_index_for_offset, trim_line_terminator_bytes,
+    build_line_starts, line_index_for_offset, trim_line_terminator_bytes, validate_doc_id,
     validate_doc_ids,
 };
 
@@ -49,21 +48,24 @@ pub(crate) fn requires_multiline_verification(config: &QueryConfig) -> Result<bo
     Ok(hir_can_match_line_terminator(&hir))
 }
 
-pub(crate) fn verify_candidates(
+pub(crate) fn verify_candidates<F>(
     candidate_ids: &[u32],
-    docs: &[DocMeta],
-    sources: &[VerifyDocSource<'_>],
+    doc_count: usize,
+    resolve_path: &F,
     matcher: &RegexMatcher,
     multiline_verifier: bool,
     mode: SearchMode,
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
-) -> Result<Vec<SearchTaskOutcome>> {
+) -> Result<Vec<SearchTaskOutcome>>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
     verify_candidate_sources(
         candidate_ids,
-        docs,
-        sources,
+        doc_count,
+        resolve_path,
         matcher,
         multiline_verifier,
         mode,
@@ -73,19 +75,21 @@ pub(crate) fn verify_candidates(
     )
 }
 
-pub(crate) fn verify_candidate_sources(
+pub(crate) fn verify_candidate_sources<F>(
     candidate_ids: &[u32],
-    docs: &[DocMeta],
-    sources: &[VerifyDocSource<'_>],
+    doc_count: usize,
+    resolve_path: &F,
     matcher: &RegexMatcher,
     multiline_verifier: bool,
     mode: SearchMode,
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
-) -> Result<Vec<SearchTaskOutcome>> {
-    validate_doc_ids(docs, candidate_ids)?;
-    validate_doc_sources(docs, sources)?;
+) -> Result<Vec<SearchTaskOutcome>>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
+    validate_doc_ids(doc_count, candidate_ids)?;
     let mut outcomes = if should_parallel_verify(candidate_ids.len()) {
         let results = candidate_ids
             .par_iter()
@@ -104,9 +108,9 @@ pub(crate) fn verify_candidate_sources(
                     )
                 },
                 |(matcher, verifier), (ordinal, &doc_id)| {
-                    let _ = doc_by_id(docs, doc_id)?;
-                    let outcome =
-                        verify_source(doc_source_by_id(sources, doc_id)?, matcher, verifier, mode)?;
+                    validate_doc_id(doc_count, doc_id)?;
+                    let path = resolve_path(doc_id)?;
+                    let outcome = verify_path(&path, matcher, verifier, mode)?;
                     Ok(SearchTaskOutcome {
                         ordinal,
                         doc_id,
@@ -131,13 +135,9 @@ pub(crate) fn verify_candidate_sources(
         );
         let mut outcomes = Vec::with_capacity(candidate_ids.len());
         for (ordinal, &doc_id) in candidate_ids.iter().enumerate() {
-            let _ = doc_by_id(docs, doc_id)?;
-            let outcome = verify_source(
-                doc_source_by_id(sources, doc_id)?,
-                matcher,
-                &mut verifier,
-                mode,
-            )?;
+            validate_doc_id(doc_count, doc_id)?;
+            let path = resolve_path(doc_id)?;
+            let outcome = verify_path(&path, matcher, &mut verifier, mode)?;
             outcomes.push(SearchTaskOutcome {
                 ordinal,
                 doc_id,
@@ -150,21 +150,24 @@ pub(crate) fn verify_candidate_sources(
     Ok(outcomes)
 }
 
-pub(crate) fn verify_candidates_json(
+pub(crate) fn verify_candidates_json<F>(
     candidate_ids: &[u32],
-    docs: &[DocMeta],
-    sources: &[VerifyDocSource<'_>],
+    doc_count: usize,
+    resolve_path: &F,
     matcher: &RegexMatcher,
     multiline_verifier: bool,
     mode: SearchMode,
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
-) -> Result<Vec<JsonSearchTaskOutcome>> {
+) -> Result<Vec<JsonSearchTaskOutcome>>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
     verify_candidate_sources_json(
         candidate_ids,
-        docs,
-        sources,
+        doc_count,
+        resolve_path,
         matcher,
         multiline_verifier,
         mode,
@@ -174,19 +177,21 @@ pub(crate) fn verify_candidates_json(
     )
 }
 
-pub(crate) fn verify_candidate_sources_json(
+pub(crate) fn verify_candidate_sources_json<F>(
     candidate_ids: &[u32],
-    docs: &[DocMeta],
-    sources: &[VerifyDocSource<'_>],
+    doc_count: usize,
+    resolve_path: &F,
     matcher: &RegexMatcher,
     multiline_verifier: bool,
     mode: SearchMode,
     max_count: Option<usize>,
     before_context: usize,
     after_context: usize,
-) -> Result<Vec<JsonSearchTaskOutcome>> {
-    validate_doc_ids(docs, candidate_ids)?;
-    validate_doc_sources(docs, sources)?;
+) -> Result<Vec<JsonSearchTaskOutcome>>
+where
+    F: Fn(u32) -> Result<PathBuf> + Sync,
+{
+    validate_doc_ids(doc_count, candidate_ids)?;
     let mut verifier = build_json_verifier(
         multiline_verifier,
         mode,
@@ -196,14 +201,10 @@ pub(crate) fn verify_candidate_sources_json(
     );
     let mut outcomes = Vec::with_capacity(candidate_ids.len());
     for &doc_id in candidate_ids {
-        let _ = doc_by_id(docs, doc_id)?;
+        validate_doc_id(doc_count, doc_id)?;
         let started = Instant::now();
-        let outcome = verify_source_json(
-            doc_source_by_id(sources, doc_id)?,
-            matcher,
-            &mut verifier,
-            mode,
-        )?;
+        let path = resolve_path(doc_id)?;
+        let outcome = verify_path_json(&path, matcher, &mut verifier, mode)?;
         outcomes.push(JsonSearchTaskOutcome {
             doc_id,
             elapsed: started.elapsed(),
@@ -239,11 +240,6 @@ pub(crate) struct JsonSearchTaskOutcome {
     pub(crate) doc_id: u32,
     pub(crate) elapsed: Duration,
     pub(crate) outcome: JsonVerifyOutcome,
-}
-
-#[derive(Clone, Copy)]
-pub(crate) enum VerifyDocSource<'a> {
-    Path(&'a Path),
 }
 
 #[derive(Debug, Default)]
@@ -372,17 +368,6 @@ fn verify_path(
     Ok(sink.finish())
 }
 
-fn verify_source(
-    source: VerifyDocSource<'_>,
-    matcher: &RegexMatcher,
-    verifier: &mut Searcher,
-    mode: SearchMode,
-) -> Result<VerifyOutcome> {
-    match source {
-        VerifyDocSource::Path(path) => verify_path(path, matcher, verifier, mode),
-    }
-}
-
 fn verify_path_json(
     path: &Path,
     matcher: &RegexMatcher,
@@ -392,42 +377,6 @@ fn verify_path_json(
     let mut sink = JsonCollectSink::new(matcher, mode);
     verifier.search_path(matcher, path, &mut sink)?;
     Ok(sink.finish())
-}
-
-fn verify_source_json(
-    source: VerifyDocSource<'_>,
-    matcher: &RegexMatcher,
-    verifier: &mut Searcher,
-    mode: SearchMode,
-) -> Result<JsonVerifyOutcome> {
-    match source {
-        VerifyDocSource::Path(path) => verify_path_json(path, matcher, verifier, mode),
-    }
-}
-
-fn validate_doc_sources(docs: &[DocMeta], sources: &[VerifyDocSource<'_>]) -> Result<()> {
-    if docs.len() == sources.len() {
-        Ok(())
-    } else {
-        Err(AppError::InvalidIndex(format!(
-            "document source count {} does not match doc count {}",
-            sources.len(),
-            docs.len()
-        )))
-    }
-}
-
-fn doc_source_by_id<'a>(
-    sources: &'a [VerifyDocSource<'a>],
-    doc_id: u32,
-) -> Result<VerifyDocSource<'a>> {
-    let index = usize::try_from(doc_id)
-        .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
-    sources.get(index).copied().ok_or_else(|| {
-        AppError::InvalidIndex(format!(
-            "doc id {doc_id} is missing from the document source table"
-        ))
-    })
 }
 
 fn should_parallel_verify(candidate_count: usize) -> bool {
