@@ -515,8 +515,7 @@ struct StreamingIndexBuilder {
 
 impl StreamingIndexBuilder {
     fn new(config: &BuildConfig, snapshot: &BaseSnapshot, layout: &IndexLayout) -> Result<Self> {
-        let build_fallback_trigram =
-            config.tokenizer == crate::config::TokenizerMode::SparseNgram;
+        let build_fallback_trigram = config.tokenizer == crate::config::TokenizerMode::SparseNgram;
         let docs_writer = DocsWriter::create(
             &layout.docs_path,
             IndexMetadata {
@@ -538,7 +537,9 @@ impl StreamingIndexBuilder {
             if build_fallback_trigram {
                 let fallback_spill_dir = spill_root.join("fallback");
                 (
-                    Some(DocTermsWriter::create(&layout.trigram_fallback_doc_terms_path)?),
+                    Some(DocTermsWriter::create(
+                        &layout.trigram_fallback_doc_terms_path,
+                    )?),
                     Some(BucketSpiller::create(&fallback_spill_dir)?),
                     Some(fallback_spill_dir),
                 )
@@ -651,7 +652,10 @@ impl StreamingIndexBuilder {
                 should_cancel,
             )?;
             fallback_lookup_entries.sort_unstable_by_key(|entry| entry.token_hash);
-            write_lookup_file(&layout.trigram_fallback_lookup_path, &fallback_lookup_entries)?;
+            write_lookup_file(
+                &layout.trigram_fallback_lookup_path,
+                &fallback_lookup_entries,
+            )?;
             self.docs_writer
                 .update_fallback_trigram(FallbackTrigramSettings {
                     doc_count: self.doc_count,

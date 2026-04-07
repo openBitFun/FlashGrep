@@ -14,6 +14,8 @@ pub enum AppError {
     Regex(#[from] regex::Error),
     #[error("invalid regex pattern: {0}")]
     InvalidPattern(String),
+    #[error("protocol error: {0}")]
+    Protocol(String),
     #[error("unsupported index format: {0}")]
     InvalidIndex(String),
     #[error("value out of range: {0}")]

@@ -14,6 +14,13 @@ use std::{
 
 use crate::{
     config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
+    daemon::{
+        protocol::{
+            ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, SearchModeConfig,
+            SearchParams,
+        },
+        DaemonClient, ManagedDaemonClient,
+    },
     error::{AppError, Result},
     index::build_index,
     search::SearchMode,
@@ -193,9 +200,15 @@ enum CacheRunner {
     Rg,
 }
 
-struct BitfunOutcome {
+pub(super) struct BitfunOutcome {
     candidate_docs: usize,
     match_count: usize,
+}
+
+pub(super) struct BenchDaemon {
+    client: DaemonClient,
+    addr: String,
+    repo_id: String,
 }
 
 const BENCHMARKS: &[BenchmarkCase] = &[
@@ -666,6 +679,97 @@ fn custom_query_config(pattern: &str, case_insensitive: bool, config: &BenchConf
         top_k_tokens: config.top_k_tokens,
         search_mode: SearchMode::CountOnly,
         ..QueryConfig::default()
+    }
+}
+
+pub(super) fn start_bench_daemon(
+    repo_path: &Path,
+    index_path: &Path,
+    config: &BenchConfig,
+) -> Result<BenchDaemon> {
+    let managed = ManagedDaemonClient::new().with_daemon_program(codgrep_executable()?);
+    let ensured = managed.ensure_repo(EnsureRepoParams {
+        repo_path: repo_path.to_path_buf(),
+        index_path: Some(index_path.to_path_buf()),
+        config: RepoConfig {
+            tokenizer: match config.tokenizer {
+                TokenizerMode::Trigram => crate::daemon::protocol::TokenizerModeConfig::Trigram,
+                TokenizerMode::SparseNgram => {
+                    crate::daemon::protocol::TokenizerModeConfig::SparseNgram
+                }
+            },
+            corpus_mode: match config.corpus_mode {
+                CorpusMode::RespectIgnore => {
+                    crate::daemon::protocol::CorpusModeConfig::RespectIgnore
+                }
+                CorpusMode::NoIgnore => crate::daemon::protocol::CorpusModeConfig::NoIgnore,
+            },
+            include_hidden: false,
+            max_file_size: 512 * 1024 * 1024,
+            min_sparse_len: 5,
+            max_sparse_len: 16,
+        },
+        refresh: Default::default(),
+    })?;
+    Ok(BenchDaemon {
+        client: DaemonClient::new(ensured.addr.clone()),
+        addr: ensured.addr,
+        repo_id: ensured.repo_id,
+    })
+}
+
+pub(super) fn run_daemon_search_count(
+    daemon: &BenchDaemon,
+    pattern: &str,
+    case_insensitive: bool,
+    config: &BenchConfig,
+    roots: Vec<PathBuf>,
+) -> Result<BitfunOutcome> {
+    let response = daemon.client.search(SearchParams {
+        repo_id: daemon.repo_id.clone(),
+        query: QuerySpec {
+            pattern: pattern.to_string(),
+            patterns: vec![pattern.to_string()],
+            case_insensitive,
+            multiline: false,
+            dot_matches_new_line: false,
+            fixed_strings: false,
+            word_regexp: false,
+            line_regexp: false,
+            before_context: 0,
+            after_context: 0,
+            top_k_tokens: config.top_k_tokens,
+            max_count: None,
+            search_mode: SearchModeConfig::CountOnly,
+        },
+        scope: PathScope {
+            roots,
+            globs: Vec::new(),
+            iglobs: Vec::new(),
+            type_add: Vec::new(),
+            type_clear: Vec::new(),
+            types: Vec::new(),
+            type_not: Vec::new(),
+        },
+        consistency: ConsistencyMode::WorkspaceEventual,
+        allow_scan_fallback: false,
+    })?;
+
+    match response {
+        crate::daemon::protocol::Response::SearchCompleted { results, .. } => Ok(BitfunOutcome {
+            candidate_docs: results.candidate_docs,
+            match_count: results.matched_lines,
+        }),
+        other => Err(AppError::Protocol(format!(
+            "unexpected daemon bench response: {other:?}"
+        ))),
+    }
+}
+
+impl Drop for BenchDaemon {
+    fn drop(&mut self) {
+        let _ = self.client.send(crate::daemon::protocol::Request::Shutdown);
+        let _ = &self.addr;
     }
 }
 

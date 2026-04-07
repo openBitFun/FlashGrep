@@ -187,9 +187,9 @@ fn runner_display_name(runner: &str) -> &'static str {
 fn classify_runner(runner: &str) -> RunnerLabel {
     match runner {
         "codgrep" => RunnerLabel {
-            display: "codgrep [cli-fallback-aware]",
+            display: "codgrep [daemon-steady-state]",
             family: "codgrep",
-            mode: "cli_fallback",
+            mode: "daemon_steady_state",
         },
         "codgrep_index" => RunnerLabel {
             display: "codgrep_index [raw-base-index]",

@@ -8,8 +8,9 @@ use std::{
 use crate::{
     config::BuildConfig,
     error::Result,
-    files::{is_text_file, scan_repository},
+    files::{is_text_file, scan_paths, scan_repository, ScanOptions},
     index::{IndexSearcher, IndexWorktreeDiff},
+    path_filter::PathFilter,
     planner::QueryPlan,
     search_engine::{SearchDocument, SearchDocumentSource},
     QueryConfig,
@@ -19,6 +20,7 @@ pub(super) struct CandidateRuntime<'a> {
     searcher: &'a IndexSearcher,
     diff: &'a IndexWorktreeDiff,
     query: &'a QueryConfig,
+    filter: Option<&'a PathFilter>,
 }
 
 pub(super) struct ResolvedDocuments {
@@ -40,9 +42,29 @@ struct PlannedWorkspaceQuery {
 
 pub(super) fn scan_text_repository_files(
     build_config: &BuildConfig,
+    filter: Option<&PathFilter>,
 ) -> Result<Vec<SearchDocument>> {
     let mut files = Vec::new();
-    for file in scan_repository(build_config)? {
+    let scanned = if filter.is_some() {
+        scan_paths(
+            std::slice::from_ref(&build_config.repo_path),
+            Some(&build_config.index_path),
+            ScanOptions {
+                respect_ignore: matches!(
+                    build_config.corpus_mode,
+                    crate::config::CorpusMode::RespectIgnore
+                ),
+                include_hidden: build_config.include_hidden,
+                max_file_size: build_config.max_file_size,
+                max_depth: None,
+                ignore_files: Vec::new(),
+            },
+            filter,
+        )?
+    } else {
+        scan_repository(build_config)?
+    };
+    for file in scanned {
         if !is_text_file(&file.path)? {
             continue;
         }
@@ -56,11 +78,13 @@ impl<'a> CandidateRuntime<'a> {
         searcher: &'a IndexSearcher,
         diff: &'a IndexWorktreeDiff,
         query: &'a QueryConfig,
+        filter: Option<&'a PathFilter>,
     ) -> Self {
         Self {
             searcher,
             diff,
             query,
+            filter,
         }
     }
 
@@ -71,7 +95,7 @@ impl<'a> CandidateRuntime<'a> {
             .candidate_doc_ids_by_branch_for_plan_with_allowed_paths(
                 self.query,
                 &planned_query.plan,
-                None,
+                self.filter,
                 None,
             )?;
         let shadowed_paths = shadowed_paths(self.diff);
@@ -80,7 +104,7 @@ impl<'a> CandidateRuntime<'a> {
             candidates.extend_doc_ids(self.searcher, branch_doc_ids, Some(&shadowed_paths));
         }
         candidates.extend_paths(existing_dirty_paths(self.diff));
-        resolve_documents(candidates)
+        resolve_documents(candidates, self.filter)
     }
 }
 
@@ -134,8 +158,9 @@ pub(super) fn candidate_documents(
     searcher: &IndexSearcher,
     diff: &IndexWorktreeDiff,
     query: &QueryConfig,
+    filter: Option<&PathFilter>,
 ) -> Result<ResolvedDocuments> {
-    CandidateRuntime::new(searcher, diff, query).candidate_documents()
+    CandidateRuntime::new(searcher, diff, query, filter).candidate_documents()
 }
 
 fn shadowed_paths(diff: &IndexWorktreeDiff) -> HashSet<String> {
@@ -182,10 +207,16 @@ impl PlannedWorkspaceQuery {
     }
 }
 
-fn resolve_documents(candidates: EffectiveCandidateSet) -> Result<ResolvedDocuments> {
+fn resolve_documents(
+    candidates: EffectiveCandidateSet,
+    filter: Option<&PathFilter>,
+) -> Result<ResolvedDocuments> {
     let mut documents = Vec::new();
     for candidate in candidates.into_ordered() {
         let path = PathBuf::from(&candidate.path);
+        if filter.is_some_and(|active| !active.matches_file(&path)) {
+            continue;
+        }
         if !path.exists() || !is_text_file(&path)? {
             continue;
         }
@@ -275,7 +306,7 @@ mod tests {
         let diff = searcher
             .diff_against_worktree()
             .expect("diff should succeed");
-        candidate_documents(searcher, &diff, &query(pattern))
+        candidate_documents(searcher, &diff, &query(pattern), None)
             .expect("candidate resolution should succeed")
             .into_documents()
             .into_iter()

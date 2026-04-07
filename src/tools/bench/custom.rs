@@ -16,8 +16,9 @@ use super::{
     custom_query_config,
     fixtures::prepare_dirty_worktree_fixture,
     report::{build_summary, mean_usize, RawSample, RawWriter},
-    BenchCachePaths, BenchConfig, BenchQueryMode, BenchReport, CorpusBuildRecord,
-    CustomBenchmarkCase, CustomBenchmarkTrace, DirtyPattern, DirtyWorktreeFixture,
+    run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchQueryMode,
+    BenchReport, CorpusBuildRecord, CustomBenchmarkCase, CustomBenchmarkTrace, DirtyPattern,
+    DirtyWorktreeFixture,
 };
 
 pub(super) fn run_custom(
@@ -44,7 +45,7 @@ pub(super) fn run_custom(
                 .map(|name| name.to_string_lossy().into_owned())
         })
         .unwrap_or_else(|| "custom".into());
-    let index_path = custom_index_path(&config.suite_dir, &target_label, config);
+    let index_path = custom_index_path(repo_path, &target_label, config);
     let should_build = config.rebuild || !index_exists(&index_path);
 
     let mut corpus_builds = Vec::new();
@@ -254,13 +255,18 @@ pub(super) fn index_exists(index_path: &Path) -> bool {
     IndexLayout::resolve(index_path).is_ok()
 }
 
-fn custom_index_path(suite_dir: &Path, target_label: &str, config: &BenchConfig) -> PathBuf {
-    suite_dir.join(".codgrep-bench").join(format!(
-        "custom-{}-{}-{}",
+fn custom_index_path(repo_path: &Path, target_label: &str, config: &BenchConfig) -> PathBuf {
+    let default_index = repo_path.join(".codgrep-index");
+    if default_index.exists() {
+        return default_index;
+    }
+    let suffix = format!(
+        ".codgrep-index-{}-{}-{}",
         sanitize_benchmark_name(target_label),
         config.corpus_mode.as_str(),
         config.tokenizer.as_str()
-    ))
+    );
+    repo_path.join(suffix)
 }
 
 fn run_codgrep_custom_benchmark(
@@ -270,31 +276,23 @@ fn run_codgrep_custom_benchmark(
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<super::RunnerSummary> {
+    let daemon = start_bench_daemon(&benchmark.repo_path, index_path, config)?;
     let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut candidate_docs = None;
     let mut match_count = 0;
 
     for _ in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_codgrep_custom_cli_once(
-            &benchmark.repo_path,
-            index_path,
-            &benchmark.pattern,
-            benchmark.case_insensitive,
-            config,
-        )?;
+        let _ = run_codgrep_custom_daemon_once(&daemon, benchmark, config)?;
     }
 
     for iter in 0..config.bench_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
-        match_count = run_codgrep_custom_cli_once(
-            &benchmark.repo_path,
-            index_path,
-            &benchmark.pattern,
-            benchmark.case_insensitive,
-            config,
-        )?;
+        let outcome = run_codgrep_custom_daemon_once(&daemon, benchmark, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
+        candidate_docs = Some(outcome.candidate_docs);
+        match_count = outcome.match_count;
         durations.push(duration_secs);
 
         if let Some(writer) = raw_writer.as_deref_mut() {
@@ -304,7 +302,7 @@ fn run_codgrep_custom_benchmark(
                 runner: "codgrep",
                 iteration: iter,
                 duration_secs,
-                candidate_docs: None,
+                candidate_docs,
                 match_count,
             })?;
         }
@@ -313,7 +311,7 @@ fn run_codgrep_custom_benchmark(
     Ok(build_summary(
         "codgrep".into(),
         durations,
-        None,
+        candidate_docs,
         match_count,
     ))
 }
@@ -382,18 +380,20 @@ fn run_codgrep_custom_trace_benchmark(
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<super::RunnerSummary> {
+    let daemon = start_bench_daemon(&benchmark.repo_path, index_path, config)?;
     let mut durations = Vec::with_capacity(config.bench_iter);
+    let mut total_candidate_docs = 0usize;
     let mut total_match_count = 0usize;
 
     for iter in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let pattern = benchmark.pattern_at(iter);
-        let _ = run_codgrep_custom_cli_once(
-            &benchmark.repo_path,
-            index_path,
+        let _ = run_daemon_search_count(
+            &daemon,
             pattern,
             benchmark.case_insensitive,
             config,
+            vec![benchmark.repo_path.clone()],
         )?;
     }
 
@@ -401,15 +401,16 @@ fn run_codgrep_custom_trace_benchmark(
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let pattern = benchmark.pattern_at(iter);
         let started = Instant::now();
-        let match_count = run_codgrep_custom_cli_once(
-            &benchmark.repo_path,
-            index_path,
+        let outcome = run_daemon_search_count(
+            &daemon,
             pattern,
             benchmark.case_insensitive,
             config,
+            vec![benchmark.repo_path.clone()],
         )?;
         let duration_secs = started.elapsed().as_secs_f64();
-        total_match_count += match_count;
+        total_candidate_docs += outcome.candidate_docs;
+        total_match_count += outcome.match_count;
         durations.push(duration_secs);
         if let Some(writer) = raw_writer.as_deref_mut() {
             writer.write_sample(RawSample {
@@ -418,8 +419,8 @@ fn run_codgrep_custom_trace_benchmark(
                 runner: "codgrep",
                 iteration: iter,
                 duration_secs,
-                candidate_docs: None,
-                match_count,
+                candidate_docs: Some(outcome.candidate_docs),
+                match_count: outcome.match_count,
             })?;
         }
     }
@@ -427,7 +428,7 @@ fn run_codgrep_custom_trace_benchmark(
     Ok(build_summary(
         "codgrep".into(),
         durations,
-        None,
+        Some(mean_usize(total_candidate_docs, config.bench_iter)),
         mean_usize(total_match_count, config.bench_iter),
     ))
 }
@@ -494,35 +495,18 @@ fn run_codgrep_custom_once(
     })
 }
 
-fn run_codgrep_custom_cli_once(
-    repo_path: &Path,
-    index_path: &Path,
-    pattern: &str,
-    case_insensitive: bool,
+fn run_codgrep_custom_daemon_once(
+    daemon: &super::BenchDaemon,
+    benchmark: &CustomBenchmarkCase,
     config: &BenchConfig,
-) -> Result<usize> {
-    let mut command = Command::new(super::codgrep_executable()?);
-    command.arg("--index").arg(index_path);
-    command.arg("-c");
-    if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
-        command.arg("--no-ignore");
-    }
-    if case_insensitive {
-        command.arg("-i");
-    }
-    command.arg("-e").arg(pattern);
-    command.arg(repo_path);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::null());
-
-    let output = command.output()?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(AppError::InvalidIndex(format!(
-            "codgrep cli failed for benchmark {} with status {}",
-            pattern, output.status
-        )));
-    }
-    super::parse_rg_count_output(&output.stdout)
+) -> Result<super::BitfunOutcome> {
+    run_daemon_search_count(
+        daemon,
+        &benchmark.pattern,
+        benchmark.case_insensitive,
+        config,
+        vec![benchmark.repo_path.clone()],
+    )
 }
 
 fn run_rg_custom_benchmark(

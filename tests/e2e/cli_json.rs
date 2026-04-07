@@ -202,6 +202,9 @@ fn cli_sparse_short_literal_json_matches_ripgrep_via_index() {
         .expect("test should succeed");
 
     assert_eq!(codgrep.status.code(), rg.status.code());
-    assert_eq!(sorted_normalized_json(&codgrep.stdout), sorted_normalized_json(&rg.stdout));
+    assert_eq!(
+        sorted_normalized_json(&codgrep.stdout),
+        sorted_normalized_json(&rg.stdout)
+    );
     assert!(!stderr_string(&codgrep.stderr).contains("fallback rg=true"));
 }

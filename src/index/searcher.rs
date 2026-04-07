@@ -1,7 +1,8 @@
 use std::{
     collections::{HashMap, HashSet},
-    fs::File,
+    fs::{self, File},
     path::{Path, PathBuf},
+    sync::Arc,
     time::Instant,
 };
 
@@ -11,7 +12,7 @@ use memmap2::Mmap;
 use crate::{
     config::{BuildConfig, QueryConfig},
     error::{AppError, Result},
-    files::{resolve_repo_path, scan_repository},
+    files::{is_text_file, resolve_repo_path, scan_repository},
     index::format::{
         DocMetaRef, DocsData, IndexBuildSettings, IndexLayout, IndexMetadata, LookupTable,
         PostingsData,
@@ -47,11 +48,20 @@ use verify::{
     SearchProfile,
 };
 
+const CANDIDATE_PROBE_WINDOW: usize = 4;
+
 #[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct IndexWorktreeDiff {
     pub modified_files: Vec<String>,
     pub deleted_files: Vec<String>,
     pub new_files: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DirtyPathKind {
+    Modified,
+    Deleted,
+    New,
 }
 
 impl IndexWorktreeDiff {
@@ -207,6 +217,13 @@ impl IndexSearcher {
             max_sparse_len: self.metadata.max_sparse_len,
         })?;
         let current = current_files
+            .into_iter()
+            .filter_map(|file| match is_text_file(&file.path) {
+                Ok(true) => Some(Ok(file)),
+                Ok(false) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect::<Result<Vec<_>>>()?
             .into_iter()
             .map(|file| {
                 (
@@ -1004,6 +1021,52 @@ impl IndexSearcher {
         Ok(self.doc_display_path_ref(doc_by_id(&self.docs, doc_id)?))
     }
 
+    pub(crate) fn classify_dirty_path(&self, path: &str) -> Result<Option<DirtyPathKind>> {
+        let indexed = self
+            .docs
+            .iter()
+            .find(|doc| self.doc_display_path_ref(*doc) == path);
+
+        match indexed {
+            Some(doc) => match fs::metadata(path) {
+                Ok(metadata) => {
+                    if !metadata.is_file() || !is_text_file(Path::new(path))? {
+                        return Ok(Some(DirtyPathKind::Deleted));
+                    }
+                    let modified = metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|duration| match u64::try_from(duration.as_nanos()) {
+                            Ok(value) => value,
+                            Err(_) => u64::MAX,
+                        })
+                        .unwrap_or_default();
+                    if metadata.len() != doc.size() || modified != doc.mtime_nanos() {
+                        Ok(Some(DirtyPathKind::Modified))
+                    } else {
+                        Ok(None)
+                    }
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(Some(DirtyPathKind::Deleted))
+                }
+                Err(error) => Err(error.into()),
+            },
+            None => {
+                let path = Path::new(path);
+                if !path.exists() || !path.is_file() {
+                    return Ok(None);
+                }
+                if is_text_file(path)? {
+                    Ok(Some(DirtyPathKind::New))
+                } else {
+                    Ok(None)
+                }
+            }
+        }
+    }
+
     pub(crate) fn indexed_paths_with_allowed_paths(
         &self,
         filter: Option<&PathFilter>,
@@ -1305,8 +1368,8 @@ impl IndexSearcher {
         allowed_paths: Option<&HashSet<String>>,
     ) -> Result<Option<Vec<u32>>> {
         let mut all_candidates = Vec::new();
-        let mut posting_cache = HashMap::new();
-        let mut fallback_posting_cache = HashMap::new();
+        let mut posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
+        let mut fallback_posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
         let mut fallback_literal_cache = HashMap::new();
 
@@ -1342,8 +1405,8 @@ impl IndexSearcher {
         allowed_paths: Option<&HashSet<String>>,
     ) -> Result<Vec<u32>> {
         let mut all_candidates = Vec::new();
-        let mut posting_cache = HashMap::new();
-        let mut fallback_posting_cache = HashMap::new();
+        let mut posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
+        let mut fallback_posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
         let mut fallback_literal_cache = HashMap::new();
 
@@ -1376,8 +1439,8 @@ impl IndexSearcher {
         allow_literal_scan: bool,
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
-        posting_cache: &mut HashMap<u64, Vec<u32>>,
-        fallback_posting_cache: &mut HashMap<u64, Vec<u32>>,
+        posting_cache: &mut HashMap<u64, Arc<[u32]>>,
+        fallback_posting_cache: &mut HashMap<u64, Arc<[u32]>>,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
         fallback_literal_cache: &mut HashMap<String, Vec<u32>>,
     ) -> Result<Option<Vec<u32>>> {
@@ -1437,7 +1500,7 @@ impl IndexSearcher {
             let docs = self.read_posting_docs(candidate.token_hash, posting_cache)?;
             branch_candidates = Some(match branch_candidates.take() {
                 Some(existing) => intersect_sorted(&existing, &docs),
-                None => docs,
+                None => docs.to_vec(),
             });
             selected_hashes.insert(candidate.token_hash);
             selected_count += 1;
@@ -1455,37 +1518,56 @@ impl IndexSearcher {
             let Some(current_candidates) = branch_candidates.as_ref() else {
                 break;
             };
-            let mut best_choice: Option<(TokenCandidate, Vec<u32>)> = None;
+            let mut best_choice: Option<(TokenCandidate, usize)> = None;
 
-            for candidates in &per_literal {
+            'candidate_search: for candidates in &per_literal {
+                let mut probed = 0usize;
                 for candidate in candidates {
                     if selected_hashes.contains(&candidate.token_hash) {
                         continue;
                     }
+                    if probed >= CANDIDATE_PROBE_WINDOW {
+                        break;
+                    }
+                    probed += 1;
 
                     let docs = self.read_posting_docs(candidate.token_hash, posting_cache)?;
-                    let reduced = intersect_sorted(current_candidates, &docs);
+                    let reduced_len_bound = best_choice
+                        .as_ref()
+                        .map_or(current_candidates.len().saturating_add(1), |(_, best_len)| {
+                            best_len.saturating_add(1)
+                        });
+                    let reduced_len = intersect_sorted_len_bounded(
+                        current_candidates,
+                        &docs,
+                        reduced_len_bound,
+                    );
                     let replace = match &best_choice {
-                        Some((best_candidate, best_reduced)) => {
-                            reduced.len() < best_reduced.len()
-                                || (reduced.len() == best_reduced.len()
+                        Some((best_candidate, best_reduced_len)) => {
+                            reduced_len < *best_reduced_len
+                                || (reduced_len == *best_reduced_len
                                     && candidate.selection_rank() < best_candidate.selection_rank())
                         }
                         None => true,
                     };
                     if replace {
-                        best_choice = Some((*candidate, reduced));
+                        best_choice = Some((*candidate, reduced_len));
+                        if reduced_len == 0 {
+                            break 'candidate_search;
+                        }
                     }
                 }
             }
 
-            let Some((candidate, reduced)) = best_choice else {
+            let Some((candidate, reduced_len)) = best_choice else {
                 break;
             };
-            if reduced.len() >= current_candidates.len() {
+            if reduced_len >= current_candidates.len() {
                 break;
             }
 
+            let docs = self.read_posting_docs(candidate.token_hash, posting_cache)?;
+            let reduced = intersect_sorted(current_candidates, &docs);
             selected_hashes.insert(candidate.token_hash);
             branch_candidates = Some(reduced);
             selected_count += 1;
@@ -1595,7 +1677,7 @@ impl IndexSearcher {
     fn fallback_literal_doc_ids(
         &self,
         literal: &str,
-        posting_cache: &mut HashMap<u64, Vec<u32>>,
+        posting_cache: &mut HashMap<u64, Arc<[u32]>>,
         literal_cache: &mut HashMap<String, Vec<u32>>,
     ) -> Result<Option<Vec<u32>>> {
         if let Some(cached) = literal_cache.get(literal) {
@@ -1631,7 +1713,7 @@ impl IndexSearcher {
             let posting_docs = self.read_fallback_posting_docs(entry.token_hash, posting_cache)?;
             docs = Some(match docs.take() {
                 Some(existing) => intersect_sorted(&existing, &posting_docs),
-                None => posting_docs,
+                None => posting_docs.to_vec(),
             });
             if docs.as_ref().is_some_and(Vec::is_empty) {
                 break;
@@ -1646,27 +1728,27 @@ impl IndexSearcher {
     fn read_posting_docs(
         &self,
         token_hash: u64,
-        posting_cache: &mut HashMap<u64, Vec<u32>>,
-    ) -> Result<Vec<u32>> {
+        posting_cache: &mut HashMap<u64, Arc<[u32]>>,
+    ) -> Result<Arc<[u32]>> {
         if let Some(cached) = posting_cache.get(&token_hash) {
-            return Ok(cached.clone());
+            return Ok(Arc::clone(cached));
         }
 
         let docs = match self.lookup.find(token_hash) {
-            Some(entry) if entry.offset != u64::MAX => self.postings.decode(entry)?,
-            Some(_) | None => Vec::new(),
+            Some(entry) if entry.offset != u64::MAX => Arc::<[u32]>::from(self.postings.decode(entry)?),
+            Some(_) | None => Arc::<[u32]>::from(Vec::<u32>::new()),
         };
-        posting_cache.insert(token_hash, docs.clone());
+        posting_cache.insert(token_hash, Arc::clone(&docs));
         Ok(docs)
     }
 
     fn read_fallback_posting_docs(
         &self,
         token_hash: u64,
-        posting_cache: &mut HashMap<u64, Vec<u32>>,
-    ) -> Result<Vec<u32>> {
+        posting_cache: &mut HashMap<u64, Arc<[u32]>>,
+    ) -> Result<Arc<[u32]>> {
         if let Some(cached) = posting_cache.get(&token_hash) {
-            return Ok(cached.clone());
+            return Ok(Arc::clone(cached));
         }
 
         let docs = match (
@@ -1675,10 +1757,12 @@ impl IndexSearcher {
                 .and_then(|lookup| lookup.find(token_hash)),
             self.fallback_postings.as_ref(),
         ) {
-            (Some(entry), Some(postings)) if entry.offset != u64::MAX => postings.decode(entry)?,
-            _ => Vec::new(),
+            (Some(entry), Some(postings)) if entry.offset != u64::MAX => {
+                Arc::<[u32]>::from(postings.decode(entry)?)
+            }
+            _ => Arc::<[u32]>::from(Vec::<u32>::new()),
         };
-        posting_cache.insert(token_hash, docs.clone());
+        posting_cache.insert(token_hash, Arc::clone(&docs));
         Ok(docs)
     }
 
@@ -1906,6 +1990,41 @@ fn intersect_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
     result
 }
 
+fn intersect_sorted_len_bounded(left: &[u32], right: &[u32], bound: usize) -> usize {
+    if left.is_empty() || right.is_empty() || bound == 0 {
+        return 0;
+    }
+    let (small, large) = if left.len() <= right.len() {
+        (left, right)
+    } else {
+        (right, left)
+    };
+    if large.len() >= small.len().saturating_mul(8) {
+        return intersect_sorted_len_bounded_galloping(small, large, bound);
+    }
+
+    let mut matched = 0usize;
+    let mut left_index = 0usize;
+    let mut right_index = 0usize;
+
+    while left_index < left.len() && right_index < right.len() {
+        match left[left_index].cmp(&right[right_index]) {
+            std::cmp::Ordering::Less => left_index += 1,
+            std::cmp::Ordering::Greater => right_index += 1,
+            std::cmp::Ordering::Equal => {
+                matched += 1;
+                if matched >= bound {
+                    return matched;
+                }
+                left_index += 1;
+                right_index += 1;
+            }
+        }
+    }
+
+    matched
+}
+
 fn intersect_sorted_galloping(small: &[u32], large: &[u32]) -> Vec<u32> {
     let mut result = Vec::with_capacity(small.len());
     let mut large_start = 0usize;
@@ -1923,6 +2042,28 @@ fn intersect_sorted_galloping(small: &[u32], large: &[u32]) -> Vec<u32> {
     }
 
     result
+}
+
+fn intersect_sorted_len_bounded_galloping(small: &[u32], large: &[u32], bound: usize) -> usize {
+    let mut matched = 0usize;
+    let mut large_start = 0usize;
+
+    for &value in small {
+        let next = lower_bound(&large[large_start..], value);
+        large_start += next;
+        if large_start >= large.len() {
+            break;
+        }
+        if large[large_start] == value {
+            matched += 1;
+            if matched >= bound {
+                return matched;
+            }
+            large_start += 1;
+        }
+    }
+
+    matched
 }
 
 fn union_sorted(left: &[u32], right: &[u32]) -> Vec<u32> {
@@ -1977,7 +2118,8 @@ fn prune_high_frequency_candidates(candidates: &mut Vec<TokenCandidate>) {
 #[allow(clippy::expect_used)]
 mod tests {
     use super::{
-        intersect_sorted, lower_bound, prune_high_frequency_candidates, union_sorted,
+        intersect_sorted, intersect_sorted_len_bounded, lower_bound,
+        prune_high_frequency_candidates, union_sorted,
         CandidateSource, LiteralPrefilter, TokenCandidate,
     };
     use crate::planner::{QueryBranch, QueryPlan};
@@ -1987,6 +2129,23 @@ mod tests {
         let small = vec![3, 50, 120, 9_999];
         let large = (0..20_000).step_by(3).collect::<Vec<u32>>();
         assert_eq!(intersect_sorted(&small, &large), vec![3, 120, 9_999]);
+    }
+
+    #[test]
+    fn bounded_intersection_len_matches_full_len_when_under_bound() {
+        let left = vec![1, 3, 5, 7, 9];
+        let right = vec![0, 3, 4, 5, 8, 9];
+        assert_eq!(
+            intersect_sorted_len_bounded(&left, &right, usize::MAX),
+            intersect_sorted(&left, &right).len()
+        );
+    }
+
+    #[test]
+    fn bounded_intersection_len_stops_at_bound() {
+        let left = (0..10_000).step_by(2).collect::<Vec<u32>>();
+        let right = (0..10_000).collect::<Vec<u32>>();
+        assert_eq!(intersect_sorted_len_bounded(&left, &right, 3), 3);
     }
 
     #[test]

@@ -15,7 +15,8 @@ use crate::{
 use super::{
     cache::prepare_sample,
     report::{build_summary, RawSample, RawWriter},
-    BenchCachePaths, BenchConfig, BenchmarkCase, BitfunOutcome, CacheRunner, RunnerSummary,
+    run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchmarkCase,
+    BitfunOutcome, CacheRunner, RunnerSummary,
 };
 
 pub(super) fn run_codgrep_index_benchmark(
@@ -74,20 +75,21 @@ pub(super) fn run_codgrep_benchmark(
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<RunnerSummary> {
     let target = benchmark.corpus.search_target(suite_dir);
+    let daemon = start_bench_daemon(&benchmark.corpus.repo_path(suite_dir), index_path, config)?;
     let mut durations = Vec::with_capacity(config.bench_iter);
     let mut match_count = 0;
 
     for _ in 0..config.warmup_iter {
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_codgrep_cli_once(benchmark, index_path, &target, config)?;
+        let _ = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
     }
 
     for iter in 0..config.bench_iter {
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
-        let matches = run_codgrep_cli_once(benchmark, index_path, &target, config)?;
+        let matches = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
-        match_count = matches;
+        match_count = matches.match_count;
         durations.push(duration_secs);
 
         if let Some(writer) = raw_writer.as_deref_mut() {
@@ -97,7 +99,7 @@ pub(super) fn run_codgrep_benchmark(
                 runner: "codgrep",
                 iteration: iter,
                 duration_secs,
-                candidate_docs: None,
+                candidate_docs: Some(matches.candidate_docs),
                 match_count,
             })?;
         }
@@ -329,34 +331,19 @@ fn run_rg_once(benchmark: BenchmarkCase, target: &Path, config: &BenchConfig) ->
     super::parse_rg_count_output(&output.stdout)
 }
 
-fn run_codgrep_cli_once(
+fn run_codgrep_daemon_once(
+    daemon: &super::BenchDaemon,
     benchmark: BenchmarkCase,
-    index_path: &Path,
     target: &Path,
     config: &BenchConfig,
-) -> Result<usize> {
-    let mut command = Command::new(super::codgrep_executable()?);
-    command.arg("--index").arg(index_path);
-    command.arg("-c");
-    if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
-        command.arg("--no-ignore");
-    }
-    if benchmark.case_insensitive {
-        command.arg("-i");
-    }
-    command.arg("-e").arg(benchmark.pattern);
-    command.arg(target);
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::null());
-
-    let output = command.output()?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(AppError::InvalidIndex(format!(
-            "codgrep cli failed for benchmark {} with status {}",
-            benchmark.name, output.status
-        )));
-    }
-    super::parse_rg_count_output(&output.stdout)
+) -> Result<BitfunOutcome> {
+    run_daemon_search_count(
+        daemon,
+        benchmark.pattern,
+        benchmark.case_insensitive,
+        config,
+        vec![target.to_path_buf()],
+    )
 }
 
 fn run_snapshot_once(

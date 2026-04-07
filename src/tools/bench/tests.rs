@@ -436,7 +436,7 @@ fn bench_report_labels_worktree_runner_modes() {
 
     let rendered = render_report(&report);
     let base = rendered
-        .find("codgrep [cli-fallback-aware]")
+        .find("codgrep [daemon-steady-state]")
         .expect("test should succeed");
     let workspace = rendered
         .find("codgrep_workspace [workspace-snapshot]")
@@ -504,7 +504,7 @@ fn bench_raw_output_includes_runner_family_and_mode() {
     );
     assert!(lines
         .iter()
-        .any(|line| line.contains(",codgrep,codgrep,cli_fallback,")));
+        .any(|line| line.contains(",codgrep,codgrep,daemon_steady_state,")));
     assert!(lines
         .iter()
         .any(|line| line.contains(",codgrep_workspace,codgrep,workspace_snapshot,")));

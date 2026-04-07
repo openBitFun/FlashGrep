@@ -14,8 +14,9 @@ use crate::{
     index::{
         build_index_with_options,
         format::{read_docs_file, IndexLayout},
-        IndexBuildOptions, IndexSearcher, IndexWorktreeDiff,
+        DirtyPathKind, IndexBuildOptions, IndexSearcher, IndexWorktreeDiff,
     },
+    path_filter::PathFilter,
     search::SearchResults,
     search_engine::search_documents,
     QueryConfig, TokenizerMode,
@@ -226,7 +227,76 @@ impl WorkspaceIndex {
 
     /// Searches the current effective workspace view.
     pub fn search(&self, query: &QueryConfig) -> Result<SearchResults> {
-        self.snapshot()?.search(query)
+        self.search_with_filter(query, None)
+    }
+
+    /// Searches the current effective workspace view with an optional path filter.
+    pub fn search_with_filter(
+        &self,
+        query: &QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<SearchResults> {
+        self.snapshot()?.search_with_filter(query, filter)
+    }
+
+    /// Searches against the base snapshot plus a caller-maintained dirty overlay diff.
+    pub fn search_with_dirty_diff(
+        &self,
+        query: &QueryConfig,
+        dirty: &IndexWorktreeDiff,
+        filter: Option<&PathFilter>,
+    ) -> Result<SearchResults> {
+        match self.open_searcher() {
+            Ok(searcher) => {
+                if dirty.is_empty() {
+                    return searcher.search_with_filter(query, filter);
+                }
+                let documents = workspace_candidate_documents(&searcher, dirty, query, filter)?
+                    .into_documents();
+                search_documents(query, &documents)
+            }
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => search_documents(
+                query,
+                &scan_text_repository_files(&self.inner.options.build_config, filter)?,
+            ),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Returns the current full worktree diff. Prefer this only for initialization
+    /// or recovery; regular daemon queries should use dirty-path overlays.
+    pub fn diff_against_worktree(&self) -> Result<IndexWorktreeDiff> {
+        self.open_searcher()?.diff_against_worktree()
+    }
+
+    pub(crate) fn classify_dirty_path(&self, path: &str) -> Result<Option<DirtyPathKind>> {
+        match self.open_searcher() {
+            Ok(searcher) => searcher.classify_dirty_path(path),
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Reconciles a caller-maintained dirty overlay against the current base snapshot.
+    pub fn reconcile_dirty_diff(&self, dirty: &IndexWorktreeDiff) -> Result<IndexWorktreeDiff> {
+        if dirty.is_empty() {
+            return Ok(IndexWorktreeDiff::default());
+        }
+
+        let searcher = self.open_searcher()?;
+        let mut remaining = IndexWorktreeDiff::default();
+        for path in dirty.dirty_paths() {
+            match searcher.classify_dirty_path(path)? {
+                Some(DirtyPathKind::Modified) => remaining.modified_files.push(path.to_string()),
+                Some(DirtyPathKind::Deleted) => remaining.deleted_files.push(path.to_string()),
+                Some(DirtyPathKind::New) => remaining.new_files.push(path.to_string()),
+                None => {}
+            }
+        }
+        remaining.modified_files.sort_unstable();
+        remaining.deleted_files.sort_unstable();
+        remaining.new_files.sort_unstable();
+        Ok(remaining)
     }
 
     /// Captures a reusable read-only workspace snapshot for repeated queries.
@@ -383,16 +453,27 @@ impl WorkspaceIndex {
 impl WorkspaceSnapshot {
     /// Searches this captured snapshot without re-evaluating its read view.
     pub fn search(&self, query: &QueryConfig) -> Result<SearchResults> {
+        self.search_with_filter(query, None)
+    }
+
+    /// Searches this captured snapshot with an optional path filter.
+    pub fn search_with_filter(
+        &self,
+        query: &QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<SearchResults> {
         match &self.view {
-            WorkspaceReadView::IndexedClean { searcher } => searcher.search(query),
+            WorkspaceReadView::IndexedClean { searcher } => {
+                searcher.search_with_filter(query, filter)
+            }
             WorkspaceReadView::IndexedDirty { searcher, diff } => {
                 let documents =
-                    workspace_candidate_documents(searcher, diff, query)?.into_documents();
+                    workspace_candidate_documents(searcher, diff, query, filter)?.into_documents();
                 search_documents(query, &documents)
             }
             WorkspaceReadView::ScanFallback => search_documents(
                 query,
-                &scan_text_repository_files(&self.workspace.options.build_config)?,
+                &scan_text_repository_files(&self.workspace.options.build_config, filter)?,
             ),
         }
     }
