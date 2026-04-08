@@ -8,8 +8,9 @@ mod tests;
 
 use std::{
     collections::BTreeMap,
-    env,
+    env, fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use crate::{
@@ -28,12 +29,11 @@ use crate::{
 
 use self::{
     cache::collect_cache_paths,
-    custom::{index_exists, run_custom},
+    custom::run_custom,
     fixtures::prepare_dirty_worktree_fixture,
     report::{print_report as print_report_impl, RawWriter},
     standard::{
-        run_codgrep_benchmark, run_codgrep_index_benchmark, run_rg_benchmark,
-        run_workspace_benchmark, run_worktree_benchmark,
+        run_codgrep_benchmark, run_rg_benchmark, run_workspace_benchmark, run_worktree_benchmark,
     },
 };
 
@@ -52,7 +52,6 @@ pub(crate) struct BenchConfig {
     pub(crate) warmup_iter: usize,
     pub(crate) bench_iter: usize,
     pub(crate) top_k_tokens: usize,
-    pub(crate) compare_index: bool,
     pub(crate) compare_rg: bool,
     pub(crate) compare_worktree: bool,
     pub(crate) compare_workspace: bool,
@@ -120,6 +119,8 @@ enum Corpus {
     SubtitlesRu,
 }
 
+pub(super) const BENCH_MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
+
 impl Corpus {
     fn label(self) -> &'static str {
         match self {
@@ -139,6 +140,33 @@ impl Corpus {
 
     fn search_target(self, suite_dir: &Path) -> PathBuf {
         self.repo_path(suite_dir)
+    }
+}
+
+pub(super) fn bench_build_config(
+    repo_path: &Path,
+    index_path: &Path,
+    config: &BenchConfig,
+) -> BuildConfig {
+    BuildConfig {
+        repo_path: repo_path.to_path_buf(),
+        index_path: index_path.to_path_buf(),
+        tokenizer: config.tokenizer,
+        corpus_mode: config.corpus_mode,
+        include_hidden: false,
+        max_file_size: BENCH_MAX_FILE_SIZE,
+        min_sparse_len: 3,
+        max_sparse_len: 8,
+    }
+}
+
+pub(super) fn configure_rg_command(command: &mut Command, config: &BenchConfig) {
+    command.arg("--count");
+    command.arg("--with-filename");
+    command.arg("--max-filesize");
+    command.arg(BENCH_MAX_FILE_SIZE.to_string());
+    if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
+        command.arg("--no-ignore");
     }
 }
 
@@ -395,26 +423,17 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             config.tokenizer.as_str()
         ));
 
-        let should_build = config.rebuild || !index_exists(&index_path);
-        if should_build {
-            let started = std::time::Instant::now();
-            let docs_indexed = build_index(&BuildConfig {
-                repo_path: repo_path.clone(),
-                index_path: index_path.clone(),
-                tokenizer: config.tokenizer,
-                corpus_mode: config.corpus_mode,
-                include_hidden: false,
-                max_file_size: 512 * 1024 * 1024,
-                min_sparse_len: 5,
-                max_sparse_len: 16,
-            })?;
-            corpus_builds.push(CorpusBuildRecord {
-                corpus: corpus.label().to_string(),
-                tokenizer: config.tokenizer,
-                docs_indexed,
-                duration_secs: started.elapsed().as_secs_f64(),
-            });
+        if config.rebuild && index_path.exists() {
+            fs::remove_dir_all(&index_path)?;
         }
+        let started = std::time::Instant::now();
+        let docs_indexed = build_index(&bench_build_config(&repo_path, &index_path, config))?;
+        corpus_builds.push(CorpusBuildRecord {
+            corpus: corpus.label().to_string(),
+            tokenizer: config.tokenizer,
+            docs_indexed,
+            duration_secs: started.elapsed().as_secs_f64(),
+        });
         let cache_entry = if config.cache_mode.is_cold() {
             Some(collect_cache_paths(
                 corpus,
@@ -471,16 +490,6 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             config,
             raw_writer.as_mut(),
         )?];
-
-        if config.compare_index {
-            runners.push(run_codgrep_index_benchmark(
-                benchmark,
-                index_path,
-                cache_paths,
-                config,
-                raw_writer.as_mut(),
-            )?);
-        }
 
         if config.compare_rg {
             runners.push(run_rg_benchmark(
@@ -706,8 +715,8 @@ pub(super) fn start_bench_daemon(
             },
             include_hidden: false,
             max_file_size: 512 * 1024 * 1024,
-            min_sparse_len: 5,
-            max_sparse_len: 16,
+            min_sparse_len: 3,
+            max_sparse_len: 8,
         },
         refresh: Default::default(),
     })?;
@@ -720,11 +729,13 @@ pub(super) fn start_bench_daemon(
 
 pub(super) fn run_daemon_search_count(
     daemon: &BenchDaemon,
+    repo_path: &Path,
     pattern: &str,
     case_insensitive: bool,
     config: &BenchConfig,
     roots: Vec<PathBuf>,
 ) -> Result<BitfunOutcome> {
+    let roots = benchmark_scope_roots(repo_path, roots);
     let response = daemon.client.search(SearchParams {
         repo_id: daemon.repo_id.clone(),
         query: QuerySpec {
@@ -764,6 +775,41 @@ pub(super) fn run_daemon_search_count(
             "unexpected daemon bench response: {other:?}"
         ))),
     }
+}
+
+pub(super) fn benchmark_scope_roots(repo_path: &Path, roots: Vec<PathBuf>) -> Vec<PathBuf> {
+    let canonical_repo = std::fs::canonicalize(repo_path).ok();
+    roots
+        .into_iter()
+        .filter_map(|root| normalize_scope_root(repo_path, canonical_repo.as_deref(), root))
+        .collect()
+}
+
+fn normalize_scope_root(
+    repo_path: &Path,
+    canonical_repo: Option<&Path>,
+    root: PathBuf,
+) -> Option<PathBuf> {
+    if root == repo_path {
+        return None;
+    }
+    if let Ok(relative) = root.strip_prefix(repo_path) {
+        return (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf());
+    }
+
+    let canonical_root = std::fs::canonicalize(&root).ok();
+    if let (Some(canonical_repo), Some(canonical_root)) =
+        (canonical_repo, canonical_root.as_deref())
+    {
+        if canonical_root == canonical_repo {
+            return None;
+        }
+        if let Ok(relative) = canonical_root.strip_prefix(canonical_repo) {
+            return (!relative.as_os_str().is_empty()).then(|| relative.to_path_buf());
+        }
+    }
+
+    Some(root)
 }
 
 impl Drop for BenchDaemon {

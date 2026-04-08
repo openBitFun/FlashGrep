@@ -5,66 +5,20 @@ use std::{
 };
 
 use crate::{
-    config::{BuildConfig, CorpusMode, QueryConfig},
+    config::QueryConfig,
     error::{AppError, Result},
-    index::IndexSearcher,
     search::SearchMode,
     WorkspaceIndex, WorkspaceIndexOptions,
 };
 
 use super::{
+    bench_build_config,
     cache::prepare_sample,
+    configure_rg_command,
     report::{build_summary, RawSample, RawWriter},
     run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchmarkCase,
     BitfunOutcome, CacheRunner, RunnerSummary,
 };
-
-pub(super) fn run_codgrep_index_benchmark(
-    benchmark: BenchmarkCase,
-    index_path: &Path,
-    cache_paths: Option<&BenchCachePaths>,
-    config: &BenchConfig,
-    mut raw_writer: Option<&mut RawWriter>,
-) -> Result<RunnerSummary> {
-    let searcher = IndexSearcher::open(index_path.to_path_buf())?;
-    let mut durations = Vec::with_capacity(config.bench_iter);
-    let mut candidate_docs = None;
-    let mut match_count = 0;
-
-    for _ in 0..config.warmup_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_codgrep_once(&searcher, benchmark, config)?;
-    }
-
-    for iter in 0..config.bench_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let started = Instant::now();
-        let outcome = run_codgrep_once(&searcher, benchmark, config)?;
-        let duration_secs = started.elapsed().as_secs_f64();
-        candidate_docs = Some(outcome.candidate_docs);
-        match_count = outcome.match_count;
-        durations.push(duration_secs);
-
-        if let Some(writer) = raw_writer.as_deref_mut() {
-            writer.write_sample(RawSample {
-                benchmark: benchmark.name,
-                corpus: benchmark.corpus.label(),
-                runner: "codgrep_index",
-                iteration: iter,
-                duration_secs,
-                candidate_docs,
-                match_count,
-            })?;
-        }
-    }
-
-    Ok(build_summary(
-        "codgrep_index".into(),
-        durations,
-        candidate_docs,
-        match_count,
-    ))
-}
 
 pub(super) fn run_codgrep_benchmark(
     benchmark: BenchmarkCase,
@@ -285,34 +239,9 @@ pub(super) fn run_workspace_benchmark(
     ))
 }
 
-fn run_codgrep_once(
-    searcher: &IndexSearcher,
-    benchmark: BenchmarkCase,
-    config: &BenchConfig,
-) -> Result<BitfunOutcome> {
-    let results = searcher.search(&QueryConfig {
-        regex_pattern: benchmark.pattern.to_string(),
-        patterns: vec![benchmark.pattern.to_string()],
-        case_insensitive: benchmark.case_insensitive,
-        multiline: false,
-        dot_matches_new_line: false,
-        top_k_tokens: config.top_k_tokens,
-        search_mode: SearchMode::CountOnly,
-        ..QueryConfig::default()
-    })?;
-    Ok(BitfunOutcome {
-        candidate_docs: results.candidate_docs,
-        match_count: results.matched_lines,
-    })
-}
-
 fn run_rg_once(benchmark: BenchmarkCase, target: &Path, config: &BenchConfig) -> Result<usize> {
     let mut command = Command::new("rg");
-    command.arg("--count");
-    command.arg("--with-filename");
-    if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
-        command.arg("--no-ignore");
-    }
+    configure_rg_command(&mut command, config);
     if benchmark.case_insensitive {
         command.arg("-i");
     }
@@ -339,6 +268,7 @@ fn run_codgrep_daemon_once(
 ) -> Result<BitfunOutcome> {
     run_daemon_search_count(
         daemon,
+        &benchmark.corpus.repo_path(&config.suite_dir),
         benchmark.pattern,
         benchmark.case_insensitive,
         config,
@@ -374,16 +304,7 @@ fn open_workspace(
     config: &BenchConfig,
 ) -> Result<WorkspaceIndex> {
     WorkspaceIndex::open(WorkspaceIndexOptions {
-        build_config: BuildConfig {
-            repo_path: repo_path.to_path_buf(),
-            index_path: index_path.to_path_buf(),
-            tokenizer: config.tokenizer,
-            corpus_mode: config.corpus_mode,
-            include_hidden: false,
-            max_file_size: 512 * 1024 * 1024,
-            min_sparse_len: 5,
-            max_sparse_len: 16,
-        },
+        build_config: bench_build_config(repo_path, index_path, config),
     })
 }
 
