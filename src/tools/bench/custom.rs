@@ -12,7 +12,7 @@ use crate::{
 };
 
 use super::{
-    bench_build_config,
+    bench_build_config, bench_index_is_usable,
     cache::{collect_cache_paths_for_target, prepare_sample, sanitize_benchmark_name},
     configure_rg_command, custom_query_config,
     fixtures::prepare_dirty_worktree_fixture,
@@ -47,19 +47,22 @@ pub(super) fn run_custom(
         })
         .unwrap_or_else(|| "custom".into());
     let index_path = custom_index_path(repo_path, &target_label, config);
+    let build_config = bench_build_config(repo_path, &index_path, config);
     if config.rebuild && index_path.exists() {
         fs::remove_dir_all(&index_path)?;
     }
 
     let mut corpus_builds = Vec::new();
-    let started = Instant::now();
-    let docs_indexed = build_index(&bench_build_config(repo_path, &index_path, config))?;
-    corpus_builds.push(CorpusBuildRecord {
-        corpus: target_label.clone(),
-        tokenizer: config.tokenizer,
-        docs_indexed,
-        duration_secs: started.elapsed().as_secs_f64(),
-    });
+    if config.rebuild || !bench_index_is_usable(&index_path, &build_config) {
+        let started = Instant::now();
+        let docs_indexed = build_index(&build_config)?;
+        corpus_builds.push(CorpusBuildRecord {
+            corpus: target_label.clone(),
+            tokenizer: config.tokenizer,
+            docs_indexed,
+            duration_secs: started.elapsed().as_secs_f64(),
+        });
+    }
 
     let cache_paths = if config.cache_mode.is_cold() {
         Some(collect_cache_paths_for_target(

@@ -23,7 +23,7 @@ use crate::{
         DaemonClient, ManagedDaemonClient,
     },
     error::{AppError, Result},
-    index::build_index,
+    index::{build_index, IndexSearcher},
     search::SearchMode,
 };
 
@@ -168,6 +168,27 @@ pub(super) fn configure_rg_command(command: &mut Command, config: &BenchConfig) 
     if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
         command.arg("--no-ignore");
     }
+}
+
+pub(super) fn bench_index_is_usable(index_path: &Path, expected: &BuildConfig) -> bool {
+    let Ok(searcher) = IndexSearcher::open(index_path.to_path_buf()) else {
+        return false;
+    };
+    if searcher.tokenizer_mode() != expected.tokenizer {
+        return false;
+    }
+    let tokenizer_options = searcher.tokenizer_options();
+    if tokenizer_options.min_sparse_len != expected.min_sparse_len
+        || tokenizer_options.max_sparse_len != expected.max_sparse_len
+    {
+        return false;
+    }
+    let Some(build) = searcher.build_settings() else {
+        return false;
+    };
+    build.corpus_mode == expected.corpus_mode
+        && build.include_hidden == expected.include_hidden
+        && build.max_file_size == expected.max_file_size
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -422,18 +443,21 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             config.corpus_mode.as_str(),
             config.tokenizer.as_str()
         ));
+        let build_config = bench_build_config(&repo_path, &index_path, config);
 
         if config.rebuild && index_path.exists() {
             fs::remove_dir_all(&index_path)?;
         }
-        let started = std::time::Instant::now();
-        let docs_indexed = build_index(&bench_build_config(&repo_path, &index_path, config))?;
-        corpus_builds.push(CorpusBuildRecord {
-            corpus: corpus.label().to_string(),
-            tokenizer: config.tokenizer,
-            docs_indexed,
-            duration_secs: started.elapsed().as_secs_f64(),
-        });
+        if config.rebuild || !bench_index_is_usable(&index_path, &build_config) {
+            let started = std::time::Instant::now();
+            let docs_indexed = build_index(&build_config)?;
+            corpus_builds.push(CorpusBuildRecord {
+                corpus: corpus.label().to_string(),
+                tokenizer: config.tokenizer,
+                docs_indexed,
+                duration_secs: started.elapsed().as_secs_f64(),
+            });
+        }
         let cache_entry = if config.cache_mode.is_cold() {
             Some(collect_cache_paths(
                 corpus,
