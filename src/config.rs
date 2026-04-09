@@ -84,8 +84,8 @@ impl Default for BuildConfig {
             corpus_mode: CorpusMode::RespectIgnore,
             include_hidden: false,
             max_file_size: 2 * 1024 * 1024,
-            min_sparse_len: 5,
-            max_sparse_len: 16,
+            min_sparse_len: 3,
+            max_sparse_len: 8,
         }
     }
 }

@@ -39,9 +39,7 @@ pub mod advanced {
     pub use crate::search::{
         FileContext, FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine,
     };
-    pub use crate::workspace::{
-        BaseSnapshotInfo, BaseSnapshotKind, IndexStatus, WorkspaceSnapshot,
-    };
+    pub use crate::workspace::{BaseSnapshotInfo, BaseSnapshotKind, IndexStatus};
 
     /// JSON event/output model types.
     ///

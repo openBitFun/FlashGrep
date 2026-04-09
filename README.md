@@ -17,7 +17,7 @@
 ## 模块布局
 
 - `src/cli.rs`
-  命令行入口；默认搜索入口对齐 ripgrep 形态，保留 `build` 和 `bench` 子命令。
+  命令行入口；当前只保留服务进程、daemon 管理和 build/bench 运维子命令。
 - `src/files.rs`
   仓库扫描、文本过滤、基础文件元数据采集。
 - `src/tokenizer/`
@@ -43,87 +43,46 @@
 ## 快速开始
 
 ```bash
-cargo run -- build --repo /path/to/repo
-cargo run -- --index /path/to/repo/.codgrep-index 'foo.*bar' /path/to/repo
+cargo run -- serve
 ```
 
-常用搜索示例：
+推荐把 `codgrep` 当成一个独立常驻进程来使用，形态更接近本地搜索 server，而不是 ripgrep 风格的一次性搜索 CLI。
+
+常用运维/调试入口：
 
 ```bash
-# 按 ripgrep 风格传 pattern 和 path
-cargo run -- 'foo.*bar' /path/to/repo/src
+# 前台拉起 server
+cargo run -- serve --bind 127.0.0.1:4597
 
-# 多 pattern
-cargo run -- -e 'foo.*bar' -e 'baz.*qux' /path/to/repo
+# 注册或打开一个 repo
+cargo run -- daemon open --repo /path/to/repo
 
-# 从 pattern 文件读取
-cargo run -- -f patterns.txt /path/to/repo
+# 对 repo 建索引
+cargo run -- daemon build --repo-id /path/to/repo
 
-# 字面量搜索，对齐 rg -F
-cargo run -- -F 'a+b?' /path/to/repo
+# 通过 daemon 发搜索请求
+cargo run -- daemon search --repo-id /path/to/repo 'foo.*bar'
 
-# 整词 / 整行匹配
-cargo run -- -w 'TODO' /path/to/repo
-cargo run -- -x 'TODO' /path/to/repo
+# 查询 repo 状态
+cargo run -- daemon status --repo-id /path/to/repo
 
-# 只输出匹配文件
-cargo run -- -l 'foo.*bar' /path/to/repo
-
-# 只输出不匹配的文件
-cargo run -- --files-without-match 'foo.*bar' /path/to/repo
-
-# 统计每个文件的匹配行数
-cargo run -- -c 'foo.*bar' /path/to/repo
-
-# 统计每个文件的总匹配次数
-cargo run -- --count-matches 'foo.*bar' /path/to/repo
-
-# 对 summary 模式保留 0，行为与 ripgrep 的 --include-zero 一致
-cargo run -- -c --include-zero 'foo.*bar' /path/to/repo
-
-# 输出 ripgrep 风格的 JSON Lines 事件流
-cargo run -- --json 'foo.*bar' /path/to/repo
-
-# 只输出命中的文本片段
-cargo run -- -o 'foo.*bar' /path/to/repo
-
-# 输出前后文，对齐 rg 的 -A/-B/-C
-cargo run -- -A 2 'foo.*bar' /path/to/repo
-cargo run -- -B 2 'foo.*bar' /path/to/repo
-cargo run -- -C 2 'foo.*bar' /path/to/repo
-
-# 每个文件最多输出前 2 个匹配行
-cargo run -- -m 2 'foo.*bar' /path/to/repo
-
-# 只关心是否命中，不输出内容；退出码与 ripgrep 对齐
-cargo run -- -q 'foo.*bar' /path/to/repo
-
-# 列出当前索引里会被搜索的文件
-cargo run -- --files /path/to/repo
-
-# 用 glob 和 type 缩小搜索范围
-cargo run -- -g '*.rs' -t rust 'foo.*bar' /path/to/repo
-
-# 搜索期再缩小 corpus：隐藏文件 / ignore / 深度 / 大小
-cargo run -- --hidden 'foo.*bar' /path/to/repo
-cargo run -- --no-ignore 'foo.*bar' /path/to/repo
-cargo run -- --ignore-file extra.ignore 'foo.*bar' /path/to/repo
-cargo run -- --max-depth 2 'foo.*bar' /path/to/repo
-cargo run -- --max-filesize 4096 'foo.*bar' /path/to/repo
+# 关闭 repo，或关闭整个 server
+cargo run -- daemon close --repo-id /path/to/repo
+cargo run -- daemon shutdown
 ```
 
-CLI 退出码现在与 ripgrep 保持一致：
+如果只是离线准备索引或做 bench，也保留这两个入口：
 
-- `0`：找到匹配；或 `--files` / `--type-list` / `build` / `bench` 成功执行。
-- `1`：搜索完成但没有匹配；或 `-L/--files-without-match` 没有可输出文件。
-- `2`：参数错误、索引错误或运行时失败。
+```bash
+cargo run -- build --repo /path/to/repo
+cargo run -- bench --suite-dir bench_data
+```
 
-当前和 `rg` 的一个显式差异：
+当前 CLI 语义：
 
-- `-L` 现在保留给 `--follow`，但 indexed search 还没有实现该语义；如需“无匹配文件”，请使用 `--files-without-match`。
-- 搜索期的 `--hidden` / `--no-ignore` 如果超出索引覆盖范围，CLI 会自动 fallback 到 scan，保证结果正确，而不是静默漏结果。
-- 搜索期的 `--ignore-file` 会像 ripgrep 一样额外缩小搜索范围，并且在 `--no-ignore` 下仍然生效。
-- 搜索不会在热路径里检查索引是否过期；如果工作树里有新增、删除或改动文件，是否重建索引由调用方自己决定。
+- 默认入口不再提供 ripgrep 风格的一次性搜索命令。
+- 搜索相关命令通过 `daemon search` 暴露，面向服务进程调试和手工排障。
+- `serve` 用于拉起 TCP server，`daemon *` 用于向该 server 发协议请求。
 
 库 API 现在额外提供一层 `SearchEngine`：
 
@@ -131,11 +90,6 @@ CLI 退出码现在与 ripgrep 保持一致：
 - `SearchPolicy::FallbackToScan`：索引缺失，或查询本身明显更适合 scan 时走 `Scan`；否则直接走索引。
 
 如果使用方希望检查索引是否过期，可以显式调用 `WorkspaceIndex::probe_freshness()` / `probe_freshness_if_due(ttl)`，或更底层的 `IndexSearcher::diff_against_worktree()` / `stale_reason()`、`SearchEngine::diff_against_worktree()` / `stale_reason()`。如果使用方希望主动刷新索引，可以显式调用 `build_index` / `rebuild_index()`，或 `build_index_with_options` / `rebuild_index_with_options`（附带进度/取消钩子）；库本身不会在搜索后偷偷调度后台重建。
-
-`--json` 现在对齐 ripgrep 的基本约束：
-
-- 只用于搜索结果输出，不与 `--files`、`--type-list`、`-l`、`-L`、`-c`、`--count-matches` 组合。
-- 输出事件序列为 `begin` / `match|context` / `end` / `summary`。
 
 ## 库用法
 
@@ -300,7 +254,7 @@ cargo run -- bench \
 - `--worktree-sample-files <N>` 只影响 `--compare-worktree` 的 fixture 构造：不再复制完整目录，而是抽一个最多 `N` 个文本文件的小型真实子仓库。这个模式更适合测“少量 dirty 文件”的真实查询成本；不传时仍然保留完整仓库 worst-case。
 - `--compare-workspace` 会额外跑 clean workspace facade 路径；每个 sample 都会重新走一次 `snapshot().search()`，用于把工作区读视图构造成本也计入结果，而不是只测固定 snapshot 上的纯查询。
 - `rg` 对比项只统计直接搜索耗时，不包含任何建索引步骤。
-- `--raw-output <path>` 会把每个 sample 以 CSV 形式落盘；除了 `runner` 原始 id 之外，还会额外写出 `runner_family` 和 `runner_mode`，方便脚本稳定地区分 `base_index` / `workspace_snapshot` / `dirty_first_query` / `dirty_cached_query` 等路径。当前这两条 dirty runner 都走 query-time repair，只是为了兼容旧 benchmark 标签而保留了名称。
+- `--raw-output <path>` 会把每个 sample 以 CSV 形式落盘；除了 `runner` 原始 id 之外，还会额外写出 `runner_family` 和 `runner_mode`，方便脚本稳定地区分 `daemon_steady_state` / `workspace_snapshot` / `dirty_first_query` / `dirty_cached_query` 等路径。当前这两条 dirty runner 都走 query-time repair，只是为了兼容旧 benchmark 标签而保留了名称。
 - bench 默认是 `warm` cache mode；`warmup_iter=1`、`bench_iter=3` 的默认值测出来的不是 cold query。
 - bench 默认是 `trace` query mode：如果 ad-hoc benchmark 传了多个 `--pattern`，会把它们当成一条 query trace 顺序执行，而不是把同一个 query 热重复很多次；需要旧的 steady-state 语义时可显式传 `--query-mode same`。
 - `cold` cache mode 默认使用 `posix_fadvise(..., DONTNEED)` 驱逐本次 benchmark 文件集的 page cache；额外的 `--cold-hook` 适合在 Linux 上配合 `drop_caches` 做更严格的系统级 cold run。

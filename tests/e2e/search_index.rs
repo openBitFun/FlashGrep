@@ -15,7 +15,7 @@ use codgrep::{
 };
 use tempfile::tempdir;
 
-use crate::common::{count_query, query, TestRepo};
+use crate::common::{count_matches_query, count_query, query, TestRepo};
 
 fn rewrite_with_fresh_mtime(path: &Path, contents: &str) {
     let before = fs::metadata(path)
@@ -284,8 +284,8 @@ fn build_ignores_untracked_codgrep_artifacts_when_detecting_dirty_worktree() {
         corpus_mode: repo.sparse_build_config().corpus_mode,
         include_hidden: false,
         max_file_size: 1024 * 1024,
-        min_sparse_len: 5,
-        max_sparse_len: 16,
+        min_sparse_len: 3,
+        max_sparse_len: 8,
     };
     build_index(&build).expect("test should succeed");
 
@@ -486,11 +486,14 @@ fn sparse_build_writes_trigram_fallback_sidecar() {
 }
 
 #[test]
-fn sparse_search_uses_trigram_fallback_sidecar_for_identifier_substrings() {
+fn sparse_search_finds_identifier_substrings_without_trigram_sidecar() {
     let repo = TestRepo::new();
     repo.write("match.rs", "const NAME: &str = \"AC_ERR_SYSTEM\";\n");
 
     repo.build_sparse();
+    let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
+    std::fs::remove_file(&layout.trigram_fallback_lookup_path).expect("test should succeed");
+    std::fs::remove_file(&layout.trigram_fallback_postings_path).expect("test should succeed");
 
     let results = repo
         .searcher()
@@ -499,6 +502,35 @@ fn sparse_search_uses_trigram_fallback_sidecar_for_identifier_substrings() {
 
     assert_eq!(results.searches_with_match, 1);
     assert_eq!(results.hits.len(), 1);
+}
+
+#[test]
+fn sparse_search_finds_punctuated_literals_without_trigram_sidecar() {
+    let repo = TestRepo::new();
+    repo.write(
+        "match.rs",
+        "const NAME: &str = \"base::ScopedAllowBlocking\";\n",
+    );
+    for idx in 0..32 {
+        repo.write(
+            format!("noise_{idx}.rs"),
+            &format!("const NAME: &str = \"scopedallowblocking_noise_{idx}\";\n"),
+        );
+    }
+
+    repo.build_sparse();
+    let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
+    std::fs::remove_file(&layout.trigram_fallback_lookup_path).expect("test should succeed");
+    std::fs::remove_file(&layout.trigram_fallback_postings_path).expect("test should succeed");
+
+    let results = repo
+        .searcher()
+        .search(&count_query("base::ScopedAllowBlocking"))
+        .expect("test should succeed");
+
+    assert_eq!(results.searches_with_match, 1);
+    assert_eq!(results.matched_lines, 1);
+    assert!(results.candidate_docs <= 8);
 }
 
 #[test]
@@ -524,6 +556,29 @@ fn pure_literal_alternation_uses_exact_multi_literal_scan() {
         .hits
         .iter()
         .all(|hit| hit.path != other.to_string_lossy()));
+}
+
+#[test]
+fn pure_literal_alternation_count_only_uses_exact_multi_literal_scan() {
+    let repo = TestRepo::new();
+    repo.write("other.rs", "const NAME: &str = \"UNRELATED\";\n");
+    repo.write("err.rs", "const NAME: &str = \"ERR_SYS\";\n");
+    repo.write("turn_off.rs", "const NAME: &str = \"PME_TURN_OFF\";\n");
+    repo.write("link.rs", "const NAME: &str = \"LINK_REQ_RST\";\n");
+    repo.write("cfg.rs", "const NAME: &str = \"CFG_BME_EVT\";\n");
+
+    repo.build_sparse();
+
+    let results = repo
+        .searcher()
+        .search(&count_query(
+            "ERR_SYS|PME_TURN_OFF|LINK_REQ_RST|CFG_BME_EVT",
+        ))
+        .expect("test should succeed");
+
+    assert_eq!(results.candidate_docs, 4);
+    assert_eq!(results.searches_with_match, 4);
+    assert_eq!(results.matched_lines, 4);
 }
 
 #[test]
@@ -645,5 +700,44 @@ fn default_search_does_not_span_lines_for_whitespace_classes() {
 
     assert_eq!(results.candidate_docs, 1);
     assert_eq!(results.matched_lines, 0);
+    assert!(results.hits.is_empty());
+}
+
+#[test]
+fn sparse_short_unindexed_literal_branch_falls_back_to_broad_candidates() {
+    let repo = TestRepo::new();
+    repo.write("alpha.rs", "const NAME: &str = \"foo\";\n");
+    repo.write("beta.rs", "const NAME: &str = \"bar\";\n");
+    repo.write("gamma.rs", "const NAME: &str = \"baz\";\n");
+
+    repo.build_sparse();
+
+    let results = repo
+        .searcher()
+        .search(&count_query("\\wAh"))
+        .expect("test should succeed");
+
+    assert_eq!(results.candidate_docs, 3);
+    assert_eq!(results.matched_lines, 0);
+    assert!(results.hits.is_empty());
+}
+
+#[test]
+fn sparse_short_unindexed_literal_count_matches_reports_occurrences() {
+    let repo = TestRepo::new();
+    repo.write("alpha.rs", "const NAME: &str = \"xAh xAh xAh\";\n");
+    repo.write("beta.rs", "const NAME: &str = \"bar\";\n");
+    repo.write("gamma.rs", "const NAME: &str = \"baz\";\n");
+
+    repo.build_sparse();
+
+    let results = repo
+        .searcher()
+        .search(&count_matches_query("\\wAh"))
+        .expect("test should succeed");
+
+    assert_eq!(results.candidate_docs, 3);
+    assert_eq!(results.matched_lines, 1);
+    assert_eq!(results.matched_occurrences, 3);
     assert!(results.hits.is_empty());
 }

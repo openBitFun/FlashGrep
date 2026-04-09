@@ -172,11 +172,9 @@ fn runner_sort_key(runner: &str) -> usize {
     match runner {
         "codgrep" => 0,
         "rg" => 1,
-        "codgrep_index" => 2,
-        "codgrep_workspace" => 3,
-        "codgrep_worktree_build" => 4,
-        "codgrep_worktree" => 5,
-        _ => 6,
+        "codgrep_worktree_build" => 2,
+        "codgrep_worktree" => 3,
+        _ => 4,
     }
 }
 
@@ -190,16 +188,6 @@ fn classify_runner(runner: &str) -> RunnerLabel {
             display: "codgrep [daemon-steady-state]",
             family: "codgrep",
             mode: "daemon_steady_state",
-        },
-        "codgrep_index" => RunnerLabel {
-            display: "codgrep_index [raw-base-index]",
-            family: "codgrep",
-            mode: "base_index",
-        },
-        "codgrep_workspace" => RunnerLabel {
-            display: "codgrep_workspace [workspace-snapshot]",
-            family: "codgrep",
-            mode: "workspace_snapshot",
         },
         "codgrep_worktree_build" => RunnerLabel {
             display: "codgrep_worktree_build [dirty-first-query]",

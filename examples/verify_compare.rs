@@ -14,6 +14,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut index: Option<PathBuf> = None;
     let mut pattern: Option<String> = None;
     let mut case_insensitive = false;
+    let mut skip_rg = false;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -22,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             "--index" => index = args.next().map(PathBuf::from),
             "--pattern" => pattern = args.next(),
             "-i" | "--ignore-case" => case_insensitive = true,
+            "--skip-rg" => skip_rg = true,
             other => {
                 return Err(format!("unknown arg: {other}").into());
             }
@@ -49,9 +51,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let full = searcher.search(&config)?;
     let full_secs = full_started.elapsed().as_secs_f64();
 
-    let rg_started = Instant::now();
-    let rg_match_count = run_rg_count(&repo, &pattern, case_insensitive, &candidate_paths)?;
-    let rg_secs = rg_started.elapsed().as_secs_f64();
+    let (rg_match_count, rg_secs) = if skip_rg {
+        (None, None)
+    } else {
+        let rg_started = Instant::now();
+        let rg_match_count = run_rg_count(&repo, &pattern, case_insensitive, &candidate_paths)?;
+        let rg_secs = rg_started.elapsed().as_secs_f64();
+        (Some(rg_match_count), Some(rg_secs))
+    };
 
     println!("repo={}", repo.display());
     println!("index={}", index.display());
@@ -59,21 +66,30 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("candidate_docs={}", candidate_paths.len());
     println!("codgrep_total_secs={full_secs:.6}");
     println!("candidate_secs={candidate_secs:.6}");
-    println!("codgrep_verify_estimated_secs={:.6}", (full_secs - candidate_secs).max(0.0));
-    println!("rg_verify_secs={rg_secs:.6}");
     println!(
-        "projected_total_with_rg_verify_secs={:.6}",
-        candidate_secs + rg_secs
+        "codgrep_verify_estimated_secs={:.6}",
+        (full_secs - candidate_secs).max(0.0)
     );
+    if let Some(rg_secs) = rg_secs {
+        println!("rg_verify_secs={rg_secs:.6}");
+        println!(
+            "projected_total_with_rg_verify_secs={:.6}",
+            candidate_secs + rg_secs
+        );
+    }
     println!("codgrep_match_lines={}", full.matched_lines);
-    println!("rg_match_lines={rg_match_count}");
+    if let Some(rg_match_count) = rg_match_count {
+        println!("rg_match_lines={rg_match_count}");
+    }
 
-    if full.matched_lines != rg_match_count {
-        return Err(format!(
-            "count mismatch: codgrep={} rg={}",
-            full.matched_lines, rg_match_count
-        )
-        .into());
+    if let Some(rg_match_count) = rg_match_count {
+        if full.matched_lines != rg_match_count {
+            return Err(format!(
+                "count mismatch: codgrep={} rg={}",
+                full.matched_lines, rg_match_count
+            )
+            .into());
+        }
     }
 
     Ok(())

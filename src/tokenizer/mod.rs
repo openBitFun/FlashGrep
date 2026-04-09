@@ -14,8 +14,8 @@ pub struct TokenizerOptions {
 impl Default for TokenizerOptions {
     fn default() -> Self {
         Self {
-            min_sparse_len: 5,
-            max_sparse_len: 16,
+            min_sparse_len: 3,
+            max_sparse_len: 8,
         }
     }
 }

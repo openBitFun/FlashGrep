@@ -1,21 +1,22 @@
-use std::{
-    collections::{BTreeMap, HashSet},
-    fs,
-    path::PathBuf,
-    time::UNIX_EPOCH,
-};
+use std::{collections::HashSet, fs, path::{Path, PathBuf}, sync::Arc, time::UNIX_EPOCH};
+
+#[cfg(test)]
+use std::collections::BTreeMap;
 
 use crate::{
     config::BuildConfig,
     error::Result,
     files::{is_text_file, scan_paths, scan_repository, ScanOptions},
-    index::{IndexSearcher, IndexWorktreeDiff},
+    index::IndexWorktreeDiff,
     path_filter::PathFilter,
-    planner::QueryPlan,
+    search::SearchResults,
     search_engine::{SearchDocument, SearchDocumentSource},
-    QueryConfig,
 };
 
+#[cfg(test)]
+use crate::{index::IndexSearcher, planner::QueryPlan, QueryConfig};
+
+#[cfg(test)]
 pub(super) struct CandidateRuntime<'a> {
     searcher: &'a IndexSearcher,
     diff: &'a IndexWorktreeDiff,
@@ -23,19 +24,28 @@ pub(super) struct CandidateRuntime<'a> {
     filter: Option<&'a PathFilter>,
 }
 
+#[cfg(test)]
 pub(super) struct ResolvedDocuments {
     documents: Vec<SearchDocument>,
 }
 
+pub(super) struct OverlaySearchScope {
+    pub(super) shadowed_base_paths: HashSet<String>,
+    pub(super) dirty_documents: Vec<SearchDocument>,
+}
+
 #[derive(Debug, Clone)]
+#[cfg(test)]
 struct EffectiveCandidate {
     path: String,
 }
 
+#[cfg(test)]
 struct EffectiveCandidateSet {
     by_path: BTreeMap<String, EffectiveCandidate>,
 }
 
+#[cfg(test)]
 struct PlannedWorkspaceQuery {
     plan: QueryPlan,
 }
@@ -73,6 +83,7 @@ pub(super) fn scan_text_repository_files(
     Ok(files)
 }
 
+#[cfg(test)]
 impl<'a> CandidateRuntime<'a> {
     pub(super) fn new(
         searcher: &'a IndexSearcher,
@@ -108,12 +119,14 @@ impl<'a> CandidateRuntime<'a> {
     }
 }
 
+#[cfg(test)]
 impl ResolvedDocuments {
     pub(super) fn into_documents(self) -> Vec<SearchDocument> {
         self.documents
     }
 }
 
+#[cfg(test)]
 impl EffectiveCandidateSet {
     fn new() -> Self {
         Self {
@@ -154,6 +167,7 @@ impl EffectiveCandidateSet {
     }
 }
 
+#[cfg(test)]
 pub(super) fn candidate_documents(
     searcher: &IndexSearcher,
     diff: &IndexWorktreeDiff,
@@ -163,6 +177,50 @@ pub(super) fn candidate_documents(
     CandidateRuntime::new(searcher, diff, query, filter).candidate_documents()
 }
 
+pub(super) fn overlay_search_scope(
+    diff: &IndexWorktreeDiff,
+    filter: Option<&PathFilter>,
+) -> Result<OverlaySearchScope> {
+    let shadowed_base_paths = diff
+        .modified_files
+        .iter()
+        .chain(diff.deleted_files.iter())
+        .cloned()
+        .collect::<HashSet<_>>();
+    let dirty_documents = resolve_dirty_documents(existing_dirty_paths(diff), filter)?;
+    Ok(OverlaySearchScope {
+        shadowed_base_paths,
+        dirty_documents,
+    })
+}
+
+pub(super) fn filter_search_documents(
+    documents: &[SearchDocument],
+    filter: Option<&PathFilter>,
+) -> Vec<SearchDocument> {
+    documents
+        .iter()
+        .filter(|document| filter.is_none_or(|active| active.matches_file(Path::new(&document.logical_path))))
+        .cloned()
+        .collect()
+}
+
+pub(super) fn merge_search_results(
+    mut base: SearchResults,
+    mut dirty: SearchResults,
+) -> SearchResults {
+    base.candidate_docs += dirty.candidate_docs;
+    base.searches_with_match += dirty.searches_with_match;
+    base.bytes_searched += dirty.bytes_searched;
+    base.matched_lines += dirty.matched_lines;
+    base.matched_occurrences += dirty.matched_occurrences;
+    base.hits.append(&mut dirty.hits);
+    base.hits
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    base
+}
+
+#[cfg(test)]
 fn shadowed_paths(diff: &IndexWorktreeDiff) -> HashSet<String> {
     diff.modified_files
         .iter()
@@ -199,6 +257,33 @@ fn search_document_from_path(logical_path: String, path: PathBuf) -> Result<Sear
     })
 }
 
+pub(super) fn load_search_document(
+    logical_path: String,
+    path: PathBuf,
+) -> Result<Option<SearchDocument>> {
+    if !path.exists() || !is_text_file(&path)? {
+        return Ok(None);
+    }
+    let metadata = fs::metadata(&path)?;
+    let mtime_nanos = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| match u64::try_from(duration.as_nanos()) {
+            Ok(value) => value,
+            Err(_) => u64::MAX,
+        })
+        .unwrap_or_default();
+    let bytes = fs::read(&path)?;
+    Ok(Some(SearchDocument::from_loaded_bytes(
+        logical_path,
+        metadata.len(),
+        mtime_nanos,
+        Arc::<[u8]>::from(bytes),
+    )))
+}
+
+#[cfg(test)]
 impl PlannedWorkspaceQuery {
     fn new(query: &QueryConfig) -> Result<Self> {
         Ok(Self {
@@ -207,6 +292,7 @@ impl PlannedWorkspaceQuery {
     }
 }
 
+#[cfg(test)]
 fn resolve_documents(
     candidates: EffectiveCandidateSet,
     filter: Option<&PathFilter>,
@@ -223,6 +309,24 @@ fn resolve_documents(
         documents.push(search_document_from_path(candidate.path, path)?);
     }
     Ok(ResolvedDocuments { documents })
+}
+
+fn resolve_dirty_documents<I>(paths: I, filter: Option<&PathFilter>) -> Result<Vec<SearchDocument>>
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut documents = Vec::new();
+    for logical_path in paths {
+        let path = PathBuf::from(&logical_path);
+        if filter.is_some_and(|active| !active.matches_file(&path)) {
+            continue;
+        }
+        if !path.exists() || !is_text_file(&path)? {
+            continue;
+        }
+        documents.push(search_document_from_path(logical_path, path)?);
+    }
+    Ok(documents)
 }
 
 #[cfg(test)]

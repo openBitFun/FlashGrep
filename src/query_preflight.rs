@@ -59,13 +59,6 @@ pub(crate) enum QueryPreflightReason {
 }
 
 impl QueryPreflightReason {
-    pub(crate) fn keep_indexed(self) -> bool {
-        matches!(
-            self,
-            Self::NonSparseTokenizer | Self::CandidatesWithinLimits
-        )
-    }
-
     pub(crate) fn requires_scan_backend(self) -> bool {
         matches!(
             self,

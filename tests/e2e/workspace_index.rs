@@ -1,10 +1,7 @@
 use std::{cell::Cell, fs, path::Path, rc::Rc, thread, time::Duration};
 
 use codgrep::{
-    advanced::{
-        json::JsonSearchReport, BaseSnapshotKind, IndexProgress, IndexProgressPhase,
-        WorkspaceSnapshot,
-    },
+    advanced::{json::JsonSearchReport, BaseSnapshotKind, IndexProgress, IndexProgressPhase},
     build_index_with_options, AppError, IndexBuildOptions, WorkspaceIndex, WorkspaceIndexOptions,
 };
 
@@ -32,10 +29,20 @@ fn rewrite_with_fresh_mtime(path: &Path, contents: &str) {
     panic!("mtime did not advance for {}", path.display());
 }
 
-fn hit_paths(snapshot: &WorkspaceSnapshot, pattern: &str) -> Vec<String> {
-    snapshot
-        .search(&query(pattern))
+fn search_with_dirty_view(
+    workspace: &WorkspaceIndex,
+    config: &codgrep::QueryConfig,
+) -> codgrep::SearchResults {
+    let diff = workspace
+        .diff_against_worktree()
+        .expect("test should succeed");
+    workspace
+        .search_with_dirty_diff(config, &diff, None)
         .expect("test should succeed")
+}
+
+fn hit_paths(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
+    search_with_dirty_view(workspace, &query(pattern))
         .hits
         .into_iter()
         .map(|hit| hit.path)
@@ -136,8 +143,7 @@ fn workspace_index_searches_latest_worktree_when_base_is_stale() {
     })
     .expect("test should succeed");
 
-    let snapshot = workspace.snapshot().expect("test should succeed");
-    let paths = hit_paths(&snapshot, "DIRTY_NAME");
+    let paths = hit_paths(&workspace, "DIRTY_NAME");
 
     assert_eq!(
         paths,
@@ -147,14 +153,12 @@ fn workspace_index_searches_latest_worktree_when_base_is_stale() {
         ]
     );
 
-    let stale_base = snapshot
-        .search(&count_query("BASE_NAME"))
-        .expect("test should succeed");
+    let stale_base = search_with_dirty_view(&workspace, &count_query("BASE_NAME"));
     assert_eq!(stale_base.matched_lines, 0);
 }
 
 #[test]
-fn workspace_index_snapshot_hides_deleted_base_results() {
+fn workspace_index_hides_deleted_base_results() {
     let repo = TestRepo::new();
     repo.write("keep.rs", "const NAME: &str = \"TOKEN\";\n");
     let deleted = repo.write("deleted.rs", "const NAME: &str = \"TOKEN\";\n");
@@ -166,8 +170,7 @@ fn workspace_index_snapshot_hides_deleted_base_results() {
     })
     .expect("test should succeed");
 
-    let snapshot = workspace.snapshot().expect("test should succeed");
-    let paths = hit_paths(&snapshot, "TOKEN");
+    let paths = hit_paths(&workspace, "TOKEN");
 
     assert_eq!(paths.len(), 1);
     assert!(!paths.contains(&deleted.to_string_lossy().into_owned()));
@@ -288,10 +291,10 @@ fn workspace_json_report_reflects_latest_worktree_view() {
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
-    let snapshot = workspace.snapshot().expect("test should succeed");
-
-    let report =
-        JsonSearchReport::from_search_results(&snapshot.search(&query("DIRTY_NAME")).unwrap());
+    let report = JsonSearchReport::from_search_results(&search_with_dirty_view(
+        &workspace,
+        &query("DIRTY_NAME"),
+    ));
     assert!(report.has_match());
     assert_eq!(report.files.len(), 2);
     let paths = report

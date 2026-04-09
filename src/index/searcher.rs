@@ -2,6 +2,7 @@ use std::{
     collections::{HashMap, HashSet},
     fs::{self, File},
     path::{Path, PathBuf},
+    process::Command,
     sync::Arc,
     time::Instant,
 };
@@ -17,7 +18,6 @@ use crate::{
         DocMetaRef, DocsData, IndexBuildSettings, IndexLayout, IndexMetadata, LookupTable,
         PostingsData,
     },
-    json_output::{JsonData, JsonDuration, JsonSearchFile, JsonSearchReport, JsonStats},
     path_filter::PathFilter,
     planner::{plan, QueryBranch},
     search::{FileCount, FileMatchCount, SearchHit, SearchMode, SearchResults},
@@ -41,12 +41,13 @@ use multi_literal::{
     collect_candidates as collect_multi_literal_candidates, prepare as prepare_multi_literal,
     search as search_multi_literal,
 };
-use query::{fold_query_literal, LiteralPrefilter, SearchPreparation};
+pub(crate) use query::LinePrefilter;
+#[cfg(test)]
+pub(crate) use query::LiteralPrefilter;
+
+use query::{fold_query_literal, SearchPreparation};
 use shared::doc_by_id;
-use verify::{
-    build_matcher, requires_multiline_verification, verify_candidates, verify_candidates_json,
-    SearchProfile,
-};
+use verify::{build_matcher, requires_multiline_verification, verify_candidates, SearchProfile};
 
 const CANDIDATE_PROBE_WINDOW: usize = 4;
 
@@ -89,19 +90,12 @@ pub struct IndexSearcher {
     docs: DocsData,
     lookup: LookupTable,
     postings: PostingsData,
-    fallback_lookup: Option<LookupTable>,
-    fallback_postings: Option<PostingsData>,
     repo_root: Option<PathBuf>,
     tokenizer_mode: crate::config::TokenizerMode,
     tokenizer_options: TokenizerOptions,
 }
 
 struct MultiLiteralPreparation {
-    prepared: multi_literal::PreparedMultiLiteral,
-    candidate_ids: Vec<u32>,
-}
-
-struct CountOnlyMultiLiteralPreparation {
     prepared: multi_literal::PreparedMultiLiteral,
     candidate_ids: Vec<u32>,
 }
@@ -113,17 +107,6 @@ impl IndexSearcher {
         let metadata = docs.metadata().clone();
         let lookup = LookupTable::open(&layout.lookup_path)?;
         let postings = PostingsData::open(&layout.postings_path)?;
-        let fallback_available = layout.trigram_fallback_lookup_path.exists()
-            && layout.trigram_fallback_postings_path.exists();
-        let (fallback_lookup, fallback_postings) =
-            if metadata.fallback_trigram.is_some() && fallback_available {
-                (
-                    Some(LookupTable::open(&layout.trigram_fallback_lookup_path)?),
-                    Some(PostingsData::open(&layout.trigram_fallback_postings_path)?),
-                )
-            } else {
-                (None, None)
-            };
 
         Ok(Self {
             index_path,
@@ -131,8 +114,6 @@ impl IndexSearcher {
             docs,
             lookup,
             postings,
-            fallback_lookup,
-            fallback_postings,
             repo_root: metadata
                 .build
                 .as_ref()
@@ -286,123 +267,37 @@ impl IndexSearcher {
         Ok(None)
     }
 
-    pub(crate) fn search_json_with_allowed_paths(
-        &self,
-        config: &QueryConfig,
-        filter: Option<&PathFilter>,
-        allowed_paths: Option<&HashSet<String>>,
-    ) -> Result<JsonSearchReport> {
-        let total_started = Instant::now();
-        let plan = plan(&config.regex_pattern)?;
-        let preparation = self.prepare_indexed_search(
-            config,
-            &plan,
-            filter,
-            allowed_paths,
-            &SearchProfile::disabled(),
-        )?;
-        let candidate_ids =
-            self.filter_candidate_ids(&preparation.candidate_ids, filter, allowed_paths)?;
-        let multiline_verifier = requires_multiline_verification(config)?;
-        let matcher = build_matcher(config, multiline_verifier)?;
-        let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
-        let outcomes = verify_candidates_json(
-            &candidate_ids,
-            self.docs.len(),
-            &resolve_path,
-            &matcher,
-            multiline_verifier,
-            config.search_mode,
-            config.max_count,
-            config.before_context,
-            config.after_context,
-        )?;
-
-        let mut files = Vec::new();
-        let mut searches_with_match = 0u64;
-        let mut bytes_searched = 0u64;
-        let mut matched_lines = 0u64;
-        let mut matches = 0u64;
-
-        for task in outcomes {
-            let doc = doc_by_id(&self.docs, task.doc_id)?;
-            bytes_searched += task.outcome.bytes_searched;
-            if task.outcome.matched_occurrences == 0 {
-                continue;
-            }
-
-            searches_with_match += 1;
-            matched_lines += task.outcome.matched_lines as u64;
-            matches += task.outcome.matched_occurrences as u64;
-            let path = JsonData::from_string(self.doc_display_path_ref(doc));
-            let messages = task
-                .outcome
-                .messages
-                .into_iter()
-                .map(|mut message| {
-                    match &mut message {
-                        crate::json_output::JsonMessage::Match(matched) => {
-                            matched.path = Some(path.clone());
-                        }
-                        crate::json_output::JsonMessage::Context(context) => {
-                            context.path = Some(path.clone());
-                        }
-                        _ => {}
-                    }
-                    message
-                })
-                .collect::<Vec<_>>();
-
-            files.push(JsonSearchFile {
-                path,
-                messages,
-                binary_offset: task.outcome.binary_offset,
-                stats: JsonStats {
-                    elapsed: JsonDuration::from_duration(task.elapsed),
-                    searches: 1,
-                    searches_with_match: 1,
-                    bytes_searched: task.outcome.bytes_searched,
-                    bytes_printed: 0,
-                    matched_lines: task.outcome.matched_lines as u64,
-                    matches: task.outcome.matched_occurrences as u64,
-                },
-            });
-        }
-
-        Ok(JsonSearchReport {
-            files,
-            summary: JsonStats {
-                elapsed: JsonDuration::from_duration(total_started.elapsed()),
-                searches: candidate_ids.len() as u64,
-                searches_with_match,
-                bytes_searched,
-                bytes_printed: 0,
-                matched_lines,
-                matches,
-            },
-            elapsed_total: JsonDuration::from_duration(total_started.elapsed()),
-        })
-    }
-
     pub fn search_with_filter(
         &self,
         config: &QueryConfig,
         filter: Option<&PathFilter>,
     ) -> Result<SearchResults> {
-        self.search_with_allowed_paths(config, filter, None)
+        self.search_with_path_overrides(config, filter, None, None)
     }
 
-    pub(crate) fn search_with_allowed_paths(
+    pub(crate) fn search_with_path_overrides(
         &self,
         config: &QueryConfig,
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
+        excluded_paths: Option<&HashSet<String>>,
     ) -> Result<SearchResults> {
         let profile = SearchProfile::enabled();
         let total_started = Instant::now();
         let plan_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
+
+        if let Some(results) =
+            self.try_search_with_rg_scan_backend(config, &plan, filter, allowed_paths, excluded_paths)?
+        {
+            profile.finish(
+                total_started.elapsed(),
+                results.candidate_docs,
+                results.matched_lines,
+            );
+            return Ok(results);
+        }
 
         if !config.has_context()
             && !matches!(config.search_mode, SearchMode::CountMatches)
@@ -411,43 +306,6 @@ impl IndexSearcher {
             && !config.word_regexp
             && !config.line_regexp
         {
-            if matches!(config.search_mode, SearchMode::CountOnly) {
-                if let Some(multi_literal) = self.prepare_count_only_multi_literal_search(
-                    &plan,
-                    config.case_insensitive,
-                    config.top_k_tokens,
-                    filter,
-                    allowed_paths,
-                    &profile,
-                )? {
-                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
-                    let candidate_ids = if filter.is_none() && allowed_paths.is_none() {
-                        multi_literal.candidate_ids
-                    } else {
-                        self.filter_candidate_ids(
-                            &multi_literal.candidate_ids,
-                            filter,
-                            allowed_paths,
-                        )?
-                    };
-                    let match_started = Instant::now();
-                    let results = search_multi_literal(
-                        &self.docs,
-                        Some(candidate_ids.as_slice()),
-                        &multi_literal.prepared,
-                        config.search_mode,
-                        &resolve_path,
-                    )?;
-                    profile.record_verify(match_started.elapsed());
-                    profile.finish(
-                        total_started.elapsed(),
-                        results.candidate_docs,
-                        results.matched_lines,
-                    );
-                    return Ok(results);
-                }
-            }
-
             if let Some(multi_literal) = self.prepare_multi_literal_search(
                 &plan,
                 config.case_insensitive,
@@ -460,7 +318,12 @@ impl IndexSearcher {
                 let candidate_ids = if filter.is_none() && allowed_paths.is_none() {
                     multi_literal.candidate_ids.clone()
                 } else {
-                    self.filter_candidate_ids(&multi_literal.candidate_ids, filter, allowed_paths)?
+                    self.filter_candidate_ids_with_exclusions(
+                        &multi_literal.candidate_ids,
+                        filter,
+                        allowed_paths,
+                        excluded_paths,
+                    )?
                 };
                 let match_started = Instant::now();
                 let results = search_multi_literal(
@@ -482,8 +345,12 @@ impl IndexSearcher {
 
         let preparation =
             self.prepare_indexed_search(config, &plan, filter, allowed_paths, &profile)?;
-        let candidate_ids =
-            self.filter_candidate_ids(&preparation.candidate_ids, filter, allowed_paths)?;
+        let candidate_ids = self.filter_candidate_ids_with_exclusions(
+            &preparation.candidate_ids,
+            filter,
+            allowed_paths,
+            excluded_paths,
+        )?;
         let candidate_doc_count = candidate_ids.len();
 
         let multiline_verifier = requires_multiline_verification(config)?;
@@ -495,7 +362,7 @@ impl IndexSearcher {
                     let verify_plan = CountVerifyPlan::compile(
                         config,
                         multiline_verifier,
-                        preparation.literal_prefilter.clone(),
+                        preparation.line_prefilter.clone(),
                         CountVerifyKind::Lines,
                     )?;
                     profile.record_regex_compile(regex_started.elapsed());
@@ -518,7 +385,7 @@ impl IndexSearcher {
                     let verify_plan = CountVerifyPlan::compile(
                         config,
                         multiline_verifier,
-                        preparation.literal_prefilter.clone(),
+                        preparation.line_prefilter.clone(),
                         CountVerifyKind::Occurrences,
                     )?;
                     profile.record_regex_compile(regex_started.elapsed());
@@ -551,6 +418,7 @@ impl IndexSearcher {
                         self.docs.len(),
                         &resolve_path,
                         &matcher,
+                        preparation.line_prefilter.as_ref(),
                         multiline_verifier,
                         config.search_mode,
                         config.max_count,
@@ -674,6 +542,7 @@ impl IndexSearcher {
         self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)
     }
 
+    #[cfg(test)]
     pub(crate) fn candidate_doc_ids_by_branch_for_plan_with_allowed_paths(
         &self,
         config: &QueryConfig,
@@ -695,9 +564,7 @@ impl IndexSearcher {
 
         let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
         let mut posting_cache = HashMap::new();
-        let mut fallback_posting_cache = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
-        let mut fallback_literal_cache = HashMap::new();
         let mut branches = Vec::with_capacity(plan.branches.len());
 
         for branch in &plan.branches {
@@ -710,9 +577,7 @@ impl IndexSearcher {
                     filter,
                     allowed_paths,
                     &mut posting_cache,
-                    &mut fallback_posting_cache,
                     &mut literal_scan_cache,
-                    &mut fallback_literal_cache,
                 )?
                 .unwrap_or_else(|| self.all_doc_ids());
             branches.push(self.filter_candidate_ids(
@@ -747,9 +612,7 @@ impl IndexSearcher {
 
         let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
         let mut posting_cache = HashMap::new();
-        let mut fallback_posting_cache = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
-        let mut fallback_literal_cache = HashMap::new();
         let mut branches = Vec::with_capacity(plan.branches.len());
 
         for branch in &plan.branches {
@@ -761,9 +624,7 @@ impl IndexSearcher {
                 filter,
                 allowed_paths,
                 &mut posting_cache,
-                &mut fallback_posting_cache,
                 &mut literal_scan_cache,
-                &mut fallback_literal_cache,
             )?
             else {
                 return Ok(None);
@@ -795,24 +656,6 @@ impl IndexSearcher {
         self.count_matches_by_file_internal(config, filter, None, true)
     }
 
-    pub(crate) fn count_matches_by_file_with_allowed_paths(
-        &self,
-        config: &QueryConfig,
-        filter: Option<&PathFilter>,
-        allowed_paths: Option<&HashSet<String>>,
-    ) -> Result<Vec<FileCount>> {
-        self.count_matches_by_file_internal(config, filter, allowed_paths, false)
-    }
-
-    pub(crate) fn count_matches_by_file_including_zero_with_allowed_paths(
-        &self,
-        config: &QueryConfig,
-        filter: Option<&PathFilter>,
-        allowed_paths: Option<&HashSet<String>>,
-    ) -> Result<Vec<FileCount>> {
-        self.count_matches_by_file_internal(config, filter, allowed_paths, true)
-    }
-
     fn count_matches_by_file_internal(
         &self,
         config: &QueryConfig,
@@ -824,28 +667,18 @@ impl IndexSearcher {
         let plan_started = Instant::now();
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
-        let literal_prefilter = LiteralPrefilter::new(&plan, config.case_insensitive);
+        let line_prefilter = query::LinePrefilter::compile(config, &plan);
 
-        let candidate_ids = if let Some(multi_literal) = self.prepare_multi_literal_search(
-            &plan,
-            config.case_insensitive,
-            config.top_k_tokens,
-            filter,
-            allowed_paths,
-            &profile,
-        )? {
-            multi_literal.candidate_ids
-        } else {
-            self.prepare_indexed_search(config, &plan, filter, allowed_paths, &profile)?
-                .candidate_ids
-        };
+        let candidate_ids = self
+            .prepare_indexed_search(config, &plan, filter, allowed_paths, &profile)?
+            .candidate_ids;
         let candidate_ids = self.filter_candidate_ids(&candidate_ids, filter, allowed_paths)?;
         let multiline_verifier = requires_multiline_verification(config)?;
         let regex_started = Instant::now();
         let verify_plan = CountVerifyPlan::compile(
             config,
             multiline_verifier,
-            literal_prefilter,
+            line_prefilter,
             CountVerifyKind::Lines,
         )?;
         profile.record_regex_compile(regex_started.elapsed());
@@ -880,24 +713,6 @@ impl IndexSearcher {
         self.count_total_matches_by_file_internal(config, filter, None, true)
     }
 
-    pub(crate) fn count_total_matches_by_file_with_allowed_paths(
-        &self,
-        config: &QueryConfig,
-        filter: Option<&PathFilter>,
-        allowed_paths: Option<&HashSet<String>>,
-    ) -> Result<Vec<FileMatchCount>> {
-        self.count_total_matches_by_file_internal(config, filter, allowed_paths, false)
-    }
-
-    pub(crate) fn count_total_matches_by_file_including_zero_with_allowed_paths(
-        &self,
-        config: &QueryConfig,
-        filter: Option<&PathFilter>,
-        allowed_paths: Option<&HashSet<String>>,
-    ) -> Result<Vec<FileMatchCount>> {
-        self.count_total_matches_by_file_internal(config, filter, allowed_paths, true)
-    }
-
     fn count_total_matches_by_file_internal(
         &self,
         config: &QueryConfig,
@@ -919,7 +734,7 @@ impl IndexSearcher {
         let verify_plan = CountVerifyPlan::compile(
             config,
             multiline_verifier,
-            preparation.literal_prefilter,
+            preparation.line_prefilter,
             CountVerifyKind::Occurrences,
         )?;
         profile.record_regex_compile(regex_started.elapsed());
@@ -1017,6 +832,7 @@ impl IndexSearcher {
             .count()
     }
 
+    #[cfg(test)]
     pub(crate) fn doc_display_path_by_id(&self, doc_id: u32) -> Result<String> {
         Ok(self.doc_display_path_ref(doc_by_id(&self.docs, doc_id)?))
     }
@@ -1139,8 +955,167 @@ impl IndexSearcher {
         profile.record_candidates(candidate_started.elapsed());
         Ok(SearchPreparation {
             candidate_ids,
-            literal_prefilter: LiteralPrefilter::new(plan, config.case_insensitive),
+            line_prefilter: query::LinePrefilter::compile(config, plan),
         })
+    }
+
+    fn try_search_with_rg_scan_backend(
+        &self,
+        config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+        excluded_paths: Option<&HashSet<String>>,
+    ) -> Result<Option<SearchResults>> {
+        if !self.should_use_rg_scan_backend(config, plan, filter, allowed_paths, excluded_paths)? {
+            return Ok(None);
+        }
+        self.search_counts_with_rg(config)
+    }
+
+    fn should_use_rg_scan_backend(
+        &self,
+        config: &QueryConfig,
+        plan: &crate::planner::QueryPlan,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+        excluded_paths: Option<&HashSet<String>>,
+    ) -> Result<bool> {
+        if !cfg!(target_os = "linux")
+            || !matches!(config.search_mode, SearchMode::CountOnly | SearchMode::CountMatches)
+            || config.has_context()
+            || config.max_count.is_some()
+            || config.multiline
+            || config.dot_matches_new_line
+            || filter.is_some()
+            || allowed_paths.is_some()
+            || excluded_paths.is_some_and(|paths| !paths.is_empty())
+            || self.repo_root.is_none()
+        {
+            return Ok(false);
+        }
+
+        if plan.fallback_to_scan {
+            return Ok(true);
+        }
+
+        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
+        Ok(self
+            .try_collect_candidates_without_literal_scan(
+                &plan.branches,
+                tokenizer.as_ref(),
+                config.top_k_tokens,
+                None,
+                None,
+            )?
+            .is_none())
+    }
+
+    fn search_counts_with_rg(&self, config: &QueryConfig) -> Result<Option<SearchResults>> {
+        let Some((matched_lines, searches_with_match)) = self.run_rg_count_query(config, false)?
+        else {
+            return Ok(None);
+        };
+        let matched_occurrences = if matches!(config.search_mode, SearchMode::CountMatches) {
+            let Some((matched_occurrences, _)) = self.run_rg_count_query(config, true)? else {
+                return Ok(None);
+            };
+            matched_occurrences
+        } else {
+            0
+        };
+
+        Ok(Some(SearchResults {
+            candidate_docs: self.docs.len(),
+            searches_with_match,
+            bytes_searched: self.docs.iter().map(|doc| doc.size()).sum(),
+            matched_lines,
+            matched_occurrences,
+            hits: Vec::new(),
+        }))
+    }
+
+    fn run_rg_count_query(
+        &self,
+        config: &QueryConfig,
+        count_matches: bool,
+    ) -> Result<Option<(usize, usize)>> {
+        let Some(repo_root) = self.repo_root.as_ref() else {
+            return Ok(None);
+        };
+        let mut command = Command::new("rg");
+        command
+            .current_dir(repo_root)
+            .arg("--with-filename")
+            .arg("--color")
+            .arg("never")
+            .arg("--no-messages");
+        if count_matches {
+            command.arg("--count-matches");
+        } else {
+            command.arg("--count");
+        }
+        if config.case_insensitive {
+            command.arg("--ignore-case");
+        }
+        if config.fixed_strings {
+            command.arg("--fixed-strings");
+            for pattern in &config.patterns {
+                command.arg("-e").arg(pattern);
+            }
+        } else {
+            if config.word_regexp {
+                command.arg("--word-regexp");
+            }
+            if config.line_regexp {
+                command.arg("--line-regexp");
+            }
+            command.arg("-e").arg(&config.regex_pattern);
+        }
+
+        if let Some(build) = self.build_settings() {
+            command.arg("--max-filesize").arg(build.max_file_size.to_string());
+            if matches!(build.corpus_mode, crate::config::CorpusMode::NoIgnore) {
+                command.arg("--no-ignore");
+            }
+            if build.include_hidden {
+                command.arg("--hidden");
+            }
+        }
+
+        command.arg("--");
+        command.arg(".");
+
+        let output = match command.output() {
+            Ok(output) => output,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Err(error) => return Err(error.into()),
+        };
+        if !output.status.success() && output.status.code() != Some(1) {
+            return Err(AppError::Protocol(format!(
+                "rg scan backend failed with status {}: {}",
+                output.status,
+                String::from_utf8_lossy(&output.stderr)
+            )));
+        }
+
+        let mut matched_total = 0usize;
+        let mut searches_with_match = 0usize;
+        for line in String::from_utf8_lossy(&output.stdout).lines() {
+            let Some((_, count)) = line.rsplit_once(':') else {
+                continue;
+            };
+            let count = count.parse::<usize>().map_err(|error| {
+                AppError::Protocol(format!("failed to parse rg count output {line:?}: {error}"))
+            })?;
+            if count == 0 {
+                continue;
+            }
+            matched_total += count;
+            searches_with_match += 1;
+        }
+
+        Ok(Some((matched_total, searches_with_match)))
     }
 
     fn prepare_multi_literal_search(
@@ -1199,55 +1174,23 @@ impl IndexSearcher {
         }))
     }
 
-    fn prepare_count_only_multi_literal_search(
-        &self,
-        plan: &crate::planner::QueryPlan,
-        case_insensitive: bool,
-        top_k_tokens: usize,
-        filter: Option<&PathFilter>,
-        allowed_paths: Option<&HashSet<String>>,
-        profile: &SearchProfile,
-    ) -> Result<Option<CountOnlyMultiLiteralPreparation>> {
-        let Some(prepared) = plan
-            .pure_literal_alternation
-            .as_ref()
-            .and_then(|alternation| prepare_multi_literal(alternation, case_insensitive))
-        else {
-            return Ok(None);
-        };
-
-        let tokenizer = create(self.tokenizer_mode, self.tokenizer_options.clone());
-        let candidate_started = Instant::now();
-        let Some(candidate_ids) = (!plan.fallback_to_scan)
-            .then(|| {
-                self.try_collect_candidates_without_literal_scan(
-                    &plan.branches,
-                    tokenizer.as_ref(),
-                    top_k_tokens,
-                    filter,
-                    allowed_paths,
-                )
-            })
-            .transpose()?
-            .flatten()
-        else {
-            return Ok(None);
-        };
-        profile.record_candidates(candidate_started.elapsed());
-
-        Ok(Some(CountOnlyMultiLiteralPreparation {
-            prepared,
-            candidate_ids,
-        }))
-    }
-
     fn filter_candidate_ids(
         &self,
         candidate_ids: &[u32],
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
     ) -> Result<Vec<u32>> {
-        if filter.is_none() && allowed_paths.is_none() {
+        self.filter_candidate_ids_with_exclusions(candidate_ids, filter, allowed_paths, None)
+    }
+
+    fn filter_candidate_ids_with_exclusions(
+        &self,
+        candidate_ids: &[u32],
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+        excluded_paths: Option<&HashSet<String>>,
+    ) -> Result<Vec<u32>> {
+        if filter.is_none() && allowed_paths.is_none() && excluded_paths.is_none() {
             return Ok(candidate_ids.to_vec());
         }
 
@@ -1258,7 +1201,7 @@ impl IndexSearcher {
                 let Ok(doc) = doc_by_id(&self.docs, doc_id) else {
                     return false;
                 };
-                self.doc_matches_filters(doc, filter, allowed_paths)
+                self.doc_matches_scope(doc, filter, allowed_paths, excluded_paths)
             })
             .collect::<Vec<_>>())
     }
@@ -1326,11 +1269,24 @@ impl IndexSearcher {
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
     ) -> bool {
+        self.doc_matches_scope(doc, filter, allowed_paths, None)
+    }
+
+    fn doc_matches_scope(
+        &self,
+        doc: DocMetaRef<'_>,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+        excluded_paths: Option<&HashSet<String>>,
+    ) -> bool {
         let display_path = self.doc_display_path_ref(doc);
         if filter.is_some_and(|filter| !filter.matches_file(Path::new(&display_path))) {
             return false;
         }
-        allowed_paths.is_none_or(|allowed_paths| allowed_paths.contains(&display_path))
+        if allowed_paths.is_some_and(|allowed_paths| !allowed_paths.contains(&display_path)) {
+            return false;
+        }
+        excluded_paths.is_none_or(|excluded_paths| !excluded_paths.contains(&display_path))
     }
 
     pub(crate) fn sum_doc_sizes(&self, candidate_ids: &[u32]) -> Result<u64> {
@@ -1369,9 +1325,7 @@ impl IndexSearcher {
     ) -> Result<Option<Vec<u32>>> {
         let mut all_candidates = Vec::new();
         let mut posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
-        let mut fallback_posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
-        let mut fallback_literal_cache = HashMap::new();
 
         for branch in branches {
             let Some(branch_candidates) = self.select_branch_candidates(
@@ -1382,9 +1336,7 @@ impl IndexSearcher {
                 filter,
                 allowed_paths,
                 &mut posting_cache,
-                &mut fallback_posting_cache,
                 &mut literal_scan_cache,
-                &mut fallback_literal_cache,
             )?
             else {
                 return Ok(None);
@@ -1406,9 +1358,7 @@ impl IndexSearcher {
     ) -> Result<Vec<u32>> {
         let mut all_candidates = Vec::new();
         let mut posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
-        let mut fallback_posting_cache: HashMap<u64, Arc<[u32]>> = HashMap::new();
         let mut literal_scan_cache = HashMap::new();
-        let mut fallback_literal_cache = HashMap::new();
 
         for branch in branches {
             let Some(branch_candidates) = self.select_branch_candidates(
@@ -1419,9 +1369,7 @@ impl IndexSearcher {
                 filter,
                 allowed_paths,
                 &mut posting_cache,
-                &mut fallback_posting_cache,
                 &mut literal_scan_cache,
-                &mut fallback_literal_cache,
             )?
             else {
                 return Ok(self.all_doc_ids());
@@ -1440,12 +1388,9 @@ impl IndexSearcher {
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
         posting_cache: &mut HashMap<u64, Arc<[u32]>>,
-        fallback_posting_cache: &mut HashMap<u64, Arc<[u32]>>,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
-        fallback_literal_cache: &mut HashMap<String, Vec<u32>>,
     ) -> Result<Option<Vec<u32>>> {
         let mut per_literal = Vec::new();
-        let mut fallback_doc_sets = Vec::new();
         let mut scanned_literals = Vec::new();
 
         for literal in &branch.literals {
@@ -1457,15 +1402,7 @@ impl IndexSearcher {
             match literal_candidates {
                 LiteralCandidates::Impossible => return Ok(Some(Vec::new())),
                 LiteralCandidates::Unavailable => {
-                    if let Some(docs) = self.fallback_literal_doc_ids(
-                        &query_literal,
-                        fallback_posting_cache,
-                        fallback_literal_cache,
-                    )? {
-                        fallback_doc_sets.push(docs);
-                    } else {
-                        scanned_literals.push(query_literal);
-                    }
+                    scanned_literals.push(query_literal);
                 }
                 LiteralCandidates::Available(candidates) => per_literal.push(candidates),
             }
@@ -1477,7 +1414,7 @@ impl IndexSearcher {
                 .cmp(&right.first().map(|candidate| candidate.selection_rank()))
         });
 
-        if per_literal.is_empty() && scanned_literals.is_empty() && fallback_doc_sets.is_empty() {
+        if per_literal.is_empty() && scanned_literals.is_empty() {
             return Ok(None);
         }
 
@@ -1532,16 +1469,12 @@ impl IndexSearcher {
                     probed += 1;
 
                     let docs = self.read_posting_docs(candidate.token_hash, posting_cache)?;
-                    let reduced_len_bound = best_choice
-                        .as_ref()
-                        .map_or(current_candidates.len().saturating_add(1), |(_, best_len)| {
-                            best_len.saturating_add(1)
-                        });
-                    let reduced_len = intersect_sorted_len_bounded(
-                        current_candidates,
-                        &docs,
-                        reduced_len_bound,
+                    let reduced_len_bound = best_choice.as_ref().map_or(
+                        current_candidates.len().saturating_add(1),
+                        |(_, best_len)| best_len.saturating_add(1),
                     );
+                    let reduced_len =
+                        intersect_sorted_len_bounded(current_candidates, &docs, reduced_len_bound);
                     let replace = match &best_choice {
                         Some((best_candidate, best_reduced_len)) => {
                             reduced_len < *best_reduced_len
@@ -1573,18 +1506,23 @@ impl IndexSearcher {
             selected_count += 1;
         }
 
-        for literal in scanned_literals {
-            let docs = self.scan_literal_docs(&literal, filter, allowed_paths, literal_scan_cache);
-            branch_candidates = Some(match branch_candidates.take() {
-                Some(existing) => intersect_sorted(&existing, &docs),
-                None => docs,
-            });
-            if branch_candidates.as_ref().is_some_and(Vec::is_empty) {
-                return Ok(Some(Vec::new()));
-            }
+        if branch_candidates.is_none()
+            && !scanned_literals.is_empty()
+            && scanned_literals
+                .iter()
+                .all(|literal| self.should_defer_unindexed_literal_scan(literal))
+        {
+            return Ok(None);
         }
 
-        for docs in fallback_doc_sets {
+        for literal in scanned_literals {
+            let docs = self.scan_literal_docs(
+                &literal,
+                filter,
+                allowed_paths,
+                branch_candidates.as_deref(),
+                literal_scan_cache,
+            );
             branch_candidates = Some(match branch_candidates.take() {
                 Some(existing) => intersect_sorted(&existing, &docs),
                 None => docs,
@@ -1612,6 +1550,10 @@ impl IndexSearcher {
 
         let should_use_document_fallbacks =
             matches!(self.tokenizer_mode, crate::config::TokenizerMode::Trigram);
+        let tolerate_missing_covering_hashes = matches!(
+            self.tokenizer_mode,
+            crate::config::TokenizerMode::SparseNgram
+        );
         let mut fallback_hashes = Vec::new();
         if should_use_document_fallbacks {
             tokenizer.collect_document_token_hashes(query_literal, &mut fallback_hashes);
@@ -1627,6 +1569,9 @@ impl IndexSearcher {
                 continue;
             }
             let Some(entry) = self.lookup.find(token_hash) else {
+                if tolerate_missing_covering_hashes {
+                    continue;
+                }
                 return LiteralCandidates::Impossible;
             };
             if entry.offset == u64::MAX {
@@ -1674,57 +1619,6 @@ impl IndexSearcher {
         }
     }
 
-    fn fallback_literal_doc_ids(
-        &self,
-        literal: &str,
-        posting_cache: &mut HashMap<u64, Arc<[u32]>>,
-        literal_cache: &mut HashMap<String, Vec<u32>>,
-    ) -> Result<Option<Vec<u32>>> {
-        if let Some(cached) = literal_cache.get(literal) {
-            return Ok(Some(cached.clone()));
-        }
-
-        let Some(lookup) = self.fallback_lookup.as_ref() else {
-            return Ok(None);
-        };
-        if self.fallback_postings.is_none() {
-            return Ok(None);
-        }
-
-        let hashes = collect_literal_fallback_trigram_hashes(literal);
-        if hashes.is_empty() {
-            return Ok(None);
-        }
-
-        let mut entries = Vec::with_capacity(hashes.len());
-        for token_hash in hashes {
-            let Some(entry) = lookup.find(token_hash) else {
-                literal_cache.insert(literal.to_string(), Vec::new());
-                return Ok(Some(Vec::new()));
-            };
-            entries.push(entry);
-        }
-
-        entries.sort_unstable_by_key(|entry| (entry.doc_freq, entry.token_hash));
-        entries.truncate(entries.len().min(3));
-
-        let mut docs: Option<Vec<u32>> = None;
-        for entry in entries {
-            let posting_docs = self.read_fallback_posting_docs(entry.token_hash, posting_cache)?;
-            docs = Some(match docs.take() {
-                Some(existing) => intersect_sorted(&existing, &posting_docs),
-                None => posting_docs.to_vec(),
-            });
-            if docs.as_ref().is_some_and(Vec::is_empty) {
-                break;
-            }
-        }
-
-        let docs = docs.unwrap_or_default();
-        literal_cache.insert(literal.to_string(), docs.clone());
-        Ok(Some(docs))
-    }
-
     fn read_posting_docs(
         &self,
         token_hash: u64,
@@ -1735,32 +1629,10 @@ impl IndexSearcher {
         }
 
         let docs = match self.lookup.find(token_hash) {
-            Some(entry) if entry.offset != u64::MAX => Arc::<[u32]>::from(self.postings.decode(entry)?),
-            Some(_) | None => Arc::<[u32]>::from(Vec::<u32>::new()),
-        };
-        posting_cache.insert(token_hash, Arc::clone(&docs));
-        Ok(docs)
-    }
-
-    fn read_fallback_posting_docs(
-        &self,
-        token_hash: u64,
-        posting_cache: &mut HashMap<u64, Arc<[u32]>>,
-    ) -> Result<Arc<[u32]>> {
-        if let Some(cached) = posting_cache.get(&token_hash) {
-            return Ok(Arc::clone(cached));
-        }
-
-        let docs = match (
-            self.fallback_lookup
-                .as_ref()
-                .and_then(|lookup| lookup.find(token_hash)),
-            self.fallback_postings.as_ref(),
-        ) {
-            (Some(entry), Some(postings)) if entry.offset != u64::MAX => {
-                Arc::<[u32]>::from(postings.decode(entry)?)
+            Some(entry) if entry.offset != u64::MAX => {
+                Arc::<[u32]>::from(self.postings.decode(entry)?)
             }
-            _ => Arc::<[u32]>::from(Vec::<u32>::new()),
+            Some(_) | None => Arc::<[u32]>::from(Vec::<u32>::new()),
         };
         posting_cache.insert(token_hash, Arc::clone(&docs));
         Ok(docs)
@@ -1787,13 +1659,30 @@ impl IndexSearcher {
         }
     }
 
+    fn should_defer_unindexed_literal_scan(&self, literal: &str) -> bool {
+        matches!(
+            self.tokenizer_mode,
+            crate::config::TokenizerMode::SparseNgram
+        ) && literal.chars().count() < self.tokenizer_options.min_sparse_len
+    }
+
     fn scan_literal_docs(
         &self,
         literal: &str,
         filter: Option<&PathFilter>,
         allowed_paths: Option<&HashSet<String>>,
+        candidate_ids: Option<&[u32]>,
         literal_scan_cache: &mut HashMap<String, Vec<u32>>,
     ) -> Vec<u32> {
+        if let Some(candidate_ids) = candidate_ids {
+            return self.scan_literal_docs_in_candidates(
+                literal,
+                filter,
+                allowed_paths,
+                candidate_ids,
+            );
+        }
+
         if let Some(cached) = literal_scan_cache.get(literal) {
             return cached.clone();
         }
@@ -1805,6 +1694,65 @@ impl IndexSearcher {
             literal_scan_cache,
         );
         literal_scan_cache.get(literal).cloned().unwrap_or_default()
+    }
+
+    fn scan_literal_docs_in_candidates(
+        &self,
+        literal: &str,
+        filter: Option<&PathFilter>,
+        allowed_paths: Option<&HashSet<String>>,
+        candidate_ids: &[u32],
+    ) -> Vec<u32> {
+        if literal.is_ascii() {
+            let matcher = AhoCorasick::builder()
+                .match_kind(MatchKind::Standard)
+                .ascii_case_insensitive(true)
+                .build([literal])
+                .expect("ascii literal matcher should build");
+            let mut docs = Vec::new();
+
+            for &doc_id in candidate_ids {
+                let Ok(doc) = doc_by_id(&self.docs, doc_id) else {
+                    continue;
+                };
+                if !self.doc_matches_filters(doc, filter, allowed_paths) {
+                    continue;
+                }
+                let path = self.doc_resolved_path_ref(doc);
+                let Some(bytes) = map_doc_bytes(&path, doc.size()) else {
+                    continue;
+                };
+                if matcher.find(&bytes).is_some() {
+                    docs.push(doc_id);
+                }
+            }
+
+            return docs;
+        }
+
+        let mut docs = Vec::new();
+        for &doc_id in candidate_ids {
+            let Ok(doc) = doc_by_id(&self.docs, doc_id) else {
+                continue;
+            };
+            if !self.doc_matches_filters(doc, filter, allowed_paths) {
+                continue;
+            }
+            let path = self.doc_resolved_path_ref(doc);
+            let Ok(text) = std::fs::read_to_string(&path) else {
+                continue;
+            };
+            let folded = if text.is_ascii() {
+                text.to_ascii_lowercase()
+            } else {
+                text.to_lowercase()
+            };
+            if folded.contains(literal) {
+                docs.push(doc_id);
+            }
+        }
+
+        docs
     }
 
     fn scan_literal_docs_batch(
@@ -1900,17 +1848,6 @@ fn map_doc_bytes(path: &Path, size: u64) -> Option<Mmap> {
     }
     let file = File::open(path).ok()?;
     unsafe { Mmap::map(&file).ok() }
-}
-
-fn collect_literal_fallback_trigram_hashes(literal: &str) -> Vec<u64> {
-    let mut token_hashes = literal
-        .as_bytes()
-        .windows(3)
-        .map(|window| u64::from(crc32fast::hash(window)))
-        .collect::<Vec<_>>();
-    token_hashes.sort_unstable();
-    token_hashes.dedup();
-    token_hashes
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -2119,8 +2056,8 @@ fn prune_high_frequency_candidates(candidates: &mut Vec<TokenCandidate>) {
 mod tests {
     use super::{
         intersect_sorted, intersect_sorted_len_bounded, lower_bound,
-        prune_high_frequency_candidates, union_sorted,
-        CandidateSource, LiteralPrefilter, TokenCandidate,
+        prune_high_frequency_candidates, union_sorted, CandidateSource, LiteralPrefilter,
+        TokenCandidate,
     };
     use crate::planner::{QueryBranch, QueryPlan};
 

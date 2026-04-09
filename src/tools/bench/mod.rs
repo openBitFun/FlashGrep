@@ -14,7 +14,7 @@ use std::{
 };
 
 use crate::{
-    config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
+    config::{BuildConfig, CorpusMode, TokenizerMode},
     daemon::{
         protocol::{
             ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, SearchModeConfig,
@@ -24,7 +24,6 @@ use crate::{
     },
     error::{AppError, Result},
     index::{build_index, IndexSearcher},
-    search::SearchMode,
 };
 
 use self::{
@@ -32,9 +31,7 @@ use self::{
     custom::run_custom,
     fixtures::prepare_dirty_worktree_fixture,
     report::{print_report as print_report_impl, RawWriter},
-    standard::{
-        run_codgrep_benchmark, run_rg_benchmark, run_workspace_benchmark, run_worktree_benchmark,
-    },
+    standard::{run_codgrep_benchmark, run_rg_benchmark, run_worktree_benchmark},
 };
 
 #[derive(Debug, Clone)]
@@ -54,7 +51,6 @@ pub(crate) struct BenchConfig {
     pub(crate) top_k_tokens: usize,
     pub(crate) compare_rg: bool,
     pub(crate) compare_worktree: bool,
-    pub(crate) compare_workspace: bool,
     pub(crate) worktree_sample_files: Option<usize>,
     pub(crate) rebuild: bool,
     pub(crate) raw_output: Option<PathBuf>,
@@ -525,16 +521,6 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             )?);
         }
 
-        if config.compare_workspace {
-            runners.push(run_workspace_benchmark(
-                benchmark,
-                index_path,
-                cache_paths,
-                config,
-                raw_writer.as_mut(),
-            )?);
-        }
-
         if config.compare_worktree {
             let fixture = dirty_worktree_fixtures
                 .get(&benchmark.corpus)
@@ -700,19 +686,6 @@ fn codgrep_executable() -> Result<PathBuf> {
     }
 
     Ok(PathBuf::from("cg"))
-}
-
-fn custom_query_config(pattern: &str, case_insensitive: bool, config: &BenchConfig) -> QueryConfig {
-    QueryConfig {
-        regex_pattern: pattern.to_string(),
-        patterns: vec![pattern.to_string()],
-        case_insensitive,
-        multiline: false,
-        dot_matches_new_line: false,
-        top_k_tokens: config.top_k_tokens,
-        search_mode: SearchMode::CountOnly,
-        ..QueryConfig::default()
-    }
 }
 
 pub(super) fn start_bench_daemon(

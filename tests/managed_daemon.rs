@@ -5,8 +5,9 @@ use std::{
 };
 
 use codgrep::daemon::{
+    daemon_state_file_path,
     protocol::{ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, SearchParams},
-    daemon_state_file_path, DaemonClient, ManagedDaemonClient,
+    DaemonClient, ManagedDaemonClient,
 };
 use tempfile::tempdir;
 
@@ -105,8 +106,10 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
         config: RepoConfig::default(),
         refresh: Default::default(),
     };
-    let state_file = daemon_state_file_path(&ensure_params).expect("state file path should resolve");
-    let managed = Arc::new(ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_cg")));
+    let state_file =
+        daemon_state_file_path(&ensure_params).expect("state file path should resolve");
+    let managed =
+        Arc::new(ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_cg")));
     let barrier = Arc::new(Barrier::new(4));
 
     let handles = (0..4)
@@ -116,7 +119,9 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
             let ensure_params = ensure_params.clone();
             thread::spawn(move || {
                 barrier.wait();
-                managed.ensure_repo(ensure_params).expect("ensure should succeed")
+                managed
+                    .ensure_repo(ensure_params)
+                    .expect("ensure should succeed")
             })
         })
         .collect::<Vec<_>>();
@@ -127,11 +132,9 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
         .collect::<Vec<_>>();
 
     let first = ensured.first().expect("ensured repos should exist");
-    assert!(
-        ensured
-            .iter()
-            .all(|repo| repo.addr == first.addr && repo.repo_id == first.repo_id)
-    );
+    assert!(ensured
+        .iter()
+        .all(|repo| repo.addr == first.addr && repo.repo_id == first.repo_id));
     assert!(!state_file.with_extension("lock").exists());
 
     let client = DaemonClient::new(first.addr.clone());

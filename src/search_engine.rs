@@ -1,4 +1,4 @@
-use std::{borrow::Cow, fs::File, io::ErrorKind, path::Path};
+use std::{borrow::Cow, fs::File, io::ErrorKind, path::Path, sync::Arc};
 
 use aho_corasick::{AhoCorasick, MatchKind};
 use memmap2::Mmap;
@@ -14,20 +14,17 @@ use crate::{
         rebuild_index_with_options,
         searcher::{
             verify::{
-                build_matcher, requires_multiline_verification, verify_candidate_sources,
-                verify_candidate_sources_json,
+                build_matcher, requires_multiline_verification, verify_candidate_sources_with_resolver,
+                VerifyCandidateSource,
             },
-            CountVerifyKind, CountVerifyPlan, IndexSearcher, IndexWorktreeDiff,
+            CountVerifyKind, CountVerifyPlan, IndexSearcher, IndexWorktreeDiff, LinePrefilter,
         },
         IndexBuildOptions,
     },
-    json_output::{JsonDuration, JsonSearchFile, JsonSearchReport, JsonStats},
     path_filter::PathFilter,
     planner::plan,
     query_preflight::{evaluate_index_query_preflight, preflight_enabled},
-    search::{
-        FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine, SearchResults,
-    },
+    search::{FileMatch, MatchLocation, SearchHit, SearchLine, SearchResults},
 };
 
 const PARALLEL_DOC_THRESHOLD: usize = 16;
@@ -66,6 +63,7 @@ pub(crate) struct SearchDocument {
 #[derive(Debug, Clone)]
 pub(crate) enum SearchDocumentSource {
     Path(std::path::PathBuf),
+    LoadedBytes(Arc<[u8]>),
 }
 
 impl SearchDocument {
@@ -75,6 +73,20 @@ impl SearchDocument {
             size: file.size,
             mtime_nanos: file.mtime_nanos,
             source: SearchDocumentSource::Path(file.path.clone()),
+        }
+    }
+
+    pub(crate) fn from_loaded_bytes(
+        logical_path: String,
+        size: u64,
+        mtime_nanos: u64,
+        bytes: Arc<[u8]>,
+    ) -> Self {
+        Self {
+            logical_path,
+            size,
+            mtime_nanos,
+            source: SearchDocumentSource::LoadedBytes(bytes),
         }
     }
 }
@@ -234,22 +246,25 @@ pub(crate) fn search_documents(
     let docs = repository_docs(documents)?;
     let candidate_ids = docs.iter().map(|doc| doc.doc_id).collect::<Vec<_>>();
     let multiline_verifier = requires_multiline_verification(config)?;
+    let query_plan = plan(&config.regex_pattern)?;
+    let line_prefilter = (!multiline_verifier).then(|| LinePrefilter::compile(config, &query_plan)).flatten();
     match config.search_mode {
         crate::search::SearchMode::CountOnly | crate::search::SearchMode::CountMatches => {
-            let verify_plan = CountVerifyPlan::compile_without_prefilter(
+            let verify_plan = CountVerifyPlan::compile(
                 config,
                 multiline_verifier,
+                line_prefilter.clone(),
                 if matches!(config.search_mode, crate::search::SearchMode::CountOnly) {
                     CountVerifyKind::Lines
                 } else {
                     CountVerifyKind::Occurrences
                 },
             )?;
-            let resolve_path = |doc_id| scan_doc_path(documents, doc_id);
-            let stats = verify_plan.verify_candidate_count_stats(
+            let resolve_source = |doc_id| scan_doc_source(documents, doc_id);
+            let stats = verify_plan.verify_candidate_count_stats_with_sources(
                 &candidate_ids,
                 docs.len(),
-                &resolve_path,
+                &resolve_source,
             )?;
             Ok(SearchResults {
                 candidate_docs: docs.len(),
@@ -262,12 +277,13 @@ pub(crate) fn search_documents(
         }
         _ => {
             let matcher = build_matcher(config, multiline_verifier)?;
-            let resolve_path = |doc_id| scan_doc_path(documents, doc_id);
-            let outcomes = verify_candidate_sources(
+            let resolve_source = |doc_id| scan_doc_source(documents, doc_id);
+            let outcomes = verify_candidate_sources_with_resolver(
                 &candidate_ids,
                 docs.len(),
-                &resolve_path,
+                &resolve_source,
                 &matcher,
+                line_prefilter.as_ref(),
                 multiline_verifier,
                 config.search_mode,
                 config.max_count,
@@ -319,6 +335,7 @@ fn search_documents_multi_literal_fast(
     documents: &[SearchDocument],
 ) -> Result<Option<SearchResults>> {
     if config.has_context()
+        || matches!(config.search_mode, crate::search::SearchMode::CountOnly)
         || matches!(config.search_mode, crate::search::SearchMode::CountMatches)
         || config.max_count.is_some()
         || config.fixed_strings
@@ -342,13 +359,7 @@ fn search_documents_multi_literal_fast(
     }
 
     let matcher = AhoCorasick::builder()
-        .match_kind(
-            if matches!(config.search_mode, crate::search::SearchMode::CountOnly) {
-                MatchKind::Standard
-            } else {
-                MatchKind::LeftmostFirst
-            },
-        )
+        .match_kind(MatchKind::LeftmostFirst)
         .ascii_case_insensitive(config.case_insensitive)
         .build(&alternation.literals)
         .map_err(|error| AppError::InvalidPattern(error.to_string()))?;
@@ -395,165 +406,6 @@ fn search_documents_multi_literal_fast(
         matched_occurrences,
         hits,
     }))
-}
-
-pub(crate) fn count_scanned_files(
-    config: &QueryConfig,
-    files: &[RepositoryFile],
-    include_zero: bool,
-) -> Result<Vec<FileCount>> {
-    let documents = files
-        .iter()
-        .map(SearchDocument::from_repository_file)
-        .collect::<Vec<_>>();
-    let docs = repository_docs(&documents)?;
-    let candidate_ids = docs.iter().map(|doc| doc.doc_id).collect::<Vec<_>>();
-    let multiline_verifier = requires_multiline_verification(config)?;
-    let verify_plan = CountVerifyPlan::compile_without_prefilter(
-        config,
-        multiline_verifier,
-        CountVerifyKind::Lines,
-    )?;
-    let resolve_path = |doc_id| scan_doc_path(&documents, doc_id);
-    let outcomes =
-        verify_plan.verify_candidate_counts_by_doc(&candidate_ids, docs.len(), &resolve_path)?;
-    let mut counts = Vec::with_capacity(outcomes.len());
-    for task in outcomes {
-        let doc = &docs[usize::try_from(task.doc_id).map_err(|_| {
-            AppError::ValueOutOfRange(format!("doc id {} exceeds usize range", task.doc_id))
-        })?];
-        counts.push(FileCount {
-            path: doc.path.clone(),
-            matched_lines: task.matched_lines,
-        });
-    }
-    if include_zero {
-        Ok(counts)
-    } else {
-        Ok(counts.into_iter().filter(FileCount::has_match).collect())
-    }
-}
-
-pub(crate) fn count_total_scanned_files(
-    config: &QueryConfig,
-    files: &[RepositoryFile],
-    include_zero: bool,
-) -> Result<Vec<FileMatchCount>> {
-    let documents = files
-        .iter()
-        .map(SearchDocument::from_repository_file)
-        .collect::<Vec<_>>();
-    let docs = repository_docs(&documents)?;
-    let candidate_ids = docs.iter().map(|doc| doc.doc_id).collect::<Vec<_>>();
-    let multiline_verifier = requires_multiline_verification(config)?;
-    let verify_plan = CountVerifyPlan::compile_without_prefilter(
-        config,
-        multiline_verifier,
-        CountVerifyKind::Occurrences,
-    )?;
-    let resolve_path = |doc_id| scan_doc_path(&documents, doc_id);
-    let outcomes =
-        verify_plan.verify_candidate_counts_by_doc(&candidate_ids, docs.len(), &resolve_path)?;
-    let mut counts = Vec::with_capacity(outcomes.len());
-    for task in outcomes {
-        let doc = &docs[usize::try_from(task.doc_id).map_err(|_| {
-            AppError::ValueOutOfRange(format!("doc id {} exceeds usize range", task.doc_id))
-        })?];
-        counts.push(FileMatchCount {
-            path: doc.path.clone(),
-            matched_occurrences: task.matched_occurrences,
-        });
-    }
-    if include_zero {
-        Ok(counts)
-    } else {
-        Ok(counts
-            .into_iter()
-            .filter(FileMatchCount::has_match)
-            .collect())
-    }
-}
-
-pub(crate) fn search_json_scanned_files(
-    config: &QueryConfig,
-    files: &[RepositoryFile],
-) -> Result<JsonSearchReport> {
-    let documents = files
-        .iter()
-        .map(SearchDocument::from_repository_file)
-        .collect::<Vec<_>>();
-    search_json_documents(config, &documents)
-}
-
-pub(crate) fn search_json_documents(
-    config: &QueryConfig,
-    documents: &[SearchDocument],
-) -> Result<JsonSearchReport> {
-    let total_started = std::time::Instant::now();
-    let docs = repository_docs(documents)?;
-    let candidate_ids = docs.iter().map(|doc| doc.doc_id).collect::<Vec<_>>();
-    let multiline_verifier = requires_multiline_verification(config)?;
-    let matcher = build_matcher(config, multiline_verifier)?;
-    let resolve_path = |doc_id| scan_doc_path(documents, doc_id);
-    let outcomes = verify_candidate_sources_json(
-        &candidate_ids,
-        docs.len(),
-        &resolve_path,
-        &matcher,
-        multiline_verifier,
-        config.search_mode,
-        config.max_count,
-        config.before_context,
-        config.after_context,
-    )?;
-
-    let mut files = Vec::new();
-    let mut searches_with_match = 0u64;
-    let mut bytes_searched = 0u64;
-    let mut matched_lines = 0u64;
-    let mut matches = 0u64;
-
-    for task in outcomes {
-        let doc = &docs[usize::try_from(task.doc_id).map_err(|_| {
-            AppError::ValueOutOfRange(format!("doc id {} exceeds usize range", task.doc_id))
-        })?];
-        bytes_searched += task.outcome.bytes_searched;
-        if task.outcome.matched_occurrences == 0 {
-            continue;
-        }
-
-        searches_with_match += 1;
-        matched_lines += task.outcome.matched_lines as u64;
-        matches += task.outcome.matched_occurrences as u64;
-        files.push(JsonSearchFile {
-            path: crate::json_output::JsonData::from_string(doc.path.clone()),
-            messages: task.outcome.messages,
-            binary_offset: task.outcome.binary_offset,
-            stats: JsonStats {
-                elapsed: JsonDuration::from_duration(task.elapsed),
-                searches: 1,
-                searches_with_match: 1,
-                bytes_searched: task.outcome.bytes_searched,
-                bytes_printed: 0,
-                matched_lines: task.outcome.matched_lines as u64,
-                matches: task.outcome.matched_occurrences as u64,
-            },
-        });
-    }
-
-    Ok(JsonSearchReport {
-        files,
-        summary: JsonStats {
-            elapsed: JsonDuration::from_duration(total_started.elapsed()),
-            searches: candidate_ids.len() as u64,
-            searches_with_match,
-            bytes_searched,
-            bytes_printed: 0,
-            matched_lines,
-            matches,
-        },
-        elapsed_total: JsonDuration::from_duration(total_started.elapsed()),
-    })
 }
 
 #[derive(Debug)]
@@ -625,6 +477,7 @@ fn document_bytes(document: &SearchDocument) -> Option<Cow<'_, [u8]>> {
             let mmap = unsafe { Mmap::map(&file).ok()? };
             Some(Cow::Owned(mmap.to_vec()))
         }
+        SearchDocumentSource::LoadedBytes(bytes) => Some(Cow::Borrowed(bytes)),
     }
 }
 
@@ -739,13 +592,14 @@ fn repository_docs(documents: &[SearchDocument]) -> Result<Vec<DocMeta>> {
         .collect()
 }
 
-fn scan_doc_path(documents: &[SearchDocument], doc_id: u32) -> Result<std::path::PathBuf> {
+fn scan_doc_source(documents: &[SearchDocument], doc_id: u32) -> Result<VerifyCandidateSource> {
     let index = usize::try_from(doc_id)
         .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
     documents
         .get(index)
         .map(|document| match &document.source {
-            SearchDocumentSource::Path(path) => path.clone(),
+            SearchDocumentSource::Path(path) => VerifyCandidateSource::Path(path.clone()),
+            SearchDocumentSource::LoadedBytes(bytes) => VerifyCandidateSource::Bytes(bytes.clone()),
         })
         .ok_or_else(|| {
             AppError::InvalidIndex(format!("doc id {doc_id} is missing from scan documents"))

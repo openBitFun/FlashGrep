@@ -358,6 +358,22 @@ mod tests {
         panic!("timed out waiting for repo status");
     }
 
+    fn assert_exact_dirty_stats(
+        status: &RepoStatusPayload,
+        modified: usize,
+        deleted: usize,
+        new: usize,
+    ) {
+        let exact = status.dirty_files.modified == modified
+            && status.dirty_files.deleted == deleted
+            && status.dirty_files.new == new;
+        assert!(
+            exact,
+            "expected exact dirty stats, got modified={}, deleted={}, new={}",
+            status.dirty_files.modified, status.dirty_files.deleted, status.dirty_files.new
+        );
+    }
+
     #[test]
     fn daemon_reports_missing_index_then_builds_and_searches() {
         let service = DaemonService::new();
@@ -517,8 +533,11 @@ mod tests {
 
         let status = wait_for_status(&service, &repo_id, |status| {
             matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+                && status.dirty_files.modified == 1
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
         });
-        assert_eq!(status.dirty_files.deleted, 0);
+        assert_exact_dirty_stats(&status, 1, 0, 0);
 
         let search = search_repo(
             &service,
@@ -571,10 +590,11 @@ mod tests {
 
         let status = wait_for_status(&service, &repo_id, |status| {
             matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+                && status.dirty_files.modified == 0
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 1
         });
-        assert_eq!(status.dirty_files.modified, 0);
-        assert_eq!(status.dirty_files.deleted, 0);
-        assert_eq!(status.dirty_files.new, 0);
+        assert_exact_dirty_stats(&status, 0, 0, 1);
 
         match search_repo(
             &service,
@@ -652,10 +672,17 @@ mod tests {
         let (repo_id, _) = open_repo(&service, repo_path.clone());
         build_repo(&service, &repo_id);
 
+        let baseline_probe = get_status(&service, &repo_id).last_probe_unix_secs;
+        thread::sleep(Duration::from_secs(1));
+
         fs::create_dir_all(repo_path.join("nested")).expect("mkdir should succeed");
 
         let status = wait_for_status(&service, &repo_id, |status| {
-            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+                && status.dirty_files.modified == 0
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
+                && status.last_probe_unix_secs != baseline_probe
         });
         assert_eq!(status.dirty_files.modified, 0);
         assert_eq!(status.dirty_files.deleted, 0);

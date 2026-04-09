@@ -4,15 +4,9 @@ use std::{
     time::Instant,
 };
 
-use crate::{
-    config::QueryConfig,
-    error::{AppError, Result},
-    search::SearchMode,
-    WorkspaceIndex, WorkspaceIndexOptions,
-};
+use crate::error::{AppError, Result};
 
 use super::{
-    bench_build_config,
     cache::prepare_sample,
     configure_rg_command,
     report::{build_summary, RawSample, RawWriter},
@@ -116,18 +110,20 @@ pub(super) fn run_worktree_benchmark(
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<RunnerSummary> {
-    let workspace = open_workspace(repo_path, index_path, config)?;
     let mut durations = Vec::with_capacity(config.bench_iter);
     let mut candidate_docs = None;
     let mut match_count = 0;
+    let daemon = (!build_overlay_each_sample)
+        .then(|| start_bench_daemon(repo_path, index_path, config))
+        .transpose()?;
 
     for _ in 0..config.warmup_iter {
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
         let _ = run_worktree_once(
-            &workspace,
+            daemon.as_ref(),
+            repo_path,
             index_path,
-            benchmark.pattern,
-            benchmark.case_insensitive,
+            benchmark,
             build_overlay_each_sample,
             config,
         )?;
@@ -137,10 +133,10 @@ pub(super) fn run_worktree_benchmark(
         prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
         let outcome = run_worktree_once(
-            &workspace,
+            daemon.as_ref(),
+            repo_path,
             index_path,
-            benchmark.pattern,
-            benchmark.case_insensitive,
+            benchmark,
             build_overlay_each_sample,
             config,
         )?;
@@ -172,67 +168,6 @@ pub(super) fn run_worktree_benchmark(
         } else {
             "codgrep_worktree".into()
         },
-        durations,
-        candidate_docs,
-        match_count,
-    ))
-}
-
-pub(super) fn run_workspace_benchmark(
-    benchmark: BenchmarkCase,
-    index_path: &Path,
-    cache_paths: Option<&BenchCachePaths>,
-    config: &BenchConfig,
-    mut raw_writer: Option<&mut RawWriter>,
-) -> Result<RunnerSummary> {
-    let workspace = open_workspace(
-        &benchmark.corpus.repo_path(&config.suite_dir),
-        index_path,
-        config,
-    )?;
-    let mut durations = Vec::with_capacity(config.bench_iter);
-    let mut candidate_docs = None;
-    let mut match_count = 0;
-
-    for _ in 0..config.warmup_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_workspace_once(
-            &workspace,
-            benchmark.pattern,
-            benchmark.case_insensitive,
-            config,
-        )?;
-    }
-
-    for iter in 0..config.bench_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let started = Instant::now();
-        let outcome = run_workspace_once(
-            &workspace,
-            benchmark.pattern,
-            benchmark.case_insensitive,
-            config,
-        )?;
-        let duration_secs = started.elapsed().as_secs_f64();
-        candidate_docs = Some(outcome.candidate_docs);
-        match_count = outcome.match_count;
-        durations.push(duration_secs);
-
-        if let Some(writer) = raw_writer.as_deref_mut() {
-            writer.write_sample(RawSample {
-                benchmark: benchmark.name,
-                corpus: benchmark.corpus.label(),
-                runner: "codgrep_workspace",
-                iteration: iter,
-                duration_secs,
-                candidate_docs,
-                match_count,
-            })?;
-        }
-    }
-
-    Ok(build_summary(
-        "codgrep_workspace".into(),
         durations,
         candidate_docs,
         match_count,
@@ -276,56 +211,37 @@ fn run_codgrep_daemon_once(
     )
 }
 
-fn run_snapshot_once(
-    snapshot: &crate::workspace::WorkspaceSnapshot,
-    pattern: &str,
-    case_insensitive: bool,
-    config: &BenchConfig,
-) -> Result<BitfunOutcome> {
-    let results = snapshot.search(&QueryConfig {
-        regex_pattern: pattern.to_string(),
-        patterns: vec![pattern.to_string()],
-        case_insensitive,
-        multiline: false,
-        dot_matches_new_line: false,
-        top_k_tokens: config.top_k_tokens,
-        search_mode: SearchMode::CountOnly,
-        ..QueryConfig::default()
-    })?;
-    Ok(BitfunOutcome {
-        candidate_docs: results.candidate_docs,
-        match_count: results.matched_lines,
-    })
-}
-
-fn open_workspace(
+fn run_worktree_query(
+    daemon: &super::BenchDaemon,
+    benchmark: BenchmarkCase,
     repo_path: &Path,
-    index_path: &Path,
-    config: &BenchConfig,
-) -> Result<WorkspaceIndex> {
-    WorkspaceIndex::open(WorkspaceIndexOptions {
-        build_config: bench_build_config(repo_path, index_path, config),
-    })
-}
-
-fn run_workspace_once(
-    workspace: &WorkspaceIndex,
-    pattern: &str,
-    case_insensitive: bool,
     config: &BenchConfig,
 ) -> Result<BitfunOutcome> {
-    let snapshot = workspace.snapshot()?;
-    run_snapshot_once(&snapshot, pattern, case_insensitive, config)
+    run_daemon_search_count(
+        daemon,
+        repo_path,
+        benchmark.pattern,
+        benchmark.case_insensitive,
+        config,
+        vec![benchmark.corpus.search_target(&config.suite_dir)],
+    )
 }
 
 fn run_worktree_once(
-    workspace: &WorkspaceIndex,
-    _index_path: &Path,
-    pattern: &str,
-    case_insensitive: bool,
-    _build_overlay_each_sample: bool,
+    daemon: Option<&super::BenchDaemon>,
+    repo_path: &Path,
+    index_path: &Path,
+    benchmark: BenchmarkCase,
+    build_overlay_each_sample: bool,
     config: &BenchConfig,
 ) -> Result<BitfunOutcome> {
-    let snapshot = workspace.snapshot()?;
-    run_snapshot_once(&snapshot, pattern, case_insensitive, config)
+    if build_overlay_each_sample {
+        let daemon = start_bench_daemon(repo_path, index_path, config)?;
+        run_worktree_query(&daemon, benchmark, repo_path, config)
+    } else {
+        let daemon = daemon.ok_or_else(|| {
+            AppError::Protocol("missing cached daemon for dirty worktree benchmark".into())
+        })?;
+        run_worktree_query(daemon, benchmark, repo_path, config)
+    }
 }

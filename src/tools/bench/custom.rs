@@ -8,13 +8,12 @@ use std::{
 use crate::{
     error::{AppError, Result},
     index::build_index,
-    WorkspaceIndex, WorkspaceIndexOptions,
 };
 
 use super::{
     bench_build_config, bench_index_is_usable,
     cache::{collect_cache_paths_for_target, prepare_sample, sanitize_benchmark_name},
-    configure_rg_command, custom_query_config,
+    configure_rg_command,
     fixtures::prepare_dirty_worktree_fixture,
     report::{build_summary, mean_usize, RawSample, RawWriter},
     run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchQueryMode,
@@ -120,16 +119,6 @@ pub(super) fn run_custom(
             )?);
         }
 
-        if config.compare_workspace {
-            runners.push(run_workspace_custom_trace_benchmark(
-                &benchmark,
-                &index_path,
-                cache_paths.as_ref(),
-                config,
-                raw_writer.as_deref_mut(),
-            )?);
-        }
-
         if let Some(fixture) = dirty_fixture.as_ref() {
             runners.push(run_worktree_custom_trace_benchmark(
                 &benchmark,
@@ -178,16 +167,6 @@ pub(super) fn run_custom(
             if config.compare_rg {
                 runners.push(run_rg_custom_benchmark(
                     &benchmark,
-                    cache_paths.as_ref(),
-                    config,
-                    raw_writer.as_deref_mut(),
-                )?);
-            }
-
-            if config.compare_workspace {
-                runners.push(run_workspace_custom_benchmark(
-                    &benchmark,
-                    &index_path,
                     cache_paths.as_ref(),
                     config,
                     raw_writer.as_deref_mut(),
@@ -490,9 +469,9 @@ fn run_worktree_custom_benchmark(
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<super::RunnerSummary> {
-    let workspace = open_workspace(&fixture.repo_path, &fixture.index_path, config)?;
     run_workspace_benchmark(
-        &workspace,
+        &fixture.repo_path,
+        &fixture.index_path,
         &benchmark.name,
         &benchmark.target,
         if build_overlay_each_sample {
@@ -502,8 +481,6 @@ fn run_worktree_custom_benchmark(
         },
         Some(&benchmark.pattern),
         benchmark.case_insensitive,
-        Some(&fixture.index_path),
-        build_overlay_each_sample,
         cache_paths_for_fixture(fixture, build_overlay_each_sample),
         config,
         raw_writer.as_deref_mut(),
@@ -517,101 +494,50 @@ fn run_worktree_custom_trace_benchmark(
     config: &BenchConfig,
     raw_writer: Option<&mut RawWriter>,
 ) -> Result<super::RunnerSummary> {
-    let workspace = open_workspace(&fixture.repo_path, &fixture.index_path, config)?;
     run_workspace_trace_benchmark(
-        &workspace,
+        &fixture.repo_path,
+        &fixture.index_path,
         benchmark,
         if build_overlay_each_sample {
             "codgrep_worktree_build"
         } else {
             "codgrep_worktree"
         },
-        Some(&fixture.index_path),
-        build_overlay_each_sample,
         cache_paths_for_fixture(fixture, build_overlay_each_sample),
         config,
         raw_writer,
     )
 }
 
-fn run_workspace_custom_benchmark(
-    benchmark: &CustomBenchmarkCase,
-    index_path: &Path,
-    cache_paths: Option<&BenchCachePaths>,
-    config: &BenchConfig,
-    mut raw_writer: Option<&mut RawWriter>,
-) -> Result<super::RunnerSummary> {
-    let workspace = open_workspace(&benchmark.repo_path, index_path, config)?;
-    run_workspace_benchmark(
-        &workspace,
-        &benchmark.name,
-        &benchmark.target,
-        "codgrep_workspace",
-        Some(&benchmark.pattern),
-        benchmark.case_insensitive,
-        None,
-        false,
-        cache_paths,
-        config,
-        raw_writer.as_deref_mut(),
-    )
-}
-
-fn run_workspace_custom_trace_benchmark(
-    benchmark: &CustomBenchmarkTrace,
-    index_path: &Path,
-    cache_paths: Option<&BenchCachePaths>,
-    config: &BenchConfig,
-    raw_writer: Option<&mut RawWriter>,
-) -> Result<super::RunnerSummary> {
-    let workspace = open_workspace(&benchmark.repo_path, index_path, config)?;
-    run_workspace_trace_benchmark(
-        &workspace,
-        benchmark,
-        "codgrep_workspace",
-        None,
-        false,
-        cache_paths,
-        config,
-        raw_writer,
-    )
-}
-
-fn open_workspace(
+fn run_workspace_benchmark(
     repo_path: &Path,
     index_path: &Path,
-    config: &BenchConfig,
-) -> Result<WorkspaceIndex> {
-    WorkspaceIndex::open(WorkspaceIndexOptions {
-        build_config: bench_build_config(repo_path, index_path, config),
-    })
-}
-
-fn run_workspace_benchmark(
-    workspace: &WorkspaceIndex,
     benchmark_name: &str,
     corpus: &str,
     runner: &str,
     pattern: Option<&str>,
     case_insensitive: bool,
-    worktree_index_path: Option<&Path>,
-    rebuild_overlay_each_sample: bool,
     cache_paths: Option<&BenchCachePaths>,
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<super::RunnerSummary> {
-    let pattern = pattern.expect("single-pattern snapshot benchmark requires a pattern");
+    let pattern = pattern.expect("single-pattern worktree benchmark requires a pattern");
     let mut durations = Vec::with_capacity(config.bench_iter);
     let mut candidate_docs = None;
     let mut match_count = 0;
+    let build_overlay_each_sample = runner == "codgrep_worktree_build";
+    let daemon = (!build_overlay_each_sample)
+        .then(|| start_bench_daemon(repo_path, index_path, config))
+        .transpose()?;
     for _ in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let _ = run_workspace_query(
-            workspace,
+            daemon.as_ref(),
+            repo_path,
+            index_path,
             pattern,
             case_insensitive,
-            worktree_index_path,
-            rebuild_overlay_each_sample,
+            build_overlay_each_sample,
             config,
         )?;
     }
@@ -619,11 +545,12 @@ fn run_workspace_benchmark(
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
         let outcome = run_workspace_query(
-            workspace,
+            daemon.as_ref(),
+            repo_path,
+            index_path,
             pattern,
             case_insensitive,
-            worktree_index_path,
-            rebuild_overlay_each_sample,
+            build_overlay_each_sample,
             config,
         )?;
         let duration_secs = started.elapsed().as_secs_f64();
@@ -651,11 +578,10 @@ fn run_workspace_benchmark(
 }
 
 fn run_workspace_trace_benchmark(
-    workspace: &WorkspaceIndex,
+    repo_path: &Path,
+    index_path: &Path,
     benchmark: &CustomBenchmarkTrace,
     runner: &str,
-    worktree_index_path: Option<&Path>,
-    rebuild_overlay_each_sample: bool,
     cache_paths: Option<&BenchCachePaths>,
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
@@ -663,14 +589,19 @@ fn run_workspace_trace_benchmark(
     let mut durations = Vec::with_capacity(config.bench_iter);
     let mut total_candidate_docs = 0usize;
     let mut total_match_count = 0usize;
+    let build_overlay_each_sample = runner == "codgrep_worktree_build";
+    let daemon = (!build_overlay_each_sample)
+        .then(|| start_bench_daemon(repo_path, index_path, config))
+        .transpose()?;
     for iter in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let _ = run_workspace_query(
-            workspace,
+            daemon.as_ref(),
+            repo_path,
+            index_path,
             benchmark.pattern_at(iter),
             benchmark.case_insensitive,
-            worktree_index_path,
-            rebuild_overlay_each_sample,
+            build_overlay_each_sample,
             config,
         )?;
     }
@@ -678,11 +609,12 @@ fn run_workspace_trace_benchmark(
         prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
         let started = Instant::now();
         let outcome = run_workspace_query(
-            workspace,
+            daemon.as_ref(),
+            repo_path,
+            index_path,
             benchmark.pattern_at(iter),
             benchmark.case_insensitive,
-            worktree_index_path,
-            rebuild_overlay_each_sample,
+            build_overlay_each_sample,
             config,
         )?;
         let duration_secs = started.elapsed().as_secs_f64();
@@ -710,19 +642,36 @@ fn run_workspace_trace_benchmark(
 }
 
 fn run_workspace_query(
-    workspace: &WorkspaceIndex,
+    daemon: Option<&super::BenchDaemon>,
+    repo_path: &Path,
+    index_path: &Path,
     pattern: &str,
     case_insensitive: bool,
-    _worktree_index_path: Option<&Path>,
-    _rebuild_overlay_each_sample: bool,
+    build_overlay_each_sample: bool,
     config: &BenchConfig,
 ) -> Result<super::BitfunOutcome> {
-    let snapshot = workspace.snapshot()?;
-    let results = snapshot.search(&custom_query_config(pattern, case_insensitive, config))?;
-    Ok(super::BitfunOutcome {
-        candidate_docs: results.candidate_docs,
-        match_count: results.matched_lines,
-    })
+    if build_overlay_each_sample {
+        let daemon = start_bench_daemon(repo_path, index_path, config)?;
+        return run_daemon_search_count(
+            &daemon,
+            repo_path,
+            pattern,
+            case_insensitive,
+            config,
+            vec![repo_path.to_path_buf()],
+        );
+    }
+    let daemon = daemon.ok_or_else(|| {
+        AppError::Protocol("missing cached daemon for dirty worktree benchmark".into())
+    })?;
+    run_daemon_search_count(
+        daemon,
+        repo_path,
+        pattern,
+        case_insensitive,
+        config,
+        vec![repo_path.to_path_buf()],
+    )
 }
 
 fn cache_paths_for_fixture(

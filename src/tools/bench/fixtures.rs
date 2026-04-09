@@ -66,8 +66,8 @@ pub(super) fn prepare_dirty_worktree_fixture(
         corpus_mode: config.corpus_mode,
         include_hidden: false,
         max_file_size: 512 * 1024 * 1024,
-        min_sparse_len: 5,
-        max_sparse_len: 16,
+        min_sparse_len: 3,
+        max_sparse_len: 8,
     };
     let _ = build_index(&build_config)?;
 

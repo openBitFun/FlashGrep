@@ -20,7 +20,7 @@ use crate::{
     index::{DirtyPathKind, IndexWorktreeDiff},
     path_filter::{PathFilter, PathFilterArgs},
     search::{SearchLine, SearchResults},
-    search_engine::{SearchBackend, SearchEngine, SearchPolicy},
+    search_engine::{SearchBackend, SearchDocument, SearchEngine, SearchPolicy},
     workspace::{IndexStatus, WorkspaceIndex, WorkspaceIndexOptions},
 };
 
@@ -144,7 +144,7 @@ impl RepoManager {
     }
 
     pub fn get_status(&self, repo_id: &str) -> Result<RepoStatus> {
-        self.repo(repo_id)?.status_snapshot()
+        self.repo(repo_id)?.refresh(false)
     }
 
     pub fn refresh_repo(&self, repo_id: &str, force: bool) -> Result<RepoStatus> {
@@ -221,7 +221,7 @@ struct RepoRuntime {
     workspace: WorkspaceIndex,
     rebuild_dirty_threshold: usize,
     state: Mutex<RepoState>,
-    dirty_paths: Mutex<DirtyPathSet>,
+    dirty_overlay: Mutex<DirtyOverlayState>,
     resync_required: AtomicBool,
     watcher_stop: Mutex<Option<mpsc::Sender<()>>>,
     watcher_handle: Mutex<Option<JoinHandle<()>>>,
@@ -258,6 +258,19 @@ struct DirtyPathSet {
     modified: std::collections::HashSet<String>,
     deleted: std::collections::HashSet<String>,
     new: std::collections::HashSet<String>,
+}
+
+#[derive(Debug, Clone, Default)]
+struct DirtyOverlayState {
+    paths: DirtyPathSet,
+    documents: HashMap<String, SearchDocument>,
+}
+
+#[derive(Debug, Clone)]
+struct DirtyOverlaySnapshot {
+    paths: DirtyPathSet,
+    shadowed_base_paths: std::collections::HashSet<String>,
+    documents: Vec<SearchDocument>,
 }
 
 impl DirtyPathSet {
@@ -330,6 +343,24 @@ impl DirtyPathSet {
     }
 }
 
+impl DirtyOverlayState {
+    fn snapshot(&self) -> DirtyOverlaySnapshot {
+        let mut documents = self.documents.values().cloned().collect::<Vec<_>>();
+        documents.sort_unstable_by(|left, right| left.logical_path.cmp(&right.logical_path));
+        DirtyOverlaySnapshot {
+            paths: self.paths.clone(),
+            shadowed_base_paths: self
+                .paths
+                .modified
+                .iter()
+                .chain(self.paths.deleted.iter())
+                .cloned()
+                .collect(),
+            documents,
+        }
+    }
+}
+
 impl RepoRuntime {
     fn new(
         repo_id: String,
@@ -347,7 +378,7 @@ impl RepoRuntime {
             workspace,
             rebuild_dirty_threshold: refresh_policy.rebuild_dirty_threshold,
             state: Mutex::new(RepoState::default()),
-            dirty_paths: Mutex::new(DirtyPathSet::default()),
+            dirty_overlay: Mutex::new(DirtyOverlayState::default()),
             resync_required: AtomicBool::new(false),
             watcher_stop: Mutex::new(None),
             watcher_handle: Mutex::new(None),
@@ -466,18 +497,27 @@ impl RepoRuntime {
                         })
                     }
                     RepoPhase::ReadyClean | RepoPhase::ReadyDirty => {
-                        let dirty = self.current_dirty_paths();
-                        let backend = if dirty.is_empty() {
+                        let overlay = self.current_overlay_snapshot();
+                        let backend = if overlay.paths.is_empty() {
                             QueryBackend::IndexedClean
                         } else {
                             QueryBackend::IndexedWorkspaceRepair
                         };
-                        let results = self.workspace.search_with_dirty_diff(
-                            &request.query,
-                            &dirty,
-                            filter.as_ref(),
-                        )?;
-                        if !dirty.is_empty() {
+                        let results = if overlay.paths.is_empty() {
+                            self.workspace.search_with_dirty_diff(
+                                &request.query,
+                                &IndexWorktreeDiff::default(),
+                                filter.as_ref(),
+                            )?
+                        } else {
+                            self.workspace.search_with_dirty_overlay(
+                                &request.query,
+                                &overlay.shadowed_base_paths,
+                                &overlay.documents,
+                                filter.as_ref(),
+                            )?
+                        };
+                        if !overlay.paths.is_empty() {
                             self.reconcile_dirty_paths()?;
                         }
                         Ok(SearchResponse {
@@ -514,7 +554,7 @@ impl RepoRuntime {
                 state.last_probe_at = Some(SystemTime::now());
                 state.last_error = None;
                 drop(state);
-                self.replace_dirty_paths(overlay);
+                self.replace_dirty_paths(overlay)?;
                 Ok(())
             }
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -541,40 +581,92 @@ impl RepoRuntime {
     fn reconcile_dirty_paths(&self) -> Result<()> {
         let current = self.current_dirty_paths();
         let remaining = self.workspace.reconcile_dirty_diff(&current)?;
-        self.replace_dirty_paths(DirtyPathSet::from_diff(remaining));
+        self.replace_dirty_paths(DirtyPathSet::from_diff(remaining))?;
         Ok(())
     }
 
     fn current_dirty_paths(&self) -> IndexWorktreeDiff {
-        match self.dirty_paths.lock() {
-            Ok(guard) => guard.to_diff(),
-            Err(poisoned) => poisoned.into_inner().to_diff(),
+        match self.dirty_overlay.lock() {
+            Ok(guard) => guard.paths.to_diff(),
+            Err(poisoned) => poisoned.into_inner().paths.to_diff(),
         }
     }
 
-    fn replace_dirty_paths(&self, dirty: DirtyPathSet) {
+    fn current_overlay_snapshot(&self) -> DirtyOverlaySnapshot {
+        match self.dirty_overlay.lock() {
+            Ok(guard) => guard.snapshot(),
+            Err(poisoned) => poisoned.into_inner().snapshot(),
+        }
+    }
+
+    fn replace_dirty_paths(&self, dirty: DirtyPathSet) -> Result<()> {
+        let documents = self.load_overlay_documents(&dirty)?;
         {
-            let mut overlay = match self.dirty_paths.lock() {
+            let mut overlay = match self.dirty_overlay.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            *overlay = dirty.clone();
+            *overlay = DirtyOverlayState {
+                paths: dirty.clone(),
+                documents,
+            };
         }
         self.update_overlay_state(&dirty);
+        Ok(())
     }
 
     fn add_dirty_paths(&self, delta: DirtyPathSet) {
         let dirty = {
-            let mut overlay = match self.dirty_paths.lock() {
+            let mut overlay = match self.dirty_overlay.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if !overlay.merge(delta) {
+            if !overlay.paths.merge(delta.clone()) {
                 return;
             }
-            overlay.clone()
+            if let Err(error) = self.apply_overlay_delta(&mut overlay, &delta) {
+                drop(overlay);
+                self.mark_resync_required();
+                self.set_last_error(Some(format!("failed to refresh dirty overlay: {error}")));
+                return;
+            }
+            overlay.paths.clone()
         };
         self.update_overlay_state(&dirty);
+    }
+
+    fn load_overlay_documents(
+        &self,
+        dirty: &DirtyPathSet,
+    ) -> Result<HashMap<String, SearchDocument>> {
+        let mut documents = HashMap::new();
+        for path in dirty.modified.iter().chain(dirty.new.iter()) {
+            if let Some(document) = self.workspace.load_dirty_document(path)? {
+                documents.insert(path.clone(), document);
+            }
+        }
+        Ok(documents)
+    }
+
+    fn apply_overlay_delta(
+        &self,
+        overlay: &mut DirtyOverlayState,
+        delta: &DirtyPathSet,
+    ) -> Result<()> {
+        for path in &delta.deleted {
+            overlay.documents.remove(path);
+        }
+        for path in delta.modified.iter().chain(delta.new.iter()) {
+            match self.workspace.load_dirty_document(path)? {
+                Some(document) => {
+                    overlay.documents.insert(path.clone(), document);
+                }
+                None => {
+                    overlay.documents.remove(path);
+                }
+            }
+        }
+        Ok(())
     }
 
     fn update_overlay_state(&self, dirty: &DirtyPathSet) {
@@ -596,11 +688,11 @@ impl RepoRuntime {
 
     fn clear_overlay(&self) {
         {
-            let mut overlay = match self.dirty_paths.lock() {
+            let mut overlay = match self.dirty_overlay.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            *overlay = DirtyPathSet::default();
+            *overlay = DirtyOverlayState::default();
         }
         self.resync_required.store(false, Ordering::Relaxed);
     }

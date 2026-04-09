@@ -1,4 +1,5 @@
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
+use grep_searcher::{BinaryDetection, MmapChoice, SearcherBuilder};
 
 use crate::{
     config::QueryConfig,
@@ -34,6 +35,19 @@ pub(crate) fn build_regex_matcher(
     builder
         .build_many(&patterns)
         .map_err(|error| AppError::InvalidPattern(error.to_string()))
+}
+
+pub(crate) fn configure_verifier_searcher(builder: &mut SearcherBuilder, multiline_verifier: bool) {
+    builder
+        .binary_detection(BinaryDetection::quit(b'\0'))
+        .multi_line(multiline_verifier);
+    #[cfg(not(target_os = "macos"))]
+    {
+        // This project already uses file-backed mmaps in other hot paths. Using
+        // the searcher's mmap path lets candidate verification behave more like
+        // ripgrep on stable files.
+        builder.memory_map(unsafe { MmapChoice::auto() });
+    }
 }
 
 pub(super) fn build_line_starts(bytes: &[u8]) -> Vec<usize> {

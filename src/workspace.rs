@@ -19,11 +19,12 @@ use crate::{
     path_filter::PathFilter,
     search::SearchResults,
     search_engine::search_documents,
-    QueryConfig, TokenizerMode,
+    TokenizerMode,
 };
 
 use self::runtime::{
-    candidate_documents as workspace_candidate_documents, scan_text_repository_files,
+    filter_search_documents, load_search_document, merge_search_results, overlay_search_scope,
+    scan_text_repository_files,
 };
 
 /// Options for opening a [`WorkspaceIndex`].
@@ -124,25 +125,6 @@ pub struct WorkspaceIndex {
     inner: Arc<WorkspaceIndexInner>,
 }
 
-/// Reusable read-only workspace view captured at a point in time.
-#[derive(Clone)]
-pub struct WorkspaceSnapshot {
-    workspace: Arc<WorkspaceIndexInner>,
-    view: WorkspaceReadView,
-}
-
-#[derive(Clone)]
-enum WorkspaceReadView {
-    IndexedClean {
-        searcher: Arc<IndexSearcher>,
-    },
-    IndexedDirty {
-        searcher: Arc<IndexSearcher>,
-        diff: IndexWorktreeDiff,
-    },
-    ScanFallback,
-}
-
 struct WorkspaceIndexInner {
     options: WorkspaceIndexOptions,
     cached_searcher: Mutex<Option<CachedBaseSearcher>>,
@@ -225,24 +207,10 @@ impl WorkspaceIndex {
         self.probe_freshness()
     }
 
-    /// Searches the current effective workspace view.
-    pub fn search(&self, query: &QueryConfig) -> Result<SearchResults> {
-        self.search_with_filter(query, None)
-    }
-
-    /// Searches the current effective workspace view with an optional path filter.
-    pub fn search_with_filter(
-        &self,
-        query: &QueryConfig,
-        filter: Option<&PathFilter>,
-    ) -> Result<SearchResults> {
-        self.snapshot()?.search_with_filter(query, filter)
-    }
-
     /// Searches against the base snapshot plus a caller-maintained dirty overlay diff.
     pub fn search_with_dirty_diff(
         &self,
-        query: &QueryConfig,
+        query: &crate::QueryConfig,
         dirty: &IndexWorktreeDiff,
         filter: Option<&PathFilter>,
     ) -> Result<SearchResults> {
@@ -251,14 +219,53 @@ impl WorkspaceIndex {
                 if dirty.is_empty() {
                     return searcher.search_with_filter(query, filter);
                 }
-                let documents = workspace_candidate_documents(&searcher, dirty, query, filter)?
-                    .into_documents();
-                search_documents(query, &documents)
+                let scope = overlay_search_scope(dirty, filter)?;
+                let base_results = searcher.search_with_path_overrides(
+                    query,
+                    filter,
+                    None,
+                    Some(&scope.shadowed_base_paths),
+                )?;
+                if scope.dirty_documents.is_empty() {
+                    return Ok(base_results);
+                }
+                let dirty_results = search_documents(query, &scope.dirty_documents)?;
+                Ok(merge_search_results(base_results, dirty_results))
             }
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => search_documents(
                 query,
                 &scan_text_repository_files(&self.inner.options.build_config, filter)?,
             ),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn search_with_dirty_overlay(
+        &self,
+        query: &crate::QueryConfig,
+        shadowed_base_paths: &std::collections::HashSet<String>,
+        dirty_documents: &[crate::search_engine::SearchDocument],
+        filter: Option<&PathFilter>,
+    ) -> Result<SearchResults> {
+        match self.open_searcher() {
+            Ok(searcher) => {
+                let base_results = searcher.search_with_path_overrides(
+                    query,
+                    filter,
+                    None,
+                    Some(shadowed_base_paths),
+                )?;
+                let filtered_dirty = filter_search_documents(dirty_documents, filter);
+                if filtered_dirty.is_empty() {
+                    return Ok(base_results);
+                }
+                let dirty_results = search_documents(query, &filtered_dirty)?;
+                Ok(merge_search_results(base_results, dirty_results))
+            }
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                let filtered_dirty = filter_search_documents(dirty_documents, filter);
+                search_documents(query, &filtered_dirty)
+            }
             Err(error) => Err(error),
         }
     }
@@ -299,29 +306,8 @@ impl WorkspaceIndex {
         Ok(remaining)
     }
 
-    /// Captures a reusable read-only workspace snapshot for repeated queries.
-    pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
-        match self.open_searcher() {
-            Ok(searcher) => {
-                let diff = searcher.diff_against_worktree()?;
-                let view = if diff.is_empty() {
-                    WorkspaceReadView::IndexedClean { searcher }
-                } else {
-                    WorkspaceReadView::IndexedDirty { searcher, diff }
-                };
-                Ok(WorkspaceSnapshot {
-                    workspace: Arc::clone(&self.inner),
-                    view,
-                })
-            }
-            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                Ok(WorkspaceSnapshot {
-                    workspace: Arc::clone(&self.inner),
-                    view: WorkspaceReadView::ScanFallback,
-                })
-            }
-            Err(error) => Err(error),
-        }
+    pub(crate) fn load_dirty_document(&self, path: &str) -> Result<Option<crate::search_engine::SearchDocument>> {
+        load_search_document(path.to_string(), PathBuf::from(path))
     }
 
     fn base_snapshot_info(&self) -> Result<BaseSnapshotInfo> {
@@ -450,49 +436,16 @@ impl WorkspaceIndex {
     }
 }
 
-impl WorkspaceSnapshot {
-    /// Searches this captured snapshot without re-evaluating its read view.
-    pub fn search(&self, query: &QueryConfig) -> Result<SearchResults> {
-        self.search_with_filter(query, None)
-    }
-
-    /// Searches this captured snapshot with an optional path filter.
-    pub fn search_with_filter(
-        &self,
-        query: &QueryConfig,
-        filter: Option<&PathFilter>,
-    ) -> Result<SearchResults> {
-        match &self.view {
-            WorkspaceReadView::IndexedClean { searcher } => {
-                searcher.search_with_filter(query, filter)
-            }
-            WorkspaceReadView::IndexedDirty { searcher, diff } => {
-                let documents =
-                    workspace_candidate_documents(searcher, diff, query, filter)?.into_documents();
-                search_documents(query, &documents)
-            }
-            WorkspaceReadView::ScanFallback => search_documents(
-                query,
-                &scan_text_repository_files(&self.workspace.options.build_config, filter)?,
-            ),
-        }
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use std::{fs, path::PathBuf, time::Duration};
 
     use tempfile::TempDir;
 
-    use super::{
-        BaseSnapshotKind, WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions,
-        WorkspaceReadView,
-    };
+    use super::{BaseSnapshotKind, WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions};
     use crate::{
         build_index,
         config::{BuildConfig, CorpusMode, TokenizerMode},
-        QueryConfig,
     };
 
     struct TestRepo {
@@ -540,64 +493,6 @@ mod tests {
         fn build(&self) {
             build_index(&self.build_config()).expect("build should succeed");
         }
-    }
-
-    fn query(pattern: &str) -> QueryConfig {
-        QueryConfig {
-            regex_pattern: pattern.into(),
-            patterns: vec![pattern.into()],
-            ..QueryConfig::default()
-        }
-    }
-
-    #[test]
-    fn workspace_snapshot_uses_indexed_clean_view_when_worktree_matches_base() {
-        let repo = TestRepo::new();
-        let source = repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
-        repo.build();
-
-        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
-            build_config: repo.build_config(),
-        })
-        .expect("workspace should open");
-        let snapshot = workspace.snapshot().expect("snapshot should open");
-
-        assert!(matches!(
-            snapshot.view,
-            WorkspaceReadView::IndexedClean { .. }
-        ));
-
-        let results = snapshot
-            .search(&query("PM_RESUME"))
-            .expect("search should succeed");
-        assert_eq!(results.hits.len(), 1);
-        assert_eq!(results.hits[0].path, source.to_string_lossy());
-    }
-
-    #[test]
-    fn workspace_snapshot_uses_indexed_dirty_view_when_worktree_is_dirty() {
-        let repo = TestRepo::new();
-        repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
-        let added = repo.write("added.rs", "const NAME: &str = \"OTHER\";\n");
-        repo.build();
-        repo.write("added.rs", "const NAME: &str = \"DIRTY\";\n");
-
-        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
-            build_config: repo.build_config(),
-        })
-        .expect("workspace should open");
-        let snapshot = workspace.snapshot().expect("snapshot should open");
-
-        assert!(matches!(
-            snapshot.view,
-            WorkspaceReadView::IndexedDirty { .. }
-        ));
-
-        let results = snapshot
-            .search(&query("DIRTY"))
-            .expect("search should succeed");
-        assert_eq!(results.hits.len(), 1);
-        assert_eq!(results.hits[0].path, added.to_string_lossy());
     }
 
     #[test]

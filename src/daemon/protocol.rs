@@ -335,11 +335,11 @@ fn default_max_file_size() -> u64 {
 }
 
 fn default_min_sparse_len() -> usize {
-    5
+    3
 }
 
 fn default_max_sparse_len() -> usize {
-    16
+    8
 }
 
 fn default_rebuild_dirty_threshold() -> usize {

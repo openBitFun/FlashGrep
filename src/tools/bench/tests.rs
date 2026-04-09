@@ -2,7 +2,9 @@ use std::fs;
 
 use tempfile::tempdir;
 
-use super::{copy_tree, parse_rg_count_output, run, BenchCacheMode, BenchConfig};
+use super::{
+    benchmark_scope_roots, copy_tree, parse_rg_count_output, run, BenchCacheMode, BenchConfig,
+};
 use super::{fixtures::prepare_dirty_worktree_fixture, DirtyPattern};
 use crate::config::{CorpusMode, TokenizerMode};
 use crate::tools::bench::report::render_report;
@@ -44,10 +46,8 @@ fn bench_runner_smoke_test() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
-        compare_workspace: false,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: None,
@@ -72,6 +72,20 @@ fn parse_rg_count_output_supports_single_and_multi_file_formats() {
         parse_rg_count_output(b"/tmp/a.rs:2\n/tmp/b.rs:5\n").expect("test should succeed"),
         7
     );
+}
+
+#[test]
+fn benchmark_scope_roots_uses_repo_relative_paths_for_daemon_queries() {
+    let temp = tempdir().expect("test should succeed");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(repo.join("src")).expect("test should succeed");
+    fs::write(repo.join("src").join("lib.rs"), "PM_RESUME\n").expect("test should succeed");
+
+    let repo_roots = benchmark_scope_roots(&repo, vec![repo.clone()]);
+    assert!(repo_roots.is_empty());
+
+    let nested = benchmark_scope_roots(&repo, vec![repo.join("src").join("lib.rs")]);
+    assert_eq!(nested, vec![std::path::PathBuf::from("src/lib.rs")]);
 }
 
 #[cfg(target_os = "linux")]
@@ -115,10 +129,8 @@ fn cold_bench_runs_hook_before_each_iteration() {
         warmup_iter: 1,
         bench_iter: 2,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
-        compare_workspace: false,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: None,
@@ -132,7 +144,7 @@ fn cold_bench_runs_hook_before_each_iteration() {
 }
 
 #[test]
-fn bench_runner_supports_workspace_and_worktree_runners() {
+fn bench_runner_supports_worktree_runners() {
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path();
     fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
@@ -168,10 +180,8 @@ fn bench_runner_supports_workspace_and_worktree_runners() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
-        compare_workspace: true,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: None,
@@ -185,7 +195,7 @@ fn bench_runner_supports_workspace_and_worktree_runners() {
         .iter()
         .find(|summary| summary.name == "linux_literal")
         .expect("test should succeed");
-    assert_eq!(summary.runners.len(), 4);
+    assert_eq!(summary.runners.len(), 3);
     assert!(summary
         .runners
         .iter()
@@ -194,10 +204,6 @@ fn bench_runner_supports_workspace_and_worktree_runners() {
         .runners
         .iter()
         .any(|runner| runner.runner == "codgrep_worktree"));
-    assert!(summary
-        .runners
-        .iter()
-        .any(|runner| runner.runner == "codgrep_workspace"));
 }
 
 #[cfg(unix)]
@@ -254,10 +260,8 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
             warmup_iter: 0,
             bench_iter: 1,
             top_k_tokens: 4,
-            compare_index: false,
             compare_rg: false,
             compare_worktree: true,
-            compare_workspace: false,
             worktree_sample_files: Some(2),
             rebuild: true,
             raw_output: None,
@@ -319,10 +323,8 @@ fn bench_runner_supports_custom_repo_patterns() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
-        compare_workspace: true,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: None,
@@ -339,10 +341,6 @@ fn bench_runner_supports_custom_repo_patterns() {
         .runners
         .iter()
         .any(|runner| runner.runner == "codgrep"));
-    assert!(summary
-        .runners
-        .iter()
-        .any(|runner| runner.runner == "codgrep_workspace"));
 }
 
 #[test]
@@ -369,10 +367,8 @@ fn bench_runner_supports_custom_worktree_build_runner() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
-        compare_workspace: false,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: None,
@@ -423,10 +419,8 @@ fn bench_report_labels_worktree_runner_modes() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
-        compare_workspace: true,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: None,
@@ -438,9 +432,6 @@ fn bench_report_labels_worktree_runner_modes() {
     let base = rendered
         .find("codgrep [daemon-steady-state]")
         .expect("test should succeed");
-    let workspace = rendered
-        .find("codgrep_workspace [workspace-snapshot]")
-        .expect("test should succeed");
     let worktree_build = rendered
         .find("codgrep_worktree_build [dirty-first-query]")
         .expect("test should succeed");
@@ -448,8 +439,7 @@ fn bench_report_labels_worktree_runner_modes() {
         .find("codgrep_worktree [dirty-cached-query]")
         .expect("test should succeed");
 
-    assert!(base < workspace);
-    assert!(workspace < worktree_build);
+    assert!(base < worktree_build);
     assert!(worktree_build < worktree_cached);
 }
 
@@ -485,10 +475,8 @@ fn bench_raw_output_includes_runner_family_and_mode() {
         warmup_iter: 0,
         bench_iter: 1,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: true,
-        compare_workspace: true,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: Some(raw_output.clone()),
@@ -505,9 +493,6 @@ fn bench_raw_output_includes_runner_family_and_mode() {
     assert!(lines
         .iter()
         .any(|line| line.contains(",codgrep,codgrep,daemon_steady_state,")));
-    assert!(lines
-        .iter()
-        .any(|line| line.contains(",codgrep_workspace,codgrep,workspace_snapshot,")));
     assert!(lines
         .iter()
         .any(|line| line.contains(",codgrep_worktree_build,codgrep,dirty_first_query,")));
@@ -544,10 +529,8 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
         warmup_iter: 0,
         bench_iter: 2,
         top_k_tokens: 4,
-        compare_index: false,
         compare_rg: false,
         compare_worktree: false,
-        compare_workspace: true,
         worktree_sample_files: None,
         rebuild: true,
         raw_output: None,

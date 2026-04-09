@@ -2,6 +2,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Write},
     net::TcpStream,
     sync::atomic::{AtomicU64, Ordering},
+    sync::Mutex,
 };
 
 use crate::error::{AppError, Result};
@@ -15,6 +16,13 @@ use super::protocol::{
 pub struct DaemonClient {
     addr: String,
     next_id: AtomicU64,
+    connection: Mutex<Option<DaemonConnection>>,
+}
+
+#[derive(Debug)]
+struct DaemonConnection {
+    reader: BufReader<TcpStream>,
+    writer: BufWriter<TcpStream>,
 }
 
 impl DaemonClient {
@@ -22,6 +30,7 @@ impl DaemonClient {
         Self {
             addr: addr.into(),
             next_id: AtomicU64::new(1),
+            connection: Mutex::new(None),
         }
     }
 
@@ -32,20 +41,17 @@ impl DaemonClient {
             request,
         };
 
-        let stream = TcpStream::connect(&self.addr)?;
-        let reader = BufReader::new(stream.try_clone()?);
-        let mut writer = BufWriter::new(stream);
-        serde_json::to_writer(&mut writer, &envelope)
-            .map_err(|error| AppError::Protocol(format!("failed to encode request: {error}")))?;
-        writer.write_all(b"\n")?;
-        writer.flush()?;
-
-        let mut lines = reader.lines();
-        let line = lines.next().ok_or_else(|| {
-            AppError::Protocol("daemon closed connection without a response".into())
-        })??;
-        let response: ResponseEnvelope = serde_json::from_str(&line)
-            .map_err(|error| AppError::Protocol(format!("failed to decode response: {error}")))?;
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| AppError::Protocol("daemon connection mutex poisoned".into()))?;
+        let response = match self.send_with_connection(&mut connection, &envelope) {
+            Ok(response) => response,
+            Err(_) => {
+                *connection = None;
+                self.send_with_connection(&mut connection, &envelope)?
+            }
+        };
 
         if response.id != Some(request_id) {
             return Err(AppError::Protocol(format!(
@@ -58,6 +64,44 @@ impl DaemonClient {
             ResponsePayload::Ok { result } => Ok(result),
             ResponsePayload::Error { error } => Err(AppError::Protocol(error.message)),
         }
+    }
+
+    fn send_with_connection(
+        &self,
+        connection: &mut Option<DaemonConnection>,
+        envelope: &RequestEnvelope,
+    ) -> Result<ResponseEnvelope> {
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                *connection = Some(self.connect()?);
+                connection
+                    .as_mut()
+                    .expect("connection must exist after successful connect")
+            }
+        };
+
+        serde_json::to_writer(&mut connection.writer, envelope)
+            .map_err(|error| AppError::Protocol(format!("failed to encode request: {error}")))?;
+        connection.writer.write_all(b"\n")?;
+        connection.writer.flush()?;
+
+        let mut line = String::new();
+        let read = connection.reader.read_line(&mut line)?;
+        if read == 0 {
+            return Err(AppError::Protocol(
+                "daemon closed connection without a response".into(),
+            ));
+        }
+        serde_json::from_str(&line)
+            .map_err(|error| AppError::Protocol(format!("failed to decode response: {error}")))
+    }
+
+    fn connect(&self) -> Result<DaemonConnection> {
+        let stream = TcpStream::connect(&self.addr)?;
+        let reader = BufReader::new(stream.try_clone()?);
+        let writer = BufWriter::new(stream);
+        Ok(DaemonConnection { reader, writer })
     }
 
     pub fn open_repo(&self, params: OpenRepoParams) -> Result<Response> {
