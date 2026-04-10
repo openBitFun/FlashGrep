@@ -3,9 +3,9 @@ use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, Output, Stdio},
     thread,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use crc32fast::Hasher;
@@ -26,6 +26,7 @@ use crate::{
 const INDEX_BUILD_BATCH_SIZE: usize = 512;
 const INDEX_BUILD_BUCKET_COUNT: usize = 256;
 const BUCKET_RECORD_BYTES: usize = 12;
+const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 
 /// Build-time hooks for optional progress reporting and cancellation.
 ///
@@ -97,7 +98,7 @@ where
         0,
         None,
     );
-    let snapshot = resolve_base_snapshot(&config)?;
+    let snapshot = resolve_base_snapshot(&config, &mut should_cancel)?;
     ensure_dir(&config.index_path)?;
     ensure_dir(&IndexLayout::generations_dir(&config.index_path))?;
 
@@ -282,8 +283,13 @@ fn build_dirty_head_index(
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<()> {
     check_cancel(should_cancel)?;
-    let checkout = materialize_head_checkout(&config.repo_path, head_commit)?;
-    let dirty_paths = dirty_tracked_paths(&config.repo_path, &config.index_path, head_commit)?;
+    let checkout = materialize_head_checkout(&config.repo_path, head_commit, should_cancel)?;
+    let dirty_paths = dirty_tracked_paths(
+        &config.repo_path,
+        &config.index_path,
+        head_commit,
+        should_cancel,
+    )?;
     report_progress(
         on_progress,
         IndexProgressPhase::Scanning,
@@ -943,12 +949,16 @@ fn existing_doc_count(layout: &IndexLayout) -> Result<usize> {
     Ok(docs.len())
 }
 
-fn resolve_base_snapshot(config: &BuildConfig) -> Result<BaseSnapshot> {
+fn resolve_base_snapshot(
+    config: &BuildConfig,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<BaseSnapshot> {
     let config_fingerprint = build_config_fingerprint(config);
-    match resolve_git_head(&config.repo_path)? {
+    match resolve_git_head(&config.repo_path, should_cancel)? {
         Some(head_commit) => {
             let generation = format!("base-git-{head_commit}-{config_fingerprint}");
-            let worktree_dirty = git_worktree_dirty(&config.repo_path, &config.index_path)?;
+            let worktree_dirty =
+                git_worktree_dirty(&config.repo_path, &config.index_path, should_cancel)?;
             Ok(BaseSnapshot {
                 generation,
                 head_commit: Some(head_commit),
@@ -968,12 +978,11 @@ fn resolve_base_snapshot(config: &BuildConfig) -> Result<BaseSnapshot> {
     }
 }
 
-pub(crate) fn resolve_git_head(repo_root: &Path) -> Result<Option<String>> {
-    let output = Command::new("git")
-        .arg("-C")
-        .arg(repo_root)
-        .args(["rev-parse", "--verify", "HEAD"])
-        .output()?;
+pub(crate) fn resolve_git_head(
+    repo_root: &Path,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Option<String>> {
+    let output = run_git_command(repo_root, ["rev-parse", "--verify", "HEAD"], should_cancel)?;
     if !output.status.success() {
         return Ok(None);
     }
@@ -985,7 +994,11 @@ pub(crate) fn resolve_git_head(repo_root: &Path) -> Result<Option<String>> {
     Ok(Some(head_commit))
 }
 
-fn git_worktree_dirty(repo_root: &Path, index_path: &Path) -> Result<bool> {
+fn git_worktree_dirty(
+    repo_root: &Path,
+    index_path: &Path,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<bool> {
     let mut command = Command::new("git");
     command.arg("-C").arg(repo_root).args([
         "status",
@@ -997,7 +1010,7 @@ fn git_worktree_dirty(repo_root: &Path, index_path: &Path) -> Result<bool> {
     if let Some(pathspec) = index_exclude_pathspec(repo_root, index_path) {
         command.arg(pathspec);
     }
-    let output = command.output()?;
+    let output = run_command_with_cancellation(&mut command, should_cancel)?;
     if !output.status.success() {
         return Err(AppError::InvalidIndex(format!(
             "failed to inspect git worktree state for {}",
@@ -1023,6 +1036,7 @@ fn dirty_tracked_paths(
     repo_root: &Path,
     index_path: &Path,
     head_commit: &str,
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<HashSet<String>> {
     let mut command = Command::new("git");
     command
@@ -1032,7 +1046,7 @@ fn dirty_tracked_paths(
     if let Some(pathspec) = index_exclude_pathspec(repo_root, index_path) {
         command.arg(pathspec);
     }
-    let output = command.output()?;
+    let output = run_command_with_cancellation(&mut command, should_cancel)?;
     if !output.status.success() {
         return Err(AppError::InvalidIndex(format!(
             "failed to diff worktree against {head_commit} for {}",
@@ -1051,6 +1065,7 @@ fn dirty_tracked_paths(
 fn materialize_head_checkout(
     repo_root: &Path,
     head_commit: &str,
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<MaterializedHeadCheckout> {
     let checkout = MaterializedHeadCheckout::new()?;
     fs::create_dir_all(checkout.root.join(".git"))?;
@@ -1062,6 +1077,7 @@ fn materialize_head_checkout(
             "failed to load git tree {head_commit} from {} into a temporary index",
             repo_root.display()
         ),
+        should_cancel,
     )?;
     run_git_with_temp_index(
         repo_root,
@@ -1077,6 +1093,7 @@ fn materialize_head_checkout(
             "failed to materialize git tree {head_commit} into {}",
             checkout.root.display()
         ),
+        should_cancel,
     )?;
     Ok(checkout)
 }
@@ -1086,13 +1103,15 @@ fn run_git_with_temp_index<const N: usize>(
     index_path: &Path,
     args: [&str; N],
     error_message: &str,
+    should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<()> {
-    let output = Command::new("git")
+    let mut command = Command::new("git");
+    command
         .arg("-C")
         .arg(repo_root)
         .env("GIT_INDEX_FILE", index_path)
-        .args(args)
-        .output()?;
+        .args(args);
+    let output = run_command_with_cancellation(&mut command, should_cancel)?;
     if output.status.success() {
         return Ok(());
     }
@@ -1102,6 +1121,44 @@ fn run_git_with_temp_index<const N: usize>(
         return Err(AppError::InvalidIndex(error_message.to_string()));
     }
     Err(AppError::InvalidIndex(format!("{error_message}: {stderr}")))
+}
+
+fn run_git_command<const N: usize>(
+    repo_root: &Path,
+    args: [&str; N],
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Output> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_root).args(args);
+    run_command_with_cancellation(&mut command, should_cancel)
+}
+
+fn run_command_with_cancellation(
+    command: &mut Command,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Output> {
+    check_cancel(should_cancel)?;
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    loop {
+        check_child_cancelled(&mut child, should_cancel)?;
+        if child.try_wait()?.is_some() {
+            return Ok(child.wait_with_output()?);
+        }
+        thread::sleep(CANCEL_POLL_INTERVAL);
+    }
+}
+
+fn check_child_cancelled(
+    child: &mut Child,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    if should_cancel() {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(AppError::Cancelled);
+    }
+    Ok(())
 }
 
 fn worktree_file_identity(path: &Path) -> Result<Option<(u64, u64)>> {

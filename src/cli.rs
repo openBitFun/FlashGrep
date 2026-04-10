@@ -105,6 +105,8 @@ struct ServeArgs {
     bind: String,
     #[arg(long)]
     state_file: Option<PathBuf>,
+    #[arg(long, default_value_t = false)]
+    stdio: bool,
 }
 
 #[derive(Debug, Args)]
@@ -357,6 +359,7 @@ fn run_serve(args: ServeArgs) -> Result<bool> {
     serve(ServerOptions {
         bind_addr: args.bind,
         state_file: args.state_file,
+        stdio: args.stdio,
     })?;
     Ok(true)
 }

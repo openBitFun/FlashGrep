@@ -15,10 +15,11 @@ use super::{
     cache::{collect_cache_paths_for_target, prepare_sample, sanitize_benchmark_name},
     configure_rg_command,
     fixtures::prepare_dirty_worktree_fixture,
+    prepare_rg_search_scope,
     report::{build_summary, mean_usize, RawSample, RawWriter},
     run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchQueryMode,
     BenchReport, CorpusBuildRecord, CustomBenchmarkCase, CustomBenchmarkTrace, DirtyPattern,
-    DirtyWorktreeFixture,
+    DirtyWorktreeFixture, RgSearchScope,
 };
 
 pub(super) fn run_custom(
@@ -73,6 +74,7 @@ pub(super) fn run_custom(
     } else {
         None
     };
+    let rg_scope = prepare_rg_search_scope(repo_path, &index_path, config)?;
     let dirty_fixture = if config.compare_worktree {
         let patterns = config
             .custom_patterns
@@ -113,6 +115,7 @@ pub(super) fn run_custom(
         if config.compare_rg {
             runners.push(run_rg_custom_trace_benchmark(
                 &benchmark,
+                &rg_scope,
                 cache_paths.as_ref(),
                 config,
                 raw_writer.as_deref_mut(),
@@ -167,6 +170,7 @@ pub(super) fn run_custom(
             if config.compare_rg {
                 runners.push(run_rg_custom_benchmark(
                     &benchmark,
+                    &rg_scope,
                     cache_paths.as_ref(),
                     config,
                     raw_writer.as_deref_mut(),
@@ -344,6 +348,7 @@ fn run_codgrep_custom_daemon_once(
 
 fn run_rg_custom_benchmark(
     benchmark: &CustomBenchmarkCase,
+    scope: &RgSearchScope,
     cache_paths: Option<&BenchCachePaths>,
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
@@ -353,7 +358,7 @@ fn run_rg_custom_benchmark(
     for _ in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
         let _ = run_rg_custom_once(
-            &benchmark.repo_path,
+            scope,
             &benchmark.pattern,
             benchmark.case_insensitive,
             config,
@@ -363,7 +368,7 @@ fn run_rg_custom_benchmark(
         prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
         let started = Instant::now();
         match_count = run_rg_custom_once(
-            &benchmark.repo_path,
+            scope,
             &benchmark.pattern,
             benchmark.case_insensitive,
             config,
@@ -387,6 +392,7 @@ fn run_rg_custom_benchmark(
 
 fn run_rg_custom_trace_benchmark(
     benchmark: &CustomBenchmarkTrace,
+    scope: &RgSearchScope,
     cache_paths: Option<&BenchCachePaths>,
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
@@ -396,23 +402,13 @@ fn run_rg_custom_trace_benchmark(
     for iter in 0..config.warmup_iter {
         prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
         let pattern = benchmark.pattern_at(iter);
-        let _ = run_rg_custom_once(
-            &benchmark.repo_path,
-            pattern,
-            benchmark.case_insensitive,
-            config,
-        )?;
+        let _ = run_rg_custom_once(scope, pattern, benchmark.case_insensitive, config)?;
     }
     for iter in 0..config.bench_iter {
         prepare_sample(super::CacheRunner::Rg, cache_paths, config)?;
         let pattern = benchmark.pattern_at(iter);
         let started = Instant::now();
-        let match_count = run_rg_custom_once(
-            &benchmark.repo_path,
-            pattern,
-            benchmark.case_insensitive,
-            config,
-        )?;
+        let match_count = run_rg_custom_once(scope, pattern, benchmark.case_insensitive, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
         total_match_count += match_count;
         durations.push(duration_secs);
@@ -437,7 +433,7 @@ fn run_rg_custom_trace_benchmark(
 }
 
 fn run_rg_custom_once(
-    repo_path: &Path,
+    scope: &RgSearchScope,
     pattern: &str,
     case_insensitive: bool,
     config: &BenchConfig,
@@ -447,8 +443,15 @@ fn run_rg_custom_once(
     if case_insensitive {
         command.arg("-i");
     }
+    if let Some(current_dir) = scope.current_dir.as_ref() {
+        command.current_dir(current_dir);
+    }
+    if let Some(ignore_file) = scope.ignore_file.as_ref() {
+        command.arg("--ignore-file");
+        command.arg(ignore_file);
+    }
     command.arg(pattern);
-    command.arg(repo_path);
+    command.arg(&scope.target);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::null());
 

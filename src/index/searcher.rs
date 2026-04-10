@@ -288,9 +288,13 @@ impl IndexSearcher {
         let plan = plan(&config.regex_pattern)?;
         profile.record_plan(plan_started.elapsed());
 
-        if let Some(results) =
-            self.try_search_with_rg_scan_backend(config, &plan, filter, allowed_paths, excluded_paths)?
-        {
+        if let Some(results) = self.try_search_with_rg_scan_backend(
+            config,
+            &plan,
+            filter,
+            allowed_paths,
+            excluded_paths,
+        )? {
             profile.finish(
                 total_started.elapsed(),
                 results.candidate_docs,
@@ -982,7 +986,10 @@ impl IndexSearcher {
         excluded_paths: Option<&HashSet<String>>,
     ) -> Result<bool> {
         if !cfg!(target_os = "linux")
-            || !matches!(config.search_mode, SearchMode::CountOnly | SearchMode::CountMatches)
+            || !matches!(
+                config.search_mode,
+                SearchMode::CountOnly | SearchMode::CountMatches
+            )
             || config.has_context()
             || config.max_count.is_some()
             || config.multiline
@@ -1074,7 +1081,9 @@ impl IndexSearcher {
         }
 
         if let Some(build) = self.build_settings() {
-            command.arg("--max-filesize").arg(build.max_file_size.to_string());
+            command
+                .arg("--max-filesize")
+                .arg(build.max_file_size.to_string());
             if matches!(build.corpus_mode, crate::config::CorpusMode::NoIgnore) {
                 command.arg("--no-ignore");
             }

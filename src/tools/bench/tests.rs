@@ -3,10 +3,12 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::{
-    benchmark_scope_roots, copy_tree, parse_rg_count_output, run, BenchCacheMode, BenchConfig,
+    bench_build_config, benchmark_scope_roots, copy_tree, parse_rg_count_output,
+    prepare_rg_search_scope, run, BenchCacheMode, BenchConfig,
 };
 use super::{fixtures::prepare_dirty_worktree_fixture, DirtyPattern};
 use crate::config::{CorpusMode, TokenizerMode};
+use crate::index::build_index;
 use crate::tools::bench::report::render_report;
 
 #[test]
@@ -341,6 +343,97 @@ fn bench_runner_supports_custom_repo_patterns() {
         .runners
         .iter()
         .any(|runner| runner.runner == "codgrep"));
+}
+
+#[test]
+fn bench_rg_runner_uses_indexed_text_scope_for_custom_repo() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path().join("suite");
+    let repo_dir = temp.path().join("repo");
+
+    fs::create_dir_all(&suite_dir).expect("test should succeed");
+    fs::create_dir_all(&repo_dir).expect("test should succeed");
+    fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+    fs::write(repo_dir.join("latin1.txt"), b"BitFun\xff\n").expect("test should succeed");
+
+    let report = run(&BenchConfig {
+        suite_dir,
+        filter: None,
+        custom_repo: Some(repo_dir),
+        custom_patterns: vec!["BitFun".into()],
+        custom_name: Some("codgrep-custom-rg-scope".into()),
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_rg: true,
+        compare_worktree: false,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    })
+    .expect("test should succeed");
+
+    let summary = &report.summaries[0];
+    let codgrep = summary
+        .runners
+        .iter()
+        .find(|runner| runner.runner == "codgrep")
+        .expect("test should succeed");
+    let rg = summary
+        .runners
+        .iter()
+        .find(|runner| runner.runner == "rg")
+        .expect("test should succeed");
+    assert_eq!(codgrep.match_count, 1);
+    assert_eq!(rg.match_count, 1);
+}
+
+#[test]
+fn prepare_rg_search_scope_excludes_non_indexed_files() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path().join("suite");
+    let repo_dir = temp.path().join("repo");
+    let index_path = temp.path().join("index");
+
+    fs::create_dir_all(&suite_dir).expect("test should succeed");
+    fs::create_dir_all(&repo_dir).expect("test should succeed");
+    fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+    fs::write(repo_dir.join("latin1.txt"), b"BitFun\xff\n").expect("test should succeed");
+
+    let config = BenchConfig {
+        suite_dir,
+        filter: None,
+        custom_repo: Some(repo_dir.clone()),
+        custom_patterns: vec!["BitFun".into()],
+        custom_name: Some("codgrep-custom-rg-scope".into()),
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::Trigram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Trace,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_rg: true,
+        compare_worktree: false,
+        worktree_sample_files: None,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    };
+    build_index(&bench_build_config(&repo_dir, &index_path, &config)).expect("test should succeed");
+
+    let scope =
+        prepare_rg_search_scope(&repo_dir, &index_path, &config).expect("test should succeed");
+    let ignore_file = scope.ignore_file.expect("test should succeed");
+    let ignore_contents = fs::read_to_string(ignore_file).expect("test should succeed");
+    assert!(ignore_contents.contains("/latin1.txt\n"));
 }
 
 #[test]

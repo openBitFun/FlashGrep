@@ -1,9 +1,17 @@
 use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
+
+fn default_jsonrpc_version() -> String {
+    "2.0".to_string()
+}
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RequestEnvelope {
+    #[serde(default = "default_jsonrpc_version")]
+    pub jsonrpc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
     #[serde(flatten)]
     pub request: Request,
@@ -12,20 +20,88 @@ pub struct RequestEnvelope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum Request {
-    OpenRepo { params: OpenRepoParams },
-    EnsureRepo { params: EnsureRepoParams },
-    GetRepoStatus { params: RepoRef },
-    RefreshRepo { params: RefreshRepoParams },
-    BuildIndex { params: RepoRef },
-    RebuildIndex { params: RepoRef },
-    Search { params: SearchParams },
-    CloseRepo { params: RepoRef },
+    Initialize {
+        params: InitializeParams,
+    },
+    Initialized,
+    Ping,
+    #[serde(rename = "index/build")]
+    IndexBuild {
+        params: RepoRef,
+    },
+    #[serde(rename = "index/rebuild")]
+    IndexRebuild {
+        params: RepoRef,
+    },
+    #[serde(rename = "task/status")]
+    TaskStatus {
+        params: TaskRef,
+    },
+    #[serde(rename = "task/cancel")]
+    TaskCancel {
+        params: TaskRef,
+    },
+    OpenRepo {
+        params: OpenRepoParams,
+    },
+    EnsureRepo {
+        params: EnsureRepoParams,
+    },
+    GetRepoStatus {
+        params: RepoRef,
+    },
+    RefreshRepo {
+        params: RefreshRepoParams,
+    },
+    BuildIndex {
+        params: RepoRef,
+    },
+    RebuildIndex {
+        params: RepoRef,
+    },
+    Search {
+        params: SearchParams,
+    },
+    CloseRepo {
+        params: RepoRef,
+    },
     Shutdown,
+    Exit,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct InitializeParams {
+    #[serde(default)]
+    pub client_info: Option<ClientInfo>,
+    #[serde(default)]
+    pub capabilities: ClientCapabilities,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ClientInfo {
+    pub name: String,
+    #[serde(default)]
+    pub version: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, Default)]
+pub struct ClientCapabilities {
+    #[serde(default)]
+    pub progress: bool,
+    #[serde(default)]
+    pub status_notifications: bool,
+    #[serde(default)]
+    pub task_notifications: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoRef {
     pub repo_id: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskRef {
+    pub task_id: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -193,27 +269,83 @@ pub enum ConsistencyMode {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct ResponseEnvelope {
+    #[serde(default = "default_jsonrpc_version")]
+    pub jsonrpc: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub id: Option<u64>,
-    #[serde(flatten)]
-    pub payload: ResponsePayload,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result: Option<Response>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error: Option<ErrorResponse>,
+}
+
+impl ResponseEnvelope {
+    pub fn success(id: Option<u64>, result: Response) -> Self {
+        Self {
+            jsonrpc: default_jsonrpc_version(),
+            id,
+            result: Some(result),
+            error: None,
+        }
+    }
+
+    pub fn error(id: Option<u64>, error: ErrorResponse) -> Self {
+        Self {
+            jsonrpc: default_jsonrpc_version(),
+            id,
+            result: None,
+            error: Some(error),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "status", rename_all = "snake_case")]
-pub enum ResponsePayload {
-    Ok { result: Response },
-    Error { error: ErrorResponse },
+pub struct NotificationEnvelope {
+    #[serde(default = "default_jsonrpc_version")]
+    pub jsonrpc: String,
+    #[serde(flatten)]
+    pub notification: Notification,
+}
+
+impl NotificationEnvelope {
+    pub fn new(notification: Notification) -> Self {
+        Self {
+            jsonrpc: default_jsonrpc_version(),
+            notification,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum ServerMessage {
+    Response(ResponseEnvelope),
+    Notification(NotificationEnvelope),
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ErrorResponse {
+    pub code: i64,
     pub message: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub data: Option<Value>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum Response {
+    InitializeResult {
+        protocol_version: u32,
+        server_info: ServerInfo,
+        capabilities: ServerCapabilities,
+        search: SearchProtocolCapabilities,
+    },
+    InitializedAck,
+    Pong {
+        now_unix_secs: u64,
+    },
     RepoOpened {
         repo_id: String,
         status: RepoStatus,
@@ -225,6 +357,16 @@ pub enum Response {
     },
     RepoStatus {
         status: RepoStatus,
+    },
+    TaskStarted {
+        task: TaskStatus,
+    },
+    TaskStatus {
+        task: TaskStatus,
+    },
+    TaskCancelled {
+        task_id: String,
+        accepted: bool,
     },
     RepoBuilt {
         indexed_docs: usize,
@@ -245,6 +387,69 @@ pub enum Response {
         repo_id: String,
     },
     ShutdownAck,
+    ExitAck,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerInfo {
+    pub name: String,
+    pub version: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ServerCapabilities {
+    pub workspace_open: bool,
+    pub workspace_ensure: bool,
+    pub workspace_list: bool,
+    pub workspace_refresh: bool,
+    pub index_build: bool,
+    pub index_rebuild: bool,
+    pub task_status: bool,
+    pub task_cancel: bool,
+    pub search_query: bool,
+    pub progress_notifications: bool,
+    pub status_notifications: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SearchProtocolCapabilities {
+    pub consistency_modes: Vec<ConsistencyMode>,
+    pub search_modes: Vec<SearchModeConfig>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "method")]
+pub enum Notification {
+    #[serde(rename = "$/progress")]
+    Progress { params: ProgressNotificationParams },
+    #[serde(rename = "workspace/statusChanged")]
+    WorkspaceStatusChanged {
+        params: WorkspaceStatusChangedParams,
+    },
+    #[serde(rename = "task/finished")]
+    TaskFinished { params: TaskFinishedParams },
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProgressNotificationParams {
+    pub task_id: String,
+    pub workspace_id: String,
+    pub kind: TaskKind,
+    pub phase: Option<TaskPhase>,
+    pub message: String,
+    pub processed: usize,
+    pub total: Option<usize>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceStatusChangedParams {
+    pub workspace_id: String,
+    pub status: RepoStatus,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskFinishedParams {
+    pub task: TaskStatus,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -258,12 +463,15 @@ pub struct RepoStatus {
     pub last_rebuild_unix_secs: Option<u64>,
     pub dirty_files: DirtyFileStats,
     pub rebuild_recommended: bool,
+    pub active_task_id: Option<String>,
+    pub watcher_healthy: bool,
     pub last_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoPhase {
+    Opening,
     MissingIndex,
     Indexing,
     ReadyClean,
@@ -279,12 +487,58 @@ pub struct DirtyFileStats {
     pub new: usize,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TaskStatus {
+    pub task_id: String,
+    pub workspace_id: String,
+    pub kind: TaskKind,
+    pub state: TaskState,
+    pub phase: Option<TaskPhase>,
+    pub message: String,
+    pub processed: usize,
+    pub total: Option<usize>,
+    pub started_unix_secs: u64,
+    pub updated_unix_secs: u64,
+    pub finished_unix_secs: Option<u64>,
+    pub cancellable: bool,
+    pub error: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskKind {
+    BuildIndex,
+    RebuildIndex,
+    RefreshWorkspace,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskState {
+    Queued,
+    Running,
+    Completed,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TaskPhase {
+    Scanning,
+    Tokenizing,
+    Writing,
+    Finalizing,
+    RefreshingOverlay,
+}
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchBackend {
     IndexedSnapshot,
     IndexedClean,
     IndexedWorkspaceRepair,
+    RgFallback,
     ScanFallback,
 }
 

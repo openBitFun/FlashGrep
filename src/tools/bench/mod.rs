@@ -7,7 +7,7 @@ mod standard;
 mod tests;
 
 use std::{
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     env, fs,
     path::{Path, PathBuf},
     process::Command,
@@ -23,6 +23,7 @@ use crate::{
         DaemonClient, ManagedDaemonClient,
     },
     error::{AppError, Result},
+    files::{repo_relative_path, scan_repository},
     index::{build_index, IndexSearcher},
 };
 
@@ -239,6 +240,13 @@ struct DirtyWorktreeFixture {
     build_cache_paths: Option<BenchCachePaths>,
 }
 
+#[derive(Debug, Clone)]
+pub(super) struct RgSearchScope {
+    current_dir: Option<PathBuf>,
+    target: PathBuf,
+    ignore_file: Option<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy)]
 enum CacheRunner {
     Bitfun,
@@ -426,6 +434,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
         .map(|case| case.corpus)
         .collect::<std::collections::BTreeSet<_>>();
     let mut index_paths = BTreeMap::new();
+    let mut rg_scopes = BTreeMap::new();
     let mut cache_paths = BTreeMap::new();
     let mut dirty_worktree_fixtures = BTreeMap::new();
     let mut corpus_builds = Vec::new();
@@ -454,6 +463,10 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
                 duration_secs: started.elapsed().as_secs_f64(),
             });
         }
+        rg_scopes.insert(
+            corpus,
+            prepare_rg_search_scope(&repo_path, &index_path, config)?,
+        );
         let cache_entry = if config.cache_mode.is_cold() {
             Some(collect_cache_paths(
                 corpus,
@@ -512,9 +525,15 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
         )?];
 
         if config.compare_rg {
+            let rg_scope = rg_scopes.get(&benchmark.corpus).ok_or_else(|| {
+                AppError::InvalidIndex(format!(
+                    "missing rg scope for corpus {}",
+                    benchmark.corpus.label()
+                ))
+            })?;
             runners.push(run_rg_benchmark(
                 benchmark,
-                &config.suite_dir,
+                rg_scope,
                 cache_paths,
                 config,
                 raw_writer.as_mut(),
@@ -650,6 +669,79 @@ fn parse_rg_count_output(stdout: &[u8]) -> Result<usize> {
         total += count;
     }
     Ok(total)
+}
+
+pub(super) fn prepare_rg_search_scope(
+    repo_path: &Path,
+    index_path: &Path,
+    config: &BenchConfig,
+) -> Result<RgSearchScope> {
+    if repo_path.is_dir() {
+        return Ok(RgSearchScope {
+            current_dir: Some(repo_path.to_path_buf()),
+            target: PathBuf::from("."),
+            ignore_file: prepare_rg_ignore_file(repo_path, index_path, config)?,
+        });
+    }
+
+    Ok(RgSearchScope {
+        current_dir: None,
+        target: repo_path.to_path_buf(),
+        ignore_file: None,
+    })
+}
+
+fn prepare_rg_ignore_file(
+    repo_path: &Path,
+    index_path: &Path,
+    config: &BenchConfig,
+) -> Result<Option<PathBuf>> {
+    let repo_root = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
+    let indexed = IndexSearcher::open(index_path.to_path_buf())?
+        .indexed_paths(None)
+        .into_iter()
+        .map(|path| canonical_repo_relative_path(Path::new(&path), &repo_root))
+        .collect::<HashSet<_>>();
+    let excluded = scan_repository(&bench_build_config(repo_path, index_path, config))?
+        .into_iter()
+        .filter_map(|file| {
+            let rel = canonical_repo_relative_path(&file.path, &repo_root);
+            (!indexed.contains(&rel)).then_some(rel)
+        })
+        .collect::<Vec<_>>();
+    if excluded.is_empty() {
+        return Ok(None);
+    }
+
+    fs::create_dir_all(index_path)?;
+    let ignore_path = index_path.join("bench-rg-exclude.ignore");
+    let mut contents = String::new();
+    for path in excluded {
+        contents.push('/');
+        contents.push_str(&escape_ignore_pattern(&path));
+        contents.push('\n');
+    }
+    fs::write(&ignore_path, contents)?;
+    Ok(Some(ignore_path))
+}
+
+fn canonical_repo_relative_path(path: &Path, repo_root: &Path) -> String {
+    let canonical = fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    repo_relative_path(&canonical, repo_root)
+}
+
+fn escape_ignore_pattern(path: &str) -> String {
+    let mut escaped = String::with_capacity(path.len());
+    for ch in path.chars() {
+        match ch {
+            '\\' | '*' | '?' | '[' | ']' | '{' | '}' => {
+                escaped.push('\\');
+                escaped.push(ch);
+            }
+            _ => escaped.push(ch),
+        }
+    }
+    escaped
 }
 
 fn codgrep_executable() -> Result<PathBuf> {

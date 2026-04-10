@@ -63,11 +63,9 @@ impl VerifyPlan {
     where
         F: Fn(u32) -> Result<PathBuf> + Sync,
     {
-        self.verify_candidate_count_stats_with_sources(
-            candidate_ids,
-            doc_count,
-            &|doc_id| resolve_path(doc_id).map(VerifyCandidateSource::Path),
-        )
+        self.verify_candidate_count_stats_with_sources(candidate_ids, doc_count, &|doc_id| {
+            resolve_path(doc_id).map(VerifyCandidateSource::Path)
+        })
     }
 
     pub(crate) fn verify_candidate_count_stats_with_sources<F>(

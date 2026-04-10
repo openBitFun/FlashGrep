@@ -11,7 +11,7 @@ use super::{
     configure_rg_command,
     report::{build_summary, RawSample, RawWriter},
     run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchmarkCase,
-    BitfunOutcome, CacheRunner, RunnerSummary,
+    BitfunOutcome, CacheRunner, RgSearchScope, RunnerSummary,
 };
 
 pub(super) fn run_codgrep_benchmark(
@@ -63,24 +63,23 @@ pub(super) fn run_codgrep_benchmark(
 
 pub(super) fn run_rg_benchmark(
     benchmark: BenchmarkCase,
-    suite_dir: &Path,
+    scope: &RgSearchScope,
     cache_paths: Option<&BenchCachePaths>,
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<RunnerSummary> {
-    let target = benchmark.corpus.search_target(suite_dir);
     let mut durations = Vec::with_capacity(config.bench_iter);
     let mut match_count = 0;
 
     for _ in 0..config.warmup_iter {
         prepare_sample(CacheRunner::Rg, cache_paths, config)?;
-        let _ = run_rg_once(benchmark, &target, config)?;
+        let _ = run_rg_once(benchmark, scope, config)?;
     }
 
     for iter in 0..config.bench_iter {
         prepare_sample(CacheRunner::Rg, cache_paths, config)?;
         let started = Instant::now();
-        let matches = run_rg_once(benchmark, &target, config)?;
+        let matches = run_rg_once(benchmark, scope, config)?;
         let duration_secs = started.elapsed().as_secs_f64();
         match_count = matches;
         durations.push(duration_secs);
@@ -174,14 +173,25 @@ pub(super) fn run_worktree_benchmark(
     ))
 }
 
-fn run_rg_once(benchmark: BenchmarkCase, target: &Path, config: &BenchConfig) -> Result<usize> {
+fn run_rg_once(
+    benchmark: BenchmarkCase,
+    scope: &RgSearchScope,
+    config: &BenchConfig,
+) -> Result<usize> {
     let mut command = Command::new("rg");
     configure_rg_command(&mut command, config);
     if benchmark.case_insensitive {
         command.arg("-i");
     }
+    if let Some(current_dir) = scope.current_dir.as_ref() {
+        command.current_dir(current_dir);
+    }
+    if let Some(ignore_file) = scope.ignore_file.as_ref() {
+        command.arg("--ignore-file");
+        command.arg(ignore_file);
+    }
     command.arg(benchmark.pattern);
-    command.arg(target);
+    command.arg(&scope.target);
     command.stdout(Stdio::piped());
     command.stderr(Stdio::null());
 

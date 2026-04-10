@@ -7,4 +7,4 @@ mod service;
 
 pub use client::DaemonClient;
 pub use managed::{daemon_state_file_path, EnsuredRepo, ManagedDaemonClient};
-pub use server::{serve, ServerOptions};
+pub use server::{serve, serve_stdio, ServerOptions};

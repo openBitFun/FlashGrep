@@ -9,7 +9,7 @@ use crate::error::{AppError, Result};
 
 use super::protocol::{
     EnsureRepoParams, OpenRepoParams, RepoRef, Request, RequestEnvelope, Response,
-    ResponseEnvelope, ResponsePayload, SearchParams,
+    ResponseEnvelope, SearchParams, TaskRef,
 };
 
 #[derive(Debug)]
@@ -37,6 +37,7 @@ impl DaemonClient {
     pub fn send(&self, request: Request) -> Result<Response> {
         let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
         let envelope = RequestEnvelope {
+            jsonrpc: "2.0".into(),
             id: Some(request_id),
             request,
         };
@@ -60,10 +61,25 @@ impl DaemonClient {
             )));
         }
 
-        match response.payload {
-            ResponsePayload::Ok { result } => Ok(result),
-            ResponsePayload::Error { error } => Err(AppError::Protocol(error.message)),
+        let ResponseEnvelope {
+            jsonrpc,
+            result,
+            error,
+            ..
+        } = response;
+
+        if jsonrpc != "2.0" {
+            return Err(AppError::Protocol(format!(
+                "unsupported daemon jsonrpc version: {}",
+                jsonrpc
+            )));
         }
+
+        if let Some(error) = error {
+            return Err(AppError::Protocol(error.message));
+        }
+
+        result.ok_or_else(|| AppError::Protocol("daemon response missing result".into()))
     }
 
     fn send_with_connection(
@@ -122,5 +138,37 @@ impl DaemonClient {
 
     pub fn search(&self, params: SearchParams) -> Result<Response> {
         self.send(Request::Search { params })
+    }
+
+    pub fn index_build(&self, repo_id: impl Into<String>) -> Result<Response> {
+        self.send(Request::IndexBuild {
+            params: RepoRef {
+                repo_id: repo_id.into(),
+            },
+        })
+    }
+
+    pub fn index_rebuild(&self, repo_id: impl Into<String>) -> Result<Response> {
+        self.send(Request::IndexRebuild {
+            params: RepoRef {
+                repo_id: repo_id.into(),
+            },
+        })
+    }
+
+    pub fn task_status(&self, task_id: impl Into<String>) -> Result<Response> {
+        self.send(Request::TaskStatus {
+            params: TaskRef {
+                task_id: task_id.into(),
+            },
+        })
+    }
+
+    pub fn task_cancel(&self, task_id: impl Into<String>) -> Result<Response> {
+        self.send(Request::TaskCancel {
+            params: TaskRef {
+                task_id: task_id.into(),
+            },
+        })
     }
 }

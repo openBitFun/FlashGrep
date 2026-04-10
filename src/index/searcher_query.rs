@@ -49,7 +49,11 @@ impl LiteralPrefilter {
             return None;
         }
 
-        if !plan.branches.iter().any(|branch| !branch.literals.is_empty()) {
+        if !plan
+            .branches
+            .iter()
+            .any(|branch| !branch.literals.is_empty())
+        {
             return None;
         }
 

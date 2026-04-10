@@ -17,14 +17,17 @@ use crate::{
         DirtyPathKind, IndexBuildOptions, IndexSearcher, IndexWorktreeDiff,
     },
     path_filter::PathFilter,
+    query_preflight::{evaluate_index_query_preflight, preflight_enabled},
     search::SearchResults,
-    search_engine::search_documents,
+    search_engine::{
+        search_document_index, search_documents, SearchBackend, SearchDocumentIndex,
+        SearchResponse,
+    },
     TokenizerMode,
 };
 
 use self::runtime::{
-    filter_search_documents, load_search_document, merge_search_results, overlay_search_scope,
-    scan_text_repository_files,
+    load_search_document, merge_search_results, overlay_search_scope, scan_text_repository_files,
 };
 
 /// Options for opening a [`WorkspaceIndex`].
@@ -240,11 +243,65 @@ impl WorkspaceIndex {
         }
     }
 
+    /// Searches only the current base snapshot and reuses the cached searcher when available.
+    pub fn search_snapshot_with_filter(
+        &self,
+        query: &crate::QueryConfig,
+        filter: Option<&PathFilter>,
+        allow_scan_fallback: bool,
+    ) -> Result<SearchResponse> {
+        match self.open_searcher() {
+            Ok(searcher) => {
+                let query_prefers_scan = if preflight_enabled() {
+                    let preflight =
+                        evaluate_index_query_preflight(&searcher, query, filter, None)?;
+                    preflight.reason.requires_scan_backend()
+                } else {
+                    false
+                };
+                if allow_scan_fallback && query_prefers_scan {
+                    return Ok(SearchResponse {
+                        backend: SearchBackend::Scan,
+                        results: self.scan_search_with_filter(query, filter)?,
+                    });
+                }
+                Ok(SearchResponse {
+                    backend: SearchBackend::Index,
+                    results: searcher.search_with_filter(query, filter)?,
+                })
+            }
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                if allow_scan_fallback {
+                    return Ok(SearchResponse {
+                        backend: SearchBackend::Scan,
+                        results: self.scan_search_with_filter(query, filter)?,
+                    });
+                }
+                Err(AppError::InvalidIndex(format!(
+                    "index does not exist at {}",
+                    self.inner.options.build_config.index_path.display()
+                )))
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    pub fn scan_search_with_filter(
+        &self,
+        query: &crate::QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<SearchResults> {
+        search_documents(
+            query,
+            &scan_text_repository_files(&self.inner.options.build_config, filter)?,
+        )
+    }
+
     pub(crate) fn search_with_dirty_overlay(
         &self,
         query: &crate::QueryConfig,
         shadowed_base_paths: &std::collections::HashSet<String>,
-        dirty_documents: &[crate::search_engine::SearchDocument],
+        dirty_index: &SearchDocumentIndex,
         filter: Option<&PathFilter>,
     ) -> Result<SearchResults> {
         match self.open_searcher() {
@@ -255,16 +312,14 @@ impl WorkspaceIndex {
                     None,
                     Some(shadowed_base_paths),
                 )?;
-                let filtered_dirty = filter_search_documents(dirty_documents, filter);
-                if filtered_dirty.is_empty() {
+                if dirty_index.is_empty() {
                     return Ok(base_results);
                 }
-                let dirty_results = search_documents(query, &filtered_dirty)?;
+                let dirty_results = search_document_index(query, dirty_index, filter)?;
                 Ok(merge_search_results(base_results, dirty_results))
             }
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                let filtered_dirty = filter_search_documents(dirty_documents, filter);
-                search_documents(query, &filtered_dirty)
+                search_document_index(query, dirty_index, filter)
             }
             Err(error) => Err(error),
         }
@@ -306,7 +361,10 @@ impl WorkspaceIndex {
         Ok(remaining)
     }
 
-    pub(crate) fn load_dirty_document(&self, path: &str) -> Result<Option<crate::search_engine::SearchDocument>> {
+    pub(crate) fn load_dirty_document(
+        &self,
+        path: &str,
+    ) -> Result<Option<crate::search_engine::SearchDocument>> {
         load_search_document(path.to_string(), PathBuf::from(path))
     }
 

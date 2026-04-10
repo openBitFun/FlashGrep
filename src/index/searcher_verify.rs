@@ -21,12 +21,12 @@ use crate::{
     search::{FileContext, FileMatch, MatchLocation, SearchLine, SearchMode},
 };
 
+use super::query::LinePrefilter;
 pub(crate) use super::shared::build_regex_matcher as build_matcher;
 use super::shared::{
     build_line_starts, configure_verifier_searcher, line_index_for_offset,
     trim_line_terminator_bytes, validate_doc_id, validate_doc_ids,
 };
-use super::query::LinePrefilter;
 
 const MAX_LOOK_AHEAD: usize = 128;
 const VERIFY_PARALLEL_THRESHOLD: usize = 512;
@@ -147,8 +147,7 @@ where
                 |(matcher, verifier), (ordinal, &doc_id)| {
                     validate_doc_id(doc_count, doc_id)?;
                     let source = resolve_source(doc_id)?;
-                    let outcome =
-                        verify_source(&source, matcher, line_prefilter, verifier, mode)?;
+                    let outcome = verify_source(&source, matcher, line_prefilter, verifier, mode)?;
                     Ok(SearchTaskOutcome {
                         ordinal,
                         doc_id,

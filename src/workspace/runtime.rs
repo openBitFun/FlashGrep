@@ -1,4 +1,10 @@
-use std::{collections::HashSet, fs, path::{Path, PathBuf}, sync::Arc, time::UNIX_EPOCH};
+use std::{
+    collections::HashSet,
+    fs,
+    path::PathBuf,
+    sync::Arc,
+    time::UNIX_EPOCH,
+};
 
 #[cfg(test)]
 use std::collections::BTreeMap;
@@ -192,17 +198,6 @@ pub(super) fn overlay_search_scope(
         shadowed_base_paths,
         dirty_documents,
     })
-}
-
-pub(super) fn filter_search_documents(
-    documents: &[SearchDocument],
-    filter: Option<&PathFilter>,
-) -> Vec<SearchDocument> {
-    documents
-        .iter()
-        .filter(|document| filter.is_none_or(|active| active.matches_file(Path::new(&document.logical_path))))
-        .cloned()
-        .collect()
 }
 
 pub(super) fn merge_search_results(
