@@ -11,6 +11,10 @@ use crate::{
     config::{BuildConfig, CorpusMode},
     error::Result,
     path_filter::PathFilter,
+    path_utils::{
+        normalize_lexical_path, repo_relative_path as repo_relative_path_impl,
+        resolve_repo_path as resolve_repo_path_impl,
+    },
 };
 
 #[derive(Debug, Clone)]
@@ -65,22 +69,11 @@ pub fn is_text_file(path: &Path) -> Result<bool> {
 }
 
 pub fn repo_relative_path(path: &Path, repo_root: &Path) -> String {
-    let normalized_path = normalize_lexical_path(path);
-    let normalized_root = normalize_lexical_path(repo_root);
-    normalized_path
-        .strip_prefix(&normalized_root)
-        .map(Path::to_path_buf)
-        .unwrap_or(normalized_path)
-        .to_string_lossy()
-        .into_owned()
+    repo_relative_path_impl(path, repo_root)
 }
 
 pub fn resolve_repo_path(repo_root: &Path, path: &str) -> PathBuf {
-    let candidate = Path::new(path);
-    if candidate.is_absolute() {
-        return normalize_lexical_path(candidate);
-    }
-    normalize_lexical_path(&repo_root.join(candidate))
+    resolve_repo_path_impl(repo_root, path)
 }
 
 pub fn scan_paths(
@@ -204,22 +197,6 @@ fn looks_like_text_prefix(bytes: &[u8]) -> bool {
         Ok(_) => true,
         Err(error) => error.error_len().is_none(),
     }
-}
-
-fn normalize_lexical_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
 }
 
 #[cfg(test)]

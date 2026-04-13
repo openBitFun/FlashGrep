@@ -1,10 +1,4 @@
-use std::{
-    collections::HashSet,
-    fs,
-    path::PathBuf,
-    sync::Arc,
-    time::UNIX_EPOCH,
-};
+use std::{collections::HashSet, fs, path::PathBuf, sync::Arc, time::UNIX_EPOCH};
 
 #[cfg(test)]
 use std::collections::BTreeMap;

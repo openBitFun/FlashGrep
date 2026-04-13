@@ -8,7 +8,7 @@ use std::{
 use crate::error::{AppError, Result};
 
 use super::protocol::{
-    EnsureRepoParams, OpenRepoParams, RepoRef, Request, RequestEnvelope, Response,
+    EnsureRepoParams, GlobParams, OpenRepoParams, RepoRef, Request, RequestEnvelope, Response,
     ResponseEnvelope, SearchParams, TaskRef,
 };
 
@@ -138,6 +138,10 @@ impl DaemonClient {
 
     pub fn search(&self, params: SearchParams) -> Result<Response> {
         self.send(Request::Search { params })
+    }
+
+    pub fn glob(&self, params: GlobParams) -> Result<Response> {
+        self.send(Request::Glob { params })
     }
 
     pub fn index_build(&self, repo_id: impl Into<String>) -> Result<Response> {

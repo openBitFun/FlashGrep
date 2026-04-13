@@ -1,7 +1,10 @@
+#[path = "workspace/base.rs"]
+mod base;
+#[path = "workspace/freshness.rs"]
+mod freshness;
 mod runtime;
 
 use std::{
-    fs,
     io::ErrorKind,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -12,16 +15,14 @@ use crate::{
     config::BuildConfig,
     error::{AppError, Result},
     index::{
-        build_index_with_options,
-        format::{read_docs_file, IndexLayout},
-        DirtyPathKind, IndexBuildOptions, IndexSearcher, IndexWorktreeDiff,
+        build_index_with_options, DirtyPathKind, IndexBuildOptions, IndexSearcher,
+        IndexWorktreeDiff,
     },
     path_filter::PathFilter,
     query_preflight::{evaluate_index_query_preflight, preflight_enabled},
     search::SearchResults,
     search_engine::{
-        search_document_index, search_documents, SearchBackend, SearchDocumentIndex,
-        SearchResponse,
+        search_document_index, search_documents, SearchBackend, SearchDocumentIndex, SearchResponse,
     },
     TokenizerMode,
 };
@@ -128,6 +129,17 @@ pub struct WorkspaceIndex {
     inner: Arc<WorkspaceIndexInner>,
 }
 
+/// Read-only workspace query view pinned to one base snapshot and dirty path set.
+///
+/// The dirty path set is captured when the snapshot is created. Matching still
+/// reads the current on-disk contents for those paths at query time.
+#[derive(Clone)]
+pub struct WorkspaceSnapshot {
+    searcher: Arc<IndexSearcher>,
+    dirty: IndexWorktreeDiff,
+    base_snapshot_key: String,
+}
+
 struct WorkspaceIndexInner {
     options: WorkspaceIndexOptions,
     cached_searcher: Mutex<Option<CachedBaseSearcher>>,
@@ -210,6 +222,54 @@ impl WorkspaceIndex {
         self.probe_freshness()
     }
 
+    /// Searches the current effective workspace view.
+    ///
+    /// This resolves the current dirty diff on demand and searches against
+    /// `base snapshot + current dirty files repaired`.
+    pub fn search(&self, query: &crate::QueryConfig) -> Result<SearchResults> {
+        self.search_with_filter(query, None)
+    }
+
+    /// Searches the current effective workspace view with an optional path filter.
+    pub fn search_with_filter(
+        &self,
+        query: &crate::QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<SearchResults> {
+        match self.open_searcher() {
+            Ok(searcher) => {
+                let dirty = searcher.diff_against_worktree()?;
+                search_workspace_view(&searcher, query, &dirty, filter)
+            }
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                self.scan_search_with_filter(query, filter)
+            }
+            Err(error) => Err(error),
+        }
+    }
+
+    /// Captures a reusable read-only workspace view pinned to the current base
+    /// snapshot and dirty path set.
+    pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
+        let searcher = match self.open_searcher() {
+            Ok(searcher) => searcher,
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                return Err(AppError::InvalidIndex(format!(
+                    "index does not exist at {}",
+                    self.inner.options.build_config.index_path.display()
+                )));
+            }
+            Err(error) => return Err(error),
+        };
+        let dirty = searcher.diff_against_worktree()?;
+        let base_snapshot_key = self.current_snapshot_key_on_disk()?;
+        Ok(WorkspaceSnapshot {
+            searcher,
+            dirty,
+            base_snapshot_key,
+        })
+    }
+
     /// Searches against the base snapshot plus a caller-maintained dirty overlay diff.
     pub fn search_with_dirty_diff(
         &self,
@@ -218,23 +278,7 @@ impl WorkspaceIndex {
         filter: Option<&PathFilter>,
     ) -> Result<SearchResults> {
         match self.open_searcher() {
-            Ok(searcher) => {
-                if dirty.is_empty() {
-                    return searcher.search_with_filter(query, filter);
-                }
-                let scope = overlay_search_scope(dirty, filter)?;
-                let base_results = searcher.search_with_path_overrides(
-                    query,
-                    filter,
-                    None,
-                    Some(&scope.shadowed_base_paths),
-                )?;
-                if scope.dirty_documents.is_empty() {
-                    return Ok(base_results);
-                }
-                let dirty_results = search_documents(query, &scope.dirty_documents)?;
-                Ok(merge_search_results(base_results, dirty_results))
-            }
+            Ok(searcher) => search_workspace_view(&searcher, query, dirty, filter),
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => search_documents(
                 query,
                 &scan_text_repository_files(&self.inner.options.build_config, filter)?,
@@ -253,8 +297,7 @@ impl WorkspaceIndex {
         match self.open_searcher() {
             Ok(searcher) => {
                 let query_prefers_scan = if preflight_enabled() {
-                    let preflight =
-                        evaluate_index_query_preflight(&searcher, query, filter, None)?;
+                    let preflight = evaluate_index_query_preflight(&searcher, query, filter, None)?;
                     preflight.reason.requires_scan_backend()
                 } else {
                     false
@@ -306,17 +349,7 @@ impl WorkspaceIndex {
     ) -> Result<SearchResults> {
         match self.open_searcher() {
             Ok(searcher) => {
-                let base_results = searcher.search_with_path_overrides(
-                    query,
-                    filter,
-                    None,
-                    Some(shadowed_base_paths),
-                )?;
-                if dirty_index.is_empty() {
-                    return Ok(base_results);
-                }
-                let dirty_results = search_document_index(query, dirty_index, filter)?;
-                Ok(merge_search_results(base_results, dirty_results))
+                search_workspace_overlay(&searcher, query, shadowed_base_paths, dirty_index, filter)
             }
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 search_document_index(query, dirty_index, filter)
@@ -335,6 +368,14 @@ impl WorkspaceIndex {
         match self.open_searcher() {
             Ok(searcher) => searcher.classify_dirty_path(path),
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Err(error) => Err(error),
+        }
+    }
+
+    pub(crate) fn has_indexed_path_under(&self, path: &str) -> Result<bool> {
+        match self.open_searcher() {
+            Ok(searcher) => Ok(searcher.has_indexed_path_under(path)),
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(false),
             Err(error) => Err(error),
         }
     }
@@ -367,131 +408,67 @@ impl WorkspaceIndex {
     ) -> Result<Option<crate::search_engine::SearchDocument>> {
         load_search_document(path.to_string(), PathBuf::from(path))
     }
+}
 
-    fn base_snapshot_info(&self) -> Result<BaseSnapshotInfo> {
-        let layout = IndexLayout::resolve(&self.inner.options.build_config.index_path)?;
-        let snapshot_key = self.current_snapshot_key_on_disk()?;
-        let (metadata, docs) = read_docs_file(&layout.docs_path)?;
-        let snapshot_kind = if snapshot_key.starts_with("base-git-") {
-            BaseSnapshotKind::GitCommit
-        } else if snapshot_key.starts_with("base-repo-") {
-            BaseSnapshotKind::RepositoryFallback
-        } else {
-            BaseSnapshotKind::Legacy
-        };
-        let (head_commit, config_fingerprint) = metadata
-            .build
-            .as_ref()
-            .map(|build| (build.head_commit.clone(), build.config_fingerprint.clone()))
-            .unwrap_or((None, None));
-
-        Ok(BaseSnapshotInfo {
-            snapshot_key,
-            index_path: self.inner.options.build_config.index_path.clone(),
-            repo_path: self.inner.options.build_config.repo_path.clone(),
-            tokenizer: metadata.tokenizer,
-            doc_count: docs.len(),
-            snapshot_kind,
-            head_commit,
-            config_fingerprint,
-        })
+impl WorkspaceSnapshot {
+    pub fn base_snapshot_key(&self) -> &str {
+        &self.base_snapshot_key
     }
 
-    fn open_searcher(&self) -> Result<Arc<IndexSearcher>> {
-        let snapshot_key = self.current_snapshot_key_on_disk()?;
-        let mut cached_searcher = match self.inner.cached_searcher.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(cached) = cached_searcher.as_ref() {
-            if cached.snapshot_key == snapshot_key {
-                return Ok(Arc::clone(&cached.searcher));
-            }
-        }
-
-        let searcher = Arc::new(IndexSearcher::open(
-            self.inner.options.build_config.index_path.clone(),
-        )?);
-        *cached_searcher = Some(CachedBaseSearcher {
-            snapshot_key,
-            searcher: Arc::clone(&searcher),
-        });
-        Ok(searcher)
+    pub fn dirty_diff(&self) -> &IndexWorktreeDiff {
+        &self.dirty
     }
 
-    fn current_snapshot_key_on_disk(&self) -> Result<String> {
-        let layout = IndexLayout::resolve(&self.inner.options.build_config.index_path)?;
-        let current_path = IndexLayout::current_path(&self.inner.options.build_config.index_path);
-        if current_path.exists() {
-            let generation = fs::read_to_string(current_path)?;
-            let generation = generation.trim();
-            if generation.is_empty() {
-                return Err(AppError::InvalidIndex(
-                    "base generation is missing from CURRENT".into(),
-                ));
-            }
-            return Ok(generation.to_string());
-        }
-        layout
-            .data_path
-            .file_name()
-            .map(|name| name.to_string_lossy().into_owned())
-            .ok_or_else(|| AppError::InvalidIndex("base generation is missing".into()))
+    pub fn search(&self, query: &crate::QueryConfig) -> Result<SearchResults> {
+        self.search_with_filter(query, None)
     }
 
-    fn compute_freshness_probe(&self) -> Result<WorkspaceFreshness> {
-        let checked_at = SystemTime::now();
-        let base = self.base_snapshot_info().ok();
-
-        match self.open_searcher() {
-            Ok(searcher) => {
-                let diff = searcher.diff_against_worktree()?;
-                let state = if diff.is_empty() {
-                    WorkspaceFreshnessState::Fresh
-                } else {
-                    WorkspaceFreshnessState::Stale
-                };
-                Ok(WorkspaceFreshness {
-                    checked_at,
-                    state,
-                    base_snapshot_key: base.map(|base| base.snapshot_key),
-                    modified_files: diff.modified_files.len(),
-                    deleted_files: diff.deleted_files.len(),
-                    new_files: diff.new_files.len(),
-                })
-            }
-            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                Ok(WorkspaceFreshness {
-                    checked_at,
-                    state: WorkspaceFreshnessState::MissingBaseSnapshot,
-                    base_snapshot_key: None,
-                    modified_files: 0,
-                    deleted_files: 0,
-                    new_files: 0,
-                })
-            }
-            Err(error) => Err(error),
-        }
+    pub fn search_with_filter(
+        &self,
+        query: &crate::QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<SearchResults> {
+        search_workspace_view(&self.searcher, query, &self.dirty, filter)
     }
+}
 
-    fn cache_freshness_probe(&self, probe: WorkspaceFreshness) {
-        let mut cache = match self.inner.cached_freshness.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *cache = Some(CachedFreshnessProbe {
-            captured_at: Instant::now(),
-            probe,
-        });
+fn search_workspace_view(
+    searcher: &IndexSearcher,
+    query: &crate::QueryConfig,
+    dirty: &IndexWorktreeDiff,
+    filter: Option<&PathFilter>,
+) -> Result<SearchResults> {
+    if dirty.is_empty() {
+        return searcher.search_with_filter(query, filter);
     }
+    let scope = overlay_search_scope(dirty, filter)?;
+    let base_results = searcher.search_with_path_overrides(
+        query,
+        filter,
+        None,
+        Some(&scope.shadowed_base_paths),
+    )?;
+    if scope.dirty_documents.is_empty() {
+        return Ok(base_results);
+    }
+    let dirty_results = search_documents(query, &scope.dirty_documents)?;
+    Ok(merge_search_results(base_results, dirty_results))
+}
 
-    fn clear_freshness_probe_cache(&self) {
-        let mut cache = match self.inner.cached_freshness.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *cache = None;
+fn search_workspace_overlay(
+    searcher: &IndexSearcher,
+    query: &crate::QueryConfig,
+    shadowed_base_paths: &std::collections::HashSet<String>,
+    dirty_index: &SearchDocumentIndex,
+    filter: Option<&PathFilter>,
+) -> Result<SearchResults> {
+    let base_results =
+        searcher.search_with_path_overrides(query, filter, None, Some(shadowed_base_paths))?;
+    if dirty_index.is_empty() {
+        return Ok(base_results);
     }
+    let dirty_results = search_document_index(query, dirty_index, filter)?;
+    Ok(merge_search_results(base_results, dirty_results))
 }
 
 #[cfg(test)]

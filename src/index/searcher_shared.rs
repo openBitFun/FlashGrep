@@ -1,7 +1,7 @@
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-use grep_searcher::{BinaryDetection, SearcherBuilder};
 #[cfg(not(target_os = "macos"))]
 use grep_searcher::MmapChoice;
+use grep_searcher::{BinaryDetection, SearcherBuilder};
 
 use crate::{
     config::QueryConfig,

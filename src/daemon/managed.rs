@@ -14,8 +14,8 @@ use crate::{
 
 use super::{
     client::DaemonClient,
-    protocol::{EnsureRepoParams, RepoStatus, Response, SearchParams},
-    repo::build_config_from_open,
+    convert::build_config_from_open,
+    protocol::{EnsureRepoParams, GlobParams, OpenRepoParams, RepoStatus, Response, SearchParams},
     server::read_state_file,
 };
 
@@ -36,6 +36,13 @@ pub struct EnsuredRepo {
     pub repo_id: String,
     pub status: RepoStatus,
     pub indexed_docs: Option<usize>,
+}
+
+#[derive(Debug, Clone)]
+pub struct OpenedRepo {
+    pub addr: String,
+    pub repo_id: String,
+    pub status: RepoStatus,
 }
 
 impl Default for ManagedDaemonClient {
@@ -111,11 +118,61 @@ impl ManagedDaemonClient {
         }
     }
 
+    pub fn open_repo(&self, params: OpenRepoParams) -> Result<OpenedRepo> {
+        let state_file = daemon_state_file_path_from_open(&params)?;
+        let lock_file = daemon_start_lock_file_path(&state_file);
+        if let Ok(repo) = self.try_open_repo(&state_file, &params) {
+            return Ok(repo);
+        }
+
+        let started = Instant::now();
+        loop {
+            if let Ok(repo) = self.try_open_repo(&state_file, &params) {
+                return Ok(repo);
+            }
+
+            if let Some(_guard) =
+                self.try_acquire_startup_lock(&lock_file, MIN_STALE_STARTUP_LOCK_AGE)?
+            {
+                if let Ok(repo) = self.try_open_repo(&state_file, &params) {
+                    return Ok(repo);
+                }
+                self.spawn_daemon(&state_file)?;
+                loop {
+                    match self.try_open_repo(&state_file, &params) {
+                        Ok(repo) => return Ok(repo),
+                        Err(error) if started.elapsed() < self.start_timeout => {
+                            let _ = error;
+                            std::thread::sleep(self.retry_interval);
+                        }
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
+
+            match self.try_open_repo(&state_file, &params) {
+                Ok(repo) => return Ok(repo),
+                Err(error) if started.elapsed() < self.start_timeout => {
+                    let _ = error;
+                    std::thread::sleep(self.retry_interval);
+                }
+                Err(error) => return Err(error),
+            }
+        }
+    }
+
     pub fn search(&self, repo: EnsureRepoParams, mut params: SearchParams) -> Result<Response> {
         let ensured = self.ensure_repo(repo)?;
         params.repo_id = ensured.repo_id;
         let client = DaemonClient::new(ensured.addr);
         client.search(params)
+    }
+
+    pub fn glob(&self, repo: EnsureRepoParams, mut params: GlobParams) -> Result<Response> {
+        let ensured = self.ensure_repo(repo)?;
+        params.repo_id = ensured.repo_id;
+        let client = DaemonClient::new(ensured.addr);
+        client.glob(params)
     }
 
     fn try_ensure_repo(&self, state_file: &Path, params: &EnsureRepoParams) -> Result<EnsuredRepo> {
@@ -134,6 +191,21 @@ impl ManagedDaemonClient {
             }),
             other => Err(AppError::Protocol(format!(
                 "unexpected ensure_repo response: {other:?}"
+            ))),
+        }
+    }
+
+    fn try_open_repo(&self, state_file: &Path, params: &OpenRepoParams) -> Result<OpenedRepo> {
+        let state = read_state_file(state_file)?;
+        let client = DaemonClient::new(state.addr.clone());
+        match client.open_repo(params.clone())? {
+            Response::RepoOpened { repo_id, status } => Ok(OpenedRepo {
+                addr: state.addr,
+                repo_id,
+                status,
+            }),
+            other => Err(AppError::Protocol(format!(
+                "unexpected open_repo response: {other:?}"
             ))),
         }
     }
@@ -213,8 +285,11 @@ impl Drop for StartupLockGuard {
 }
 
 pub fn daemon_state_file_path(params: &EnsureRepoParams) -> Result<PathBuf> {
-    let build_config = build_config_from_ensure(params).normalized()?;
-    Ok(build_config.index_path.join(DEFAULT_DAEMON_STATE_FILE))
+    daemon_state_file_path_from_build_config(build_config_from_ensure(params))
+}
+
+pub fn daemon_state_file_path_from_open(params: &OpenRepoParams) -> Result<PathBuf> {
+    daemon_state_file_path_from_build_config(build_config_from_open_params(params))
 }
 
 fn daemon_start_lock_file_path(state_file: &Path) -> PathBuf {
@@ -243,4 +318,22 @@ fn build_config_from_ensure(params: &EnsureRepoParams) -> BuildConfig {
         params.config.min_sparse_len,
         params.config.max_sparse_len,
     )
+}
+
+fn build_config_from_open_params(params: &OpenRepoParams) -> BuildConfig {
+    build_config_from_open(
+        params.repo_path.clone(),
+        params.index_path.clone(),
+        params.config.tokenizer,
+        params.config.corpus_mode,
+        params.config.include_hidden,
+        params.config.max_file_size,
+        params.config.min_sparse_len,
+        params.config.max_sparse_len,
+    )
+}
+
+fn daemon_state_file_path_from_build_config(build_config: BuildConfig) -> Result<PathBuf> {
+    let build_config = build_config.normalized()?;
+    Ok(build_config.index_path.join(DEFAULT_DAEMON_STATE_FILE))
 }

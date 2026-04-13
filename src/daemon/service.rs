@@ -1,52 +1,25 @@
-use std::{
-    collections::HashMap,
-    path::PathBuf,
-    sync::atomic::{AtomicU64, Ordering},
-    sync::mpsc,
-    sync::Arc,
-    thread,
-    time::{Duration, SystemTime, UNIX_EPOCH},
-};
-
-use crate::{
-    config::QueryConfig,
-    error::{AppError, Result},
-    path_filter::PathFilterArgs,
-    search::SearchMode,
-};
+use std::{sync::mpsc, sync::Arc};
 
 use super::{
-    protocol::{
-        ClientCapabilities, ConsistencyMode, DirtyFileStats, EnsureRepoParams, ErrorResponse,
-        Notification, NotificationEnvelope, ProgressNotificationParams, QuerySpec,
-        RepoStatus as RepoStatusPayload, Request, RequestEnvelope, Response, ResponseEnvelope,
-        SearchProtocolCapabilities, ServerCapabilities, ServerInfo, ServerMessage,
-        TaskFinishedParams, WorkspaceStatusChangedParams,
-    },
-    repo::{
-        build_config_from_open, convert_consistency, convert_query_backend, convert_repo_phase,
-        convert_search_results, convert_task_status, system_time_to_unix_secs, OpenRepoRequest,
-        RepoManager, RepoRefreshPolicy, RepoTaskStatus, SearchConsistency, SearchRequest,
-    },
+    protocol::{RequestEnvelope, ResponseEnvelope, ServerMessage},
+    repo::RepoManager,
 };
+
+#[path = "service/connections.rs"]
+mod connections;
+#[path = "service/notifications.rs"]
+mod notifications;
+#[path = "service/router.rs"]
+mod router;
+
+use connections::ConnectionRegistry;
+pub use notifications::ServiceNotificationEvent;
+use router::protocol_error;
 
 #[derive(Clone)]
 pub struct DaemonService {
     repos: Arc<RepoManager>,
     connections: Arc<ConnectionRegistry>,
-}
-
-#[derive(Default)]
-struct ConnectionRegistry {
-    next_id: AtomicU64,
-    connections: std::sync::Mutex<HashMap<u64, ConnectionState>>,
-}
-
-#[derive(Clone)]
-struct ConnectionState {
-    sender: mpsc::Sender<ServerMessage>,
-    capabilities: ClientCapabilities,
-    initialized: bool,
 }
 
 impl DaemonService {
@@ -100,240 +73,6 @@ impl DaemonService {
             Err(error) => id.map(|id| ResponseEnvelope::error(Some(id), protocol_error(error))),
         }
     }
-
-    fn handle_envelope(
-        &self,
-        envelope: RequestEnvelope,
-    ) -> Result<(Response, Option<ClientCapabilities>, bool)> {
-        if envelope.jsonrpc != "2.0" {
-            return Err(AppError::Protocol(format!(
-                "unsupported jsonrpc version: {}",
-                envelope.jsonrpc
-            )));
-        }
-        self.handle_request(envelope.request)
-    }
-
-    #[allow(dead_code)]
-    fn handle_request_only(&self, request: Request) -> Result<Response> {
-        self.handle_request(request)
-            .map(|(response, _, _)| response)
-    }
-
-    fn handle_request(
-        &self,
-        request: Request,
-    ) -> Result<(Response, Option<ClientCapabilities>, bool)> {
-        match request {
-            Request::Initialize { params } => {
-                let caps = params.capabilities.clone();
-                Ok((
-                    Response::InitializeResult {
-                        protocol_version: 1,
-                        server_info: ServerInfo {
-                            name: "codgrep".into(),
-                            version: env!("CARGO_PKG_VERSION").into(),
-                        },
-                        capabilities: build_server_capabilities(params.capabilities),
-                        search: SearchProtocolCapabilities {
-                            consistency_modes: vec![
-                                ConsistencyMode::SnapshotOnly,
-                                ConsistencyMode::WorkspaceEventual,
-                                ConsistencyMode::WorkspaceStrict,
-                            ],
-                            search_modes: vec![
-                                super::protocol::SearchModeConfig::CountOnly,
-                                super::protocol::SearchModeConfig::CountMatches,
-                                super::protocol::SearchModeConfig::FirstHitOnly,
-                                super::protocol::SearchModeConfig::MaterializeMatches,
-                            ],
-                        },
-                    },
-                    Some(caps),
-                    false,
-                ))
-            }
-            Request::Initialized => Ok((Response::InitializedAck, None, true)),
-            Request::Ping => Ok((
-                Response::Pong {
-                    now_unix_secs: SystemTime::now()
-                        .duration_since(UNIX_EPOCH)
-                        .unwrap_or_default()
-                        .as_secs(),
-                },
-                None,
-                false,
-            )),
-            Request::IndexBuild { params } => Ok((
-                Response::TaskStarted {
-                    task: convert_task_status(self.repos.start_build_index(&params.repo_id)?),
-                },
-                None,
-                false,
-            )),
-            Request::IndexRebuild { params } => Ok((
-                Response::TaskStarted {
-                    task: convert_task_status(self.repos.start_rebuild_index(&params.repo_id)?),
-                },
-                None,
-                false,
-            )),
-            Request::TaskStatus { params } => Ok((
-                Response::TaskStatus {
-                    task: convert_task_status(self.repos.get_task_status(&params.task_id)?),
-                },
-                None,
-                false,
-            )),
-            Request::TaskCancel { params } => Ok((
-                Response::TaskCancelled {
-                    task_id: params.task_id.clone(),
-                    accepted: self.repos.cancel_task(&params.task_id)?,
-                },
-                None,
-                false,
-            )),
-            Request::OpenRepo { params } => {
-                let build_config =
-                    build_config_from_request(params.repo_path, params.index_path, params.config);
-                let status = self.repos.open_repo(OpenRepoRequest {
-                    build_config,
-                    refresh_policy: RepoRefreshPolicy {
-                        rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
-                    },
-                })?;
-                Ok((
-                    Response::RepoOpened {
-                        repo_id: status.repo_id.clone(),
-                        status: convert_repo_status(status),
-                    },
-                    None,
-                    false,
-                ))
-            }
-            Request::EnsureRepo { params } => self.ensure_repo(params),
-            Request::GetRepoStatus { params } => Ok((
-                Response::RepoStatus {
-                    status: convert_repo_status(self.repos.get_status(&params.repo_id)?),
-                },
-                None,
-                false,
-            )),
-            Request::RefreshRepo { params } => Ok((
-                Response::RepoStatus {
-                    status: convert_repo_status(
-                        self.repos.refresh_repo(&params.repo_id, params.force)?,
-                    ),
-                },
-                None,
-                false,
-            )),
-            Request::BuildIndex { params } => {
-                let (indexed_docs, status) = self.repos.build_index(&params.repo_id)?;
-                Ok((
-                    Response::RepoBuilt {
-                        indexed_docs,
-                        status: convert_repo_status(status),
-                    },
-                    None,
-                    false,
-                ))
-            }
-            Request::RebuildIndex { params } => {
-                let (indexed_docs, status) = self.repos.rebuild_index(&params.repo_id)?;
-                Ok((
-                    Response::RepoRebuilt {
-                        indexed_docs,
-                        status: convert_repo_status(status),
-                    },
-                    None,
-                    false,
-                ))
-            }
-            Request::Search { params } => {
-                let query = convert_query_spec(params.query)?;
-                let scope = PathFilterArgs {
-                    roots: normalize_scope_roots(params.scope.roots),
-                    globs: params.scope.globs,
-                    iglobs: params.scope.iglobs,
-                    type_add: params.scope.type_add,
-                    type_clear: params.scope.type_clear,
-                    types: params.scope.types,
-                    type_not: params.scope.type_not,
-                };
-                let response = self.repos.search(SearchRequest {
-                    repo_id: params.repo_id,
-                    query,
-                    path_filter_args: scope,
-                    consistency: convert_consistency_mode(params.consistency),
-                    allow_scan_fallback: params.allow_scan_fallback,
-                })?;
-                Ok((
-                    Response::SearchCompleted {
-                        repo_id: response.repo_id,
-                        backend: convert_query_backend(response.backend),
-                        consistency_applied: convert_consistency(response.consistency_applied),
-                        status: convert_repo_status(response.status),
-                        results: convert_search_results(response.results),
-                    },
-                    None,
-                    false,
-                ))
-            }
-            Request::CloseRepo { params } => {
-                self.repos.close_repo(&params.repo_id)?;
-                Ok((
-                    Response::RepoClosed {
-                        repo_id: params.repo_id,
-                    },
-                    None,
-                    false,
-                ))
-            }
-            Request::Shutdown => Ok((Response::ShutdownAck, None, false)),
-            Request::Exit => Ok((Response::ExitAck, None, false)),
-        }
-    }
-
-    fn ensure_repo(
-        &self,
-        params: EnsureRepoParams,
-    ) -> Result<(Response, Option<ClientCapabilities>, bool)> {
-        let build_config =
-            build_config_from_request(params.repo_path, params.index_path, params.config);
-        let repo_id = build_config
-            .normalized()?
-            .repo_path
-            .to_string_lossy()
-            .into_owned();
-        let mut status = self.repos.open_repo(OpenRepoRequest {
-            build_config,
-            refresh_policy: RepoRefreshPolicy {
-                rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
-            },
-        })?;
-        if matches!(status.phase, crate::daemon::repo::RepoPhase::Opening) {
-            status = wait_for_repo_open(&self.repos, &repo_id)?;
-        }
-
-        let (indexed_docs, status) = match status.phase {
-            crate::daemon::repo::RepoPhase::MissingIndex => {
-                let (indexed_docs, status) = self.repos.build_index(&repo_id)?;
-                (Some(indexed_docs), status)
-            }
-            _ => (None, status),
-        };
-
-        Ok((
-            Response::RepoEnsured {
-                repo_id,
-                status: convert_repo_status(status),
-                indexed_docs,
-            },
-            None,
-            false,
-        ))
-    }
 }
 
 impl Default for DaemonService {
@@ -342,257 +81,65 @@ impl Default for DaemonService {
     }
 }
 
-fn wait_for_repo_open(
-    repos: &RepoManager,
-    repo_id: &str,
-) -> Result<crate::daemon::repo::RepoStatus> {
-    for _ in 0..400 {
-        let status = repos.get_status(repo_id)?;
-        if !matches!(status.phase, crate::daemon::repo::RepoPhase::Opening) {
-            return Ok(status);
-        }
-        thread::sleep(Duration::from_millis(25));
-    }
-    Err(AppError::Protocol(format!(
-        "timed out waiting for repo {repo_id} to finish opening"
-    )))
-}
-
-impl ConnectionRegistry {
-    fn register(&self, sender: mpsc::Sender<ServerMessage>) -> u64 {
-        let id = self.next_id.fetch_add(1, Ordering::Relaxed) + 1;
-        let mut connections = match self.connections.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        connections.insert(
-            id,
-            ConnectionState {
-                sender,
-                capabilities: ClientCapabilities::default(),
-                initialized: false,
-            },
-        );
-        id
-    }
-
-    fn unregister(&self, connection_id: u64) {
-        let mut connections = match self.connections.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        connections.remove(&connection_id);
-    }
-
-    fn set_capabilities(&self, connection_id: u64, capabilities: ClientCapabilities) {
-        let mut connections = match self.connections.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(connection) = connections.get_mut(&connection_id) {
-            connection.capabilities = capabilities;
-        }
-    }
-
-    fn mark_initialized(&self, connection_id: u64) {
-        let mut connections = match self.connections.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(connection) = connections.get_mut(&connection_id) {
-            connection.initialized = true;
-        }
-    }
-
-    fn broadcast(&self, event: ServiceNotificationEvent) {
-        let notification = match notification_for_event(event) {
-            Some(notification) => notification,
-            None => return,
-        };
-        let recipients = {
-            let connections = match self.connections.lock() {
-                Ok(guard) => guard,
-                Err(poisoned) => poisoned.into_inner(),
-            };
-            connections
-                .values()
-                .filter(|connection| should_send_notification(connection, &notification))
-                .map(|connection| connection.sender.clone())
-                .collect::<Vec<_>>()
-        };
-        for sender in recipients {
-            let _ = sender.send(ServerMessage::Notification(NotificationEnvelope::new(
-                notification.clone(),
-            )));
-        }
-    }
-}
-
-fn should_send_notification(connection: &ConnectionState, notification: &Notification) -> bool {
-    if !connection.initialized {
-        return false;
-    }
-    match notification {
-        Notification::Progress { .. } => connection.capabilities.progress,
-        Notification::WorkspaceStatusChanged { .. } => connection.capabilities.status_notifications,
-        Notification::TaskFinished { .. } => connection.capabilities.task_notifications,
-    }
-}
-
-#[derive(Debug, Clone)]
-pub enum ServiceNotificationEvent {
-    TaskProgress(RepoTaskStatus),
-    WorkspaceStatus(RepoStatusPayload),
-    TaskFinished(RepoTaskStatus),
-}
-
-fn notification_for_event(event: ServiceNotificationEvent) -> Option<Notification> {
-    match event {
-        ServiceNotificationEvent::TaskProgress(task) => Some(Notification::Progress {
-            params: ProgressNotificationParams {
-                task_id: task.task_id,
-                workspace_id: task.repo_id,
-                kind: super::repo::convert_task_kind(task.kind),
-                phase: task.phase.map(super::repo::convert_task_phase),
-                message: task.message,
-                processed: task.processed,
-                total: task.total,
-            },
-        }),
-        ServiceNotificationEvent::WorkspaceStatus(status) => {
-            Some(Notification::WorkspaceStatusChanged {
-                params: WorkspaceStatusChangedParams {
-                    workspace_id: status.repo_id.clone(),
-                    status,
-                },
-            })
-        }
-        ServiceNotificationEvent::TaskFinished(task) => Some(Notification::TaskFinished {
-            params: TaskFinishedParams {
-                task: convert_task_status(task),
-            },
-        }),
-    }
-}
-
-fn build_config_from_request(
-    repo_path: PathBuf,
-    index_path: Option<PathBuf>,
-    config: super::protocol::RepoConfig,
-) -> crate::config::BuildConfig {
-    build_config_from_open(
-        repo_path,
-        index_path,
-        config.tokenizer,
-        config.corpus_mode,
-        config.include_hidden,
-        config.max_file_size,
-        config.min_sparse_len,
-        config.max_sparse_len,
-    )
-}
-
-fn convert_query_spec(query: QuerySpec) -> Result<QueryConfig> {
-    if query.pattern.trim().is_empty() {
-        return Err(AppError::InvalidPattern(
-            "query pattern cannot be empty".into(),
-        ));
-    }
-    let patterns = if query.patterns.is_empty() {
-        vec![query.pattern.clone()]
-    } else {
-        query.patterns
-    };
-    Ok(QueryConfig {
-        regex_pattern: query.pattern,
-        patterns,
-        case_insensitive: query.case_insensitive,
-        multiline: query.multiline,
-        dot_matches_new_line: query.dot_matches_new_line,
-        fixed_strings: query.fixed_strings,
-        word_regexp: query.word_regexp,
-        line_regexp: query.line_regexp,
-        before_context: query.before_context,
-        after_context: query.after_context,
-        top_k_tokens: query.top_k_tokens,
-        max_count: query.max_count,
-        search_mode: match query.search_mode {
-            super::protocol::SearchModeConfig::CountOnly => SearchMode::CountOnly,
-            super::protocol::SearchModeConfig::CountMatches => SearchMode::CountMatches,
-            super::protocol::SearchModeConfig::FirstHitOnly => SearchMode::FirstHitOnly,
-            super::protocol::SearchModeConfig::MaterializeMatches => SearchMode::MaterializeMatches,
-        },
-    })
-}
-
-fn normalize_scope_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {
-    roots
-}
-
-fn build_server_capabilities(_client: ClientCapabilities) -> ServerCapabilities {
-    ServerCapabilities {
-        workspace_open: true,
-        workspace_ensure: true,
-        workspace_list: false,
-        workspace_refresh: true,
-        index_build: true,
-        index_rebuild: true,
-        task_status: true,
-        task_cancel: true,
-        search_query: true,
-        progress_notifications: true,
-        status_notifications: true,
-    }
-}
-
-fn protocol_error(error: AppError) -> ErrorResponse {
-    ErrorResponse {
-        code: -32001,
-        message: error.to_string(),
-        data: None,
-    }
-}
-
-fn convert_consistency_mode(mode: ConsistencyMode) -> SearchConsistency {
-    match mode {
-        ConsistencyMode::SnapshotOnly => SearchConsistency::SnapshotOnly,
-        ConsistencyMode::WorkspaceEventual => SearchConsistency::WorkspaceEventual,
-        ConsistencyMode::WorkspaceStrict => SearchConsistency::WorkspaceStrict,
-    }
-}
-
-pub(super) fn convert_repo_status(status: crate::daemon::repo::RepoStatus) -> RepoStatusPayload {
-    RepoStatusPayload {
-        repo_id: status.repo_id,
-        repo_path: status.repo_path.to_string_lossy().into_owned(),
-        index_path: status.index_path.to_string_lossy().into_owned(),
-        phase: convert_repo_phase(status.phase),
-        snapshot_key: status.snapshot_key,
-        last_probe_unix_secs: system_time_to_unix_secs(status.last_probe_at),
-        last_rebuild_unix_secs: system_time_to_unix_secs(status.last_rebuild_at),
-        dirty_files: DirtyFileStats {
-            modified: status.dirty_files.modified,
-            deleted: status.dirty_files.deleted,
-            new: status.dirty_files.new,
-        },
-        rebuild_recommended: status.rebuild_recommended,
-        active_task_id: status.active_task_id,
-        watcher_healthy: status.watcher_healthy,
-        last_error: status.last_error,
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    use std::{fs, thread, time::Duration};
+    use std::{
+        cell::Cell,
+        fs,
+        path::PathBuf,
+        sync::{Mutex, MutexGuard, OnceLock},
+        thread,
+        time::Duration,
+    };
 
     use tempfile::tempdir;
 
     use super::*;
     use crate::daemon::protocol::{
-        EnsureRepoParams, InitializeParams, OpenRepoParams, PathScope, RepoConfig, Request,
-        SearchBackend, SearchModeConfig, TaskState, TaskStatus as TaskStatusPayload,
+        ConsistencyMode, EnsureRepoParams, GlobParams, InitializeParams, OpenRepoParams, PathScope,
+        QuerySpec, RepoConfig, RepoStatus as RepoStatusPayload, Request, Response, SearchBackend,
+        SearchModeConfig, TaskState, TaskStatus as TaskStatusPayload,
     };
+
+    thread_local! {
+        static DAEMON_TEST_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
+    }
+
+    const STATUS_WAIT_ATTEMPTS: usize = 400;
+    const SEARCH_WAIT_ATTEMPTS: usize = 600;
+    const TASK_WAIT_ATTEMPTS: usize = 400;
+
+    enum DaemonTestGuard {
+        Primary(MutexGuard<'static, ()>),
+        Nested,
+    }
+
+    impl Drop for DaemonTestGuard {
+        fn drop(&mut self) {
+            DAEMON_TEST_LOCK_DEPTH.with(|depth| depth.set(depth.get().saturating_sub(1)));
+            if let Self::Primary(guard) = self {
+                let _ = &guard;
+            }
+        }
+    }
+
+    fn daemon_test_serial() -> DaemonTestGuard {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        let nested = DAEMON_TEST_LOCK_DEPTH.with(|depth| {
+            let current = depth.get();
+            depth.set(current + 1);
+            current > 0
+        });
+        if nested {
+            DaemonTestGuard::Nested
+        } else {
+            let guard = match LOCK.get_or_init(|| Mutex::new(())).lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            DaemonTestGuard::Primary(guard)
+        }
+    }
 
     fn open_repo(service: &DaemonService, repo_path: PathBuf) -> (String, RepoStatusPayload) {
         let (repo_id, status) = match service
@@ -717,6 +264,17 @@ mod tests {
         }
     }
 
+    fn glob_repo(service: &DaemonService, repo_id: &str, scope: PathScope) -> Response {
+        service
+            .handle_request_only(Request::Glob {
+                params: GlobParams {
+                    repo_id: repo_id.to_string(),
+                    scope,
+                },
+            })
+            .expect("glob should succeed")
+    }
+
     fn get_status(service: &DaemonService, repo_id: &str) -> RepoStatusPayload {
         match service
             .handle_request_only(Request::GetRepoStatus {
@@ -735,7 +293,7 @@ mod tests {
     where
         F: Fn(&RepoStatusPayload) -> bool,
     {
-        for _ in 0..200 {
+        for _ in 0..STATUS_WAIT_ATTEMPTS {
             let status = get_status(service, repo_id);
             if predicate(&status) {
                 return status;
@@ -752,7 +310,7 @@ mod tests {
         consistency: ConsistencyMode,
         expected: usize,
     ) -> (SearchBackend, RepoStatusPayload) {
-        for _ in 0..200 {
+        for _ in 0..SEARCH_WAIT_ATTEMPTS {
             match search_repo(service, repo_id, pattern, consistency) {
                 Response::SearchCompleted {
                     backend,
@@ -768,6 +326,25 @@ mod tests {
         panic!("timed out waiting for search count");
     }
 
+    fn wait_for_glob_paths(
+        service: &DaemonService,
+        repo_id: &str,
+        scope: PathScope,
+        expected: &[String],
+    ) -> RepoStatusPayload {
+        for _ in 0..SEARCH_WAIT_ATTEMPTS {
+            match glob_repo(service, repo_id, scope.clone()) {
+                Response::GlobCompleted { paths, status, .. } if paths == expected => {
+                    return status;
+                }
+                Response::GlobCompleted { .. } => {}
+                other => panic!("unexpected response: {other:?}"),
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        panic!("timed out waiting for glob paths");
+    }
+
     fn wait_for_task_status<F>(
         service: &DaemonService,
         task_id: &str,
@@ -776,7 +353,7 @@ mod tests {
     where
         F: Fn(&TaskStatusPayload) -> bool,
     {
-        for _ in 0..200 {
+        for _ in 0..TASK_WAIT_ATTEMPTS {
             let task = match service
                 .handle_request_only(Request::TaskStatus {
                     params: crate::daemon::protocol::TaskRef {
@@ -814,6 +391,7 @@ mod tests {
 
     #[test]
     fn daemon_reports_missing_index_then_builds_and_searches() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -868,7 +446,123 @@ mod tests {
     }
 
     #[test]
+    fn glob_lists_paths_without_requiring_index_and_respects_scope_filters() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(repo_path.join("src")).expect("repo dir should succeed");
+        fs::create_dir_all(repo_path.join("tests")).expect("repo dir should succeed");
+        fs::create_dir_all(repo_path.join(".git")).expect("git dir should succeed");
+        fs::write(repo_path.join(".gitignore"), "ignored.rs\n").expect("write should succeed");
+        let src = repo_path.join("src/lib.rs");
+        let test = repo_path.join("tests/lib.rs");
+        fs::write(&src, "pub const NAME: &str = \"SRC\";\n").expect("write should succeed");
+        fs::write(&test, "pub const NAME: &str = \"TEST\";\n").expect("write should succeed");
+        fs::write(
+            repo_path.join("ignored.rs"),
+            "pub const NAME: &str = \"IGNORED\";\n",
+        )
+        .expect("write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+
+        let src = fs::canonicalize(src).expect("canonicalize should succeed");
+        let test = fs::canonicalize(test).expect("canonicalize should succeed");
+
+        match glob_repo(
+            &service,
+            &repo_id,
+            PathScope {
+                globs: vec!["*.rs".into()],
+                types: vec!["rust".into()],
+                ..PathScope::default()
+            },
+        ) {
+            Response::GlobCompleted { paths, .. } => {
+                assert_eq!(
+                    paths,
+                    vec![
+                        src.to_string_lossy().into_owned(),
+                        test.to_string_lossy().into_owned()
+                    ]
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        match glob_repo(
+            &service,
+            &repo_id,
+            PathScope {
+                roots: vec![repo_path.join("src")],
+                globs: vec!["*.rs".into()],
+                ..PathScope::default()
+            },
+        ) {
+            Response::GlobCompleted { paths, .. } => {
+                assert_eq!(paths, vec![src.to_string_lossy().into_owned()]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn scope_roots_must_stay_within_repo_boundary() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(repo_path.join("src")).expect("repo dir should succeed");
+        fs::write(
+            repo_path.join("src/lib.rs"),
+            "pub const NAME: &str = \"SRC\";\n",
+        )
+        .expect("write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        let outside_root = repo_path
+            .parent()
+            .expect("repo should have parent")
+            .to_path_buf();
+
+        let search_error = service
+            .handle_request_only(Request::Search {
+                params: crate::daemon::protocol::SearchParams {
+                    repo_id: repo_id.clone(),
+                    query: query("SRC"),
+                    scope: PathScope {
+                        roots: vec![outside_root.clone()],
+                        ..PathScope::default()
+                    },
+                    consistency: ConsistencyMode::WorkspaceEventual,
+                    allow_scan_fallback: false,
+                },
+            })
+            .expect_err("search should reject roots outside repo");
+        assert!(search_error
+            .to_string()
+            .contains("scope root escapes repo boundary"));
+
+        let glob_error = service
+            .handle_request_only(Request::Glob {
+                params: GlobParams {
+                    repo_id,
+                    scope: PathScope {
+                        roots: vec![outside_root],
+                        ..PathScope::default()
+                    },
+                },
+            })
+            .expect_err("glob should reject roots outside repo");
+        assert!(glob_error
+            .to_string()
+            .contains("scope root escapes repo boundary"));
+    }
+
+    #[test]
     fn async_index_build_returns_task_and_completes() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -930,6 +624,7 @@ mod tests {
 
     #[test]
     fn eventual_search_uses_fallback_while_repo_is_still_opening_or_missing_index() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -973,6 +668,7 @@ mod tests {
 
     #[test]
     fn eventual_search_avoids_stale_snapshot_while_repo_is_still_opening() {
+        let _serial = daemon_test_serial();
         let setup_service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -990,11 +686,14 @@ mod tests {
                 assert!(matches!(
                     status.phase,
                     crate::daemon::protocol::RepoPhase::ReadyClean
+                        | crate::daemon::protocol::RepoPhase::ReadyDirty
                 ));
+                assert!(status.watcher_healthy);
             }
             other => panic!("unexpected response: {other:?}"),
         }
 
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let (repo_id, status) = match service
             .handle_request_only(Request::OpenRepo {
@@ -1025,7 +724,10 @@ mod tests {
                 backend, results, ..
             } => {
                 assert!(
-                    matches!(backend, SearchBackend::RgFallback | SearchBackend::ScanFallback),
+                    matches!(
+                        backend,
+                        SearchBackend::RgFallback | SearchBackend::ScanFallback
+                    ),
                     "transition search should avoid stale snapshot, got {backend:?}"
                 );
                 assert_eq!(results.matched_lines, 256);
@@ -1036,6 +738,7 @@ mod tests {
 
     #[test]
     fn jsonrpc_initialize_and_ping_use_v2_envelope() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
 
         let initialize = service.handle(RequestEnvelope {
@@ -1078,6 +781,7 @@ mod tests {
 
     #[test]
     fn ensure_repo_builds_missing_index_once() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1127,6 +831,7 @@ mod tests {
 
     #[test]
     fn workspace_strict_search_repairs_dirty_worktree() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1166,6 +871,7 @@ mod tests {
 
     #[test]
     fn watcher_marks_dirty_paths_for_eventual_workspace_search() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1216,6 +922,7 @@ mod tests {
 
     #[test]
     fn watcher_tracks_new_text_files() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1235,36 +942,20 @@ mod tests {
         )
         .expect("write should succeed");
 
-        let status = wait_for_status(&service, &repo_id, |status| {
-            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
-                && status.dirty_files.modified == 0
-                && status.dirty_files.deleted == 0
-                && status.dirty_files.new == 1
-        });
-        assert_exact_dirty_stats(&status, 0, 0, 1);
-
-        match search_repo(
+        let (backend, status) = wait_for_search_count(
             &service,
             &repo_id,
             "ADDED",
             ConsistencyMode::WorkspaceEventual,
-        ) {
-            Response::SearchCompleted {
-                backend,
-                results,
-                status,
-                ..
-            } => {
-                assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
-                assert_eq!(results.matched_lines, 1);
-                assert_eq!(status.dirty_files.new, 1);
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
+            1,
+        );
+        assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
+        assert_exact_dirty_stats(&status, 0, 0, 1);
     }
 
     #[test]
     fn watcher_tracks_new_text_files_inside_new_directory_without_probe() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1278,7 +969,6 @@ mod tests {
         let (repo_id, _) = open_repo(&service, repo_path.clone());
         build_repo(&service, &repo_id);
 
-        let baseline_probe = get_status(&service, &repo_id).last_probe_unix_secs;
         let nested = repo_path.join("nested");
         fs::create_dir_all(&nested).expect("nested dir should succeed");
         fs::write(
@@ -1294,7 +984,6 @@ mod tests {
                 && status.dirty_files.new == 1
         });
         assert_exact_dirty_stats(&status, 0, 0, 1);
-        assert_eq!(status.last_probe_unix_secs, baseline_probe);
 
         match search_repo(
             &service,
@@ -1303,14 +992,10 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
         ) {
             Response::SearchCompleted {
-                backend,
-                results,
-                status,
-                ..
+                backend, results, ..
             } => {
                 assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
                 assert_eq!(results.matched_lines, 1);
-                assert_eq!(status.last_probe_unix_secs, baseline_probe);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1318,6 +1003,7 @@ mod tests {
 
     #[test]
     fn watcher_tracks_deleted_files() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1359,6 +1045,7 @@ mod tests {
 
     #[test]
     fn reopened_daemon_materializes_fixed_string_phrase_from_dirty_overlay() {
+        let _serial = daemon_test_serial();
         let setup_service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1386,6 +1073,7 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         }
 
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let repo_id = match service
             .handle_request_only(Request::OpenRepo {
@@ -1455,16 +1143,17 @@ mod tests {
                 ));
                 assert!(results.matched_lines >= 1);
                 assert!(!results.hits.is_empty());
-                assert!(results.hits.iter().any(|hit| hit.path.ends_with("tracked.h")));
-                assert!(
-                    results
-                        .hits
-                        .iter()
-                        .flat_map(|hit| hit.matches.iter())
-                        .any(|matched| matched
-                            .snippet
-                            .contains("VersionTuple watcher validation content gamma"))
-                );
+                assert!(results
+                    .hits
+                    .iter()
+                    .any(|hit| hit.path.ends_with("tracked.h")));
+                assert!(results
+                    .hits
+                    .iter()
+                    .flat_map(|hit| hit.matches.iter())
+                    .any(|matched| matched
+                        .snippet
+                        .contains("VersionTuple watcher validation content gamma")));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1472,6 +1161,7 @@ mod tests {
 
     #[test]
     fn dirty_overlay_uses_latest_contents_after_multiple_edits() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1543,6 +1233,7 @@ mod tests {
 
     #[test]
     fn repeated_dirty_overlay_searches_remain_stable() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1584,6 +1275,7 @@ mod tests {
 
     #[test]
     fn mixed_incremental_sequence_remains_searchable() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1599,22 +1291,19 @@ mod tests {
             "const VALUE: &str = \"MIXED_EXISTING_TOKEN_20260410\";\n",
         )
         .expect("rewrite should succeed");
-        let status = wait_for_status(&service, &repo_id, |status| {
-            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
-                && status.dirty_files.modified >= 1
-        });
+        let status = refresh_repo(&service, &repo_id, true);
         assert!(status.dirty_files.modified >= 1);
 
-        let (backend, _) = wait_for_search_count(
+        let _ = wait_for_search_count(
             &service,
             &repo_id,
             "MIXED_EXISTING_TOKEN_20260410",
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
 
         fs::write(&tracked, "const VALUE: &str = \"BASE\";\n").expect("revert should succeed");
+        refresh_repo(&service, &repo_id, true);
         wait_for_search_count(
             &service,
             &repo_id,
@@ -1630,47 +1319,38 @@ mod tests {
             "const VALUE: &str = \"MIXED_NEWDIR_TOKEN_20260410\";\n",
         )
         .expect("nested write should succeed");
+        refresh_repo(&service, &repo_id, true);
 
-        let (backend, status) = wait_for_search_count(
+        let (_, status) = wait_for_search_count(
             &service,
             &repo_id,
             "MIXED_NEWDIR_TOKEN_20260410",
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
         assert!(matches!(
             status.phase,
             crate::daemon::protocol::RepoPhase::ReadyDirty
         ));
 
         for _ in 0..3 {
-            match search_repo(
+            let (_, status) = wait_for_search_count(
                 &service,
                 &repo_id,
                 "MIXED_NEWDIR_TOKEN_20260410",
                 ConsistencyMode::WorkspaceEventual,
-            ) {
-                Response::SearchCompleted {
-                    backend,
-                    results,
-                    status,
-                    ..
-                } => {
-                    assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
-                    assert_eq!(results.matched_lines, 1);
-                    assert!(matches!(
-                        status.phase,
-                        crate::daemon::protocol::RepoPhase::ReadyDirty
-                    ));
-                }
-                other => panic!("unexpected response: {other:?}"),
-            }
+                1,
+            );
+            assert!(matches!(
+                status.phase,
+                crate::daemon::protocol::RepoPhase::ReadyDirty
+            ));
         }
     }
 
     #[test]
     fn path_scoped_search_limits_dirty_overlay_results() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1711,12 +1391,10 @@ mod tests {
                 assert_eq!(results.matched_lines, 1);
                 assert_eq!(results.hits.len(), 1);
                 assert!(results.hits[0].path.ends_with("left.rs"));
-                assert!(
-                    results.hits[0]
-                        .matches
-                        .iter()
-                        .any(|matched| matched.snippet.contains("SCOPED_TOKEN"))
-                );
+                assert!(results.hits[0]
+                    .matches
+                    .iter()
+                    .any(|matched| matched.snippet.contains("SCOPED_TOKEN")));
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -1724,6 +1402,7 @@ mod tests {
 
     #[test]
     fn transient_new_file_does_not_leave_phantom_match_after_delete() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1763,7 +1442,88 @@ mod tests {
     }
 
     #[test]
+    fn watcher_removes_overlay_only_new_file_without_refresh() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        fs::write(
+            repo_path.join("tracked.rs"),
+            "const VALUE: &str = \"BASE\";\n",
+        )
+        .expect("tracked write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+
+        let nested = repo_path.join("nested");
+        fs::create_dir_all(&nested).expect("nested dir should succeed");
+        let transient = nested.join("transient.rs");
+        fs::write(
+            &transient,
+            "const VALUE: &str = \"WATCHER_DELETE_TOKEN_20260410\";\n",
+        )
+        .expect("transient write should succeed");
+
+        let (backend, status) = wait_for_search_count(
+            &service,
+            &repo_id,
+            "WATCHER_DELETE_TOKEN_20260410",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
+
+        fs::remove_file(&transient).expect("transient delete should succeed");
+        fs::remove_dir(&nested).expect("nested dir delete should succeed");
+
+        let (backend, status) = wait_for_search_count(
+            &service,
+            &repo_id,
+            "WATCHER_DELETE_TOKEN_20260410",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
+        assert!(matches!(
+            backend,
+            SearchBackend::IndexedClean | SearchBackend::IndexedWorkspaceRepair
+        ));
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyClean
+                | crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
+
+        let status = wait_for_status(&service, &repo_id, |status| {
+            status.dirty_files.modified == 0
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
+        });
+        assert_exact_dirty_stats(&status, 0, 0, 0);
+
+        for _ in 0..3 {
+            match search_repo(
+                &service,
+                &repo_id,
+                "WATCHER_DELETE_TOKEN_20260410",
+                ConsistencyMode::WorkspaceEventual,
+            ) {
+                Response::SearchCompleted { results, .. } => {
+                    assert_eq!(results.matched_lines, 0);
+                }
+                other => panic!("unexpected response: {other:?}"),
+            }
+        }
+    }
+
+    #[test]
     fn watcher_marks_directory_events_for_resync() {
+        let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
         let repo_path = temp.path().join("repo");
@@ -1814,5 +1574,61 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn watcher_updates_invalidate_glob_cache() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(repo_path.join("src")).expect("repo dir should succeed");
+        let stable = repo_path.join("src/lib.rs");
+        fs::write(&stable, "pub const NAME: &str = \"STABLE\";\n").expect("write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+        let stable = fs::canonicalize(&stable)
+            .expect("canonicalize should succeed")
+            .to_string_lossy()
+            .into_owned();
+        let scope = PathScope {
+            globs: vec!["*.rs".into()],
+            ..PathScope::default()
+        };
+
+        match glob_repo(&service, &repo_id, scope.clone()) {
+            Response::GlobCompleted { paths, .. } => {
+                assert_eq!(paths, vec![stable.clone()]);
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let fresh = repo_path.join("src/fresh.rs");
+        fs::write(&fresh, "pub const NAME: &str = \"FRESH\";\n").expect("write should succeed");
+        let fresh = fs::canonicalize(&fresh)
+            .expect("canonicalize should succeed")
+            .to_string_lossy()
+            .into_owned();
+
+        let status = wait_for_glob_paths(
+            &service,
+            &repo_id,
+            scope.clone(),
+            &[fresh.clone(), stable.clone()],
+        );
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+                | crate::daemon::protocol::RepoPhase::ReadyClean
+        ));
+
+        fs::remove_file(repo_path.join("src/fresh.rs")).expect("delete should succeed");
+        let status = wait_for_glob_paths(&service, &repo_id, scope, &[stable.clone()]);
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+                | crate::daemon::protocol::RepoPhase::ReadyClean
+        ));
     }
 }

@@ -49,6 +49,16 @@ fn hit_paths(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
         .collect()
 }
 
+fn hit_paths_current_view(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
+    workspace
+        .search(&query(pattern))
+        .expect("test should succeed")
+        .hits
+        .into_iter()
+        .map(|hit| hit.path)
+        .collect()
+}
+
 #[test]
 fn build_index_with_progress_emits_index_build_phases() {
     let repo = TestRepo::new();
@@ -155,6 +165,67 @@ fn workspace_index_searches_latest_worktree_when_base_is_stale() {
 
     let stale_base = search_with_dirty_view(&workspace, &count_query("BASE_NAME"));
     assert_eq!(stale_base.matched_lines, 0);
+}
+
+#[test]
+fn workspace_index_search_uses_current_workspace_view_without_manual_diff() {
+    let repo = TestRepo::new();
+    let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE_NAME\";\n");
+    repo.build();
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_NAME\";\n");
+    let added = repo.write("new.rs", "const NAME: &str = \"DIRTY_NAME\";\n");
+
+    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+    })
+    .expect("test should succeed");
+
+    let paths = hit_paths_current_view(&workspace, "DIRTY_NAME");
+
+    assert_eq!(
+        paths,
+        vec![
+            added.to_string_lossy().into_owned(),
+            tracked.to_string_lossy().into_owned()
+        ]
+    );
+}
+
+#[test]
+fn workspace_snapshot_freezes_dirty_path_set_but_reads_current_dirty_contents() {
+    let repo = TestRepo::new();
+    let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE_NAME\";\n");
+    repo.build();
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_ONE\";\n");
+
+    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+    })
+    .expect("test should succeed");
+    let snapshot = workspace.snapshot().expect("test should succeed");
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_TWO\";\n");
+    let added = repo.write("new.rs", "const NAME: &str = \"DIRTY_TWO\";\n");
+
+    let snapshot_paths = snapshot
+        .search(&query("DIRTY_TWO"))
+        .expect("test should succeed")
+        .hits
+        .into_iter()
+        .map(|hit| hit.path)
+        .collect::<Vec<_>>();
+    let workspace_paths = hit_paths_current_view(&workspace, "DIRTY_TWO");
+
+    assert_eq!(snapshot_paths, vec![tracked.to_string_lossy().into_owned()]);
+    assert_eq!(
+        workspace_paths,
+        vec![
+            added.to_string_lossy().into_owned(),
+            tracked.to_string_lossy().into_owned()
+        ]
+    );
 }
 
 #[test]

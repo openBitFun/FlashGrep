@@ -63,6 +63,9 @@ cargo run -- daemon build --repo-id /path/to/repo
 # 通过 daemon 发搜索请求
 cargo run -- daemon search --repo-id /path/to/repo 'foo.*bar'
 
+# 通过 daemon 做路径 glob / scope 解析
+cargo run -- daemon glob --repo-id /path/to/repo -g '*.rs' src
+
 # 查询 repo 状态
 cargo run -- daemon status --repo-id /path/to/repo
 
@@ -74,7 +77,10 @@ cargo run -- daemon shutdown
 如果只是离线准备索引或做 bench，也保留这两个入口：
 
 ```bash
+# 通过 managed daemon 自动拉起/连接 server，并确保 repo 已可搜索
 cargo run -- build --repo /path/to/repo
+
+# benchmark 仍是本地运维工具入口
 cargo run -- bench --suite-dir bench_data
 ```
 
@@ -82,114 +88,131 @@ cargo run -- bench --suite-dir bench_data
 
 - 默认入口不再提供 ripgrep 风格的一次性搜索命令。
 - 搜索相关命令通过 `daemon search` 暴露，面向服务进程调试和手工排障。
+- 路径枚举/glob 相关能力通过 `daemon glob` 暴露。
 - `serve` 用于拉起 TCP server，`daemon *` 用于向该 server 发协议请求。
+- `build` 现在也会通过 managed daemon 走进程协议，不再直接在 CLI 进程里调用建索引库函数。
 
-库 API 现在额外提供一层 `SearchEngine`：
+## External Interface
 
-- `SearchPolicy::IndexOnly`：只允许走索引；索引缺失时直接返回错误。
-- `SearchPolicy::FallbackToScan`：索引缺失，或查询本身明显更适合 scan 时走 `Scan`；否则直接走索引。
+当前稳定的对外接口应视为 daemon 进程协议：
 
-如果使用方希望检查索引是否过期，可以显式调用 `WorkspaceIndex::probe_freshness()` / `probe_freshness_if_due(ttl)`，或更底层的 `IndexSearcher::diff_against_worktree()` / `stale_reason()`、`SearchEngine::diff_against_worktree()` / `stale_reason()`。如果使用方希望主动刷新索引，可以显式调用 `build_index` / `rebuild_index()`，或 `build_index_with_options` / `rebuild_index_with_options`（附带进度/取消钩子）；库本身不会在搜索后偷偷调度后台重建。
+- daemon protocol request/response/notification schema
+- `DaemonClient` / `ManagedDaemonClient`
+- `codgrep::sdk` Rust SDK facade
+- `cg serve` 与 `cg daemon *` 这些围绕 daemon 的工具入口
 
-## 库用法
-
-当前对外 API 分三层：
-
-- 稳定层（crate 根）：
-  - `SearchEngine` / `WorkspaceIndex` / `BuildConfig` / `QueryConfig` / `SearchResults` / `SearchResponse`
-  - `build_index_with_options` / `rebuild_index_with_options` / `IndexBuildOptions`
-- 专家层（`codgrep::advanced`）：
-  - `IndexSearcher` / `WorkspaceSnapshot` / `PathFilter` / `IndexProgress*` / JSON 模型
-- 实验层（`codgrep::experimental`）：
-  - `planner`、`tokenizer`、低层 `index_format` 工具（后续可能调整）
+crate 根上仍然存在若干历史库导出，便于仓库内部与迁移期代码复用，但它们不再是推荐的产品接入方式。
 
 入口选择（推荐）：
 
-- 一次性脚本/工具链任务：优先用 crate 级 `build_index*` / `rebuild_index*` free functions。
-- 常驻服务 / IDE / agent 集成：优先持有 `SearchEngine` 或 `WorkspaceIndex`。
+- 外部集成 / IDE / agent / 脚本：优先接 daemon 协议。
+- Rust 调用方：优先使用 `codgrep::sdk`，而不是直接拼 `Request/Response`。
+- 本仓库内部实现：可以继续复用 workspace / index / search 这些库层模块。
+
+Rust SDK 最小示例：
+
+```rust
+use codgrep::sdk::{
+    count_only_query, EnsureRepoParams, GlobRequest, ManagedClient, PathScope, RepoConfig,
+    SearchRequest,
+};
+
+let client = ManagedClient::new();
+let repo = client.ensure_repo(EnsureRepoParams {
+    repo_path: "/path/to/repo".into(),
+    index_path: None,
+    config: RepoConfig::default(),
+    refresh: Default::default(),
+})?;
+
+let search = repo.search(SearchRequest::new(count_only_query("LLVMContext")))?;
+let glob = repo.glob(
+    GlobRequest::new().with_scope(PathScope {
+        globs: vec!["*.rs".into()],
+        ..PathScope::default()
+    }),
+)?;
+```
+
+如果你的产品流程是“先打开 repo，等用户手动点索引”，可以走 `open_repo + index_build + wait_task`：
+
+```rust
+use std::time::Duration;
+
+use codgrep::sdk::{count_only_query, ManagedClient, OpenRepoParams, RepoConfig, SearchRequest};
+
+let client = ManagedClient::new();
+let repo = client.open_repo(OpenRepoParams {
+    repo_path: "/path/to/repo".into(),
+    index_path: None,
+    config: RepoConfig::default(),
+    refresh: Default::default(),
+})?;
+
+let task = repo.index_build()?;
+repo.wait_task(task.task_id, Duration::from_secs(30))?;
+
+let search = repo.search(SearchRequest::new(count_only_query("LLVMContext")))?;
+```
+
+如果调用方本身已经是 `tokio` 应用，可以打开 `tokio-sdk` feature：
+
+```bash
+cargo add codgrep --features tokio-sdk
+```
+
+最小异步示例：
+
+```rust
+use codgrep::sdk::{
+    count_only_query, EnsureRepoParams, RepoConfig, SearchRequest,
+};
+
+let client = codgrep::sdk::tokio::ManagedClient::new();
+let repo = client
+    .ensure_repo(EnsureRepoParams {
+        repo_path: "/path/to/repo".into(),
+        index_path: None,
+        config: RepoConfig::default(),
+        refresh: Default::default(),
+    })
+    .await?;
+
+let search = repo
+    .search(SearchRequest::new(count_only_query("LLVMContext")))
+    .await?;
+```
 
 核心职责边界（固定定义）：
 
-- `SearchEngine`：面向大多数调用方的统一搜索入口。
-- `WorkspaceIndex`：面向需要管理 `base snapshot` / `overlay` / `freshness` 的集成方。
+- `daemon::protocol`：唯一稳定外部 contract。
+- `DaemonClient` / `ManagedDaemonClient`：面向外部调用方的 transport/client 封装。
+- `SearchEngine` / `WorkspaceIndex` / `WorkspaceSnapshot`：当前主要服务于 daemon 内部实现与迁移期代码。
 - `advanced::IndexSearcher`：面向高级场景的低层只读索引查询接口。
 
-建议新用户先掌握这组最小 API：
+## Internal Library Notes
 
-- `BuildConfig`
-- `QueryConfig`
-- `SearchEngine`
-- `SearchResponse`
-- `SearchResults`
-- `SearchMode`
-- `WorkspaceIndex`
-- `WorkspaceIndexOptions`
-- `WorkspaceFreshness`
-- `build_index_with_options`
-- `rebuild_index_with_options`
-- `IndexBuildOptions`
+crate 根上仍然保留若干历史库导出，主要用于：
 
-如果你希望把项目当成一个可复用库，而不是只走 CLI，当前推荐的接入顺序是：
+- daemon 内部实现
+- benchmark / fixture / 测试代码
+- 迁移期的仓库内辅助代码
 
-1. 用 `WorkspaceIndex::open(...)` 打开工作区 facade。
-2. 启动时用 `ensure_base_snapshot()` 确保 base snapshot 已存在。
-3. 调度侧按自己的策略调用 `probe_freshness()` / `probe_freshness_if_due(ttl)` 观察工作区是否偏离 base。
-4. 对同一个只读视图做多次查询时，优先复用同一个 `WorkspaceSnapshot`。
+这些库接口不是推荐的外部接入方式，后续会继续收缩。
 
-最小示例：
+## Daemon Overlay
 
-```rust
-use codgrep::{
-    BuildConfig, CorpusMode, QueryConfig, TokenizerMode, WorkspaceIndex, WorkspaceIndexOptions,
-};
+daemon 运行时会在内存里维护一层 dirty overlay：
 
-fn main() -> codgrep::Result<()> {
-    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
-        build_config: BuildConfig {
-            repo_path: "/path/to/repo".into(),
-            index_path: "/path/to/repo/.codgrep-index".into(),
-            tokenizer: TokenizerMode::Trigram,
-            corpus_mode: CorpusMode::RespectIgnore,
-            include_hidden: false,
-            max_file_size: 2 * 1024 * 1024,
-            min_sparse_len: 3,
-            max_sparse_len: 32,
-        },
-    })?;
+- `base snapshot` 仍然是磁盘上的主索引。
+- dirty 路径集合、dirty 文档和 dirty `SearchDocumentIndex` 只存在于 daemon 进程内存。
+- daemon 重启或 repo 被关闭后，内存 overlay 会丢失；下次 `open_repo` 时会根据“当前 base snapshot + 当前 worktree”重新计算并重建。
 
-    workspace.ensure_base_snapshot()?;
-    let freshness = workspace.probe_freshness_if_due(std::time::Duration::from_secs(2))?;
-    if freshness.needs_base_snapshot() {
-        workspace.ensure_base_snapshot()?;
-    }
+这意味着：
 
-    let snapshot = workspace.snapshot()?;
-    let results = snapshot.search(&QueryConfig {
-        regex_pattern: "foo.*bar".into(),
-        patterns: vec!["foo.*bar".into()],
-        ..QueryConfig::default()
-    })?;
-
-    println!(
-        "base={}",
-        freshness.base_snapshot_key.as_deref().unwrap_or("<missing>")
-    );
-    println!("hits={}", results.hits.len());
-    Ok(())
-}
-```
-
-调用建议：
-
-- `WorkspaceIndex::search()` 适合直接做一次性查询。
-- `WorkspaceIndex::snapshot()` 适合先固定一个只读视图，再连续跑多个 query。
-- `SearchEngine::search_with_filter()` 是 path scope 的便捷入口，不建议继续扩展更多 `search_with_*` 变体。
-- 如果需要 JSON 结构，可在搜索后做适配：`codgrep::advanced::json::JsonSearchReport::from_search_results(&results)`。
-- `advanced::json` 主要用于 CLI/集成输出适配，当前不承诺长期 schema 完全稳定。
-- `WorkspaceIndex::probe_freshness()` 每次都做一次真实 freshness 检查。
-- `WorkspaceIndex::probe_freshness_if_due(ttl)` 适合调度层限频检查；`if_due` 表示“上次 probe 超过 `ttl` 才重新探测”。
-- `WorkspaceIndex::search()` / `snapshot().search()` 会直接按“base snapshot + 当前 dirty files 修补”的视图执行查询，不需要额外 refresh 步骤。
-- `snapshot_key` / `base_snapshot_key` 是应该对外缓存或记录的稳定身份；不要依赖内部目录命名。
+- 正确性依旧由当前 worktree 保证。
+- 冷启动 / 重启后会有一段 overlay 恢复时间。
+- `WorkspaceStrict` 在 repo 未 ready 前可能短暂不可用；`WorkspaceEventual` 可以先退到 `rg` / scan fallback。
 
 ## Benchmark
 
@@ -272,7 +295,7 @@ cargo run -- bench \
 - `lookup.bin` 已做 `mmap`，`postings.bin` 仍是按 offset 解码读取。
 - CLI 和库层都不会在后台偷偷重建 base snapshot；如果需要新的 commit base，需要显式调用 build/rebuild 接口。
 
-## 库层状态
+## 内部库层状态
 
 `WorkspaceIndex::ensure_base_snapshot()` / `WorkspaceIndex::status()` 暴露的 `BaseSnapshotInfo` 现在包含：
 
@@ -281,12 +304,7 @@ cargo run -- bench \
 - `head_commit`
 - `config_fingerprint`
 
-另外还可以直接调用：
-
-- `WorkspaceIndex::probe_freshness()`
-- `WorkspaceIndex::probe_freshness_if_due(ttl)`
-
-这里的 `snapshot_key` / `base_snapshot_key` 才是外部库应该依赖的稳定身份。
+如果后续需要把 freshness 结果作为稳定外部 contract 暴露，优先补到 daemon protocol，而不是继续扩展库层 facade。
 
 ## 下一步建议
 

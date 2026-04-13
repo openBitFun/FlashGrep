@@ -1,38 +1,36 @@
 use std::{
-    collections::HashMap,
-    io::{BufRead, BufReader},
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::{Duration, Instant, SystemTime},
 };
 
 use notify::{
     event::{ModifyKind, RemoveKind},
     Config, Event, EventKind, RecommendedWatcher, RecursiveMode, Watcher,
 };
-use serde_json::Value;
 
 use crate::{
-    config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode},
+    config::{BuildConfig, CorpusMode, QueryConfig},
     error::{AppError, Result},
     files::{scan_paths, ScanOptions},
     index::{DirtyPathKind, IndexBuildOptions, IndexWorktreeDiff},
-    path_filter::{PathFilter, PathFilterArgs},
+    path_filter::{normalize_path, PathFilter, PathFilterArgs},
     progress::{IndexProgress, IndexProgressPhase},
-    search::{
-        FileContext, FileMatch, MatchLocation, SearchHit, SearchLine, SearchMode, SearchResults,
-    },
+    search::SearchResults,
     search_engine::{SearchBackend, SearchDocument, SearchDocumentIndex, SearchEngine},
     tokenizer::TokenizerOptions,
     workspace::{IndexStatus, WorkspaceIndex, WorkspaceIndexOptions},
 };
 
-use super::service::ServiceNotificationEvent;
+use super::{
+    rg_backend::{run_rg_glob, run_rg_search},
+    service::ServiceNotificationEvent,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RepoPhase {
@@ -155,6 +153,19 @@ pub struct SearchResponse {
     pub results: SearchResults,
 }
 
+#[derive(Debug, Clone)]
+pub struct GlobRequest {
+    pub repo_id: String,
+    pub path_filter_args: PathFilterArgs,
+}
+
+#[derive(Debug, Clone)]
+pub struct GlobResponse {
+    pub repo_id: String,
+    pub status: RepoStatus,
+    pub paths: Vec<String>,
+}
+
 pub struct RepoManager {
     repos: Mutex<HashMap<String, Arc<RepoRuntime>>>,
     next_task_id: AtomicU64,
@@ -261,6 +272,10 @@ impl RepoManager {
         self.repo(&request.repo_id)?.search(request)
     }
 
+    pub fn glob(&self, request: GlobRequest) -> Result<GlobResponse> {
+        self.repo(&request.repo_id)?.glob(request)
+    }
+
     pub fn close_repo(&self, repo_id: &str) -> Result<()> {
         let runtime = {
             let mut repos = match self.repos.lock() {
@@ -326,6 +341,9 @@ struct RepoRuntime {
     notifier: Arc<dyn Fn(ServiceNotificationEvent) + Send + Sync>,
     state: Mutex<RepoState>,
     dirty_overlay: Mutex<DirtyOverlayState>,
+    glob_cache: Mutex<GlobCacheState>,
+    pending_directory_rescans: Mutex<BTreeMap<String, Instant>>,
+    glob_cache_epoch: AtomicU64,
     resync_required: AtomicBool,
     watcher_stop: Mutex<Option<mpsc::Sender<()>>>,
     watcher_handle: Mutex<Option<JoinHandle<()>>>,
@@ -392,6 +410,12 @@ struct DirtyOverlaySnapshot {
     paths: DirtyPathSet,
     shadowed_base_paths: std::collections::HashSet<String>,
     search_index: Option<Arc<SearchDocumentIndex>>,
+}
+
+#[derive(Debug, Default)]
+struct GlobCacheState {
+    epoch: u64,
+    entries: HashMap<String, Vec<String>>,
 }
 
 impl RepoTaskRecord {
@@ -605,6 +629,9 @@ impl RepoRuntime {
             notifier,
             state: Mutex::new(RepoState::default()),
             dirty_overlay: Mutex::new(DirtyOverlayState::default()),
+            glob_cache: Mutex::new(GlobCacheState::default()),
+            pending_directory_rescans: Mutex::new(BTreeMap::new()),
+            glob_cache_epoch: AtomicU64::new(0),
             resync_required: AtomicBool::new(false),
             watcher_stop: Mutex::new(None),
             watcher_handle: Mutex::new(None),
@@ -638,7 +665,7 @@ impl RepoRuntime {
     fn emit_workspace_status_changed(&self) {
         if let Ok(status) = self.status_snapshot() {
             (self.notifier)(ServiceNotificationEvent::WorkspaceStatus(
-                super::service::convert_repo_status(status),
+                super::convert::convert_repo_status(status),
             ));
         }
     }
@@ -741,7 +768,9 @@ impl RepoRuntime {
     }
 
     fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
-        let filter = build_path_filter(&self.build_config.repo_path, &request.path_filter_args)?;
+        let scope =
+            normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
+        let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
         match request.consistency {
             SearchConsistency::SnapshotOnly => {
                 let response = self.workspace.search_snapshot_with_filter(
@@ -762,6 +791,7 @@ impl RepoRuntime {
                 })
             }
             SearchConsistency::WorkspaceEventual | SearchConsistency::WorkspaceStrict => {
+                self.rescan_pending_directories()?;
                 if matches!(request.consistency, SearchConsistency::WorkspaceStrict)
                     || self.resync_required.load(Ordering::Relaxed)
                 {
@@ -774,7 +804,7 @@ impl RepoRuntime {
                     | RepoPhase::MissingIndex
                     | RepoPhase::Indexing
                     | RepoPhase::Rebuilding => {
-                        self.search_during_transition(&request, filter.as_ref(), status)
+                        self.search_during_transition(&request, &scope, filter.as_ref(), status)
                     }
                     RepoPhase::ReadyClean | RepoPhase::ReadyDirty => {
                         let overlay = self.current_overlay_snapshot();
@@ -819,6 +849,55 @@ impl RepoRuntime {
                 }
             }
         }
+    }
+
+    fn glob(&self, request: GlobRequest) -> Result<GlobResponse> {
+        let scope =
+            normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
+        let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
+        let cache_key = glob_scope_cache_key(&scope);
+        let cache_epoch = self.glob_cache_epoch.load(Ordering::Relaxed);
+        if let Some(paths) = self.lookup_glob_cache(cache_epoch, &cache_key) {
+            return Ok(GlobResponse {
+                repo_id: self.repo_id.clone(),
+                status: self.status_snapshot()?,
+                paths,
+            });
+        }
+        let paths = match run_rg_glob(&self.build_config, &scope, filter.as_ref()) {
+            Ok(paths) => paths,
+            Err(_) => {
+                let roots = scan_roots(&self.build_config.repo_path, &scope);
+                let mut paths = scan_paths(
+                    &roots,
+                    Some(&self.build_config.index_path),
+                    ScanOptions {
+                        respect_ignore: matches!(
+                            self.build_config.corpus_mode,
+                            CorpusMode::RespectIgnore
+                        ),
+                        include_hidden: self.build_config.include_hidden,
+                        max_file_size: self.build_config.max_file_size,
+                        max_depth: None,
+                        ignore_files: Vec::new(),
+                    },
+                    filter.as_ref(),
+                )?
+                .into_iter()
+                .map(|file| file.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+                paths.sort_unstable();
+                paths
+            }
+        };
+        if self.glob_cache_epoch.load(Ordering::Relaxed) == cache_epoch {
+            self.store_glob_cache(cache_epoch, cache_key, &paths);
+        }
+        Ok(GlobResponse {
+            repo_id: self.repo_id.clone(),
+            status: self.status_snapshot()?,
+            paths,
+        })
     }
 
     fn run_task(&self, task: Arc<RepoTaskRecord>) {
@@ -1045,6 +1124,7 @@ impl RepoRuntime {
             state.phase = RepoPhase::ReadyDirty;
         }
         drop(state);
+        self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
     }
 
@@ -1056,6 +1136,14 @@ impl RepoRuntime {
             };
             *overlay = DirtyOverlayState::default();
         }
+        {
+            let mut pending = match self.pending_directory_rescans.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            pending.clear();
+        }
+        self.invalidate_glob_cache();
         self.resync_required.store(false, Ordering::Relaxed);
     }
 
@@ -1179,6 +1267,8 @@ impl RepoRuntime {
 
     fn handle_watch_event(&self, event: Event) {
         let mut dirty = DirtyPathSet::default();
+        let is_remove_file = matches!(event.kind, EventKind::Remove(RemoveKind::File));
+        let is_remove_folder = matches!(event.kind, EventKind::Remove(RemoveKind::Folder));
         let mut needs_resync = matches!(
             event.kind,
             EventKind::Any
@@ -1199,13 +1289,45 @@ impl RepoRuntime {
             }
             match self.normalize_watch_path(&candidate) {
                 Some(normalized) => {
+                    if !candidate.exists()
+                        && (self.discard_overlay_new_path(&normalized)
+                            || self.discard_overlay_new_paths_under_directory(&normalized))
+                    {
+                        needs_resync = false;
+                        self.clear_pending_directory_rescan(&normalized);
+                        continue;
+                    }
+                    if is_remove_file && self.discard_overlay_new_path(&normalized) {
+                        needs_resync = false;
+                        self.clear_pending_directory_rescan(&normalized);
+                        continue;
+                    }
+                    if is_remove_folder
+                        && self.discard_overlay_new_paths_under_directory(&normalized)
+                    {
+                        needs_resync = false;
+                        self.clear_pending_directory_rescan(&normalized);
+                        continue;
+                    }
+                    if is_remove_folder
+                        && !candidate.exists()
+                        && matches!(
+                            self.workspace.has_indexed_path_under(&normalized),
+                            Ok(false)
+                        )
+                    {
+                        needs_resync = false;
+                        self.clear_pending_directory_rescan(&normalized);
+                        continue;
+                    }
                     if candidate.exists() && candidate.is_dir() {
                         match self.collect_directory_dirty_paths(&candidate) {
                             Ok(directory_dirty) => {
                                 if !directory_dirty.is_empty() {
+                                    self.clear_pending_directory_rescan(&normalized);
                                     dirty.merge(directory_dirty);
                                 } else {
-                                    needs_resync = true;
+                                    self.note_pending_directory_rescan(normalized.clone());
                                 }
                             }
                             Err(_) => needs_resync = true,
@@ -1232,6 +1354,128 @@ impl RepoRuntime {
         if needs_resync {
             self.mark_resync_required();
         }
+    }
+
+    fn note_pending_directory_rescan(&self, directory: String) {
+        let mut pending = match self.pending_directory_rescans.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.entry(directory).or_insert_with(Instant::now);
+    }
+
+    fn clear_pending_directory_rescan(&self, path: &str) {
+        let mut pending = match self.pending_directory_rescans.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        pending.retain(|directory, _| {
+            directory != path
+                && !directory.starts_with(&format!("{path}{}", std::path::MAIN_SEPARATOR))
+        });
+    }
+
+    fn rescan_pending_directories(&self) -> Result<()> {
+        const PENDING_RESCAN_TTL: Duration = Duration::from_secs(5);
+
+        let directories = {
+            let pending = match self.pending_directory_rescans.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            pending
+                .iter()
+                .map(|(directory, first_seen)| (directory.clone(), *first_seen))
+                .collect::<Vec<_>>()
+        };
+        if directories.is_empty() {
+            return Ok(());
+        }
+
+        let mut resolved = Vec::new();
+        let mut should_resync = false;
+        for (directory, first_seen) in directories {
+            let candidate = PathBuf::from(&directory);
+            if !candidate.exists() || !candidate.is_dir() {
+                resolved.push(directory);
+                continue;
+            }
+            match self.collect_directory_dirty_paths(&candidate) {
+                Ok(directory_dirty) => {
+                    if !directory_dirty.is_empty() {
+                        self.add_dirty_paths(directory_dirty);
+                        resolved.push(directory);
+                    } else if first_seen.elapsed() >= PENDING_RESCAN_TTL {
+                        resolved.push(directory);
+                    }
+                }
+                Err(_) => {
+                    resolved.push(directory);
+                    should_resync = true;
+                }
+            }
+        }
+
+        if !resolved.is_empty() {
+            let mut pending = match self.pending_directory_rescans.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            for directory in resolved {
+                pending.remove(&directory);
+            }
+        }
+        if should_resync {
+            self.mark_resync_required();
+        }
+        Ok(())
+    }
+
+    fn discard_overlay_new_path(&self, path: &str) -> bool {
+        self.discard_overlay_new_paths_matching(|candidate| candidate == path)
+    }
+
+    fn discard_overlay_new_paths_under_directory(&self, directory: &str) -> bool {
+        let prefix = format!("{directory}{}", std::path::MAIN_SEPARATOR);
+        self.discard_overlay_new_paths_matching(|candidate| {
+            candidate == directory || candidate.starts_with(&prefix)
+        })
+    }
+
+    fn discard_overlay_new_paths_matching<F>(&self, mut matches: F) -> bool
+    where
+        F: FnMut(&str) -> bool,
+    {
+        let dirty = {
+            let mut overlay = match self.dirty_overlay.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            let removed = overlay
+                .paths
+                .new
+                .iter()
+                .filter(|path| matches(path))
+                .cloned()
+                .collect::<Vec<_>>();
+            if removed.is_empty() {
+                return false;
+            }
+
+            if let Some(search_index) = &mut overlay.search_index {
+                let index = Arc::make_mut(search_index);
+                for path in &removed {
+                    index.remove_document(path);
+                }
+            }
+            for path in &removed {
+                overlay.paths.remove(path);
+                overlay.documents.remove(path);
+            }
+            overlay.paths.clone()
+        };
+        self.update_overlay_state(&dirty);
+        true
     }
 
     fn collect_directory_dirty_paths(&self, directory: &Path) -> Result<DirtyPathSet> {
@@ -1438,7 +1682,42 @@ impl RepoRuntime {
             state.phase = RepoPhase::ReadyDirty;
         }
         drop(state);
+        self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
+    }
+
+    fn invalidate_glob_cache(&self) {
+        self.glob_cache_epoch.fetch_add(1, Ordering::Relaxed);
+    }
+
+    fn lookup_glob_cache(&self, epoch: u64, key: &str) -> Option<Vec<String>> {
+        let mut cache = match self.glob_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cache.epoch != epoch {
+            cache.epoch = epoch;
+            cache.entries.clear();
+            return None;
+        }
+        cache.entries.get(key).cloned()
+    }
+
+    fn store_glob_cache(&self, epoch: u64, key: String, paths: &[String]) {
+        const MAX_GLOB_CACHE_ENTRIES: usize = 32;
+
+        let mut cache = match self.glob_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cache.epoch != epoch {
+            cache.epoch = epoch;
+            cache.entries.clear();
+        }
+        if !cache.entries.contains_key(&key) && cache.entries.len() >= MAX_GLOB_CACHE_ENTRIES {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, paths.to_vec());
     }
 
     fn mark_task_started(&self, kind: RepoTaskKind, active_task_id: Option<String>) {
@@ -1460,6 +1739,7 @@ impl RepoRuntime {
     fn search_during_transition(
         &self,
         request: &SearchRequest,
+        scope: &PathFilterArgs,
         filter: Option<&PathFilter>,
         status: RepoStatus,
     ) -> Result<SearchResponse> {
@@ -1471,11 +1751,7 @@ impl RepoRuntime {
             )));
         }
 
-        match run_rg_search(
-            &self.build_config,
-            &request.query,
-            &request.path_filter_args,
-        ) {
+        match run_rg_search(&self.build_config, &request.query, scope) {
             Ok(results) => Ok(SearchResponse {
                 repo_id: self.repo_id.clone(),
                 backend: QueryBackend::RgFallback,
@@ -1483,15 +1759,15 @@ impl RepoRuntime {
                 status: self.status_snapshot()?,
                 results,
             }),
-            Err(_) => {
-                Ok(SearchResponse {
-                    repo_id: self.repo_id.clone(),
-                    backend: QueryBackend::ScanFallback,
-                    consistency_applied: request.consistency,
-                    status: self.status_snapshot()?,
-                    results: self.workspace.scan_search_with_filter(&request.query, filter)?,
-                })
-            }
+            Err(_) => Ok(SearchResponse {
+                repo_id: self.repo_id.clone(),
+                backend: QueryBackend::ScanFallback,
+                consistency_applied: request.consistency,
+                status: self.status_snapshot()?,
+                results: self
+                    .workspace
+                    .scan_search_with_filter(&request.query, filter)?,
+            }),
         }
     }
 }
@@ -1508,389 +1784,6 @@ fn repo_phase_label(phase: RepoPhase) -> &'static str {
     }
 }
 
-fn run_rg_search(
-    build_config: &BuildConfig,
-    query: &QueryConfig,
-    scope: &PathFilterArgs,
-) -> Result<SearchResults> {
-    match query.search_mode {
-        SearchMode::CountOnly => run_rg_count_search(build_config, query, scope, false),
-        SearchMode::CountMatches => run_rg_count_search(build_config, query, scope, true),
-        SearchMode::FirstHitOnly | SearchMode::MaterializeMatches => {
-            run_rg_json_search(build_config, query, scope)
-        }
-    }
-}
-
-fn run_rg_count_search(
-    build_config: &BuildConfig,
-    query: &QueryConfig,
-    scope: &PathFilterArgs,
-    count_matches: bool,
-) -> Result<SearchResults> {
-    let (matched_lines, searches_with_match) =
-        run_rg_count_command(build_config, query, scope, false)?;
-    let matched_occurrences = if count_matches {
-        run_rg_count_command(build_config, query, scope, true)?.0
-    } else {
-        0
-    };
-    Ok(SearchResults {
-        candidate_docs: searches_with_match,
-        searches_with_match,
-        bytes_searched: 0,
-        matched_lines,
-        matched_occurrences,
-        hits: Vec::new(),
-    })
-}
-
-fn run_rg_count_command(
-    build_config: &BuildConfig,
-    query: &QueryConfig,
-    scope: &PathFilterArgs,
-    count_matches: bool,
-) -> Result<(usize, usize)> {
-    let mut command = build_rg_base_command(build_config, query, scope);
-    if count_matches {
-        command.arg("--count-matches");
-    } else {
-        command.arg("--count");
-    }
-
-    let output = command.output()?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(AppError::Protocol(format!(
-            "rg fallback failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    let mut matched_total = 0usize;
-    let mut searches_with_match = 0usize;
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((_, count)) = line.rsplit_once(':') else {
-            continue;
-        };
-        let count = count.parse::<usize>().map_err(|error| {
-            AppError::Protocol(format!("failed to parse rg count output {line:?}: {error}"))
-        })?;
-        if count == 0 {
-            continue;
-        }
-        matched_total += count;
-        searches_with_match += 1;
-    }
-    Ok((matched_total, searches_with_match))
-}
-
-fn run_rg_json_search(
-    build_config: &BuildConfig,
-    query: &QueryConfig,
-    scope: &PathFilterArgs,
-) -> Result<SearchResults> {
-    let mut command = build_rg_base_command(build_config, query, scope);
-    command.arg("--json");
-    if query.before_context > 0 {
-        command.arg("-B").arg(query.before_context.to_string());
-    }
-    if query.after_context > 0 {
-        command.arg("-A").arg(query.after_context.to_string());
-    }
-    if let Some(max_count) = query.max_count {
-        command.arg("-m").arg(max_count.to_string());
-    } else if matches!(query.search_mode, SearchMode::FirstHitOnly) {
-        command.arg("-m").arg("1");
-    }
-
-    let output = command.output()?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(AppError::Protocol(format!(
-            "rg fallback failed with status {}: {}",
-            output.status,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    let reader = BufReader::new(output.stdout.as_slice());
-    let mut hits = Vec::<SearchHit>::new();
-    let mut hit_indexes = HashMap::<String, usize>::new();
-    let mut matched_lines = 0usize;
-    let mut matched_occurrences = 0usize;
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let event: Value = serde_json::from_str(&line).map_err(|error| {
-            AppError::Protocol(format!("failed to decode rg json event: {error}"))
-        })?;
-        let Some(kind) = event.get("type").and_then(Value::as_str) else {
-            continue;
-        };
-        let data = event.get("data").unwrap_or(&Value::Null);
-        match kind {
-            "match" => {
-                let Some(path) = rg_text_field(data.get("path")) else {
-                    continue;
-                };
-                let line_number = rg_line_number(data).unwrap_or(1);
-                let snippet = rg_text_field(data.get("lines")).unwrap_or_default();
-                let snippet = trim_rg_newline(&snippet).to_string();
-                let index = ensure_rg_hit(&mut hits, &mut hit_indexes, &path);
-                push_rg_context_break_if_needed(&mut hits[index], line_number);
-                let submatches = data
-                    .get("submatches")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                if submatches.is_empty() {
-                    continue;
-                }
-                matched_lines += 1;
-                for submatch in submatches {
-                    let file_match = rg_file_match(&snippet, line_number, &submatch)
-                        .unwrap_or_else(|| FileMatch {
-                            location: MatchLocation {
-                                line: line_number,
-                                column: 1,
-                            },
-                            snippet: snippet.clone(),
-                            matched_text: snippet.clone(),
-                        });
-                    hits[index].matches.push(file_match.clone());
-                    hits[index].lines.push(SearchLine::Match(file_match));
-                    matched_occurrences += 1;
-                }
-            }
-            "context" => {
-                let Some(path) = rg_text_field(data.get("path")) else {
-                    continue;
-                };
-                let line_number = rg_line_number(data).unwrap_or(1);
-                let snippet = rg_text_field(data.get("lines")).unwrap_or_default();
-                let snippet = trim_rg_newline(&snippet).to_string();
-                let index = ensure_rg_hit(&mut hits, &mut hit_indexes, &path);
-                push_rg_context_break_if_needed(&mut hits[index], line_number);
-                hits[index].lines.push(SearchLine::Context(FileContext {
-                    line_number,
-                    snippet,
-                }));
-            }
-            _ => {}
-        }
-    }
-
-    let searches_with_match = hits.iter().filter(|hit| !hit.matches.is_empty()).count();
-    hits.retain(|hit| !hit.matches.is_empty());
-    Ok(SearchResults {
-        candidate_docs: searches_with_match,
-        searches_with_match,
-        bytes_searched: 0,
-        matched_lines,
-        matched_occurrences,
-        hits,
-    })
-}
-
-fn build_rg_base_command(
-    build_config: &BuildConfig,
-    query: &QueryConfig,
-    scope: &PathFilterArgs,
-) -> Command {
-    let mut command = Command::new("rg");
-    command
-        .current_dir(&build_config.repo_path)
-        .arg("--with-filename")
-        .arg("--color")
-        .arg("never")
-        .arg("--no-messages");
-
-    if query.case_insensitive {
-        command.arg("--ignore-case");
-    }
-    if query.multiline {
-        command.arg("--multiline");
-    }
-    if query.dot_matches_new_line {
-        command.arg("--multiline-dotall");
-    }
-    if query.fixed_strings {
-        command.arg("--fixed-strings");
-        for pattern in &query.patterns {
-            command.arg("-e").arg(pattern);
-        }
-    } else {
-        if query.word_regexp {
-            command.arg("--word-regexp");
-        }
-        if query.line_regexp {
-            command.arg("--line-regexp");
-        }
-        command.arg("-e").arg(&query.regex_pattern);
-    }
-
-    command
-        .arg("--max-filesize")
-        .arg(build_config.max_file_size.to_string());
-    if matches!(build_config.corpus_mode, CorpusMode::NoIgnore) {
-        command.arg("--no-ignore");
-    }
-    if build_config.include_hidden {
-        command.arg("--hidden");
-    }
-
-    for glob in &scope.globs {
-        command.arg("-g").arg(glob);
-    }
-    for glob in &scope.iglobs {
-        command.arg("--iglob").arg(glob);
-    }
-    for spec in &scope.type_add {
-        command.arg("--type-add").arg(spec);
-    }
-    for name in &scope.type_clear {
-        command.arg("--type-clear").arg(name);
-    }
-    for name in &scope.types {
-        command.arg("-t").arg(name);
-    }
-    for name in &scope.type_not {
-        command.arg("-T").arg(name);
-    }
-    if let Some(exclude_glob) =
-        rg_index_exclude_glob(&build_config.repo_path, &build_config.index_path)
-    {
-        command.arg("-g").arg(format!("!{exclude_glob}"));
-    }
-
-    command.arg("--");
-    let roots = rg_scope_roots(&build_config.repo_path, &scope.roots);
-    if roots.is_empty() {
-        command.arg(".");
-    } else {
-        for root in roots {
-            command.arg(root);
-        }
-    }
-
-    command
-}
-
-fn rg_scope_roots(repo_root: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
-    if roots.is_empty() {
-        return Vec::new();
-    }
-
-    roots
-        .iter()
-        .map(|root| {
-            if root.is_absolute() {
-                if let Ok(relative) = root.strip_prefix(repo_root) {
-                    if relative.as_os_str().is_empty() {
-                        PathBuf::from(".")
-                    } else {
-                        relative.to_path_buf()
-                    }
-                } else {
-                    root.clone()
-                }
-            } else if root.as_os_str().is_empty() {
-                PathBuf::from(".")
-            } else {
-                root.clone()
-            }
-        })
-        .collect()
-}
-
-fn rg_index_exclude_glob(repo_root: &Path, index_path: &Path) -> Option<String> {
-    let relative = index_path.strip_prefix(repo_root).ok()?;
-    if relative.as_os_str().is_empty() {
-        return None;
-    }
-    Some(format!(
-        "{}/**",
-        relative.to_string_lossy().replace('\\', "/")
-    ))
-}
-
-fn rg_text_field(value: Option<&Value>) -> Option<String> {
-    value
-        .and_then(|field| field.get("text"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-}
-
-fn rg_line_number(data: &Value) -> Option<usize> {
-    data.get("line_number")
-        .and_then(Value::as_u64)
-        .and_then(|line| usize::try_from(line).ok())
-}
-
-fn trim_rg_newline(value: &str) -> &str {
-    value.trim_end_matches(['\r', '\n'])
-}
-
-fn ensure_rg_hit(
-    hits: &mut Vec<SearchHit>,
-    indexes: &mut HashMap<String, usize>,
-    path: &str,
-) -> usize {
-    if let Some(index) = indexes.get(path).copied() {
-        return index;
-    }
-    let index = hits.len();
-    hits.push(SearchHit {
-        path: path.to_string(),
-        matches: Vec::new(),
-        lines: Vec::new(),
-    });
-    indexes.insert(path.to_string(), index);
-    index
-}
-
-fn push_rg_context_break_if_needed(hit: &mut SearchHit, line_number: usize) {
-    let previous_line = hit.lines.iter().rev().find_map(|line| match line {
-        SearchLine::Match(value) => Some(value.location.line),
-        SearchLine::Context(value) => Some(value.line_number),
-        SearchLine::ContextBreak => None,
-    });
-    if previous_line.is_some_and(|previous| line_number > previous.saturating_add(1))
-        && !matches!(hit.lines.last(), Some(SearchLine::ContextBreak))
-    {
-        hit.lines.push(SearchLine::ContextBreak);
-    }
-}
-
-fn rg_file_match(snippet: &str, line_number: usize, submatch: &Value) -> Option<FileMatch> {
-    let start = submatch.get("start")?.as_u64()?;
-    let end = submatch.get("end")?.as_u64()?;
-    let start = usize::try_from(start).ok()?;
-    let end = usize::try_from(end).ok()?;
-    let matched_text = submatch
-        .get("match")
-        .and_then(|value| value.get("text"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| snippet.get(start..end).map(ToOwned::to_owned))
-        .unwrap_or_default();
-    let column = snippet
-        .get(..start)
-        .map(|prefix| prefix.chars().count() + 1)
-        .unwrap_or(1);
-    Some(FileMatch {
-        location: MatchLocation {
-            line: line_number,
-            column,
-        },
-        snippet: snippet.to_string(),
-        matched_text,
-    })
-}
-
 fn build_path_filter(repo_root: &PathBuf, args: &PathFilterArgs) -> Result<Option<PathFilter>> {
     let has_scope = !args.roots.is_empty()
         || !args.globs.is_empty()
@@ -1905,183 +1798,64 @@ fn build_path_filter(repo_root: &PathBuf, args: &PathFilterArgs) -> Result<Optio
     Ok(Some(PathFilter::new(args.clone(), repo_root)?))
 }
 
-pub fn system_time_to_unix_secs(time: Option<SystemTime>) -> Option<u64> {
-    time.and_then(|value| value.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| duration.as_secs())
+fn normalize_repo_scope_args(repo_root: &Path, args: &PathFilterArgs) -> Result<PathFilterArgs> {
+    let mut normalized = args.clone();
+    normalized.roots = args
+        .roots
+        .iter()
+        .map(|root| {
+            let normalized = normalize_path(root, repo_root);
+            if normalized == *repo_root || normalized.starts_with(repo_root) {
+                Ok(normalized)
+            } else {
+                Err(AppError::Protocol(format!(
+                    "scope root escapes repo boundary: {}",
+                    normalized.to_string_lossy()
+                )))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(normalized)
 }
 
-pub fn convert_search_results(results: SearchResults) -> crate::daemon::protocol::SearchResults {
-    crate::daemon::protocol::SearchResults {
-        candidate_docs: results.candidate_docs,
-        searches_with_match: results.searches_with_match,
-        bytes_searched: results.bytes_searched,
-        matched_lines: results.matched_lines,
-        matched_occurrences: results.matched_occurrences,
-        hits: results
-            .hits
-            .into_iter()
-            .map(|hit| crate::daemon::protocol::SearchHit {
-                path: hit.path,
-                matches: hit
-                    .matches
-                    .into_iter()
-                    .map(|matched| crate::daemon::protocol::FileMatch {
-                        location: crate::daemon::protocol::MatchLocation {
-                            line: matched.location.line,
-                            column: matched.location.column,
-                        },
-                        snippet: matched.snippet,
-                        matched_text: matched.matched_text,
-                    })
-                    .collect(),
-                lines: hit
-                    .lines
-                    .into_iter()
-                    .map(|line| match line {
-                        SearchLine::Match(value) => crate::daemon::protocol::SearchLine::Match {
-                            value: crate::daemon::protocol::FileMatch {
-                                location: crate::daemon::protocol::MatchLocation {
-                                    line: value.location.line,
-                                    column: value.location.column,
-                                },
-                                snippet: value.snippet,
-                                matched_text: value.matched_text,
-                            },
-                        },
-                        SearchLine::Context(context) => {
-                            crate::daemon::protocol::SearchLine::Context {
-                                line_number: context.line_number,
-                                snippet: context.snippet,
-                            }
-                        }
-                        SearchLine::ContextBreak => {
-                            crate::daemon::protocol::SearchLine::ContextBreak
-                        }
-                    })
-                    .collect(),
-            })
-            .collect(),
-    }
-}
-
-pub fn convert_task_status(task: RepoTaskStatus) -> crate::daemon::protocol::TaskStatus {
-    crate::daemon::protocol::TaskStatus {
-        task_id: task.task_id,
-        workspace_id: task.repo_id,
-        kind: convert_task_kind(task.kind),
-        state: convert_task_state(task.state),
-        phase: task.phase.map(convert_task_phase),
-        message: task.message,
-        processed: task.processed,
-        total: task.total,
-        started_unix_secs: task
-            .started_at
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        updated_unix_secs: task
-            .updated_at
-            .duration_since(UNIX_EPOCH)
-            .unwrap_or_default()
-            .as_secs(),
-        finished_unix_secs: system_time_to_unix_secs(task.finished_at),
-        cancellable: task.cancellable,
-        error: task.error,
-    }
-}
-
-pub fn convert_task_kind(kind: RepoTaskKind) -> crate::daemon::protocol::TaskKind {
-    match kind {
-        RepoTaskKind::BuildIndex => crate::daemon::protocol::TaskKind::BuildIndex,
-        RepoTaskKind::RebuildIndex => crate::daemon::protocol::TaskKind::RebuildIndex,
-        RepoTaskKind::RefreshWorkspace => crate::daemon::protocol::TaskKind::RefreshWorkspace,
-    }
-}
-
-pub fn convert_task_state(state: RepoTaskState) -> crate::daemon::protocol::TaskState {
-    match state {
-        RepoTaskState::Queued => crate::daemon::protocol::TaskState::Queued,
-        RepoTaskState::Running => crate::daemon::protocol::TaskState::Running,
-        RepoTaskState::Completed => crate::daemon::protocol::TaskState::Completed,
-        RepoTaskState::Failed => crate::daemon::protocol::TaskState::Failed,
-        RepoTaskState::Cancelled => crate::daemon::protocol::TaskState::Cancelled,
-    }
-}
-
-pub fn convert_task_phase(phase: IndexProgressPhase) -> crate::daemon::protocol::TaskPhase {
-    match phase {
-        IndexProgressPhase::Scanning => crate::daemon::protocol::TaskPhase::Scanning,
-        IndexProgressPhase::Tokenizing => crate::daemon::protocol::TaskPhase::Tokenizing,
-        IndexProgressPhase::Writing => crate::daemon::protocol::TaskPhase::Writing,
-        IndexProgressPhase::Finalizing => crate::daemon::protocol::TaskPhase::Finalizing,
-        IndexProgressPhase::RefreshingOverlay => {
-            crate::daemon::protocol::TaskPhase::RefreshingOverlay
+fn glob_scope_cache_key(args: &PathFilterArgs) -> String {
+    fn append_path_list(key: &mut String, values: &[PathBuf]) {
+        for value in values {
+            key.push('\u{1f}');
+            key.push_str(&value.to_string_lossy());
         }
     }
-}
 
-pub fn convert_query_backend(backend: QueryBackend) -> crate::daemon::protocol::SearchBackend {
-    match backend {
-        QueryBackend::IndexedSnapshot => crate::daemon::protocol::SearchBackend::IndexedSnapshot,
-        QueryBackend::IndexedClean => crate::daemon::protocol::SearchBackend::IndexedClean,
-        QueryBackend::IndexedWorkspaceRepair => {
-            crate::daemon::protocol::SearchBackend::IndexedWorkspaceRepair
-        }
-        QueryBackend::RgFallback => crate::daemon::protocol::SearchBackend::RgFallback,
-        QueryBackend::ScanFallback => crate::daemon::protocol::SearchBackend::ScanFallback,
-    }
-}
-
-pub fn convert_repo_phase(phase: RepoPhase) -> crate::daemon::protocol::RepoPhase {
-    match phase {
-        RepoPhase::Opening => crate::daemon::protocol::RepoPhase::Opening,
-        RepoPhase::MissingIndex => crate::daemon::protocol::RepoPhase::MissingIndex,
-        RepoPhase::Indexing => crate::daemon::protocol::RepoPhase::Indexing,
-        RepoPhase::ReadyClean => crate::daemon::protocol::RepoPhase::ReadyClean,
-        RepoPhase::ReadyDirty => crate::daemon::protocol::RepoPhase::ReadyDirty,
-        RepoPhase::Rebuilding => crate::daemon::protocol::RepoPhase::Rebuilding,
-        RepoPhase::Degraded => crate::daemon::protocol::RepoPhase::Degraded,
-    }
-}
-
-pub fn convert_consistency(
-    consistency: SearchConsistency,
-) -> crate::daemon::protocol::ConsistencyMode {
-    match consistency {
-        SearchConsistency::SnapshotOnly => crate::daemon::protocol::ConsistencyMode::SnapshotOnly,
-        SearchConsistency::WorkspaceEventual => {
-            crate::daemon::protocol::ConsistencyMode::WorkspaceEventual
-        }
-        SearchConsistency::WorkspaceStrict => {
-            crate::daemon::protocol::ConsistencyMode::WorkspaceStrict
+    fn append_string_list(key: &mut String, values: &[String]) {
+        for value in values {
+            key.push('\u{1f}');
+            key.push_str(value);
         }
     }
+
+    let mut key = String::new();
+    append_path_list(&mut key, &args.roots);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.globs);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.iglobs);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.type_add);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.type_clear);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.types);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.type_not);
+    key
 }
 
-pub fn build_config_from_open(
-    repo_path: PathBuf,
-    index_path: Option<PathBuf>,
-    tokenizer: crate::daemon::protocol::TokenizerModeConfig,
-    corpus_mode: crate::daemon::protocol::CorpusModeConfig,
-    include_hidden: bool,
-    max_file_size: u64,
-    min_sparse_len: usize,
-    max_sparse_len: usize,
-) -> BuildConfig {
-    BuildConfig {
-        index_path: index_path.unwrap_or_else(|| repo_path.join(".codgrep-index")),
-        repo_path,
-        tokenizer: match tokenizer {
-            crate::daemon::protocol::TokenizerModeConfig::Trigram => TokenizerMode::Trigram,
-            crate::daemon::protocol::TokenizerModeConfig::SparseNgram => TokenizerMode::SparseNgram,
-        },
-        corpus_mode: match corpus_mode {
-            crate::daemon::protocol::CorpusModeConfig::RespectIgnore => CorpusMode::RespectIgnore,
-            crate::daemon::protocol::CorpusModeConfig::NoIgnore => CorpusMode::NoIgnore,
-        },
-        include_hidden,
-        max_file_size,
-        min_sparse_len,
-        max_sparse_len,
+fn scan_roots(repo_root: &Path, args: &PathFilterArgs) -> Vec<PathBuf> {
+    if args.roots.is_empty() {
+        return vec![repo_root.to_path_buf()];
     }
+    args.roots
+        .iter()
+        .map(|root| normalize_path(root, repo_root))
+        .collect()
 }

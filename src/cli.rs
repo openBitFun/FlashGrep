@@ -4,16 +4,15 @@ use std::path::PathBuf;
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
 use crate::{
-    config::{BuildConfig, CorpusMode, TokenizerMode},
+    config::{CorpusMode, TokenizerMode},
     daemon::{
         protocol::{
-            ConsistencyMode, OpenRepoParams, PathScope, QuerySpec, RefreshRepoParams, RepoConfig,
-            RepoRef, Request, SearchModeConfig, SearchParams,
+            ConsistencyMode, EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec,
+            RefreshRepoParams, RepoConfig, RepoRef, Request, SearchModeConfig, SearchParams,
         },
-        serve, DaemonClient, ServerOptions,
+        serve, DaemonClient, ManagedDaemonClient, ServerOptions,
     },
     error::{AppError, Result},
-    index::build_index,
     tools::bench::BenchQueryMode,
     tools::bench::{self, BenchCacheMode, BenchConfig},
 };
@@ -124,6 +123,7 @@ enum DaemonCommands {
     Build(DaemonRepoArgs),
     Rebuild(DaemonRepoArgs),
     Search(DaemonSearchArgs),
+    Glob(DaemonGlobArgs),
     Close(DaemonRepoArgs),
     Shutdown(DaemonConnectArgs),
 }
@@ -231,6 +231,26 @@ struct DaemonSearchArgs {
     paths: Vec<PathBuf>,
 }
 
+#[derive(Debug, Args)]
+struct DaemonGlobArgs {
+    #[command(flatten)]
+    repo: DaemonRepoArgs,
+    #[arg(short = 'g', long = "glob", value_name = "GLOB")]
+    glob: Vec<String>,
+    #[arg(long = "iglob", value_name = "GLOB")]
+    iglob: Vec<String>,
+    #[arg(short = 't', long = "type", value_name = "TYPE")]
+    file_type: Vec<String>,
+    #[arg(short = 'T', long = "type-not", value_name = "TYPE")]
+    file_type_not: Vec<String>,
+    #[arg(long = "type-add", value_name = "TYPE_SPEC")]
+    type_add: Vec<String>,
+    #[arg(long = "type-clear", value_name = "TYPE")]
+    type_clear: Vec<String>,
+    #[arg(index = 1, value_name = "PATH")]
+    paths: Vec<PathBuf>,
+}
+
 #[derive(Debug, Clone, Copy, ValueEnum)]
 enum BenchCacheArg {
     Warm,
@@ -334,24 +354,44 @@ fn run_build(args: BuildArgs) -> Result<bool> {
     } else {
         args.corpus_mode.unwrap_or(CorpusArg::Ignore).into()
     };
-    let index_path = args
-        .index
-        .unwrap_or_else(|| args.repo.join(".codgrep-index"));
-    let config = BuildConfig {
+    let params = EnsureRepoParams {
         repo_path: args.repo,
-        index_path,
-        tokenizer: args.tokenizer.into(),
-        corpus_mode,
-        include_hidden: args.hidden,
-        max_file_size: args.max_file_size,
-        min_sparse_len: args.min_sparse_len,
-        max_sparse_len: args.max_sparse_len,
+        index_path: args.index,
+        config: RepoConfig {
+            tokenizer: match args.tokenizer {
+                TokenizerArg::Trigram => crate::daemon::protocol::TokenizerModeConfig::Trigram,
+                TokenizerArg::SparseNgram => {
+                    crate::daemon::protocol::TokenizerModeConfig::SparseNgram
+                }
+            },
+            corpus_mode: match corpus_mode {
+                CorpusMode::RespectIgnore => {
+                    crate::daemon::protocol::CorpusModeConfig::RespectIgnore
+                }
+                CorpusMode::NoIgnore => crate::daemon::protocol::CorpusModeConfig::NoIgnore,
+            },
+            include_hidden: args.hidden,
+            max_file_size: args.max_file_size,
+            min_sparse_len: args.min_sparse_len,
+            max_sparse_len: args.max_sparse_len,
+        },
+        refresh: crate::daemon::protocol::RefreshPolicyConfig::default(),
     };
-    let doc_count = build_index(&config)?;
-    println!(
-        "indexed {doc_count} docs with {}",
-        config.tokenizer.as_str()
-    );
+    let ensured = ManagedDaemonClient::new().ensure_repo(params)?;
+    match ensured.indexed_docs {
+        Some(indexed_docs) => {
+            println!(
+                "ensured repo via daemon at {}: indexed {indexed_docs} docs",
+                ensured.addr
+            );
+        }
+        None => {
+            println!(
+                "ensured repo via daemon at {}: base snapshot already available",
+                ensured.addr
+            );
+        }
+    }
     Ok(true)
 }
 
@@ -476,6 +516,23 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
                         DaemonConsistencyArg::WorkspaceStrict => ConsistencyMode::WorkspaceStrict,
                     },
                     allow_scan_fallback: args.allow_scan_fallback,
+                },
+            })?;
+            print_daemon_response(&response)?;
+            Ok(true)
+        }
+        DaemonCommands::Glob(args) => {
+            let client = DaemonClient::new(args.repo.connect.addr);
+            let response = client.glob(GlobParams {
+                repo_id: args.repo.repo_id,
+                scope: PathScope {
+                    roots: args.paths,
+                    globs: args.glob,
+                    iglobs: args.iglob,
+                    type_add: args.type_add,
+                    type_clear: args.type_clear,
+                    types: args.file_type,
+                    type_not: args.file_type_not,
                 },
             })?;
             print_daemon_response(&response)?;

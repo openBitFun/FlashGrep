@@ -6,7 +6,7 @@ use ignore::{
     Match,
 };
 
-use crate::error::Result;
+use crate::{error::Result, path_utils::normalize_path as normalize_path_impl};
 
 #[derive(Debug, Clone, Default)]
 pub struct PathFilterArgs {
@@ -144,29 +144,7 @@ fn common_prefix(left: &Path, right: &Path) -> Option<PathBuf> {
 }
 
 pub fn normalize_path(path: &Path, current_dir: &Path) -> PathBuf {
-    let joined = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        current_dir.join(path)
-    };
-    let normalized = normalize_lexical_path(&joined);
-    std::fs::canonicalize(&normalized).unwrap_or(normalized)
-}
-
-fn normalize_lexical_path(path: &Path) -> PathBuf {
-    use std::path::Component;
-
-    let mut normalized = PathBuf::new();
-    for component in path.components() {
-        match component {
-            Component::CurDir => {}
-            Component::ParentDir => {
-                normalized.pop();
-            }
-            _ => normalized.push(component.as_os_str()),
-        }
-    }
-    normalized
+    normalize_path_impl(path, current_dir)
 }
 
 #[cfg(test)]

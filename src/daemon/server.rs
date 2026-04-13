@@ -1,12 +1,11 @@
 use std::{
     fs,
-    io::{BufRead, BufReader, BufWriter, Write},
-    net::{TcpListener, TcpStream},
+    io::{BufReader, BufWriter},
+    net::TcpListener,
     path::{Path, PathBuf},
     sync::{
-        mpsc,
         atomic::{AtomicBool, Ordering},
-        Arc,
+        mpsc, Arc,
     },
     thread,
     time::{Duration, SystemTime, UNIX_EPOCH},
@@ -16,11 +15,19 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     daemon::{
-        protocol::{RequestEnvelope, Request, ServerMessage},
+        protocol::{Request, ServerMessage},
         service::DaemonService,
     },
     error::{AppError, Result},
 };
+
+#[path = "server/codec.rs"]
+mod codec;
+#[path = "server/connection.rs"]
+mod connection;
+
+use codec::{read_content_length_request, write_content_length_message};
+use connection::handle_connection;
 
 #[derive(Debug, Clone)]
 pub struct ServerOptions {
@@ -275,11 +282,12 @@ mod tests {
             },
         );
         match read_message(&mut reader) {
-            ServerMessage::Response(response) => match response.result.expect("result should exist")
-            {
-                Response::InitializeResult { .. } => {}
-                other => panic!("unexpected initialize response: {other:?}"),
-            },
+            ServerMessage::Response(response) => {
+                match response.result.expect("result should exist") {
+                    Response::InitializeResult { .. } => {}
+                    other => panic!("unexpected initialize response: {other:?}"),
+                }
+            }
             other => panic!("unexpected message: {other:?}"),
         }
 
@@ -373,7 +381,10 @@ mod tests {
 
         assert!(task_id.is_some(), "expected task_started response");
         assert!(saw_progress, "expected progress notification");
-        assert!(saw_status_changed, "expected workspace/statusChanged notification");
+        assert!(
+            saw_status_changed,
+            "expected workspace/statusChanged notification"
+        );
         assert!(saw_task_finished, "expected task/finished notification");
 
         let client = DaemonClient::new(state.addr);
@@ -402,17 +413,19 @@ mod tests {
             if line.trim().is_empty() {
                 continue;
             }
-            let value: serde_json::Value = serde_json::from_str(&line)
-                .unwrap_or_else(|error| panic!("decode json should succeed: {error}; line={line:?}"));
+            let value: serde_json::Value = serde_json::from_str(&line).unwrap_or_else(|error| {
+                panic!("decode json should succeed: {error}; line={line:?}")
+            });
             if value.get("method").is_some() {
                 let envelope = serde_json::from_value(value).unwrap_or_else(|error| {
                     panic!("decode notification should succeed: {error}; line={line:?}")
                 });
                 return ServerMessage::Notification(envelope);
             }
-            let envelope: ResponseEnvelope = serde_json::from_value(value).unwrap_or_else(|error| {
-                panic!("decode response should succeed: {error}; line={line:?}")
-            });
+            let envelope: ResponseEnvelope =
+                serde_json::from_value(value).unwrap_or_else(|error| {
+                    panic!("decode response should succeed: {error}; line={line:?}")
+                });
             return ServerMessage::Response(envelope);
         }
     }
@@ -447,95 +460,4 @@ mod tests {
         reader.read_line(&mut header).expect("header should read");
         assert!(header.starts_with("Content-Length: "));
     }
-}
-
-fn read_content_length_request(reader: &mut impl BufRead) -> Result<Option<RequestEnvelope>> {
-    let mut content_length = None;
-    loop {
-        let mut line = String::new();
-        let read = reader.read_line(&mut line)?;
-        if read == 0 {
-            return Ok(None);
-        }
-        if line == "\r\n" || line == "\n" {
-            break;
-        }
-        let trimmed = line.trim_end_matches(['\r', '\n']);
-        if let Some(value) = trimmed.strip_prefix("Content-Length:") {
-            let length = value.trim().parse::<usize>().map_err(|error| {
-                AppError::Protocol(format!("invalid Content-Length header: {error}"))
-            })?;
-            content_length = Some(length);
-        }
-    }
-
-    let content_length =
-        content_length.ok_or_else(|| AppError::Protocol("missing Content-Length header".into()))?;
-    let mut body = vec![0u8; content_length];
-    reader.read_exact(&mut body)?;
-    serde_json::from_slice(&body)
-        .map_err(|error| AppError::Protocol(format!("invalid daemon request: {error}")))
-}
-
-fn write_content_length_message(
-    writer: &mut impl Write,
-    message: &ServerMessage,
-) -> Result<()> {
-    let body = serde_json::to_vec(message)
-        .map_err(|error| AppError::Protocol(format!("failed to encode response: {error}")))?;
-    write!(writer, "Content-Length: {}\r\n\r\n", body.len())?;
-    writer.write_all(&body)?;
-    writer.flush()?;
-    Ok(())
-}
-
-fn handle_connection(
-    stream: TcpStream,
-    service: &DaemonService,
-    running: &Arc<AtomicBool>,
-) -> Result<()> {
-    let reader = BufReader::new(stream.try_clone()?);
-    let (out_tx, out_rx) = mpsc::channel::<ServerMessage>();
-    let connection_id = service.register_connection(out_tx.clone());
-    let writer_handle = thread::spawn(move || -> Result<()> {
-        let mut writer = BufWriter::new(stream);
-        while let Ok(message) = out_rx.recv() {
-            write_line_message(&mut writer, &message)?;
-        }
-        Ok(())
-    });
-
-    for line in reader.lines() {
-        let line = line?;
-        if line.trim().is_empty() {
-            continue;
-        }
-        let request: RequestEnvelope = serde_json::from_str(&line)
-            .map_err(|error| AppError::Protocol(format!("invalid daemon request: {error}")))?;
-        let is_shutdown = matches!(request.request, Request::Shutdown);
-        if let Some(response) = service.handle_for_connection(Some(connection_id), request) {
-            out_tx
-                .send(ServerMessage::Response(response))
-                .map_err(|error| AppError::Protocol(format!("failed to send response: {error}")))?;
-        }
-        if is_shutdown {
-            running.store(false, Ordering::Relaxed);
-            break;
-        }
-    }
-
-    service.unregister_connection(connection_id);
-    drop(out_tx);
-    writer_handle
-        .join()
-        .map_err(|_| AppError::Protocol("daemon writer thread panicked".into()))??;
-    Ok(())
-}
-
-fn write_line_message(writer: &mut impl Write, message: &ServerMessage) -> Result<()> {
-    serde_json::to_writer(&mut *writer, message)
-        .map_err(|error| AppError::Protocol(format!("failed to encode response: {error}")))?;
-    writer.write_all(b"\n")?;
-    writer.flush()?;
-    Ok(())
 }

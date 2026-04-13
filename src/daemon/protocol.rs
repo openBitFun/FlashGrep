@@ -62,6 +62,9 @@ pub enum Request {
     Search {
         params: SearchParams,
     },
+    Glob {
+        params: GlobParams,
+    },
     CloseRepo {
         params: RepoRef,
     },
@@ -141,6 +144,13 @@ pub struct SearchParams {
     pub consistency: ConsistencyMode,
     #[serde(default)]
     pub allow_scan_fallback: bool,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GlobParams {
+    pub repo_id: String,
+    #[serde(default)]
+    pub scope: PathScope,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -383,6 +393,11 @@ pub enum Response {
         status: RepoStatus,
         results: SearchResults,
     },
+    GlobCompleted {
+        repo_id: String,
+        status: RepoStatus,
+        paths: Vec<String>,
+    },
     RepoClosed {
         repo_id: String,
     },
@@ -407,6 +422,7 @@ pub struct ServerCapabilities {
     pub task_status: bool,
     pub task_cancel: bool,
     pub search_query: bool,
+    pub glob_query: bool,
     pub progress_notifications: bool,
     pub status_notifications: bool,
 }
