@@ -2,7 +2,7 @@ use std::fs;
 
 use codgrep::sdk::{
     count_only_query, EnsureRepoParams, GlobRequest, ManagedClient, OpenRepoParams, PathScope,
-    RepoConfig, RepoPhase, SearchBackend, SearchRequest, TaskState,
+    RepoConfig, RepoEvent, RepoPhase, SearchBackend, SearchRequest, TaskState,
 };
 use tempfile::tempdir;
 
@@ -103,6 +103,71 @@ fn rust_sdk_supports_open_then_manual_index_build() {
         .search(SearchRequest::new(count_only_query("HELLO")))
         .expect("search should succeed after build");
     assert_eq!(search.results.matched_lines, 1);
+
+    repo.shutdown_daemon().expect("shutdown should succeed");
+}
+
+#[test]
+fn rust_sdk_can_subscribe_to_progress_notifications() {
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("src")).expect("repo dir should succeed");
+    fs::write(
+        repo_path.join("src/lib.rs"),
+        "const NAME: &str = \"HELLO\";\n",
+    )
+    .expect("write should succeed");
+
+    let client = ManagedClient::new().with_daemon_program(env!("CARGO_BIN_EXE_cg"));
+    let repo = client
+        .open_repo(OpenRepoParams {
+            repo_path,
+            index_path: None,
+            config: RepoConfig::default(),
+            refresh: Default::default(),
+        })
+        .expect("open should succeed");
+
+    let mut events = repo
+        .subscribe_events()
+        .expect("event subscription should succeed");
+    let task = repo.index_build().expect("async build should start");
+
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    let mut saw_progress = false;
+    let mut saw_status_changed = false;
+    let mut saw_task_finished = false;
+    while std::time::Instant::now() < deadline {
+        let Some(event) = events
+            .recv_timeout(std::time::Duration::from_secs(1))
+            .expect("recv should succeed")
+        else {
+            continue;
+        };
+        match event {
+            RepoEvent::Progress(params) => {
+                if params.task_id == task.task_id {
+                    saw_progress = true;
+                }
+            }
+            RepoEvent::WorkspaceStatusChanged(_) => {
+                saw_status_changed = true;
+            }
+            RepoEvent::TaskFinished(params) => {
+                if params.task.task_id == task.task_id {
+                    saw_task_finished = true;
+                    break;
+                }
+            }
+        }
+    }
+
+    assert!(saw_progress, "expected progress notification");
+    assert!(
+        saw_status_changed,
+        "expected workspace/statusChanged notification"
+    );
+    assert!(saw_task_finished, "expected task/finished notification");
 
     repo.shutdown_daemon().expect("shutdown should succeed");
 }

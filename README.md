@@ -101,7 +101,11 @@ cargo run -- bench --suite-dir bench_data
 - `codgrep::sdk` Rust SDK facade
 - `cg serve` 与 `cg daemon *` 这些围绕 daemon 的工具入口
 
-crate 根上仍然存在若干历史库导出，便于仓库内部与迁移期代码复用，但它们不再是推荐的产品接入方式。
+其中：
+
+- `daemon::protocol` 是唯一稳定的外部 contract。
+- `DaemonClient` / `ManagedDaemonClient` 与 `codgrep::sdk` 都只是这个 contract 的客户端封装。
+- crate 根上仍然存在的历史库导出，仅用于仓库内部与迁移期代码复用，不应当作产品接入面。
 
 入口选择（推荐）：
 
@@ -155,6 +159,40 @@ repo.wait_task(task.task_id, Duration::from_secs(30))?;
 let search = repo.search(SearchRequest::new(count_only_query("LLVMContext")))?;
 ```
 
+如果调用方需要消费 daemon 的 `$/progress`、`workspace/statusChanged`、`task/finished`，可以订阅 repo 事件：
+
+```rust
+use std::time::Duration;
+
+use codgrep::sdk::{ManagedClient, OpenRepoParams, RepoConfig, RepoEvent};
+
+let client = ManagedClient::new();
+let repo = client.open_repo(OpenRepoParams {
+    repo_path: "/path/to/repo".into(),
+    index_path: None,
+    config: RepoConfig::default(),
+    refresh: Default::default(),
+})?;
+
+let mut events = repo.subscribe_events()?;
+let task = repo.index_build()?;
+
+while let Some(event) = events.recv_timeout(Duration::from_secs(1))? {
+    match event {
+        RepoEvent::Progress(progress) if progress.task_id == task.task_id => {
+            eprintln!("build progress: {} / {:?}", progress.processed, progress.total);
+        }
+        RepoEvent::WorkspaceStatusChanged(status) => {
+            eprintln!("repo phase: {:?}", status.status.phase);
+        }
+        RepoEvent::TaskFinished(done) if done.task.task_id == task.task_id => {
+            break;
+        }
+        _ => {}
+    }
+}
+```
+
 如果调用方本身已经是 `tokio` 应用，可以打开 `tokio-sdk` feature：
 
 ```bash
@@ -183,12 +221,29 @@ let search = repo
     .await?;
 ```
 
+异步 SDK 也提供同样的 repo 事件订阅接口：
+
+```rust
+let mut events = repo.subscribe_events().await?;
+if let Some(event) = events.recv_timeout(std::time::Duration::from_secs(1)).await? {
+    match event {
+        codgrep::sdk::RepoEvent::Progress(progress) => {
+            eprintln!("progress: {}", progress.message);
+        }
+        codgrep::sdk::RepoEvent::WorkspaceStatusChanged(_) => {}
+        codgrep::sdk::RepoEvent::TaskFinished(done) => {
+            eprintln!("task finished: {}", done.task.task_id);
+        }
+    }
+}
+```
+
 核心职责边界（固定定义）：
 
 - `daemon::protocol`：唯一稳定外部 contract。
-- `DaemonClient` / `ManagedDaemonClient`：面向外部调用方的 transport/client 封装。
-- `SearchEngine` / `WorkspaceIndex` / `WorkspaceSnapshot`：当前主要服务于 daemon 内部实现与迁移期代码。
-- `advanced::IndexSearcher`：面向高级场景的低层只读索引查询接口。
+- `DaemonClient` / `ManagedDaemonClient`：daemon protocol 的低层 transport/client 封装。
+- `codgrep::sdk`：Rust 调用方的首选 facade，建立在 daemon protocol 之上。
+- 其他 crate library API：内部实现、测试、benchmark、迁移期兼容，不作为稳定外部接口。
 
 ## Internal Library Notes
 
@@ -198,7 +253,7 @@ crate 根上仍然保留若干历史库导出，主要用于：
 - benchmark / fixture / 测试代码
 - 迁移期的仓库内辅助代码
 
-这些库接口不是推荐的外部接入方式，后续会继续收缩。
+这些库接口不是推荐的外部接入方式，后续会继续收缩；新的外部能力优先补到 daemon protocol / SDK，而不是继续扩展库层 facade。
 
 ## Daemon Overlay
 
@@ -304,7 +359,7 @@ cargo run -- bench \
 - `head_commit`
 - `config_fingerprint`
 
-如果后续需要把 freshness 结果作为稳定外部 contract 暴露，优先补到 daemon protocol，而不是继续扩展库层 facade。
+如果后续需要把 freshness 结果作为稳定外部 contract 暴露，优先补到 daemon protocol / SDK，而不是继续扩展库层 facade。
 
 ## 下一步建议
 

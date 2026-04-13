@@ -20,23 +20,27 @@ mod workspace;
 pub use error::{AppError, Result};
 
 #[deprecated(
-    note = "Use the daemon process API (`codgrep::daemon::protocol` / `DaemonClient`) as the stable external interface."
+    note = "Use the daemon process API (`codgrep::daemon::protocol`) or `codgrep::sdk`; library exports are not the stable external interface."
 )]
 pub use config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode};
 #[deprecated(
-    note = "Use daemon protocol requests for index lifecycle instead of calling library build functions directly."
+    note = "Use daemon protocol requests or `codgrep::sdk` for index lifecycle; direct library build functions are not the stable external interface."
 )]
 pub use index::{
     build_index, build_index_with_options, rebuild_index, rebuild_index_with_options,
     IndexBuildOptions,
 };
 #[deprecated(
-    note = "Use daemon protocol search responses/results instead of the library search models."
+    note = "Use daemon protocol search responses/results or `codgrep::sdk`; library search models are not the stable external interface."
 )]
 pub use search::{SearchMode, SearchResults};
-#[deprecated(note = "Use the daemon process API instead of direct library search facades.")]
+#[deprecated(
+    note = "Use the daemon process API or `codgrep::sdk` instead of direct library search facades."
+)]
 pub use search_engine::{SearchBackend, SearchEngine, SearchPolicy, SearchResponse};
-#[deprecated(note = "Use the daemon process API instead of direct workspace library facades.")]
+#[deprecated(
+    note = "Use the daemon process API or `codgrep::sdk` instead of direct workspace library facades."
+)]
 pub use workspace::{
     WorkspaceFreshness, WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions,
     WorkspaceSnapshot,
@@ -44,7 +48,7 @@ pub use workspace::{
 
 /// Expert-facing API surface for advanced integration scenarios.
 #[deprecated(
-    note = "Advanced library APIs are not part of the stable external contract; prefer the daemon process API."
+    note = "Advanced library APIs are internal/experimental integration helpers, not the stable external contract; prefer the daemon process API or `codgrep::sdk`."
 )]
 pub mod advanced {
     pub use crate::files::{
@@ -75,7 +79,7 @@ pub mod advanced {
 
 /// Unstable or evolving API surface intended for experimentation.
 #[deprecated(
-    note = "Experimental library APIs are not part of the stable external contract; prefer the daemon process API."
+    note = "Experimental library APIs are not the stable external contract; prefer the daemon process API or `codgrep::sdk`."
 )]
 pub mod experimental {
     pub use crate::planner::{plan, PureLiteralAlternation, QueryBranch, QueryPlan};
