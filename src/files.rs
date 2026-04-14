@@ -1,4 +1,5 @@
 use std::{
+    ffi::OsStr,
     fs::{self, File},
     io::Read,
     path::{Path, PathBuf},
@@ -34,6 +35,11 @@ pub struct ScanOptions {
     pub ignore_files: Vec<PathBuf>,
 }
 
+pub fn is_workspace_internal_path(path: &Path) -> bool {
+    path.components()
+        .any(|component| component.as_os_str() == OsStr::new(".bitfun"))
+}
+
 pub fn scan_repository(config: &BuildConfig) -> Result<Vec<RepositoryFile>> {
     scan_paths(
         std::slice::from_ref(&config.repo_path),
@@ -61,6 +67,14 @@ pub fn read_text_file(path: &std::path::Path) -> Result<Option<String>> {
     }
 }
 
+pub fn is_indexable_text_file(path: &Path) -> Result<bool> {
+    let bytes = fs::read(path)?;
+    if looks_binary(&bytes) {
+        return Ok(false);
+    }
+    Ok(std::str::from_utf8(&bytes).is_ok())
+}
+
 pub fn is_text_file(path: &Path) -> Result<bool> {
     let mut file = File::open(path)?;
     let mut probe = [0u8; 8 * 1024];
@@ -85,6 +99,9 @@ pub fn scan_paths(
     let mut files = Vec::new();
 
     for root in roots {
+        if is_workspace_internal_path(root) {
+            continue;
+        }
         if root.is_file() {
             if let Some(file) = repository_file(root, files.len(), options.max_file_size)? {
                 if path_filter.is_none_or(|filter| filter.matches_file(root)) {
@@ -124,10 +141,13 @@ fn build_walker_from_options(
     builder.follow_links(false);
     builder.max_filesize(Some(options.max_file_size));
     builder.max_depth(options.max_depth);
-    if let Some(index_path) = index_path {
-        let index_path = index_path.to_path_buf();
-        builder.filter_entry(move |entry| !entry.path().starts_with(&index_path));
-    }
+    let index_path = index_path.map(PathBuf::from);
+    builder.filter_entry(move |entry| {
+        !is_workspace_internal_path(entry.path())
+            && !index_path
+                .as_ref()
+                .is_some_and(|index_path| entry.path().starts_with(index_path))
+    });
 
     if options.respect_ignore {
         builder.hidden(!options.include_hidden);
@@ -201,7 +221,17 @@ fn looks_like_text_prefix(bytes: &[u8]) -> bool {
 
 #[cfg(test)]
 mod tests {
-    use super::looks_like_text_prefix;
+    use std::{
+        fs,
+        path::{Path, PathBuf},
+    };
+
+    use tempfile::TempDir;
+
+    use super::{
+        is_indexable_text_file, is_workspace_internal_path, looks_like_text_prefix, scan_paths,
+        ScanOptions,
+    };
 
     #[test]
     fn text_prefix_accepts_utf8() {
@@ -223,5 +253,65 @@ mod tests {
     #[test]
     fn text_prefix_rejects_invalid_utf8() {
         assert!(!looks_like_text_prefix(&[0xFF, b'a']));
+    }
+
+    #[test]
+    fn indexable_text_file_rejects_invalid_utf8_after_text_prefix() {
+        let temp = TempDir::new().expect("temp dir should succeed");
+        let path = temp.path().join("encoded.txt");
+        let mut bytes = vec![b'a'; 8 * 1024];
+        bytes.push(0xFF);
+        fs::write(&path, bytes).expect("encoded file should be written");
+
+        assert!(!is_indexable_text_file(&path).expect("probe should succeed"));
+    }
+
+    #[test]
+    fn workspace_internal_path_detects_bitfun_component() {
+        assert!(is_workspace_internal_path(Path::new(
+            "/tmp/repo/.bitfun/search/codgrep-index/docs.bin"
+        )));
+        assert!(is_workspace_internal_path(Path::new(
+            "/tmp/repo/subdir/.bitfun/session.json"
+        )));
+        assert!(!is_workspace_internal_path(Path::new(
+            "/tmp/repo/src/main.rs"
+        )));
+    }
+
+    #[test]
+    fn scan_paths_excludes_workspace_internal_files() {
+        let temp = TempDir::new().expect("temp dir should succeed");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(repo.join("src")).expect("src dir should succeed");
+        fs::create_dir_all(repo.join(".bitfun").join("sessions"))
+            .expect(".bitfun dir should succeed");
+        fs::write(repo.join("src").join("main.rs"), "fn main() {}\n")
+            .expect("main.rs should be written");
+        fs::write(
+            repo.join(".bitfun").join("sessions").join("turn-0000.json"),
+            "{}\n",
+        )
+        .expect("session file should be written");
+
+        let scanned = scan_paths(
+            &[PathBuf::from(&repo)],
+            Some(&repo.join(".bitfun").join("search").join("codgrep-index")),
+            ScanOptions {
+                respect_ignore: false,
+                include_hidden: true,
+                max_file_size: 1024 * 1024,
+                max_depth: None,
+                ignore_files: Vec::new(),
+            },
+            None,
+        )
+        .expect("scan_paths should succeed");
+
+        let paths = scanned
+            .into_iter()
+            .map(|file| file.path)
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec![repo.join("src").join("main.rs")]);
     }
 }

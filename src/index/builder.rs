@@ -13,11 +13,15 @@ use crc32fast::Hasher;
 use crate::{
     config::BuildConfig,
     error::{AppError, Result},
-    files::{read_text_file, repo_relative_path, scan_repository, RepositoryFile},
+    files::{
+        is_workspace_internal_path, read_text_file, repo_relative_path, resolve_repo_path,
+        scan_repository, RepositoryFile,
+    },
     index::format::{
-        activate_generation, ensure_dir, read_doc_terms_file, read_docs_file, write_lookup_file,
-        DocMeta, DocTermsWriter, DocsWriter, FallbackTrigramSettings, IndexBuildSettings,
-        IndexLayout, IndexMetadata, LookupEntry, PostingsWriter,
+        activate_generation, ensure_dir, read_doc_terms_file, read_docs_file, read_docs_header,
+        validate_index_layout, write_lookup_file, DocMeta, DocTermsWriter, DocsWriter,
+        FallbackTrigramSettings, IndexBuildSettings, IndexLayout, IndexMetadata, LookupEntry,
+        PostingsWriter,
     },
     progress::{IndexProgress, IndexProgressPhase},
     tokenizer::{create, TokenizerOptions},
@@ -35,6 +39,13 @@ const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 pub struct IndexBuildOptions<'a> {
     pub progress: Option<&'a mut dyn FnMut(IndexProgress)>,
     pub should_cancel: Option<&'a mut dyn FnMut() -> bool>,
+    pub rebuild_mode: RebuildMode,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RebuildMode {
+    ReuseExistingSnapshot,
+    ForceRebuildSnapshot,
 }
 
 impl<'a> Default for IndexBuildOptions<'a> {
@@ -42,6 +53,7 @@ impl<'a> Default for IndexBuildOptions<'a> {
         Self {
             progress: None,
             should_cancel: None,
+            rebuild_mode: RebuildMode::ReuseExistingSnapshot,
         }
     }
 }
@@ -60,6 +72,11 @@ impl<'a> IndexBuildOptions<'a> {
         self.should_cancel = Some(should_cancel);
         self
     }
+
+    pub fn with_rebuild_mode(mut self, rebuild_mode: RebuildMode) -> Self {
+        self.rebuild_mode = rebuild_mode;
+        self
+    }
 }
 
 pub fn build_index(config: &BuildConfig) -> Result<usize> {
@@ -72,14 +89,21 @@ pub fn build_index_with_options(
 ) -> Result<usize> {
     let mut noop_progress = |_event: IndexProgress| {};
     let mut noop_cancel = || false;
+    let rebuild_mode = options.rebuild_mode;
     let on_progress = options.progress.take().unwrap_or(&mut noop_progress);
     let should_cancel = options.should_cancel.take().unwrap_or(&mut noop_cancel);
 
-    build_index_internal(config, |event| on_progress(event), || should_cancel())
+    build_index_internal(
+        config,
+        rebuild_mode,
+        |event| on_progress(event),
+        || should_cancel(),
+    )
 }
 
 fn build_index_internal<F, C>(
     config: &BuildConfig,
+    rebuild_mode: RebuildMode,
     on_progress: F,
     should_cancel: C,
 ) -> Result<usize>
@@ -102,12 +126,20 @@ where
     ensure_dir(&config.index_path)?;
     ensure_dir(&IndexLayout::generations_dir(&config.index_path))?;
 
-    let layout = IndexLayout::for_generation(&config.index_path, &snapshot.generation);
-    if snapshot.git_worktree_dirty {
-        if layout.docs_path.exists() {
+    let generation = match rebuild_mode {
+        RebuildMode::ReuseExistingSnapshot => snapshot.generation.clone(),
+        RebuildMode::ForceRebuildSnapshot => fresh_generation_name(&snapshot.generation),
+    };
+    let layout = IndexLayout::for_generation(&config.index_path, &generation);
+    if snapshot.git_worktree_dirty && rebuild_mode == RebuildMode::ReuseExistingSnapshot {
+        if let Some(doc_count) = reusable_generation_doc_count(
+            &config,
+            &generation,
+            snapshot.head_commit.as_deref(),
+            &snapshot.config_fingerprint,
+        ) {
             check_cancel(&mut should_cancel)?;
-            activate_generation(&config.index_path, &snapshot.generation)?;
-            let doc_count = existing_doc_count(&layout)?;
+            activate_generation(&config.index_path, &generation)?;
             report_progress(
                 &mut on_progress,
                 IndexProgressPhase::Finalizing,
@@ -130,8 +162,8 @@ where
     let mut builder = StreamingIndexBuilder::new(&config, &snapshot, &layout)?;
     let cached_docs = load_cached_docs(&config, &snapshot);
 
-    if snapshot.git_worktree_dirty {
-        if let Some(head_commit) = snapshot.head_commit.as_deref() {
+    if let Some(head_commit) = snapshot.head_commit.as_deref() {
+        if snapshot.git_worktree_dirty {
             build_dirty_head_index(
                 &config,
                 &layout,
@@ -142,29 +174,11 @@ where
                 &mut should_cancel,
             )?;
         } else {
-            check_cancel(&mut should_cancel)?;
-            report_progress(
-                &mut on_progress,
-                IndexProgressPhase::Scanning,
-                "Scanning repository files",
-                0,
-                None,
-            );
-            let files = scan_repository(&config)?;
-            check_cancel(&mut should_cancel)?;
-            report_progress(
-                &mut on_progress,
-                IndexProgressPhase::Scanning,
-                "Scanned repository files",
-                files.len(),
-                Some(files.len()),
-            );
-            build_clean_index(
-                &files,
-                config.tokenizer,
-                tokenizer_options,
+            build_clean_git_index(
+                &config,
                 &cached_docs,
                 &mut builder,
+                tokenizer_options,
                 &mut on_progress,
                 &mut should_cancel,
             )?;
@@ -205,7 +219,7 @@ where
         &mut should_cancel,
     )?;
     check_cancel(&mut should_cancel)?;
-    activate_generation(&config.index_path, &snapshot.generation)?;
+    activate_generation(&config.index_path, &generation)?;
     report_progress(
         &mut on_progress,
         IndexProgressPhase::Finalizing,
@@ -225,7 +239,13 @@ pub fn rebuild_index_with_options(
     config: &BuildConfig,
     options: IndexBuildOptions<'_>,
 ) -> Result<usize> {
-    build_index_with_options(config, options)
+    build_index_with_options(
+        config,
+        IndexBuildOptions {
+            rebuild_mode: RebuildMode::ForceRebuildSnapshot,
+            ..options
+        },
+    )
 }
 
 fn compute_high_freq_doc_threshold(doc_count: usize) -> usize {
@@ -275,7 +295,7 @@ fn build_clean_index(
 
 fn build_dirty_head_index(
     config: &BuildConfig,
-    layout: &IndexLayout,
+    _layout: &IndexLayout,
     builder: &mut StreamingIndexBuilder,
     head_commit: &str,
     tokenizer_options: TokenizerOptions,
@@ -297,16 +317,14 @@ fn build_dirty_head_index(
         0,
         None,
     );
-    let files = scan_repository(&BuildConfig {
-        repo_path: checkout.root.clone(),
-        index_path: layout.root_path.join(".head-snapshot-index"),
-        tokenizer: config.tokenizer,
-        corpus_mode: config.corpus_mode,
-        include_hidden: config.include_hidden,
-        max_file_size: config.max_file_size,
-        min_sparse_len: config.min_sparse_len,
-        max_sparse_len: config.max_sparse_len,
-    })?;
+    let files = scan_git_head_files(
+        &config.repo_path,
+        &checkout.root,
+        head_commit,
+        config.include_hidden,
+        config.max_file_size,
+        should_cancel,
+    )?;
     report_progress(
         on_progress,
         IndexProgressPhase::Scanning,
@@ -355,6 +373,48 @@ fn build_dirty_head_index(
         check_cancel(should_cancel)?;
     }
     Ok(())
+}
+
+fn build_clean_git_index(
+    config: &BuildConfig,
+    cached_docs: &HashMap<String, CachedDoc>,
+    builder: &mut StreamingIndexBuilder,
+    tokenizer_options: TokenizerOptions,
+    on_progress: &mut impl FnMut(IndexProgress),
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<()> {
+    check_cancel(should_cancel)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Scanning,
+        "Scanning git tracked files",
+        0,
+        None,
+    );
+    let files = scan_git_tracked_files(
+        &config.repo_path,
+        &config.repo_path,
+        config.include_hidden,
+        config.max_file_size,
+        should_cancel,
+    )?;
+    check_cancel(should_cancel)?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Scanning,
+        "Scanned git tracked files",
+        files.len(),
+        Some(files.len()),
+    );
+    build_clean_index(
+        &files,
+        config.tokenizer,
+        tokenizer_options,
+        cached_docs,
+        builder,
+        on_progress,
+        should_cancel,
+    )
 }
 
 fn process_file_batch_in_parallel(
@@ -944,11 +1004,6 @@ fn build_settings_match(
         && build.config_fingerprint.as_deref() == Some(expected_config_fingerprint)
 }
 
-fn existing_doc_count(layout: &IndexLayout) -> Result<usize> {
-    let (_, docs) = read_docs_file(&layout.docs_path)?;
-    Ok(docs.len())
-}
-
 fn resolve_base_snapshot(
     config: &BuildConfig,
     should_cancel: &mut impl FnMut() -> bool,
@@ -956,9 +1011,15 @@ fn resolve_base_snapshot(
     let config_fingerprint = build_config_fingerprint(config);
     match resolve_git_head(&config.repo_path, should_cancel)? {
         Some(head_commit) => {
-            let generation = format!("base-git-{head_commit}-{config_fingerprint}");
+            let stable_generation = format!("base-git-{head_commit}-{config_fingerprint}");
             let worktree_dirty =
                 git_worktree_dirty(&config.repo_path, &config.index_path, should_cancel)?;
+            let generation = current_compatible_generation(
+                config,
+                Some(head_commit.as_str()),
+                &config_fingerprint,
+            )
+            .unwrap_or(stable_generation);
             Ok(BaseSnapshot {
                 generation,
                 head_commit: Some(head_commit),
@@ -968,8 +1029,11 @@ fn resolve_base_snapshot(
         }
         None => {
             let repo_fingerprint = repo_fingerprint(&config.repo_path);
+            let stable_generation = format!("base-repo-{repo_fingerprint}-{config_fingerprint}");
+            let generation = current_compatible_generation(config, None, &config_fingerprint)
+                .unwrap_or(stable_generation);
             Ok(BaseSnapshot {
-                generation: format!("base-repo-{repo_fingerprint}-{config_fingerprint}"),
+                generation,
                 head_commit: None,
                 config_fingerprint,
                 git_worktree_dirty: false,
@@ -1098,6 +1162,108 @@ fn materialize_head_checkout(
     Ok(checkout)
 }
 
+fn scan_git_tracked_files(
+    repo_root: &Path,
+    checkout_root: &Path,
+    include_hidden: bool,
+    max_file_size: u64,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Vec<RepositoryFile>> {
+    let paths = git_path_list(
+        repo_root,
+        ["ls-files", "-z", "--cached", "--", "."],
+        should_cancel,
+    )?;
+    collect_git_repository_files(checkout_root, paths, include_hidden, max_file_size)
+}
+
+fn scan_git_head_files(
+    repo_root: &Path,
+    checkout_root: &Path,
+    head_commit: &str,
+    include_hidden: bool,
+    max_file_size: u64,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Vec<RepositoryFile>> {
+    let paths = git_path_list(
+        repo_root,
+        ["ls-tree", "-r", "-z", "--name-only", head_commit, "--", "."],
+        should_cancel,
+    )?;
+    collect_git_repository_files(checkout_root, paths, include_hidden, max_file_size)
+}
+
+fn collect_git_repository_files(
+    checkout_root: &Path,
+    paths: Vec<String>,
+    include_hidden: bool,
+    max_file_size: u64,
+) -> Result<Vec<RepositoryFile>> {
+    let mut files = Vec::with_capacity(paths.len());
+    for logical_path in paths {
+        let path = resolve_repo_path(checkout_root, &logical_path);
+        if is_workspace_internal_path(&path)
+            || (!include_hidden && path_has_hidden_components(&path, checkout_root))
+        {
+            continue;
+        }
+        let metadata = match fs::metadata(&path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error.into()),
+        };
+        if !metadata.is_file() || metadata.len() > max_file_size {
+            continue;
+        }
+        let mtime_nanos = metadata
+            .modified()
+            .ok()
+            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+            .map(|duration| match u64::try_from(duration.as_nanos()) {
+                Ok(value) => value,
+                Err(_) => u64::MAX,
+            })
+            .unwrap_or_default();
+        files.push(RepositoryFile {
+            ordinal: files.len(),
+            path,
+            size: metadata.len(),
+            mtime_nanos,
+        });
+    }
+    Ok(files)
+}
+
+fn git_path_list<const N: usize>(
+    repo_root: &Path,
+    args: [&str; N],
+    _should_cancel: &mut impl FnMut() -> bool,
+) -> Result<Vec<String>> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_root).args(args);
+    let output = command.output()?;
+    if !output.status.success() {
+        return Err(AppError::InvalidIndex(format!(
+            "failed to enumerate git files for {}",
+            repo_root.display()
+        )));
+    }
+    Ok(output
+        .stdout
+        .split(|byte| *byte == 0)
+        .filter(|path| !path.is_empty())
+        .map(|path| String::from_utf8_lossy(path).into_owned())
+        .collect())
+}
+
+fn path_has_hidden_components(path: &Path, root: &Path) -> bool {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    relative.components().any(|component| match component {
+        std::path::Component::Normal(value) => value.to_string_lossy().starts_with('.'),
+        _ => false,
+    })
+}
+
 fn run_git_with_temp_index<const N: usize>(
     repo_root: &Path,
     index_path: &Path,
@@ -1194,6 +1360,68 @@ fn repo_fingerprint(repo_root: &Path) -> String {
     let mut hasher = Hasher::new();
     hasher.update(canonical_repo_root(repo_root).as_bytes());
     format!("{:08x}", hasher.finalize())
+}
+
+fn current_compatible_generation(
+    config: &BuildConfig,
+    expected_head_commit: Option<&str>,
+    expected_config_fingerprint: &str,
+) -> Option<String> {
+    let current_path = IndexLayout::current_path(&config.index_path);
+    let generation = fs::read_to_string(current_path).ok()?;
+    let generation = generation.trim();
+    if generation.is_empty() {
+        return None;
+    }
+
+    reusable_generation_doc_count(
+        config,
+        generation,
+        expected_head_commit,
+        expected_config_fingerprint,
+    )
+    .map(|_| generation.to_string())
+}
+
+fn fresh_generation_name(base_generation: &str) -> String {
+    let stable_generation = base_generation
+        .rsplit_once("-r")
+        .and_then(|(prefix, suffix)| {
+            suffix
+                .chars()
+                .all(|value| value.is_ascii_hexdigit())
+                .then_some(prefix)
+        })
+        .unwrap_or(base_generation);
+    let now_nanos = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|duration| duration.as_nanos())
+        .unwrap_or_default();
+    format!("{stable_generation}-r{now_nanos:x}")
+}
+
+fn reusable_generation_doc_count(
+    config: &BuildConfig,
+    generation: &str,
+    expected_head_commit: Option<&str>,
+    expected_config_fingerprint: &str,
+) -> Option<usize> {
+    let layout = IndexLayout::for_generation(&config.index_path, generation);
+    let (metadata, doc_count) = read_docs_header(&layout.docs_path).ok()?;
+    if metadata.tokenizer != config.tokenizer
+        || metadata.min_sparse_len != config.min_sparse_len
+        || metadata.max_sparse_len != config.max_sparse_len
+        || !build_settings_match(
+            metadata.build.as_ref(),
+            config,
+            expected_head_commit,
+            expected_config_fingerprint,
+        )
+    {
+        return None;
+    }
+    validate_index_layout(&layout, &metadata, doc_count).ok()?;
+    Some(doc_count)
 }
 
 pub(crate) fn canonical_repo_root(repo_root: &Path) -> String {
@@ -1297,4 +1525,83 @@ struct CachedDoc {
     mtime_nanos: u64,
     token_hashes: Vec<u64>,
     fallback_token_hashes: Vec<u64>,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, path::Path};
+
+    use tempfile::TempDir;
+
+    use super::build_index;
+    use crate::{
+        config::{BuildConfig, CorpusMode, TokenizerMode},
+        experimental::index_format::read_docs_file,
+        index::IndexSearcher,
+    };
+
+    #[test]
+    fn git_build_indexes_tracked_files_even_if_gitignored() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = temp.path().join("repo");
+        let index = repo.join(".bitfun").join("search").join("codgrep-index");
+        fs::create_dir_all(&repo).expect("create repo dir");
+        run_git(&repo, ["init"]);
+        run_git(&repo, ["config", "user.name", "Codgrep Test"]);
+        run_git(&repo, ["config", "user.email", "codgrep@example.com"]);
+
+        fs::write(repo.join(".gitignore"), "tracked-ignored.txt\n").expect("write gitignore");
+        fs::write(repo.join("tracked-ignored.txt"), "tracked ignored text\n")
+            .expect("write tracked ignored");
+        fs::write(repo.join("visible.txt"), "visible text\n").expect("write visible");
+        run_git(&repo, ["add", ".gitignore", "visible.txt"]);
+        run_git(&repo, ["add", "-f", "tracked-ignored.txt"]);
+        run_git(&repo, ["commit", "-m", "init"]);
+
+        let config = BuildConfig {
+            repo_path: repo.clone(),
+            index_path: index.clone(),
+            tokenizer: TokenizerMode::Trigram,
+            corpus_mode: CorpusMode::RespectIgnore,
+            include_hidden: false,
+            max_file_size: 1 << 20,
+            min_sparse_len: 3,
+            max_sparse_len: 64,
+        };
+        build_index(&config).expect("build index");
+
+        let current = fs::read_to_string(index.join("CURRENT")).expect("read current");
+        let docs_path = index
+            .join("generations")
+            .join(current.trim())
+            .join("docs.bin");
+        let (_meta, docs) = read_docs_file(&docs_path).expect("read docs");
+        assert!(
+            docs.iter().any(|doc| doc.path == "tracked-ignored.txt"),
+            "tracked gitignored file should be indexed"
+        );
+        assert!(
+            docs.iter().any(|doc| doc.path == "visible.txt"),
+            "visible tracked file should be indexed"
+        );
+
+        let searcher = IndexSearcher::open(index).expect("open searcher");
+        let diff = searcher
+            .diff_against_worktree()
+            .expect("diff against worktree");
+        assert!(
+            diff.is_empty(),
+            "clean git repo should not look dirty: {diff:?}"
+        );
+    }
+
+    fn run_git<const N: usize>(repo: &Path, args: [&str; N]) {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("run git");
+        assert!(status.success(), "git command failed");
+    }
 }

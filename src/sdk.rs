@@ -28,9 +28,9 @@ use crate::{
 };
 
 pub use crate::daemon::protocol::{
-    ConsistencyMode, DirtyFileStats, EnsureRepoParams, OpenRepoParams, PathScope, QuerySpec,
-    RepoConfig, RepoPhase, RepoStatus, SearchBackend, SearchModeConfig, SearchResults, TaskKind,
-    TaskPhase, TaskState, TaskStatus,
+    ConsistencyMode, DirtyFileStats, EnsureRepoParams, FileCount, FileMatchCount, OpenRepoParams,
+    PathScope, QuerySpec, RepoConfig, RepoPhase, RepoStatus, SearchBackend, SearchModeConfig,
+    SearchResults, TaskKind, TaskPhase, TaskState, TaskStatus,
 };
 
 #[derive(Debug, Clone)]
@@ -652,6 +652,7 @@ pub fn count_only_query(pattern: impl Into<String>) -> QuerySpec {
         after_context: 0,
         top_k_tokens: 6,
         max_count: None,
+        global_max_results: None,
         search_mode: SearchModeConfig::CountOnly,
     }
 }

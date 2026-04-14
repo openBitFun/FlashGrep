@@ -840,6 +840,7 @@ pub(super) fn run_daemon_search_count(
             after_context: 0,
             top_k_tokens: config.top_k_tokens,
             max_count: None,
+            global_max_results: None,
             search_mode: SearchModeConfig::CountOnly,
         },
         scope: PathScope {

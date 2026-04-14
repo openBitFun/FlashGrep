@@ -489,6 +489,7 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
                         after_context: args.after_context.unwrap_or(0),
                         top_k_tokens: 6,
                         max_count: args.max_count,
+                        global_max_results: None,
                         search_mode: if args.quiet {
                             SearchModeConfig::FirstHitOnly
                         } else if args.count_matches {

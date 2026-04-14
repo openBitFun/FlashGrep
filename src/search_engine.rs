@@ -199,6 +199,16 @@ mod tests {
         }
     }
 
+    fn materialize_regex_query(pattern: &str, global_max_results: Option<usize>) -> QueryConfig {
+        QueryConfig {
+            regex_pattern: pattern.to_string(),
+            patterns: vec![pattern.to_string()],
+            global_max_results,
+            search_mode: SearchMode::MaterializeMatches,
+            ..QueryConfig::default()
+        }
+    }
+
     fn document_index(documents: Vec<SearchDocument>) -> SearchDocumentIndex {
         SearchDocumentIndex::build(
             TokenizerMode::Trigram,
@@ -306,5 +316,30 @@ mod tests {
         assert_eq!(indexed.hits.len(), 1);
         assert_eq!(indexed.hits[0].path, "hit.txt");
         assert_eq!(indexed.candidate_docs, 1);
+    }
+
+    #[test]
+    fn search_documents_honors_global_result_limit_for_regex_verification() {
+        let documents = vec![
+            SearchDocument::from_loaded_bytes(
+                "one.txt".into(),
+                12,
+                0,
+                Arc::<[u8]>::from(b"foo1\nfoo2\n".to_vec()),
+            ),
+            SearchDocument::from_loaded_bytes(
+                "two.txt".into(),
+                5,
+                0,
+                Arc::<[u8]>::from(b"foo3\n".to_vec()),
+            ),
+        ];
+
+        let results = search_documents(&materialize_regex_query(r"foo\d", Some(2)), &documents)
+            .expect("search should succeed");
+
+        assert_eq!(results.matched_lines, 2);
+        assert_eq!(results.searches_with_match, 1);
+        assert_eq!(results.hits.len(), 1);
     }
 }

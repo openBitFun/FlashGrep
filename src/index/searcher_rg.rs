@@ -56,18 +56,31 @@ impl IndexSearcher {
         &self,
         config: &QueryConfig,
     ) -> Result<Option<SearchResults>> {
-        let Some((matched_lines, searches_with_match)) = self.run_rg_count_query(config, false)?
+        let Some((matched_lines, searches_with_match, file_counts)) =
+            self.run_rg_count_query(config, false)?
         else {
             return Ok(None);
         };
-        let matched_occurrences = if matches!(config.search_mode, SearchMode::CountMatches) {
-            let Some((matched_occurrences, _)) = self.run_rg_count_query(config, true)? else {
-                return Ok(None);
+        let (matched_occurrences, file_match_counts) =
+            if matches!(config.search_mode, SearchMode::CountMatches) {
+                let Some((matched_occurrences, _, file_counts)) =
+                    self.run_rg_count_query(config, true)?
+                else {
+                    return Ok(None);
+                };
+                (
+                    matched_occurrences,
+                    file_counts
+                        .into_iter()
+                        .map(|count| crate::search::FileMatchCount {
+                            path: count.path,
+                            matched_occurrences: count.matched_lines,
+                        })
+                        .collect(),
+                )
+            } else {
+                (0, Vec::new())
             };
-            matched_occurrences
-        } else {
-            0
-        };
 
         Ok(Some(SearchResults {
             candidate_docs: self.docs.len(),
@@ -75,6 +88,8 @@ impl IndexSearcher {
             bytes_searched: self.docs.iter().map(|doc| doc.size()).sum(),
             matched_lines,
             matched_occurrences,
+            file_counts,
+            file_match_counts,
             hits: Vec::new(),
         }))
     }
@@ -83,7 +98,7 @@ impl IndexSearcher {
         &self,
         config: &QueryConfig,
         count_matches: bool,
-    ) -> Result<Option<(usize, usize)>> {
+    ) -> Result<Option<(usize, usize, Vec<crate::search::FileCount>)>> {
         let Some(repo_root) = self.repo_root.as_ref() else {
             return Ok(None);
         };
@@ -147,8 +162,9 @@ impl IndexSearcher {
 
         let mut matched_total = 0usize;
         let mut searches_with_match = 0usize;
+        let mut file_counts = Vec::new();
         for line in String::from_utf8_lossy(&output.stdout).lines() {
-            let Some((_, count)) = line.rsplit_once(':') else {
+            let Some((path, count)) = line.rsplit_once(':') else {
                 continue;
             };
             let count = count.parse::<usize>().map_err(|error| {
@@ -159,8 +175,12 @@ impl IndexSearcher {
             }
             matched_total += count;
             searches_with_match += 1;
+            file_counts.push(crate::search::FileCount {
+                path: path.to_string(),
+                matched_lines: count,
+            });
         }
 
-        Ok(Some((matched_total, searches_with_match)))
+        Ok(Some((matched_total, searches_with_match, file_counts)))
     }
 }

@@ -1,25 +1,33 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    process::Command,
 };
 
 use crate::{
     config::BuildConfig,
+    config::CorpusMode,
     error::{AppError, Result},
-    files::{is_text_file, resolve_repo_path, scan_repository},
-    index::format::{DocMetaRef, IndexBuildSettings, IndexLayout, LookupTable, PostingsData},
+    files::{
+        is_indexable_text_file, is_workspace_internal_path, resolve_repo_path, scan_repository,
+    },
+    index::format::{
+        validate_index_layout, DocMetaRef, IndexBuildSettings, IndexLayout, LookupTable,
+        PostingsData,
+    },
     path_filter::PathFilter,
     tokenizer::TokenizerOptions,
 };
 
-use super::{shared::doc_by_id, DirtyPathKind, IndexSearcher, IndexWorktreeDiff};
+use super::{shared::doc_by_id, IndexSearcher, IndexWorktreeDiff, IndexedDocState};
 
 impl IndexSearcher {
     pub fn open(index_path: PathBuf) -> Result<Self> {
         let layout = IndexLayout::resolve(&index_path)?;
         let docs = crate::index::format::DocsData::open(&layout.docs_path)?;
         let metadata = docs.metadata().clone();
+        validate_index_layout(&layout, &metadata, docs.len())?;
         let lookup = LookupTable::open(&layout.lookup_path)?;
         let postings = PostingsData::open(&layout.postings_path)?;
 
@@ -38,6 +46,8 @@ impl IndexSearcher {
                 min_sparse_len: metadata.min_sparse_len,
                 max_sparse_len: metadata.max_sparse_len,
             },
+            doc_state_by_path: std::sync::OnceLock::new(),
+            indexed_paths: std::sync::OnceLock::new(),
         })
     }
 
@@ -98,6 +108,10 @@ impl IndexSearcher {
             return Ok(IndexWorktreeDiff::default());
         };
 
+        if let Some(diff) = self.diff_against_worktree_git(build)? {
+            return Ok(diff);
+        }
+
         let current_files = scan_repository(&BuildConfig {
             repo_path: PathBuf::from(&build.repo_root),
             index_path: self.index_path.clone(),
@@ -110,7 +124,7 @@ impl IndexSearcher {
         })?;
         let current = current_files
             .into_iter()
-            .filter_map(|file| match is_text_file(&file.path) {
+            .filter_map(|file| match is_indexable_text_file(&file.path) {
                 Ok(true) => Some(Ok(file)),
                 Ok(false) => None,
                 Err(error) => Some(Err(error)),
@@ -124,21 +138,14 @@ impl IndexSearcher {
                 )
             })
             .collect::<HashMap<_, _>>();
-        let indexed_paths = self
-            .docs
-            .iter()
-            .map(|doc| self.doc_display_path_ref(doc))
-            .collect::<HashSet<_>>();
-
         let mut modified_files = Vec::new();
         let mut deleted_files = Vec::new();
-        for doc in self.docs.iter() {
-            let doc_path = self.doc_display_path_ref(doc);
-            match current.get(&doc_path) {
+        for (path, state) in self.doc_state_by_path() {
+            match current.get(path.as_str()) {
                 Some(&(size, mtime_nanos))
-                    if size == doc.size() && mtime_nanos == doc.mtime_nanos() => {}
-                Some(_) => modified_files.push(doc_path),
-                None => deleted_files.push(doc_path),
+                    if size == state.size && mtime_nanos == state.mtime_nanos => {}
+                Some(_) => modified_files.push(path.clone()),
+                None => deleted_files.push(path.clone()),
             }
         }
 
@@ -146,7 +153,7 @@ impl IndexSearcher {
         deleted_files.sort_unstable();
         let mut new_files = current
             .keys()
-            .filter(|path| !indexed_paths.contains(path.as_str()))
+            .filter(|path| !self.doc_state_by_path().contains_key(path.as_str()))
             .cloned()
             .collect::<Vec<_>>();
         new_files.sort_unstable();
@@ -156,6 +163,98 @@ impl IndexSearcher {
             deleted_files,
             new_files,
         })
+    }
+
+    fn diff_against_worktree_git(
+        &self,
+        build: &IndexBuildSettings,
+    ) -> Result<Option<IndexWorktreeDiff>> {
+        let Some(head_commit) = build.head_commit.as_deref() else {
+            return Ok(None);
+        };
+        if !matches!(build.corpus_mode, CorpusMode::RespectIgnore) {
+            return Ok(None);
+        }
+
+        let repo_root = self
+            .repo_root
+            .as_ref()
+            .cloned()
+            .unwrap_or_else(|| PathBuf::from(&build.repo_root));
+        let tracked_paths = self.git_changed_paths(
+            &repo_root,
+            ["diff", "--name-only", "-z", head_commit, "--", "."],
+        )?;
+        let tracked_visible_paths = self.git_visible_paths(
+            &repo_root,
+            ["ls-files", "-z", "--cached", "--", "."],
+            !build.include_hidden,
+        )?;
+        let untracked_visible_paths = self.git_visible_paths(
+            &repo_root,
+            [
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--",
+                ".",
+            ],
+            !build.include_hidden,
+        )?;
+
+        let mut tracked_diff = self.classify_dirty_paths(tracked_paths)?;
+        tracked_diff.new_files.clear();
+
+        let tracked_modified = tracked_diff
+            .modified_files
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let tracked_deleted = tracked_diff
+            .deleted_files
+            .iter()
+            .cloned()
+            .collect::<HashSet<_>>();
+        let tracked_visible_new_candidates = tracked_visible_paths
+            .iter()
+            .filter(|path| !self.doc_state_by_path().contains_key(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let untracked_visible_new_candidates = untracked_visible_paths
+            .iter()
+            .filter(|path| !self.doc_state_by_path().contains_key(path.as_str()))
+            .cloned()
+            .collect::<Vec<_>>();
+        let mut new_files = self
+            .classify_dirty_paths(tracked_visible_new_candidates)?
+            .new_files;
+        new_files.extend(
+            self.classify_dirty_paths(untracked_visible_new_candidates)?
+                .new_files,
+        );
+        new_files.sort_unstable();
+        new_files.dedup();
+
+        let mut deleted_files = tracked_deleted;
+        deleted_files.extend(
+            self.indexed_path_set()
+                .iter()
+                .filter(|path| !tracked_visible_paths.contains(path.as_str()))
+                .filter(|path| !tracked_modified.contains(path.as_str()))
+                .cloned(),
+        );
+
+        let mut modified_files = tracked_modified.into_iter().collect::<Vec<_>>();
+        let mut deleted_files = deleted_files.into_iter().collect::<Vec<_>>();
+        modified_files.sort_unstable();
+        deleted_files.sort_unstable();
+
+        Ok(Some(IndexWorktreeDiff {
+            modified_files,
+            deleted_files,
+            new_files,
+        }))
     }
 
     pub fn stale_reason(&self) -> Result<Option<String>> {
@@ -172,58 +271,109 @@ impl IndexSearcher {
         Ok(None)
     }
 
-    pub(crate) fn classify_dirty_path(&self, path: &str) -> Result<Option<DirtyPathKind>> {
-        let indexed = self
-            .docs
-            .iter()
-            .find(|doc| self.doc_display_path_ref(*doc) == path);
+    pub(crate) fn reconcile_dirty_paths(
+        &self,
+        dirty: &IndexWorktreeDiff,
+    ) -> Result<IndexWorktreeDiff> {
+        if dirty.is_empty() {
+            return Ok(IndexWorktreeDiff::default());
+        }
 
-        match indexed {
-            Some(doc) => match fs::metadata(path) {
-                Ok(metadata) => {
-                    if !metadata.is_file() || !is_text_file(Path::new(path))? {
-                        return Ok(Some(DirtyPathKind::Deleted));
+        let mut remaining = IndexWorktreeDiff::default();
+        for path in &dirty.new_files {
+            let path_buf = Path::new(path);
+            if self.current_path_matches_corpus(path_buf)? {
+                remaining.new_files.push(path.clone());
+            }
+        }
+
+        for path in dirty
+            .modified_files
+            .iter()
+            .chain(dirty.deleted_files.iter())
+        {
+            match self.doc_state_by_path().get(path) {
+                Some(state) => match fs::metadata(path) {
+                    Ok(metadata) => {
+                        if !self.current_file_matches_corpus(Path::new(path), &metadata)? {
+                            remaining.deleted_files.push(path.clone());
+                            continue;
+                        }
+                        let modified = file_mtime_nanos(&metadata);
+                        if metadata.len() != state.size || modified != state.mtime_nanos {
+                            remaining.modified_files.push(path.clone());
+                        }
                     }
-                    let modified = metadata
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
-                        .map(|duration| match u64::try_from(duration.as_nanos()) {
-                            Ok(value) => value,
-                            Err(_) => u64::MAX,
-                        })
-                        .unwrap_or_default();
-                    if metadata.len() != doc.size() || modified != doc.mtime_nanos() {
-                        Ok(Some(DirtyPathKind::Modified))
-                    } else {
-                        Ok(None)
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        remaining.deleted_files.push(path.clone());
                     }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(Some(DirtyPathKind::Deleted))
-                }
-                Err(error) => Err(error.into()),
-            },
-            None => {
-                let path = Path::new(path);
-                if !path.exists() || !path.is_file() {
-                    return Ok(None);
-                }
-                if is_text_file(path)? {
-                    Ok(Some(DirtyPathKind::New))
-                } else {
-                    Ok(None)
+                    Err(error) => return Err(error.into()),
+                },
+                None => {}
+            }
+        }
+
+        remaining.modified_files.sort_unstable();
+        remaining.deleted_files.sort_unstable();
+        remaining.new_files.sort_unstable();
+        Ok(remaining)
+    }
+
+    pub(crate) fn classify_dirty_paths<I>(&self, paths: I) -> Result<IndexWorktreeDiff>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let mut modified_files = Vec::new();
+        let mut deleted_files = Vec::new();
+        let mut new_files = Vec::new();
+        let mut seen = HashSet::new();
+
+        for path in paths {
+            if !seen.insert(path.clone()) {
+                continue;
+            }
+            match self.doc_state_by_path().get(&path) {
+                Some(state) => match fs::metadata(&path) {
+                    Ok(metadata) => {
+                        if !self.current_file_matches_corpus(Path::new(&path), &metadata)? {
+                            deleted_files.push(path);
+                            continue;
+                        }
+                        let modified = file_mtime_nanos(&metadata);
+                        if metadata.len() != state.size || modified != state.mtime_nanos {
+                            modified_files.push(path);
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                        deleted_files.push(path);
+                    }
+                    Err(error) => return Err(error.into()),
+                },
+                None => {
+                    let path_ref = Path::new(&path);
+                    if self.current_path_matches_corpus(path_ref)? {
+                        new_files.push(path);
+                    }
                 }
             }
         }
+
+        modified_files.sort_unstable();
+        deleted_files.sort_unstable();
+        new_files.sort_unstable();
+        Ok(IndexWorktreeDiff {
+            modified_files,
+            deleted_files,
+            new_files,
+        })
     }
 
     pub(crate) fn has_indexed_path_under(&self, directory: &str) -> bool {
         let prefix = format!("{directory}{}", std::path::MAIN_SEPARATOR);
-        self.docs.iter().any(|doc| {
-            let path = self.doc_display_path_ref(doc);
-            path == directory || path.starts_with(&prefix)
-        })
+        self.indexed_path_set()
+            .range(directory.to_string()..)
+            .next()
+            .is_some_and(|path| path == directory || path.starts_with(&prefix))
     }
 
     pub(crate) fn indexed_paths_with_allowed_paths(
@@ -252,6 +402,129 @@ impl IndexSearcher {
         Ok(self.doc_resolved_path_ref(doc_by_id(&self.docs, doc_id)?))
     }
 
+    fn doc_state_by_path(&self) -> &HashMap<String, IndexedDocState> {
+        self.doc_state_by_path.get_or_init(|| {
+            self.docs
+                .iter()
+                .map(|doc| {
+                    (
+                        self.doc_display_path_ref(doc),
+                        IndexedDocState {
+                            size: doc.size(),
+                            mtime_nanos: doc.mtime_nanos(),
+                        },
+                    )
+                })
+                .collect()
+        })
+    }
+
+    fn indexed_path_set(&self) -> &BTreeSet<String> {
+        self.indexed_paths.get_or_init(|| {
+            self.doc_state_by_path()
+                .keys()
+                .cloned()
+                .collect::<BTreeSet<_>>()
+        })
+    }
+
+    fn git_changed_paths<const N: usize>(
+        &self,
+        repo_root: &Path,
+        args: [&str; N],
+    ) -> Result<Vec<String>> {
+        Ok(self
+            .git_path_output(repo_root, args)?
+            .into_iter()
+            .filter(|path| !is_workspace_internal_path(path) && !path.starts_with(&self.index_path))
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    fn git_visible_paths<const N: usize>(
+        &self,
+        repo_root: &Path,
+        args: [&str; N],
+        filter_hidden: bool,
+    ) -> Result<HashSet<String>> {
+        Ok(self
+            .git_path_output(repo_root, args)?
+            .into_iter()
+            .filter(|path| !is_workspace_internal_path(path) && !path.starts_with(&self.index_path))
+            .filter(|path| !filter_hidden || !self.path_is_hidden_for_build(path, repo_root))
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect())
+    }
+
+    fn git_path_output<const N: usize>(
+        &self,
+        repo_root: &Path,
+        args: [&str; N],
+    ) -> Result<Vec<PathBuf>> {
+        let mut command = Command::new("git");
+        command.arg("-C").arg(repo_root).args(args);
+        if let Some(pathspec) = self.index_exclude_pathspec(repo_root) {
+            command.arg(pathspec);
+        }
+        let output = command.output()?;
+        if !output.status.success() {
+            return Err(AppError::InvalidIndex(format!(
+                "failed to inspect git worktree state for {}",
+                repo_root.display()
+            )));
+        }
+
+        Ok(output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+            .map(|path| resolve_repo_path(repo_root, &String::from_utf8_lossy(path)))
+            .collect())
+    }
+
+    fn current_path_matches_corpus(&self, path: &Path) -> Result<bool> {
+        let metadata = match fs::metadata(path) {
+            Ok(metadata) => metadata,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(false),
+            Err(error) => return Err(error.into()),
+        };
+        self.current_file_matches_corpus(path, &metadata)
+    }
+
+    fn current_file_matches_corpus(&self, path: &Path, metadata: &fs::Metadata) -> Result<bool> {
+        if is_workspace_internal_path(path) || path.starts_with(&self.index_path) {
+            return Ok(false);
+        }
+        let Some(build) = self.build_settings() else {
+            return Ok(metadata.is_file() && is_indexable_text_file(path)?);
+        };
+        if !metadata.is_file() || metadata.len() > build.max_file_size {
+            return Ok(false);
+        }
+        if !build.include_hidden && self.path_is_hidden_for_build(path, Path::new(&build.repo_root))
+        {
+            return Ok(false);
+        }
+        is_indexable_text_file(path)
+    }
+
+    fn path_is_hidden_for_build(&self, path: &Path, repo_root: &Path) -> bool {
+        let relative = path.strip_prefix(repo_root).unwrap_or(path);
+        relative.components().any(|component| match component {
+            std::path::Component::Normal(value) => value.to_string_lossy().starts_with('.'),
+            _ => false,
+        })
+    }
+
+    fn index_exclude_pathspec(&self, repo_root: &Path) -> Option<String> {
+        let relative = self.index_path.strip_prefix(repo_root).ok()?;
+        if relative.as_os_str().is_empty() {
+            return None;
+        }
+        let path = relative.to_string_lossy().replace('\\', "/");
+        Some(format!(":(exclude){path}"))
+    }
+
     pub(super) fn doc_display_path(&self, doc: &crate::index::format::DocMeta) -> String {
         self.doc_display_path_str(&doc.path)
     }
@@ -273,4 +546,16 @@ impl IndexSearcher {
 
         PathBuf::from(path)
     }
+}
+
+fn file_mtime_nanos(metadata: &fs::Metadata) -> u64 {
+    metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok())
+        .map(|duration| match u64::try_from(duration.as_nanos()) {
+            Ok(value) => value,
+            Err(_) => u64::MAX,
+        })
+        .unwrap_or_default()
 }

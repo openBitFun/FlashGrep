@@ -14,10 +14,7 @@ use std::{
 use crate::{
     config::BuildConfig,
     error::{AppError, Result},
-    index::{
-        build_index_with_options, DirtyPathKind, IndexBuildOptions, IndexSearcher,
-        IndexWorktreeDiff,
-    },
+    index::{build_index_with_options, IndexBuildOptions, IndexSearcher, IndexWorktreeDiff},
     path_filter::PathFilter,
     query_preflight::{evaluate_index_query_preflight, preflight_enabled},
     search::SearchResults,
@@ -183,7 +180,16 @@ impl WorkspaceIndex {
     ) -> Result<BaseSnapshotInfo> {
         self.clear_freshness_probe_cache();
         build_index_with_options(&self.inner.options.build_config, options)?;
+        self.clear_cached_searcher();
         self.base_snapshot_info()
+    }
+
+    fn clear_cached_searcher(&self) {
+        let mut cached_searcher = match self.inner.cached_searcher.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *cached_searcher = None;
     }
 
     /// Reports the current base snapshot and worktree diff state.
@@ -364,10 +370,15 @@ impl WorkspaceIndex {
         self.open_searcher()?.diff_against_worktree()
     }
 
-    pub(crate) fn classify_dirty_path(&self, path: &str) -> Result<Option<DirtyPathKind>> {
+    pub(crate) fn classify_dirty_paths<I>(&self, paths: I) -> Result<IndexWorktreeDiff>
+    where
+        I: IntoIterator<Item = String>,
+    {
         match self.open_searcher() {
-            Ok(searcher) => searcher.classify_dirty_path(path),
-            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(None),
+            Ok(searcher) => searcher.classify_dirty_paths(paths),
+            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
+                Ok(IndexWorktreeDiff::default())
+            }
             Err(error) => Err(error),
         }
     }
@@ -387,19 +398,7 @@ impl WorkspaceIndex {
         }
 
         let searcher = self.open_searcher()?;
-        let mut remaining = IndexWorktreeDiff::default();
-        for path in dirty.dirty_paths() {
-            match searcher.classify_dirty_path(path)? {
-                Some(DirtyPathKind::Modified) => remaining.modified_files.push(path.to_string()),
-                Some(DirtyPathKind::Deleted) => remaining.deleted_files.push(path.to_string()),
-                Some(DirtyPathKind::New) => remaining.new_files.push(path.to_string()),
-                None => {}
-            }
-        }
-        remaining.modified_files.sort_unstable();
-        remaining.deleted_files.sort_unstable();
-        remaining.new_files.sort_unstable();
-        Ok(remaining)
+        searcher.reconcile_dirty_paths(dirty)
     }
 
     pub(crate) fn load_dirty_document(
@@ -451,7 +450,10 @@ fn search_workspace_view(
     if scope.dirty_documents.is_empty() {
         return Ok(base_results);
     }
-    let dirty_results = search_documents(query, &scope.dirty_documents)?;
+    let Some(dirty_query) = query_with_remaining_global_limit(query, &base_results) else {
+        return Ok(base_results);
+    };
+    let dirty_results = search_documents(&dirty_query, &scope.dirty_documents)?;
     Ok(merge_search_results(base_results, dirty_results))
 }
 
@@ -467,8 +469,28 @@ fn search_workspace_overlay(
     if dirty_index.is_empty() {
         return Ok(base_results);
     }
-    let dirty_results = search_document_index(query, dirty_index, filter)?;
+    let Some(dirty_query) = query_with_remaining_global_limit(query, &base_results) else {
+        return Ok(base_results);
+    };
+    let dirty_results = search_document_index(&dirty_query, dirty_index, filter)?;
     Ok(merge_search_results(base_results, dirty_results))
+}
+
+fn query_with_remaining_global_limit(
+    query: &crate::QueryConfig,
+    current_results: &SearchResults,
+) -> Option<crate::QueryConfig> {
+    let Some(limit) = query.effective_global_max_results() else {
+        return Some(query.clone());
+    };
+    let consumed = current_results.result_units(query.search_mode);
+    if consumed >= limit {
+        return None;
+    }
+
+    let mut next_query = query.clone();
+    next_query.global_max_results = Some(limit - consumed);
+    Some(next_query)
 }
 
 #[cfg(test)]
@@ -481,6 +503,7 @@ mod tests {
     use crate::{
         build_index,
         config::{BuildConfig, CorpusMode, TokenizerMode},
+        index::IndexWorktreeDiff,
     };
 
     struct TestRepo {
@@ -509,6 +532,15 @@ mod tests {
                 fs::create_dir_all(parent).expect("parent dir should succeed");
             }
             fs::write(&path, contents).expect("write should succeed");
+            path
+        }
+
+        fn write_bytes(&self, relative: &str, bytes: &[u8]) -> PathBuf {
+            let path = self.repo.join(relative);
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent).expect("parent dir should succeed");
+            }
+            fs::write(&path, bytes).expect("write should succeed");
             path
         }
 
@@ -595,6 +627,280 @@ mod tests {
             .expect("fresh freshness probe should succeed");
         assert_eq!(refreshed.state, WorkspaceFreshnessState::Stale);
         assert_eq!(refreshed.new_files, 1);
+    }
+
+    #[test]
+    fn ensure_base_snapshot_invalidates_cached_searcher_after_rebuild() {
+        let repo = TestRepo::new();
+        repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
+        repo.build();
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+
+        let initial_status = workspace.status().expect("status should succeed");
+        let initial_dirty = initial_status.dirty_files.expect("dirty diff should exist");
+        assert!(initial_dirty.modified_files.is_empty());
+        assert!(initial_dirty.deleted_files.is_empty());
+        assert!(initial_dirty.new_files.is_empty());
+
+        repo.write("added.rs", "const NAME: &str = \"ADDED\";\n");
+
+        let stale_status = workspace.status().expect("status should succeed");
+        let stale_dirty = stale_status.dirty_files.expect("dirty diff should exist");
+        assert_eq!(stale_dirty.new_files.len(), 1);
+
+        workspace
+            .ensure_base_snapshot()
+            .expect("rebuild should succeed");
+
+        let refreshed_status = workspace.status().expect("status should succeed");
+        let refreshed_dirty = refreshed_status
+            .dirty_files
+            .expect("dirty diff should exist");
+        assert!(refreshed_dirty.modified_files.is_empty());
+        assert!(refreshed_dirty.deleted_files.is_empty());
+        assert!(refreshed_dirty.new_files.is_empty());
+    }
+
+    #[test]
+    fn reconcile_dirty_diff_keeps_only_paths_that_are_still_dirty() {
+        let repo = TestRepo::new();
+        let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
+        let removed = repo.write("removed.rs", "const NAME: &str = \"REMOVED\";\n");
+        repo.build();
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+
+        let added = repo.write("added.rs", "const NAME: &str = \"ADDED\";\n");
+        fs::remove_file(&removed).expect("remove should succeed");
+        fs::remove_file(&added).expect("remove should succeed");
+
+        let reconciled = workspace
+            .reconcile_dirty_diff(&IndexWorktreeDiff {
+                modified_files: vec![tracked.to_string_lossy().into_owned()],
+                deleted_files: vec![removed.to_string_lossy().into_owned()],
+                new_files: vec![added.to_string_lossy().into_owned()],
+            })
+            .expect("reconcile should succeed");
+
+        assert!(reconciled.modified_files.is_empty());
+        assert_eq!(
+            reconciled.deleted_files,
+            vec![removed.to_string_lossy().into_owned()]
+        );
+        assert!(reconciled.new_files.is_empty());
+    }
+
+    #[test]
+    fn classify_dirty_paths_batches_mixed_changes() {
+        let repo = TestRepo::new();
+        let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
+        let removed = repo.write("removed.rs", "const NAME: &str = \"REMOVED\";\n");
+        repo.build();
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+
+        repo.write("tracked.rs", "const NAME: &str = \"DIRTY\";\n");
+        fs::remove_file(&removed).expect("remove should succeed");
+        let added = repo.write("added.rs", "const NAME: &str = \"ADDED\";\n");
+
+        let classified = workspace
+            .classify_dirty_paths([
+                tracked.to_string_lossy().into_owned(),
+                removed.to_string_lossy().into_owned(),
+                added.to_string_lossy().into_owned(),
+                added.to_string_lossy().into_owned(),
+            ])
+            .expect("classify should succeed");
+
+        assert_eq!(
+            classified.modified_files,
+            vec![tracked.to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            classified.deleted_files,
+            vec![removed.to_string_lossy().into_owned()]
+        );
+        assert_eq!(
+            classified.new_files,
+            vec![added.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn git_workspace_status_uses_filtered_dirty_paths() {
+        let repo = TestRepo::new();
+        let git_repo = repo.repo.clone();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .expect("git config should succeed");
+        let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
+        repo.write(".gitignore", "ignored.rs\n");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["add", "."])
+            .status()
+            .expect("git add should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["commit", "-qm", "initial"])
+            .status()
+            .expect("git commit should succeed");
+        repo.build();
+
+        repo.write("tracked.rs", "const NAME: &str = \"DIRTY\";\n");
+        let added = repo.write("added.rs", "const NAME: &str = \"ADDED\";\n");
+        repo.write(".hidden.rs", "const NAME: &str = \"HIDDEN\";\n");
+        repo.write("ignored.rs", "const NAME: &str = \"IGNORED\";\n");
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+        let status = workspace.status().expect("status should succeed");
+        let dirty = status.dirty_files.expect("dirty diff should exist");
+
+        assert_eq!(
+            dirty.modified_files,
+            vec![tracked.to_string_lossy().into_owned()]
+        );
+        assert_eq!(dirty.deleted_files, Vec::<String>::new());
+        assert_eq!(dirty.new_files, vec![added.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn git_workspace_status_detects_files_revealed_by_gitignore_change() {
+        let repo = TestRepo::new();
+        let git_repo = repo.repo.clone();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .expect("git config should succeed");
+        repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
+        repo.write(".gitignore", "revealed.rs\n");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["add", "."])
+            .status()
+            .expect("git add should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["commit", "-qm", "initial"])
+            .status()
+            .expect("git commit should succeed");
+        repo.build();
+
+        let revealed = repo.write("revealed.rs", "const NAME: &str = \"REVEALED\";\n");
+        repo.write(".gitignore", "");
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+        let status = workspace.status().expect("status should succeed");
+        let dirty = status.dirty_files.expect("dirty diff should exist");
+
+        assert_eq!(dirty.modified_files, Vec::<String>::new());
+        assert_eq!(dirty.deleted_files, Vec::<String>::new());
+        assert_eq!(
+            dirty.new_files,
+            vec![revealed.to_string_lossy().into_owned()]
+        );
+    }
+
+    #[test]
+    fn git_workspace_status_skips_new_files_that_cannot_enter_the_index() {
+        let repo = TestRepo::new();
+        let git_repo = repo.repo.clone();
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .expect("git config should succeed");
+        repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["add", "."])
+            .status()
+            .expect("git add should succeed");
+        std::process::Command::new("git")
+            .arg("-C")
+            .arg(&git_repo)
+            .args(["commit", "-qm", "initial"])
+            .status()
+            .expect("git commit should succeed");
+        repo.build();
+
+        let mut bytes = vec![b'a'; 8 * 1024];
+        bytes.push(0xFF);
+        repo.write_bytes("encoded.txt", &bytes);
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+        let status = workspace.status().expect("status should succeed");
+        let dirty = status.dirty_files.expect("dirty diff should exist");
+
+        assert_eq!(dirty.modified_files, Vec::<String>::new());
+        assert_eq!(dirty.deleted_files, Vec::<String>::new());
+        assert_eq!(dirty.new_files, Vec::<String>::new());
     }
 
     #[test]

@@ -344,6 +344,7 @@ fn convert_query_spec(query: QuerySpec) -> Result<QueryConfig> {
         after_context: query.after_context,
         top_k_tokens: query.top_k_tokens,
         max_count: query.max_count,
+        global_max_results: query.global_max_results,
         search_mode: match query.search_mode {
             super::super::protocol::SearchModeConfig::CountOnly => SearchMode::CountOnly,
             super::super::protocol::SearchModeConfig::CountMatches => SearchMode::CountMatches,

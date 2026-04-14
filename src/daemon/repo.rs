@@ -17,7 +17,7 @@ use notify::{
 use crate::{
     config::{BuildConfig, CorpusMode, QueryConfig},
     error::{AppError, Result},
-    files::{scan_paths, ScanOptions},
+    files::{is_workspace_internal_path, scan_paths, ScanOptions},
     index::{DirtyPathKind, IndexBuildOptions, IndexWorktreeDiff},
     path_filter::{normalize_path, PathFilter, PathFilterArgs},
     progress::{IndexProgress, IndexProgressPhase},
@@ -215,7 +215,7 @@ impl RepoManager {
     }
 
     pub fn get_status(&self, repo_id: &str) -> Result<RepoStatus> {
-        self.repo(repo_id)?.refresh(false)
+        self.repo(repo_id)?.status_snapshot()
     }
 
     pub fn refresh_repo(&self, repo_id: &str, force: bool) -> Result<RepoStatus> {
@@ -343,6 +343,8 @@ struct RepoRuntime {
     dirty_overlay: Mutex<DirtyOverlayState>,
     glob_cache: Mutex<GlobCacheState>,
     pending_directory_rescans: Mutex<BTreeMap<String, Instant>>,
+    scheduled_reconcile_at: Mutex<Option<Instant>>,
+    watch_event_burst: Mutex<WatchEventBurst>,
     glob_cache_epoch: AtomicU64,
     resync_required: AtomicBool,
     watcher_stop: Mutex<Option<mpsc::Sender<()>>>,
@@ -416,6 +418,21 @@ struct DirtyOverlaySnapshot {
 struct GlobCacheState {
     epoch: u64,
     entries: HashMap<String, Vec<String>>,
+}
+
+#[derive(Debug, Clone)]
+struct WatchEventBurst {
+    window_started_at: Instant,
+    event_count: usize,
+}
+
+impl Default for WatchEventBurst {
+    fn default() -> Self {
+        Self {
+            window_started_at: Instant::now(),
+            event_count: 0,
+        }
+    }
 }
 
 impl RepoTaskRecord {
@@ -631,6 +648,8 @@ impl RepoRuntime {
             dirty_overlay: Mutex::new(DirtyOverlayState::default()),
             glob_cache: Mutex::new(GlobCacheState::default()),
             pending_directory_rescans: Mutex::new(BTreeMap::new()),
+            scheduled_reconcile_at: Mutex::new(None),
+            watch_event_burst: Mutex::new(WatchEventBurst::default()),
             glob_cache_epoch: AtomicU64::new(0),
             resync_required: AtomicBool::new(false),
             watcher_stop: Mutex::new(None),
@@ -792,10 +811,13 @@ impl RepoRuntime {
             }
             SearchConsistency::WorkspaceEventual | SearchConsistency::WorkspaceStrict => {
                 self.rescan_pending_directories()?;
-                if matches!(request.consistency, SearchConsistency::WorkspaceStrict)
-                    || self.resync_required.load(Ordering::Relaxed)
-                {
+                if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
                     self.refresh(true)?;
+                } else if self.resync_required.load(Ordering::Relaxed) {
+                    // Keep eventual searches responsive under watcher churn by
+                    // reconciling in the background instead of forcing a
+                    // synchronous full refresh on every query.
+                    self.schedule_background_reconcile(Duration::from_millis(0));
                 }
 
                 let status = self.status_snapshot()?;
@@ -1006,6 +1028,22 @@ impl RepoRuntime {
                 self.emit_workspace_status_changed();
                 Ok(())
             }
+            Err(AppError::InvalidIndex(error)) => {
+                self.clear_overlay();
+                let mut state = match self.state.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.snapshot_key = None;
+                state.last_probe_at = Some(SystemTime::now());
+                state.last_error = Some(error);
+                state.dirty_files = DirtyStats::default();
+                state.rebuild_recommended = false;
+                state.phase = RepoPhase::MissingIndex;
+                drop(state);
+                self.emit_workspace_status_changed();
+                Ok(())
+            }
             Err(error) => {
                 self.set_phase(RepoPhase::Degraded, Some(error.to_string()));
                 Err(error)
@@ -1143,6 +1181,13 @@ impl RepoRuntime {
             };
             pending.clear();
         }
+        {
+            let mut scheduled = match self.scheduled_reconcile_at.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *scheduled = None;
+        }
         self.invalidate_glob_cache();
         self.resync_required.store(false, Ordering::Relaxed);
     }
@@ -1234,13 +1279,18 @@ impl RepoRuntime {
                     break;
                 }
                 match event_rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                    Ok(Ok(event)) => thread_runtime.handle_watch_event(event),
+                    Ok(Ok(event)) => {
+                        thread_runtime.handle_watch_event(event);
+                        thread_runtime.run_scheduled_reconcile_if_due();
+                    }
                     Ok(Err(error)) => {
                         thread_runtime.set_watcher_healthy(false);
                         thread_runtime.mark_resync_required();
                         thread_runtime.set_last_error(Some(format!("watch error: {error}")));
                     }
-                    Err(mpsc::RecvTimeoutError::Timeout) => {}
+                    Err(mpsc::RecvTimeoutError::Timeout) => {
+                        thread_runtime.run_scheduled_reconcile_if_due();
+                    }
                     Err(mpsc::RecvTimeoutError::Disconnected) => break,
                 }
             }
@@ -1266,6 +1316,7 @@ impl RepoRuntime {
     }
 
     fn handle_watch_event(&self, event: Event) {
+        let event_path_count = event.paths.len().max(1);
         let mut dirty = DirtyPathSet::default();
         let is_remove_file = matches!(event.kind, EventKind::Remove(RemoveKind::File));
         let is_remove_folder = matches!(event.kind, EventKind::Remove(RemoveKind::Folder));
@@ -1284,6 +1335,9 @@ impl RepoRuntime {
             } else {
                 self.build_config.repo_path.join(path)
             };
+            if is_workspace_internal_path(&candidate) {
+                continue;
+            }
             if self.is_index_path(&candidate) {
                 continue;
             }
@@ -1334,11 +1388,10 @@ impl RepoRuntime {
                         }
                         continue;
                     }
-                    match self.classify_watch_path(&normalized) {
-                        Ok(Some(kind)) => {
-                            dirty.upsert(normalized, kind);
+                    match self.classify_watch_paths([normalized]) {
+                        Ok(classified) => {
+                            dirty.merge(classified);
                         }
-                        Ok(None) => {}
                         Err(_) => needs_resync = true,
                     }
                 }
@@ -1346,6 +1399,10 @@ impl RepoRuntime {
                     needs_resync = true;
                 }
             }
+        }
+
+        if self.note_watch_event_burst(event_path_count) {
+            needs_resync = true;
         }
 
         if !dirty.is_empty() {
@@ -1362,6 +1419,8 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         pending.entry(directory).or_insert_with(Instant::now);
+        drop(pending);
+        self.schedule_background_reconcile(Duration::from_millis(750));
     }
 
     fn clear_pending_directory_rescan(&self, path: &str) {
@@ -1431,6 +1490,96 @@ impl RepoRuntime {
         Ok(())
     }
 
+    fn note_watch_event_burst(&self, event_count: usize) -> bool {
+        const WATCH_EVENT_BURST_WINDOW: Duration = Duration::from_millis(750);
+        const WATCH_EVENT_BURST_THRESHOLD: usize = 64;
+
+        let now = Instant::now();
+        let mut burst = match self.watch_event_burst.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if now.duration_since(burst.window_started_at) > WATCH_EVENT_BURST_WINDOW {
+            burst.window_started_at = now;
+            burst.event_count = event_count;
+        } else {
+            burst.event_count = burst.event_count.saturating_add(event_count);
+        }
+
+        let exceeded = burst.event_count >= WATCH_EVENT_BURST_THRESHOLD;
+        if exceeded {
+            burst.window_started_at = now;
+            burst.event_count = 0;
+        }
+        drop(burst);
+
+        if exceeded {
+            self.schedule_background_reconcile(Duration::from_millis(750));
+        }
+        exceeded
+    }
+
+    fn schedule_background_reconcile(&self, delay: Duration) {
+        let due_at = Instant::now() + delay;
+        let mut scheduled = match self.scheduled_reconcile_at.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        match *scheduled {
+            Some(existing) if existing <= due_at => {}
+            _ => *scheduled = Some(due_at),
+        }
+    }
+
+    fn run_scheduled_reconcile_if_due(&self) {
+        let due_at = {
+            let scheduled = match self.scheduled_reconcile_at.lock() {
+                Ok(guard) => *guard,
+                Err(poisoned) => *poisoned.into_inner(),
+            };
+            scheduled
+        };
+        let Some(due_at) = due_at else {
+            return;
+        };
+        if Instant::now() < due_at {
+            return;
+        }
+        if self.has_active_task() {
+            self.schedule_background_reconcile(Duration::from_secs(1));
+            return;
+        }
+
+        {
+            let mut scheduled = match self.scheduled_reconcile_at.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *scheduled = None;
+        }
+
+        let result = self.rescan_pending_directories().and_then(|_| {
+            if self.resync_required.load(Ordering::Relaxed) {
+                self.refresh_overlay_from_worktree()
+            } else {
+                Ok(())
+            }
+        });
+        if let Err(error) = result {
+            self.set_last_error(Some(format!(
+                "background workspace reconcile failed: {error}"
+            )));
+            self.schedule_background_reconcile(Duration::from_secs(1));
+        }
+    }
+
+    fn has_active_task(&self) -> bool {
+        match self.state.lock() {
+            Ok(guard) => guard.active_task_id.is_some(),
+            Err(poisoned) => poisoned.into_inner().active_task_id.is_some(),
+        }
+    }
+
     fn discard_overlay_new_path(&self, path: &str) -> bool {
         self.discard_overlay_new_paths_matching(|candidate| candidate == path)
     }
@@ -1492,27 +1641,28 @@ impl RepoRuntime {
             None,
         )?;
 
-        let mut dirty = DirtyPathSet::default();
+        let mut paths = Vec::new();
         for file in scanned {
+            if is_workspace_internal_path(&file.path) {
+                continue;
+            }
             if self.is_index_path(&file.path) {
                 continue;
             }
             let Some(normalized) = self.normalize_watch_path(&file.path) else {
                 continue;
             };
-            if let Some(kind) = self.classify_watch_path(&normalized)? {
-                dirty.upsert(normalized, kind);
-            }
+            paths.push(normalized);
         }
-        Ok(dirty)
+        self.classify_watch_paths(paths)
     }
 
-    fn classify_watch_path(&self, path: &str) -> Result<Option<DirtyPathKind>> {
-        match self.workspace.classify_dirty_path(path) {
-            Ok(kind) => Ok(kind),
-            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error),
-        }
+    fn classify_watch_paths<I>(&self, paths: I) -> Result<DirtyPathSet>
+    where
+        I: IntoIterator<Item = String>,
+    {
+        let diff = self.workspace.classify_dirty_paths(paths)?;
+        Ok(DirtyPathSet::from_diff(diff))
     }
 
     fn normalize_watch_path(&self, path: &Path) -> Option<String> {
@@ -1682,6 +1832,7 @@ impl RepoRuntime {
             state.phase = RepoPhase::ReadyDirty;
         }
         drop(state);
+        self.schedule_background_reconcile(Duration::from_millis(750));
         self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
     }

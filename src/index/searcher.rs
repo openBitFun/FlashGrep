@@ -1,8 +1,8 @@
 use std::{
-    collections::{HashMap, HashSet},
+    collections::{BTreeSet, HashMap, HashSet},
     fs::File,
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::Instant,
 };
 
@@ -65,6 +65,12 @@ pub(crate) enum DirtyPathKind {
     New,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct IndexedDocState {
+    pub(super) size: u64,
+    pub(super) mtime_nanos: u64,
+}
+
 impl IndexWorktreeDiff {
     pub fn is_empty(&self) -> bool {
         self.modified_files.is_empty() && self.deleted_files.is_empty() && self.new_files.is_empty()
@@ -93,6 +99,8 @@ pub struct IndexSearcher {
     repo_root: Option<PathBuf>,
     tokenizer_mode: crate::config::TokenizerMode,
     tokenizer_options: TokenizerOptions,
+    doc_state_by_path: OnceLock<HashMap<String, IndexedDocState>>,
+    indexed_paths: OnceLock<BTreeSet<String>>,
 }
 
 struct MultiLiteralPreparation {
@@ -173,6 +181,7 @@ impl IndexSearcher {
                     Some(candidate_ids.as_slice()),
                     &multi_literal.prepared,
                     config.search_mode,
+                    config.effective_global_max_results(),
                     &resolve_path,
                 )?;
                 profile.record_verify(match_started.elapsed());
@@ -197,99 +206,137 @@ impl IndexSearcher {
 
         let multiline_verifier = requires_multiline_verification(config)?;
         let match_started = Instant::now();
-        let (matched_lines, matched_occurrences, searches_with_match, hits, bytes_searched) =
-            match config.search_mode {
-                SearchMode::CountOnly => {
-                    let regex_started = Instant::now();
-                    let verify_plan = CountVerifyPlan::compile(
-                        config,
-                        multiline_verifier,
-                        preparation.line_prefilter.clone(),
-                        CountVerifyKind::Lines,
-                    )?;
-                    profile.record_regex_compile(regex_started.elapsed());
-                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
-                    let stats = verify_plan.verify_candidate_count_stats(
-                        &candidate_ids,
-                        self.docs.len(),
-                        &resolve_path,
-                    )?;
-                    (
-                        stats.matched_lines,
-                        0,
-                        stats.matched_docs,
-                        Vec::new(),
-                        self.sum_doc_sizes(&candidate_ids)?,
-                    )
-                }
-                SearchMode::CountMatches => {
-                    let regex_started = Instant::now();
-                    let verify_plan = CountVerifyPlan::compile(
-                        config,
-                        multiline_verifier,
-                        preparation.line_prefilter.clone(),
-                        CountVerifyKind::Occurrences,
-                    )?;
-                    profile.record_regex_compile(regex_started.elapsed());
-                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
-                    let stats = verify_plan.verify_candidate_count_stats(
-                        &candidate_ids,
-                        self.docs.len(),
-                        &resolve_path,
-                    )?;
-                    (
-                        stats.matched_lines,
-                        stats.matched_occurrences,
-                        stats.matched_docs,
-                        Vec::new(),
-                        self.sum_doc_sizes(&candidate_ids)?,
-                    )
-                }
-                _ => {
-                    let regex_started = Instant::now();
-                    let matcher = build_matcher(config, multiline_verifier)?;
-                    profile.record_regex_compile(regex_started.elapsed());
-                    let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
-                    let mut hits = Vec::new();
-                    let mut matched_lines = 0usize;
-                    let mut matched_occurrences = 0usize;
-                    let mut searches_with_match = 0usize;
-                    let mut bytes_searched = 0u64;
-                    let outcomes = verify_candidates(
-                        &candidate_ids,
-                        self.docs.len(),
-                        &resolve_path,
-                        &matcher,
-                        preparation.line_prefilter.as_ref(),
-                        multiline_verifier,
-                        config.search_mode,
-                        config.max_count,
-                        config.before_context,
-                        config.after_context,
-                    )?;
-                    for task in outcomes {
-                        matched_lines += task.outcome.matched_lines;
-                        matched_occurrences += task.outcome.matched_occurrences;
-                        bytes_searched += task.outcome.bytes_searched;
-                        if !task.outcome.matches.is_empty() {
-                            searches_with_match += 1;
-                            let doc = doc_by_id(&self.docs, task.doc_id)?;
-                            hits.push(SearchHit {
-                                path: self.doc_display_path_ref(doc),
-                                matches: task.outcome.matches,
-                                lines: task.outcome.lines,
-                            });
-                        }
+        let (
+            matched_lines,
+            matched_occurrences,
+            searches_with_match,
+            file_counts,
+            file_match_counts,
+            hits,
+            bytes_searched,
+        ) = match config.search_mode {
+            SearchMode::CountOnly => {
+                let regex_started = Instant::now();
+                let verify_plan = CountVerifyPlan::compile(
+                    config,
+                    multiline_verifier,
+                    preparation.line_prefilter.clone(),
+                    CountVerifyKind::Lines,
+                )?;
+                profile.record_regex_compile(regex_started.elapsed());
+                let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
+                let counts = verify_plan.verify_candidate_counts_by_doc(
+                    &candidate_ids,
+                    self.docs.len(),
+                    &resolve_path,
+                )?;
+                let matched_docs = counts.len();
+                let matched_lines = counts.iter().map(|count| count.matched_lines).sum();
+                let file_counts = counts
+                    .into_iter()
+                    .map(|count| {
+                        Ok(crate::search::FileCount {
+                            path: self.doc_display_path_ref(doc_by_id(&self.docs, count.doc_id)?),
+                            matched_lines: count.matched_lines,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (
+                    matched_lines,
+                    0,
+                    matched_docs,
+                    file_counts,
+                    Vec::new(),
+                    Vec::new(),
+                    self.sum_doc_sizes(&candidate_ids)?,
+                )
+            }
+            SearchMode::CountMatches => {
+                let regex_started = Instant::now();
+                let verify_plan = CountVerifyPlan::compile(
+                    config,
+                    multiline_verifier,
+                    preparation.line_prefilter.clone(),
+                    CountVerifyKind::Occurrences,
+                )?;
+                profile.record_regex_compile(regex_started.elapsed());
+                let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
+                let counts = verify_plan.verify_candidate_counts_by_doc(
+                    &candidate_ids,
+                    self.docs.len(),
+                    &resolve_path,
+                )?;
+                let matched_docs = counts.len();
+                let matched_lines = counts.iter().map(|count| count.matched_lines).sum();
+                let matched_occurrences =
+                    counts.iter().map(|count| count.matched_occurrences).sum();
+                let file_match_counts = counts
+                    .into_iter()
+                    .map(|count| {
+                        Ok(crate::search::FileMatchCount {
+                            path: self.doc_display_path_ref(doc_by_id(&self.docs, count.doc_id)?),
+                            matched_occurrences: count.matched_occurrences,
+                        })
+                    })
+                    .collect::<Result<Vec<_>>>()?;
+                (
+                    matched_lines,
+                    matched_occurrences,
+                    matched_docs,
+                    Vec::new(),
+                    file_match_counts,
+                    Vec::new(),
+                    self.sum_doc_sizes(&candidate_ids)?,
+                )
+            }
+            _ => {
+                let regex_started = Instant::now();
+                let matcher = build_matcher(config, multiline_verifier)?;
+                profile.record_regex_compile(regex_started.elapsed());
+                let resolve_path = |doc_id| self.resolve_doc_path_by_id(doc_id);
+                let mut hits = Vec::new();
+                let mut matched_lines = 0usize;
+                let mut matched_occurrences = 0usize;
+                let mut searches_with_match = 0usize;
+                let mut bytes_searched = 0u64;
+                let outcomes = verify_candidates(
+                    &candidate_ids,
+                    self.docs.len(),
+                    &resolve_path,
+                    &matcher,
+                    preparation.line_prefilter.as_ref(),
+                    multiline_verifier,
+                    config.search_mode,
+                    config.max_count,
+                    config.effective_global_max_results(),
+                    config.before_context,
+                    config.after_context,
+                )?;
+                for task in outcomes {
+                    matched_lines += task.outcome.matched_lines;
+                    matched_occurrences += task.outcome.matched_occurrences;
+                    bytes_searched += task.outcome.bytes_searched;
+                    if !task.outcome.matches.is_empty() {
+                        searches_with_match += 1;
+                        let doc = doc_by_id(&self.docs, task.doc_id)?;
+                        hits.push(SearchHit {
+                            path: self.doc_display_path_ref(doc),
+                            matches: task.outcome.matches,
+                            lines: task.outcome.lines,
+                        });
                     }
-                    (
-                        matched_lines,
-                        matched_occurrences,
-                        searches_with_match,
-                        hits,
-                        bytes_searched,
-                    )
                 }
-            };
+                (
+                    matched_lines,
+                    matched_occurrences,
+                    searches_with_match,
+                    Vec::new(),
+                    Vec::new(),
+                    hits,
+                    bytes_searched,
+                )
+            }
+        };
         profile.record_verify(match_started.elapsed());
         profile.finish(total_started.elapsed(), candidate_doc_count, matched_lines);
 
@@ -299,6 +346,8 @@ impl IndexSearcher {
             bytes_searched,
             matched_lines,
             matched_occurrences,
+            file_counts,
+            file_match_counts,
             hits,
         })
     }
