@@ -29,6 +29,22 @@ pub(super) fn convert_search_results(results: SearchResults) -> proto::SearchRes
         bytes_searched: results.bytes_searched,
         matched_lines: results.matched_lines,
         matched_occurrences: results.matched_occurrences,
+        file_counts: results
+            .file_counts
+            .into_iter()
+            .map(|count| proto::FileCount {
+                path: count.path,
+                matched_lines: count.matched_lines,
+            })
+            .collect(),
+        file_match_counts: results
+            .file_match_counts
+            .into_iter()
+            .map(|count| proto::FileMatchCount {
+                path: count.path,
+                matched_occurrences: count.matched_occurrences,
+            })
+            .collect(),
         hits: results
             .hits
             .into_iter()

@@ -160,6 +160,65 @@ impl VerifyPlan {
         }
     }
 
+    pub(crate) fn verify_candidate_counts_by_doc_with_sources<F>(
+        &self,
+        candidate_ids: &[u32],
+        doc_count: usize,
+        resolve_source: &F,
+    ) -> Result<Vec<DocMatchCount>>
+    where
+        F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
+    {
+        validate_doc_ids(doc_count, candidate_ids)?;
+        if should_parallel_verify(candidate_ids.len()) {
+            let results = candidate_ids
+                .par_iter()
+                .enumerate()
+                .map_init(
+                    || self.create_runtime(),
+                    |runtime, (ordinal, &doc_id)| {
+                        validate_doc_id(doc_count, doc_id)?;
+                        let source = resolve_source(doc_id)?;
+                        let stats = runtime.verify_source(&source)?;
+                        Ok(stats.has_match().then_some(OrdinalDocMatchCount {
+                            ordinal,
+                            count: DocMatchCount {
+                                doc_id,
+                                matched_lines: stats.matched_lines,
+                                matched_occurrences: stats.matched_occurrences,
+                            },
+                        }))
+                    },
+                )
+                .collect::<Vec<Result<Option<OrdinalDocMatchCount>>>>();
+
+            let mut counts = Vec::new();
+            for result in results {
+                if let Some(count) = result? {
+                    counts.push(count);
+                }
+            }
+            counts.sort_unstable_by_key(|count| count.ordinal);
+            Ok(counts.into_iter().map(|count| count.count).collect())
+        } else {
+            let mut runtime = self.create_runtime();
+            let mut counts = Vec::new();
+            for &doc_id in candidate_ids {
+                validate_doc_id(doc_count, doc_id)?;
+                let source = resolve_source(doc_id)?;
+                let stats = runtime.verify_source(&source)?;
+                if stats.has_match() {
+                    counts.push(DocMatchCount {
+                        doc_id,
+                        matched_lines: stats.matched_lines,
+                        matched_occurrences: stats.matched_occurrences,
+                    });
+                }
+            }
+            Ok(counts)
+        }
+    }
+
     fn create_runtime(&self) -> VerifyRuntime<'_> {
         VerifyRuntime {
             plan: self,

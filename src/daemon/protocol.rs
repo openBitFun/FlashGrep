@@ -179,6 +179,8 @@ pub struct QuerySpec {
     #[serde(default)]
     pub max_count: Option<usize>,
     #[serde(default)]
+    pub global_max_results: Option<usize>,
+    #[serde(default)]
     pub search_mode: SearchModeConfig,
 }
 
@@ -565,7 +567,23 @@ pub struct SearchResults {
     pub bytes_searched: u64,
     pub matched_lines: usize,
     pub matched_occurrences: usize,
+    #[serde(default)]
+    pub file_counts: Vec<FileCount>,
+    #[serde(default)]
+    pub file_match_counts: Vec<FileMatchCount>,
     pub hits: Vec<SearchHit>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileCount {
+    pub path: String,
+    pub matched_lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct FileMatchCount {
+    pub path: String,
+    pub matched_occurrences: usize,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

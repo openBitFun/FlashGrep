@@ -80,12 +80,23 @@ fn run_rg_count_search(
     scope: &PathFilterArgs,
     count_matches: bool,
 ) -> Result<SearchResults> {
-    let (matched_lines, searches_with_match) =
+    let (matched_lines, searches_with_match, file_counts) =
         run_rg_count_command(build_config, query, scope, false)?;
-    let matched_occurrences = if count_matches {
-        run_rg_count_command(build_config, query, scope, true)?.0
+    let (matched_occurrences, file_match_counts) = if count_matches {
+        let (matched_occurrences, _, file_counts) =
+            run_rg_count_command(build_config, query, scope, true)?;
+        (
+            matched_occurrences,
+            file_counts
+                .into_iter()
+                .map(|count| crate::search::FileMatchCount {
+                    path: count.path,
+                    matched_occurrences: count.matched_lines,
+                })
+                .collect(),
+        )
     } else {
-        0
+        (0, Vec::new())
     };
     Ok(SearchResults {
         candidate_docs: searches_with_match,
@@ -93,6 +104,8 @@ fn run_rg_count_search(
         bytes_searched: 0,
         matched_lines,
         matched_occurrences,
+        file_counts,
+        file_match_counts,
         hits: Vec::new(),
     })
 }
@@ -102,7 +115,7 @@ fn run_rg_count_command(
     query: &QueryConfig,
     scope: &PathFilterArgs,
     count_matches: bool,
-) -> Result<(usize, usize)> {
+) -> Result<(usize, usize, Vec<crate::search::FileCount>)> {
     let mut command = build_rg_base_command(build_config, query, scope);
     if count_matches {
         command.arg("--count-matches");
@@ -121,8 +134,9 @@ fn run_rg_count_command(
 
     let mut matched_total = 0usize;
     let mut searches_with_match = 0usize;
+    let mut file_counts = Vec::new();
     for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((_, count)) = line.rsplit_once(':') else {
+        let Some((path, count)) = line.rsplit_once(':') else {
             continue;
         };
         let count = count.parse::<usize>().map_err(|error| {
@@ -133,8 +147,14 @@ fn run_rg_count_command(
         }
         matched_total += count;
         searches_with_match += 1;
+        file_counts.push(crate::search::FileCount {
+            path: normalize_lexical_path(&build_config.repo_path.join(path))
+                .to_string_lossy()
+                .into_owned(),
+            matched_lines: count,
+        });
     }
-    Ok((matched_total, searches_with_match))
+    Ok((matched_total, searches_with_match, file_counts))
 }
 
 fn run_rg_json_search(
@@ -243,6 +263,8 @@ fn run_rg_json_search(
         bytes_searched: 0,
         matched_lines,
         matched_occurrences,
+        file_counts: Vec::new(),
+        file_match_counts: Vec::new(),
         hits,
     })
 }
@@ -322,6 +344,7 @@ fn build_rg_scope_command(build_config: &BuildConfig, scope: &PathFilterArgs) ->
     {
         command.arg("-g").arg(format!("!{exclude_glob}"));
     }
+    command.arg("-g").arg("!.bitfun/**");
 
     command
 }
@@ -344,6 +367,7 @@ fn build_rg_files_command(build_config: &BuildConfig) -> Command {
     {
         command.arg("-g").arg(format!("!{exclude_glob}"));
     }
+    command.arg("-g").arg("!.bitfun/**");
     command
 }
 

@@ -28,7 +28,7 @@ pub use config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode};
 )]
 pub use index::{
     build_index, build_index_with_options, rebuild_index, rebuild_index_with_options,
-    IndexBuildOptions,
+    IndexBuildOptions, RebuildMode,
 };
 #[deprecated(
     note = "Use daemon protocol search responses/results or `codgrep::sdk`; library search models are not the stable external interface."

@@ -124,12 +124,18 @@ pub struct QueryConfig {
     pub after_context: usize,
     pub top_k_tokens: usize,
     pub max_count: Option<usize>,
+    pub global_max_results: Option<usize>,
     pub search_mode: SearchMode,
 }
 
 impl QueryConfig {
     pub fn has_context(&self) -> bool {
         self.before_context > 0 || self.after_context > 0
+    }
+
+    pub fn effective_global_max_results(&self) -> Option<usize> {
+        self.global_max_results
+            .filter(|limit| *limit > 0 && self.search_mode.materializes_matches())
     }
 }
 
@@ -148,6 +154,7 @@ impl Default for QueryConfig {
             after_context: 0,
             top_k_tokens: 6,
             max_count: None,
+            global_max_results: None,
             search_mode: SearchMode::MaterializeMatches,
         }
     }

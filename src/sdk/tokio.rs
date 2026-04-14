@@ -177,7 +177,11 @@ impl RepoSession {
     }
 
     pub async fn status(&self) -> Result<RepoStatus> {
-        match self.client.get_repo_status(self.repo_id.clone()).await? {
+        match self
+            .client
+            .get_repo_status_isolated(self.repo_id.clone())
+            .await?
+        {
             Response::RepoStatus { status } => Ok(status),
             other => unexpected_response("get_repo_status", other),
         }
@@ -478,7 +482,9 @@ impl AsyncDaemonClient {
     }
 
     async fn search(&self, params: SearchParams) -> Result<Response> {
-        self.send(Request::Search { params }).await
+        // Keep search requests off the shared session connection to avoid
+        // head-of-line blocking from unrelated status/task calls.
+        self.send_isolated(Request::Search { params }).await
     }
 
     async fn glob(&self, params: GlobParams) -> Result<Response> {
@@ -487,6 +493,15 @@ impl AsyncDaemonClient {
 
     async fn get_repo_status(&self, repo_id: impl Into<String>) -> Result<Response> {
         self.send(Request::GetRepoStatus {
+            params: RepoRef {
+                repo_id: repo_id.into(),
+            },
+        })
+        .await
+    }
+
+    async fn get_repo_status_isolated(&self, repo_id: impl Into<String>) -> Result<Response> {
+        self.send_isolated(Request::GetRepoStatus {
             params: RepoRef {
                 repo_id: repo_id.into(),
             },
@@ -560,6 +575,42 @@ impl AsyncDaemonClient {
         }
         serde_json::from_str(&line)
             .map_err(|error| AppError::Protocol(format!("failed to decode response: {error}")))
+    }
+
+    async fn send_isolated(&self, request: Request) -> Result<Response> {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let envelope = RequestEnvelope {
+            jsonrpc: "2.0".into(),
+            id: Some(request_id),
+            request,
+        };
+
+        let mut connection = Some(self.connect().await?);
+        let response = self
+            .send_with_connection(&mut connection, &envelope)
+            .await?;
+
+        if response.id != Some(request_id) {
+            return Err(AppError::Protocol(format!(
+                "daemon response id mismatch: expected {request_id:?}, got {:?}",
+                response.id
+            )));
+        }
+
+        if response.jsonrpc != "2.0" {
+            return Err(AppError::Protocol(format!(
+                "unsupported daemon jsonrpc version: {}",
+                response.jsonrpc
+            )));
+        }
+
+        if let Some(error) = response.error {
+            return Err(AppError::Protocol(error.message));
+        }
+
+        response
+            .result
+            .ok_or_else(|| AppError::Protocol("daemon response missing result".into()))
     }
 
     async fn connect(&self) -> Result<AsyncDaemonConnection> {

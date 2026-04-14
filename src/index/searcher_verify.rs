@@ -62,6 +62,7 @@ pub(crate) fn verify_candidates<F>(
     multiline_verifier: bool,
     mode: SearchMode,
     max_count: Option<usize>,
+    global_max_results: Option<usize>,
     before_context: usize,
     after_context: usize,
 ) -> Result<Vec<SearchTaskOutcome>>
@@ -77,6 +78,7 @@ where
         multiline_verifier,
         mode,
         max_count,
+        global_max_results,
         before_context,
         after_context,
     )
@@ -91,6 +93,7 @@ pub(crate) fn verify_candidate_sources<F>(
     multiline_verifier: bool,
     mode: SearchMode,
     max_count: Option<usize>,
+    global_max_results: Option<usize>,
     before_context: usize,
     after_context: usize,
 ) -> Result<Vec<SearchTaskOutcome>>
@@ -106,6 +109,7 @@ where
         multiline_verifier,
         mode,
         max_count,
+        global_max_results,
         before_context,
         after_context,
     )
@@ -120,6 +124,7 @@ pub(crate) fn verify_candidate_sources_with_resolver<F>(
     multiline_verifier: bool,
     mode: SearchMode,
     max_count: Option<usize>,
+    global_max_results: Option<usize>,
     before_context: usize,
     after_context: usize,
 ) -> Result<Vec<SearchTaskOutcome>>
@@ -127,7 +132,9 @@ where
     F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
 {
     validate_doc_ids(doc_count, candidate_ids)?;
-    let mut outcomes = if should_parallel_verify(candidate_ids.len()) {
+    let mut outcomes = if global_max_results.is_none()
+        && should_parallel_verify(candidate_ids.len())
+    {
         let results = candidate_ids
             .par_iter()
             .enumerate()
@@ -171,20 +178,34 @@ where
             after_context,
         );
         let mut outcomes = Vec::with_capacity(candidate_ids.len());
+        let mut consumed_results = 0usize;
         for (ordinal, &doc_id) in candidate_ids.iter().enumerate() {
             validate_doc_id(doc_count, doc_id)?;
             let source = resolve_source(doc_id)?;
             let outcome = verify_source(&source, matcher, line_prefilter, &mut verifier, mode)?;
+            consumed_results += outcome_result_units(mode, &outcome);
             outcomes.push(SearchTaskOutcome {
                 ordinal,
                 doc_id,
                 outcome,
             });
+            if global_max_results.is_some_and(|limit| consumed_results >= limit) {
+                break;
+            }
         }
         return Ok(outcomes);
     };
     outcomes.sort_unstable_by_key(|task| task.ordinal);
     Ok(outcomes)
+}
+
+fn outcome_result_units(mode: SearchMode, outcome: &VerifyOutcome) -> usize {
+    match mode {
+        SearchMode::CountOnly => outcome.matched_lines,
+        SearchMode::CountMatches => outcome.matched_occurrences,
+        SearchMode::FirstHitOnly => usize::from(!outcome.matches.is_empty()),
+        SearchMode::MaterializeMatches => outcome.matched_lines,
+    }
 }
 
 pub(crate) struct VerifyOutcome {

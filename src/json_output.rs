@@ -538,6 +538,8 @@ mod tests {
             bytes_searched: 1234,
             matched_lines: 3,
             matched_occurrences: 4,
+            file_counts: Vec::new(),
+            file_match_counts: Vec::new(),
             hits: Vec::new(),
         };
 
@@ -557,6 +559,8 @@ mod tests {
             bytes_searched: 10,
             matched_lines: 1,
             matched_occurrences: 1,
+            file_counts: Vec::new(),
+            file_match_counts: Vec::new(),
             hits: vec![SearchHit {
                 path: "src/main.rs".into(),
                 matches: vec![FileMatch {

@@ -10,8 +10,10 @@ use std::{
 use codgrep::{
     advanced::{repo_relative_path, IndexSearcher},
     build_index,
-    experimental::index_format::{read_doc_terms_file, read_docs_file, IndexLayout},
-    BuildConfig, QueryConfig, SearchMode, TokenizerMode,
+    experimental::index_format::{
+        read_doc_terms_file, read_docs_file, write_docs_file, IndexLayout,
+    },
+    rebuild_index, BuildConfig, QueryConfig, SearchMode, TokenizerMode,
 };
 use tempfile::tempdir;
 
@@ -226,6 +228,78 @@ fn build_keeps_commit_snapshot_when_git_worktree_is_dirty() {
         .modified()
         .expect("test should succeed");
     assert_eq!(docs_mtime_before, docs_mtime_after);
+}
+
+#[test]
+fn rebuild_refreshes_dirty_git_snapshot_even_when_generation_exists() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let tracked = repo.write("service.rs", "const NAME: &str = \"BASE_NAME\";\n");
+    repo.commit_all("initial");
+
+    let build = repo.trigram_build_config();
+    build_index(&build).expect("test should succeed");
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_ONE\";\n");
+    build_index(&build).expect("test should succeed");
+
+    let generation = std::fs::read_to_string(IndexLayout::current_path(&repo.index))
+        .expect("test should succeed");
+    let generation = generation.trim().to_string();
+    let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
+    let docs_mtime_before = std::fs::metadata(&layout.docs_path)
+        .expect("test should succeed")
+        .modified()
+        .expect("test should succeed");
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_TWO\";\n");
+    rebuild_index(&build).expect("test should succeed");
+
+    let current_generation = std::fs::read_to_string(IndexLayout::current_path(&repo.index))
+        .expect("test should succeed");
+    let current_generation = current_generation.trim().to_string();
+    assert_ne!(current_generation, generation);
+    assert!(current_generation.starts_with(&generation));
+
+    let rebuilt_layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
+    let docs_mtime_after = std::fs::metadata(&rebuilt_layout.docs_path)
+        .expect("test should succeed")
+        .modified()
+        .expect("test should succeed");
+    assert!(docs_mtime_after > docs_mtime_before);
+
+    let searcher = IndexSearcher::open(repo.index.clone()).expect("test should succeed");
+    let stale_reason = searcher
+        .stale_reason()
+        .expect("test should succeed")
+        .expect("dirty tracked file should keep snapshot stale");
+    assert!(stale_reason.contains("indexed file changed"));
+}
+
+#[test]
+fn build_rebuilds_instead_of_reusing_corrupted_current_generation() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    let tracked = repo.write("service.rs", "const NAME: &str = \"BASE_NAME\";\n");
+    repo.commit_all("initial");
+
+    let build = repo.trigram_build_config();
+    build_index(&build).expect("test should succeed");
+
+    let layout = IndexLayout::resolve(&repo.index).expect("test should succeed");
+    let (metadata, _) = read_docs_file(&layout.docs_path).expect("test should succeed");
+    write_docs_file(&layout.docs_path, metadata, &[]).expect("test should succeed");
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_NAME\";\n");
+    build_index(&build).expect("test should succeed");
+
+    let searcher = IndexSearcher::open(repo.index.clone()).expect("test should succeed");
+    assert_eq!(searcher.doc_count(), 1);
+    let stale_reason = searcher
+        .stale_reason()
+        .expect("test should succeed")
+        .expect("dirty tracked file should keep snapshot stale");
+    assert!(stale_reason.contains("indexed file changed"));
 }
 
 #[test]

@@ -1,6 +1,6 @@
 use std::{
     fs::{self, File},
-    io::{Seek, SeekFrom, Write},
+    io::{Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
 };
 
@@ -221,6 +221,13 @@ pub fn write_docs_file(path: &Path, metadata: IndexMetadata, docs: &[DocMeta]) -
     }
     writer.finish()?;
     Ok(())
+}
+
+pub fn read_docs_header(path: &Path) -> Result<(IndexMetadata, usize)> {
+    let mut file = File::open(path)?;
+    let metadata = read_docs_metadata_from_reader(&mut file)?;
+    let doc_count = u32_to_usize(read_u32_from_reader(&mut file)?, "document count")?;
+    Ok((metadata, doc_count))
 }
 
 pub struct DocsWriter {
@@ -597,6 +604,18 @@ pub fn read_doc_terms_file(path: &Path) -> Result<Vec<Vec<u64>>> {
     Ok(doc_terms)
 }
 
+pub fn read_doc_terms_count(path: &Path) -> Result<usize> {
+    let mut file = File::open(path)?;
+    expect_magic_from_reader(&mut file, DOC_TERMS_MAGIC)?;
+    let version = read_u32_from_reader(&mut file)?;
+    if version != FORMAT_VERSION {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported doc terms version: {version}"
+        )));
+    }
+    u32_to_usize(read_u32_from_reader(&mut file)?, "doc term count")
+}
+
 pub fn write_postings_file(
     path: &Path,
     postings: &[(u64, Vec<u32>)],
@@ -846,6 +865,34 @@ impl PostingsData {
     }
 }
 
+pub(crate) fn validate_index_layout(
+    layout: &IndexLayout,
+    metadata: &IndexMetadata,
+    doc_count: usize,
+) -> Result<()> {
+    validate_doc_terms_file(&layout.doc_terms_path, doc_count, "doc terms")?;
+    validate_lookup_file(&layout.lookup_path)?;
+    validate_postings_file(&layout.postings_path)?;
+
+    if let Some(fallback) = metadata.fallback_trigram.as_ref() {
+        if fallback.doc_count != doc_count {
+            return Err(AppError::InvalidIndex(format!(
+                "fallback trigram doc count mismatch: docs={doc_count}, metadata={}",
+                fallback.doc_count
+            )));
+        }
+        validate_doc_terms_file(
+            &layout.trigram_fallback_doc_terms_path,
+            doc_count,
+            "fallback doc terms",
+        )?;
+        validate_lookup_file(&layout.trigram_fallback_lookup_path)?;
+        validate_postings_file(&layout.trigram_fallback_postings_path)?;
+    }
+
+    Ok(())
+}
+
 struct Cursor<'a> {
     bytes: &'a [u8],
     position: usize,
@@ -899,6 +946,183 @@ impl<'a> Cursor<'a> {
 fn open_readonly_mmap(path: &Path) -> Result<Mmap> {
     let file = File::open(path)?;
     Ok(unsafe { Mmap::map(&file)? })
+}
+
+fn expect_magic_from_reader(reader: &mut impl Read, magic: &[u8; 4]) -> Result<()> {
+    let mut value = [0u8; 4];
+    reader.read_exact(&mut value)?;
+    if &value != magic {
+        return Err(AppError::InvalidIndex("magic mismatch".into()));
+    }
+    Ok(())
+}
+
+fn read_byte_from_reader(reader: &mut impl Read) -> Result<u8> {
+    let mut value = [0u8; 1];
+    reader.read_exact(&mut value)?;
+    Ok(value[0])
+}
+
+fn read_u32_from_reader(reader: &mut impl Read) -> Result<u32> {
+    let mut value = [0u8; 4];
+    reader.read_exact(&mut value)?;
+    Ok(u32::from_le_bytes(value))
+}
+
+fn read_u64_from_reader(reader: &mut impl Read) -> Result<u64> {
+    let mut value = [0u8; 8];
+    reader.read_exact(&mut value)?;
+    Ok(u64::from_le_bytes(value))
+}
+
+fn read_string_from_reader(reader: &mut impl Read, len: usize) -> Result<String> {
+    let mut bytes = vec![0u8; len];
+    reader.read_exact(&mut bytes)?;
+    String::from_utf8(bytes).map_err(|source| AppError::InvalidUtf8 {
+        path: PathBuf::from("<index>"),
+        source,
+    })
+}
+
+fn read_docs_metadata_from_reader(reader: &mut impl Read) -> Result<IndexMetadata> {
+    expect_magic_from_reader(reader, DOCS_MAGIC)?;
+    let version = read_u32_from_reader(reader)?;
+    if version != DOCS_FORMAT_VERSION
+        && version != DOCS_FORMAT_VERSION_V6
+        && version != DOCS_FORMAT_VERSION_V5
+        && version != DOCS_FORMAT_VERSION_LEGACY
+    {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported docs version: {version}"
+        )));
+    }
+
+    let tokenizer = TokenizerMode::from_byte(read_byte_from_reader(reader)?)
+        .ok_or_else(|| AppError::InvalidIndex("unknown tokenizer mode".into()))?;
+    let min_sparse_len = u32_to_usize(read_u32_from_reader(reader)?, "min_sparse_len")?;
+    let max_sparse_len = u32_to_usize(read_u32_from_reader(reader)?, "max_sparse_len")?;
+    let fallback_trigram = if version == DOCS_FORMAT_VERSION {
+        let enabled = read_byte_from_reader(reader)? != 0;
+        enabled
+            .then(|| -> Result<FallbackTrigramSettings> {
+                Ok(FallbackTrigramSettings {
+                    doc_count: u32_to_usize(
+                        read_u32_from_reader(reader)?,
+                        "fallback trigram doc count",
+                    )?,
+                    key_count: u32_to_usize(
+                        read_u32_from_reader(reader)?,
+                        "fallback trigram key count",
+                    )?,
+                })
+            })
+            .transpose()?
+    } else {
+        None
+    };
+    let build = if version == DOCS_FORMAT_VERSION
+        || version == DOCS_FORMAT_VERSION_V6
+        || version == DOCS_FORMAT_VERSION_V5
+    {
+        let corpus_mode = CorpusMode::from_byte(read_byte_from_reader(reader)?)
+            .ok_or_else(|| AppError::InvalidIndex("unknown corpus mode".into()))?;
+        let include_hidden = read_byte_from_reader(reader)? != 0;
+        let max_file_size = read_u64_from_reader(reader)?;
+        let repo_root_len = u32_to_usize(read_u32_from_reader(reader)?, "repo root length")?;
+        let repo_root = read_string_from_reader(reader, repo_root_len)?;
+        let (head_commit, config_fingerprint) =
+            if version == DOCS_FORMAT_VERSION || version == DOCS_FORMAT_VERSION_V6 {
+                let head_commit_len =
+                    u32_to_usize(read_u32_from_reader(reader)?, "head commit length")?;
+                let head_commit = read_string_from_reader(reader, head_commit_len)?;
+                let config_fingerprint_len =
+                    u32_to_usize(read_u32_from_reader(reader)?, "config fingerprint length")?;
+                let config_fingerprint = read_string_from_reader(reader, config_fingerprint_len)?;
+                (
+                    (!head_commit.is_empty()).then_some(head_commit),
+                    (!config_fingerprint.is_empty()).then_some(config_fingerprint),
+                )
+            } else {
+                (None, None)
+            };
+        Some(IndexBuildSettings {
+            repo_root,
+            corpus_mode,
+            include_hidden,
+            max_file_size,
+            head_commit,
+            config_fingerprint,
+        })
+    } else {
+        None
+    };
+
+    Ok(IndexMetadata {
+        tokenizer,
+        min_sparse_len,
+        max_sparse_len,
+        fallback_trigram,
+        build,
+    })
+}
+
+fn validate_doc_terms_file(path: &Path, expected_doc_count: usize, label: &str) -> Result<()> {
+    let doc_count = read_doc_terms_count(path)?;
+    if doc_count != expected_doc_count {
+        return Err(AppError::InvalidIndex(format!(
+            "{label} count mismatch: expected {expected_doc_count}, got {doc_count}"
+        )));
+    }
+    Ok(())
+}
+
+fn validate_lookup_file(path: &Path) -> Result<()> {
+    let file_len = fs::metadata(path)?.len();
+    if file_len < 16 {
+        return Err(AppError::InvalidIndex("lookup file too small".into()));
+    }
+
+    let mut file = File::open(path)?;
+    expect_magic_from_reader(&mut file, LOOKUP_MAGIC)?;
+    let version = read_u32_from_reader(&mut file)?;
+    if version != FORMAT_VERSION {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported lookup version: {version}"
+        )));
+    }
+
+    let entries_len = u64_to_usize(read_u64_from_reader(&mut file)?, "lookup entry count")?;
+    let expected_len = 16u64
+        .checked_add(
+            u64::try_from(entries_len)
+                .map_err(|_| {
+                    AppError::ValueOutOfRange("lookup entry count exceeds u64 range".into())
+                })?
+                .checked_mul(LOOKUP_ENTRY_SIZE as u64)
+                .ok_or_else(|| AppError::InvalidIndex("lookup length overflow".into()))?,
+        )
+        .ok_or_else(|| AppError::InvalidIndex("lookup length overflow".into()))?;
+    if file_len < expected_len {
+        return Err(AppError::InvalidIndex("lookup file truncated".into()));
+    }
+    Ok(())
+}
+
+fn validate_postings_file(path: &Path) -> Result<()> {
+    let file_len = fs::metadata(path)?.len();
+    if file_len < 12 {
+        return Err(AppError::InvalidIndex("postings file too small".into()));
+    }
+
+    let mut file = File::open(path)?;
+    expect_magic_from_reader(&mut file, POSTINGS_MAGIC)?;
+    let version = read_u32_from_reader(&mut file)?;
+    if version != FORMAT_VERSION {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported postings version: {version}"
+        )));
+    }
+    Ok(())
 }
 
 fn write_u32(writer: &mut File, value: u32) -> Result<()> {

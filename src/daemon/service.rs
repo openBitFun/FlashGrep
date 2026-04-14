@@ -100,6 +100,7 @@ mod tests {
         QuerySpec, RepoConfig, RepoStatus as RepoStatusPayload, Request, Response, SearchBackend,
         SearchModeConfig, TaskState, TaskStatus as TaskStatusPayload,
     };
+    use crate::experimental::index_format::{read_docs_file, write_docs_file, IndexLayout};
 
     thread_local! {
         static DAEMON_TEST_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -203,6 +204,7 @@ mod tests {
             after_context: 0,
             top_k_tokens: 6,
             max_count: None,
+            global_max_results: None,
             search_mode: SearchModeConfig::CountOnly,
         }
     }
@@ -443,6 +445,46 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn daemon_treats_corrupted_current_generation_as_missing_index() {
+        let _serial = daemon_test_serial();
+        let setup_service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        fs::write(
+            repo_path.join("main.rs"),
+            "const NAME: &str = \"WORKTREE\";\n",
+        )
+        .expect("write should succeed");
+
+        let (repo_id, _) = open_repo(&setup_service, repo_path.clone());
+        build_repo(&setup_service, &repo_id);
+        let built = wait_for_status(&setup_service, &repo_id, |status| {
+            matches!(
+                status.phase,
+                crate::daemon::protocol::RepoPhase::ReadyClean
+                    | crate::daemon::protocol::RepoPhase::ReadyDirty
+            )
+        });
+
+        let index_path = PathBuf::from(&built.index_path);
+        let current = fs::read_to_string(IndexLayout::current_path(&index_path))
+            .expect("current generation should exist");
+        let layout = IndexLayout::for_generation(&index_path, current.trim());
+        let (metadata, _) = read_docs_file(&layout.docs_path).expect("docs should load");
+        write_docs_file(&layout.docs_path, metadata, &[]).expect("corrupt docs should succeed");
+
+        setup_service.shutdown_all();
+
+        let service = DaemonService::new();
+        let (_, status) = open_repo(&service, repo_path);
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::MissingIndex
+        ));
     }
 
     #[test]
@@ -918,6 +960,53 @@ mod tests {
             }
             other => panic!("unexpected response: {other:?}"),
         }
+    }
+
+    #[test]
+    fn watcher_reconciles_batched_tracked_file_updates() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+
+        let dirty_count = 96usize;
+        for index in 0..dirty_count {
+            fs::write(
+                repo_path.join(format!("tracked_{index:03}.rs")),
+                "const NAME: &str = \"BASE\";\n",
+            )
+            .expect("write should succeed");
+        }
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+
+        for index in 0..dirty_count {
+            fs::write(
+                repo_path.join(format!("tracked_{index:03}.rs")),
+                "const NAME: &str = \"DIRTY\";\n",
+            )
+            .expect("rewrite should succeed");
+        }
+
+        let status = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+                && status.dirty_files.modified == dirty_count
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
+        });
+        assert_exact_dirty_stats(&status, dirty_count, 0, 0);
+
+        let (backend, search_status) = wait_for_search_count(
+            &service,
+            &repo_id,
+            "DIRTY",
+            ConsistencyMode::WorkspaceEventual,
+            dirty_count,
+        );
+        assert!(matches!(backend, SearchBackend::IndexedWorkspaceRepair));
+        assert_eq!(search_status.dirty_files.modified, dirty_count);
     }
 
     #[test]

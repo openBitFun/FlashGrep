@@ -66,17 +66,52 @@ pub(crate) fn search_documents(
                 },
             )?;
             let resolve_source = |doc_id| scan_doc_source(documents, doc_id);
-            let stats = verify_plan.verify_candidate_count_stats_with_sources(
+            let counts = verify_plan.verify_candidate_counts_by_doc_with_sources(
                 &candidate_ids,
                 docs.len(),
                 &resolve_source,
             )?;
+            let matched_docs = counts.len();
+            let matched_lines = counts.iter().map(|count| count.matched_lines).sum();
+            let matched_occurrences = counts.iter().map(|count| count.matched_occurrences).sum();
+            let (file_counts, file_match_counts) =
+                if matches!(config.search_mode, crate::search::SearchMode::CountOnly) {
+                    (
+                        counts
+                            .into_iter()
+                            .map(|count| crate::search::FileCount {
+                                path: docs[usize::try_from(count.doc_id)
+                                    .expect("doc id should fit usize")]
+                                .path
+                                .clone(),
+                                matched_lines: count.matched_lines,
+                            })
+                            .collect(),
+                        Vec::new(),
+                    )
+                } else {
+                    (
+                        Vec::new(),
+                        counts
+                            .into_iter()
+                            .map(|count| crate::search::FileMatchCount {
+                                path: docs[usize::try_from(count.doc_id)
+                                    .expect("doc id should fit usize")]
+                                .path
+                                .clone(),
+                                matched_occurrences: count.matched_occurrences,
+                            })
+                            .collect(),
+                    )
+                };
             Ok(SearchResults {
                 candidate_docs: docs.len(),
-                searches_with_match: stats.matched_docs,
+                searches_with_match: matched_docs,
                 bytes_searched: documents.iter().map(|document| document.size).sum(),
-                matched_lines: stats.matched_lines,
-                matched_occurrences: stats.matched_occurrences,
+                matched_lines,
+                matched_occurrences,
+                file_counts,
+                file_match_counts,
                 hits: Vec::new(),
             })
         }
@@ -92,6 +127,7 @@ pub(crate) fn search_documents(
                 multiline_verifier,
                 config.search_mode,
                 config.max_count,
+                config.effective_global_max_results(),
                 config.before_context,
                 config.after_context,
             )?;
@@ -129,6 +165,8 @@ pub(crate) fn search_documents(
                 bytes_searched,
                 matched_lines,
                 matched_occurrences,
+                file_counts: Vec::new(),
+                file_match_counts: Vec::new(),
                 hits,
             })
         }
@@ -197,7 +235,9 @@ fn search_documents_multi_literal_fast(
         .build(&alternation.literals)
         .map_err(|error| AppError::InvalidPattern(error.to_string()))?;
 
-    let outcomes = if should_parallel_scan_documents(documents) {
+    let outcomes = if config.effective_global_max_results().is_none()
+        && should_parallel_scan_documents(documents)
+    {
         documents
             .par_iter()
             .map(|document| scan_document_multi_literal(document, &matcher, config.search_mode))
@@ -214,6 +254,7 @@ fn search_documents_multi_literal_fast(
     let mut searches_with_match = 0usize;
     let mut hits = Vec::new();
     let mut bytes_searched = 0u64;
+    let global_limit = config.effective_global_max_results();
 
     for outcome in outcomes.into_iter().flatten() {
         matched_lines += outcome.matched_lines;
@@ -229,6 +270,15 @@ fn search_documents_multi_literal_fast(
         } else if outcome.matched_lines > 0 || outcome.matched_occurrences > 0 {
             searches_with_match += 1;
         }
+        let consumed_results = match config.search_mode {
+            crate::search::SearchMode::FirstHitOnly => searches_with_match,
+            crate::search::SearchMode::MaterializeMatches => matched_lines,
+            crate::search::SearchMode::CountOnly => matched_lines,
+            crate::search::SearchMode::CountMatches => matched_occurrences,
+        };
+        if global_limit.is_some_and(|limit| consumed_results >= limit) {
+            break;
+        }
     }
 
     Ok(Some(SearchResults {
@@ -237,6 +287,8 @@ fn search_documents_multi_literal_fast(
         bytes_searched,
         matched_lines,
         matched_occurrences,
+        file_counts: Vec::new(),
+        file_match_counts: Vec::new(),
         hits,
     }))
 }

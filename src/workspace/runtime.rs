@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use crate::{
     config::BuildConfig,
     error::Result,
-    files::{is_text_file, scan_paths, scan_repository, ScanOptions},
+    files::{is_indexable_text_file, is_text_file, scan_paths, scan_repository, ScanOptions},
     index::IndexWorktreeDiff,
     path_filter::PathFilter,
     search::SearchResults,
@@ -203,8 +203,14 @@ pub(super) fn merge_search_results(
     base.bytes_searched += dirty.bytes_searched;
     base.matched_lines += dirty.matched_lines;
     base.matched_occurrences += dirty.matched_occurrences;
+    base.file_counts.append(&mut dirty.file_counts);
+    base.file_match_counts.append(&mut dirty.file_match_counts);
     base.hits.append(&mut dirty.hits);
     base.hits
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    base.file_counts
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    base.file_match_counts
         .sort_unstable_by(|left, right| left.path.cmp(&right.path));
     base
 }
@@ -250,7 +256,7 @@ pub(super) fn load_search_document(
     logical_path: String,
     path: PathBuf,
 ) -> Result<Option<SearchDocument>> {
-    if !path.exists() || !is_text_file(&path)? {
+    if !path.exists() || !is_indexable_text_file(&path)? {
         return Ok(None);
     }
     let metadata = fs::metadata(&path)?;
@@ -292,7 +298,7 @@ fn resolve_documents(
         if filter.is_some_and(|active| !active.matches_file(&path)) {
             continue;
         }
-        if !path.exists() || !is_text_file(&path)? {
+        if !path.exists() || !is_indexable_text_file(&path)? {
             continue;
         }
         documents.push(search_document_from_path(candidate.path, path)?);
@@ -310,7 +316,7 @@ where
         if filter.is_some_and(|active| !active.matches_file(&path)) {
             continue;
         }
-        if !path.exists() || !is_text_file(&path)? {
+        if !path.exists() || !is_indexable_text_file(&path)? {
             continue;
         }
         documents.push(search_document_from_path(logical_path, path)?);

@@ -23,12 +23,23 @@ pub struct SearchResults {
     pub bytes_searched: u64,
     pub matched_lines: usize,
     pub matched_occurrences: usize,
+    pub file_counts: Vec<FileCount>,
+    pub file_match_counts: Vec<FileMatchCount>,
     pub hits: Vec<SearchHit>,
 }
 
 impl SearchResults {
     pub fn has_match(&self) -> bool {
         self.matched_lines > 0 || self.matched_occurrences > 0
+    }
+
+    pub fn result_units(&self, mode: SearchMode) -> usize {
+        match mode {
+            SearchMode::CountOnly => self.matched_lines,
+            SearchMode::CountMatches => self.matched_occurrences,
+            SearchMode::FirstHitOnly => self.searches_with_match,
+            SearchMode::MaterializeMatches => self.matched_lines,
+        }
     }
 }
 
