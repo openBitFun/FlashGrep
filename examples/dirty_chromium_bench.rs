@@ -11,7 +11,13 @@ use std::{
 use codgrep::{
     build_index, BuildConfig, CorpusMode, QueryConfig, Result, SearchMode, TokenizerMode,
     WorkspaceIndex, WorkspaceIndexOptions,
-    sdk::{count_only_query, EnsureRepoParams, ManagedClient, RepoConfig, RepoSession, SearchRequest},
+    daemon::{
+        protocol::{
+            ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request,
+            SearchModeConfig, SearchParams,
+        },
+        DaemonClient, ManagedDaemonClient,
+    },
 };
 
 const QUERY: &str = "ScopedAllowBlocking";
@@ -56,6 +62,12 @@ struct SearchMeasurement {
     matched_lines: usize,
     backend: String,
     elapsed_ms: f64,
+}
+
+#[derive(Debug)]
+struct DaemonRepo {
+    repo_id: String,
+    client: DaemonClient,
 }
 
 #[derive(Debug)]
@@ -194,7 +206,7 @@ fn main() -> Result<()> {
         for _ in 0..BENCH_ITERS {
             steady.push(run_codgrep_query(&repo)?);
         }
-        repo.shutdown_daemon()?;
+        shutdown_daemon(&repo)?;
 
         let mut rg_times = Vec::with_capacity(BENCH_ITERS);
         let mut rg_count = None;
@@ -345,30 +357,60 @@ fn open_codgrep_repo(
     cg_path: &Path,
     repo_path: &Path,
     index_path: &Path,
-) -> Result<(RepoSession, f64)> {
-    let client = ManagedClient::new()
+) -> Result<(DaemonRepo, f64)> {
+    let client = ManagedDaemonClient::new()
         .with_daemon_program(OsString::from(cg_path))
         .with_start_timeout(std::time::Duration::from_secs(120));
     let started = Instant::now();
-    let repo = client.ensure_repo(EnsureRepoParams {
+    let ensured = client.ensure_repo(EnsureRepoParams {
         repo_path: repo_path.to_path_buf(),
         index_path: Some(index_path.to_path_buf()),
         config: RepoConfig::default(),
         refresh: Default::default(),
     })?;
-    Ok((repo, elapsed_ms(started.elapsed().as_secs_f64())))
+    Ok((
+        DaemonRepo {
+            repo_id: ensured.repo_id,
+            client: DaemonClient::new(ensured.addr),
+        },
+        elapsed_ms(started.elapsed().as_secs_f64()),
+    ))
 }
 
-fn run_codgrep_query(repo: &RepoSession) -> Result<SearchMeasurement> {
+fn run_codgrep_query(repo: &DaemonRepo) -> Result<SearchMeasurement> {
     let started = Instant::now();
-    let outcome = repo.search(SearchRequest::new(count_only_query(QUERY)))?;
+    let outcome = repo.client.send(Request::Search {
+        params: SearchParams {
+            repo_id: repo.repo_id.clone(),
+            query: count_only_query(QUERY),
+            scope: PathScope::default(),
+            consistency: ConsistencyMode::WorkspaceEventual,
+            allow_scan_fallback: false,
+        },
+    })?;
     let elapsed_ms = elapsed_ms(started.elapsed().as_secs_f64());
 
-    Ok(SearchMeasurement {
-        matched_lines: outcome.results.matched_lines,
-        backend: format!("{:?}", outcome.backend),
-        elapsed_ms,
-    })
+    match outcome {
+        codgrep::daemon::protocol::Response::SearchCompleted {
+            backend, results, ..
+        } => Ok(SearchMeasurement {
+            matched_lines: results.matched_lines,
+            backend: format!("{backend:?}"),
+            elapsed_ms,
+        }),
+        other => Err(codgrep::AppError::Protocol(format!(
+            "unexpected search response: {other:?}"
+        ))),
+    }
+}
+
+fn shutdown_daemon(repo: &DaemonRepo) -> Result<()> {
+    match repo.client.send(Request::Shutdown)? {
+        codgrep::daemon::protocol::Response::ShutdownAck => Ok(()),
+        other => Err(codgrep::AppError::Protocol(format!(
+            "unexpected shutdown response: {other:?}"
+        ))),
+    }
 }
 
 fn run_rg_query(repo_path: &Path) -> Result<(usize, f64)> {
@@ -424,6 +466,26 @@ fn profile_query() -> QueryConfig {
         fixed_strings: true,
         search_mode: SearchMode::CountOnly,
         ..QueryConfig::default()
+    }
+}
+
+fn count_only_query(pattern: impl Into<String>) -> QuerySpec {
+    let pattern = pattern.into();
+    QuerySpec {
+        pattern: pattern.clone(),
+        patterns: vec![pattern],
+        case_insensitive: false,
+        multiline: false,
+        dot_matches_new_line: false,
+        fixed_strings: true,
+        word_regexp: false,
+        line_regexp: false,
+        before_context: 0,
+        after_context: 0,
+        top_k_tokens: 6,
+        max_count: None,
+        global_max_results: None,
+        search_mode: SearchModeConfig::CountOnly,
     }
 }
 

@@ -48,7 +48,7 @@ cargo run -- serve
 
 推荐把 `codgrep` 当成一个独立常驻进程来使用，形态更接近本地搜索 server，而不是 ripgrep 风格的一次性搜索 CLI。
 
-如果你使用 `ManagedDaemonClient` 或 `codgrep::sdk::{ManagedClient, tokio::ManagedClient}`：
+如果你使用 `ManagedDaemonClient`：
 
 - daemon 默认按 `index_path/daemon-state.json` 发现和复用。
 - 多个调用方会通过同一路径下的 `daemon-state.lock` 协调启动，避免重复拉起。
@@ -100,170 +100,86 @@ cargo run -- bench --suite-dir bench_data
 
 ## External Interface
 
-当前稳定的对外接口应视为 daemon 进程协议，以及建立在它之上的 Rust SDK：
+当前稳定的对外接口应视为 daemon 进程协议，以及围绕它的二进制与基础客户端：
 
 - daemon protocol request/response/notification schema
 - `DaemonClient` / `ManagedDaemonClient`
-- `codgrep::sdk` Rust SDK facade
 - `cg serve` 与 `cg daemon *` 这些围绕 daemon 的工具入口
 
 其中：
 
 - `daemon::protocol` 是跨语言/跨进程集成时的规范基线。
-- `DaemonClient` / `ManagedDaemonClient` 与 `codgrep::sdk` 都是这层 contract 的客户端封装。
-- Rust 调用方应优先依赖 `codgrep::sdk`，而不是直接在产品代码里拼 protocol 请求。
+- 下游产品应自己在客户端侧封装 SDK / service facade；`codgrep` 不再内置 Rust SDK facade。
+- `codgrep` 这边的交付物以 daemon 二进制 `cg` 为主；像 BitFun 这类宿主只需要打包 `cg` 并按协议接入。
 - crate 根上仍然存在的历史库导出，仅用于仓库内部与迁移期代码复用，不应当作产品接入面。
 
 入口选择（推荐）：
 
-- 外部集成 / IDE / agent / 脚本 / 后续多语言 SDK：以 daemon 协议为准。
-- Rust 调用方：优先使用 `codgrep::sdk`，而不是直接拼 `Request/Response`。
-- 本仓库内部实现：可以继续复用 workspace / index / search 这些库层模块。
-
-Rust SDK 当前会重导出一批常用 protocol DTO，例如 `OpenRepoParams`、`EnsureRepoParams`、`RepoStatus`、`TaskStatus`、`RefreshPolicyConfig`。这些类型在 Rust 集成里建议从 `codgrep::sdk` 路径引用，而不是从 `codgrep::daemon::protocol` 直接引用。
+- 外部集成 / IDE / agent / 宿主产品：以 daemon 协议为准。
+- 需要自动拉起和复用 daemon 的 Rust 调用方：使用 `ManagedDaemonClient`。
+- 需要直接发协议请求的调用方：使用 `DaemonClient` + `daemon::protocol::*`。
 
 路径边界约定：
 
 - `codgrep` 只把自己的产物目录 `.codgrep-index`、`.codgrep-bench`，以及调用方显式配置的 `index_path` 视为内部路径。
 - `codgrep` 不会内建保留某个宿主产品目录名；像 `.bitfun`、`.idea`、`.vscode` 这类目录是否排除，应由接入方或 ignore 规则决定。
 
-Rust SDK 最小示例：
+最小接入示例：
 
 ```rust
-use codgrep::sdk::{
-    count_only_query, EnsureRepoParams, GlobRequest, ManagedClient, PathScope,
-    RefreshPolicyConfig, RepoConfig, SearchRequest,
+use codgrep::daemon::{
+    protocol::{
+        ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request,
+        SearchModeConfig, SearchParams,
+    },
+    DaemonClient, ManagedDaemonClient,
 };
 
-let client = ManagedClient::new();
-let repo = client.ensure_repo(EnsureRepoParams {
+let managed = ManagedDaemonClient::new();
+let ensured = managed.ensure_repo(EnsureRepoParams {
     repo_path: "/path/to/repo".into(),
     index_path: None,
     config: RepoConfig::default(),
-    refresh: RefreshPolicyConfig::default(),
+    refresh: Default::default(),
 })?;
 
-let search = repo.search(SearchRequest::new(count_only_query("LLVMContext")))?;
-let glob = repo.glob(
-    GlobRequest::new().with_scope(PathScope {
-        globs: vec!["*.rs".into()],
-        ..PathScope::default()
-    }),
-)?;
-```
-
-如果你的产品流程是“先打开 repo，等用户手动点索引”，可以走 `open_repo + index_build + wait_task`：
-
-```rust
-use std::time::Duration;
-
-use codgrep::sdk::{
-    count_only_query, ManagedClient, OpenRepoParams, RefreshPolicyConfig, RepoConfig,
-    SearchRequest,
-};
-
-let client = ManagedClient::new();
-let repo = client.open_repo(OpenRepoParams {
-    repo_path: "/path/to/repo".into(),
-    index_path: None,
-    config: RepoConfig::default(),
-    refresh: RefreshPolicyConfig::default(),
+let client = DaemonClient::new(ensured.addr);
+let response = client.send(Request::Search {
+    params: SearchParams {
+        repo_id: ensured.repo_id,
+        query: QuerySpec {
+            pattern: "LLVMContext".into(),
+            patterns: vec!["LLVMContext".into()],
+            case_insensitive: false,
+            multiline: false,
+            dot_matches_new_line: false,
+            fixed_strings: true,
+            word_regexp: false,
+            line_regexp: false,
+            before_context: 0,
+            after_context: 0,
+            top_k_tokens: 6,
+            max_count: None,
+            global_max_results: None,
+            search_mode: SearchModeConfig::CountOnly,
+        },
+        scope: PathScope::default(),
+        consistency: ConsistencyMode::WorkspaceEventual,
+        allow_scan_fallback: false,
+    },
 })?;
-
-let task = repo.index_build()?;
-repo.wait_task(task.task_id, Duration::from_secs(30))?;
-
-let search = repo.search(SearchRequest::new(count_only_query("LLVMContext")))?;
 ```
 
-如果调用方需要消费 daemon 的 `$/progress`、`workspace/statusChanged`、`task/finished`，可以订阅 repo 事件：
+如果宿主产品只需要打包资源：
 
-```rust
-use std::time::Duration;
-
-use codgrep::sdk::{
-    ManagedClient, OpenRepoParams, RefreshPolicyConfig, RepoEvent, RepoTaskFinished,
-    RepoWorkspaceStatusChanged, RepoConfig,
-};
-
-let client = ManagedClient::new();
-let repo = client.open_repo(OpenRepoParams {
-    repo_path: "/path/to/repo".into(),
-    index_path: None,
-    config: RepoConfig::default(),
-    refresh: RefreshPolicyConfig::default(),
-})?;
-
-let mut events = repo.subscribe_events()?;
-let task = repo.index_build()?;
-let task_id = task.task_id.clone();
-
-while let Some(event) = events.recv_timeout(Duration::from_secs(1))? {
-    match event {
-        RepoEvent::Progress(progress) if progress.task_id == task_id => {
-            eprintln!("build progress: {} / {:?}", progress.processed, progress.total);
-        }
-        RepoEvent::WorkspaceStatusChanged(RepoWorkspaceStatusChanged { status, .. }) => {
-            eprintln!("repo phase: {:?}", status.phase);
-        }
-        RepoEvent::TaskFinished(RepoTaskFinished { task, .. }) if task.task_id == task_id => {
-            break;
-        }
-        _ => {}
-    }
-}
-```
-
-如果调用方本身已经是 `tokio` 应用，可以打开 `tokio-sdk` feature：
-
-```bash
-cargo add codgrep --features tokio-sdk
-```
-
-最小异步示例：
-
-```rust
-use codgrep::sdk::{
-    count_only_query, EnsureRepoParams, RefreshPolicyConfig, RepoConfig, SearchRequest,
-};
-
-let client = codgrep::sdk::tokio::ManagedClient::new();
-let repo = client
-    .ensure_repo(EnsureRepoParams {
-        repo_path: "/path/to/repo".into(),
-        index_path: None,
-        config: RepoConfig::default(),
-        refresh: RefreshPolicyConfig::default(),
-    })
-    .await?;
-
-let search = repo
-    .search(SearchRequest::new(count_only_query("LLVMContext")))
-    .await?;
-```
-
-异步 SDK 也提供同样的 repo 事件订阅接口：
-
-```rust
-let mut events = repo.subscribe_events().await?;
-if let Some(event) = events.recv_timeout(std::time::Duration::from_secs(1)).await? {
-    match event {
-        codgrep::sdk::RepoEvent::Progress(progress) => {
-            eprintln!("progress: {}", progress.message);
-        }
-        codgrep::sdk::RepoEvent::WorkspaceStatusChanged(_) => {}
-        codgrep::sdk::RepoEvent::TaskFinished(done) => {
-            eprintln!("task finished: {}", done.task.task_id);
-        }
-    }
-}
-```
+- 打包 `cg` 二进制到产品资源目录。
+- 启动时通过 `CODGREP_DAEMON_BIN` 或显式路径把二进制位置传给调用侧。
+- 客户端自己管理更高层的 repo session、事件订阅、重试策略和 API facade。
 
 核心职责边界（固定定义）：
 
 - `daemon::protocol`：唯一稳定外部 contract。
 - `DaemonClient` / `ManagedDaemonClient`：daemon protocol 的低层 transport/client 封装。
-- `codgrep::sdk`：Rust 调用方的首选 facade，建立在 daemon protocol 之上。
 - 其他 crate library API：内部实现、测试、benchmark、迁移期兼容，不作为稳定外部接口。
 
 ## Internal Library Notes
@@ -274,7 +190,7 @@ crate 根上仍然保留若干历史库导出，主要用于：
 - benchmark / fixture / 测试代码
 - 迁移期的仓库内辅助代码
 
-这些库接口不是推荐的外部接入方式，后续会继续收缩；新的外部能力优先补到 daemon protocol / SDK，而不是继续扩展库层 facade。
+这些库接口不是推荐的外部接入方式，后续会继续收缩；新的外部能力优先补到 daemon protocol，而不是继续扩展库层 facade。
 
 ## Daemon Overlay
 

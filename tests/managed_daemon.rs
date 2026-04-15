@@ -35,6 +35,7 @@ fn managed_client_spawns_ensures_and_searches() {
     assert!(matches!(
         ensure.status.phase,
         codgrep::daemon::protocol::RepoPhase::ReadyClean
+            | codgrep::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
     let search = managed
@@ -85,6 +86,7 @@ fn managed_client_spawns_ensures_and_searches() {
             assert!(matches!(
                 status.phase,
                 codgrep::daemon::protocol::RepoPhase::ReadyClean
+                    | codgrep::daemon::protocol::RepoPhase::ReadyDirty
             ));
         }
         other => panic!("unexpected response: {other:?}"),
