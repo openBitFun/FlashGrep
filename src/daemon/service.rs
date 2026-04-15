@@ -872,7 +872,7 @@ mod tests {
     }
 
     #[test]
-    fn workspace_strict_search_repairs_dirty_worktree() {
+    fn workspace_strict_search_uses_explicitly_refreshed_state() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -886,14 +886,13 @@ mod tests {
 
         fs::write(&tracked, "const NAME: &str = \"DIRTY\";\n").expect("rewrite should succeed");
 
-        let search = search_repo(
-            &service,
-            &repo_id,
-            "DIRTY",
-            ConsistencyMode::WorkspaceStrict,
-        );
+        let status = refresh_repo(&service, &repo_id, true);
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
 
-        match search {
+        match search_repo(&service, &repo_id, "DIRTY", ConsistencyMode::WorkspaceStrict) {
             Response::SearchCompleted {
                 backend,
                 results,

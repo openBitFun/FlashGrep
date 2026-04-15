@@ -119,6 +119,30 @@ impl WorkspaceFreshness {
     }
 }
 
+#[derive(Debug, Clone, Default)]
+pub struct WorkspaceSearchTimings {
+    pub diff: Duration,
+    pub overlay_build: Duration,
+    pub base_search: Duration,
+    pub dirty_search: Duration,
+    pub merge: Duration,
+    pub total: Duration,
+}
+
+#[derive(Debug, Clone)]
+pub struct WorkspaceSearchProfile {
+    pub diff: IndexWorktreeDiff,
+    pub shadowed_base_paths: usize,
+    pub dirty_documents: usize,
+    pub base_candidate_docs: usize,
+    pub base_matched_lines: usize,
+    pub dirty_candidate_docs: usize,
+    pub dirty_matched_lines: usize,
+    pub final_candidate_docs: usize,
+    pub final_matched_lines: usize,
+    pub timings: WorkspaceSearchTimings,
+}
+
 /// High-level workspace facade for base snapshot management and searching
 /// against the current effective repository view.
 #[derive(Clone)]
@@ -252,6 +276,100 @@ impl WorkspaceIndex {
             }
             Err(error) => Err(error),
         }
+    }
+
+    pub fn profile_search_with_filter(
+        &self,
+        query: &crate::QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<WorkspaceSearchProfile> {
+        let total_started = Instant::now();
+        let searcher = self.open_searcher()?;
+
+        let diff_started = Instant::now();
+        let diff = searcher.diff_against_worktree()?;
+        let diff_elapsed = diff_started.elapsed();
+
+        if diff.is_empty() {
+            let base_started = Instant::now();
+            let base_results = searcher.search_with_filter(query, filter)?;
+            let base_elapsed = base_started.elapsed();
+            return Ok(WorkspaceSearchProfile {
+                diff,
+                shadowed_base_paths: 0,
+                dirty_documents: 0,
+                base_candidate_docs: base_results.candidate_docs,
+                base_matched_lines: base_results.matched_lines,
+                dirty_candidate_docs: 0,
+                dirty_matched_lines: 0,
+                final_candidate_docs: base_results.candidate_docs,
+                final_matched_lines: base_results.matched_lines,
+                timings: WorkspaceSearchTimings {
+                    diff: diff_elapsed,
+                    overlay_build: Duration::ZERO,
+                    base_search: base_elapsed,
+                    dirty_search: Duration::ZERO,
+                    merge: Duration::ZERO,
+                    total: total_started.elapsed(),
+                },
+            });
+        }
+
+        let overlay_started = Instant::now();
+        let scope = overlay_search_scope(&diff, filter)?;
+        let overlay_elapsed = overlay_started.elapsed();
+
+        let base_started = Instant::now();
+        let base_results = searcher.search_with_path_overrides(
+            query,
+            filter,
+            None,
+            Some(&scope.shadowed_base_paths),
+        )?;
+        let base_elapsed = base_started.elapsed();
+
+        let dirty_started = Instant::now();
+        let dirty_results = match query_with_remaining_global_limit(query, &base_results) {
+            Some(dirty_query) if !scope.dirty_documents.is_empty() => {
+                search_documents(&dirty_query, &scope.dirty_documents)?
+            }
+            _ => empty_search_results(),
+        };
+        let dirty_elapsed = dirty_started.elapsed();
+
+        let merge_started = Instant::now();
+        let final_results = if dirty_results.candidate_docs == 0
+            && dirty_results.matched_lines == 0
+            && dirty_results.matched_occurrences == 0
+            && dirty_results.file_counts.is_empty()
+            && dirty_results.file_match_counts.is_empty()
+            && dirty_results.hits.is_empty()
+        {
+            base_results.clone()
+        } else {
+            merge_search_results(base_results.clone(), dirty_results.clone())
+        };
+        let merge_elapsed = merge_started.elapsed();
+
+        Ok(WorkspaceSearchProfile {
+            diff,
+            shadowed_base_paths: scope.shadowed_base_paths.len(),
+            dirty_documents: scope.dirty_documents.len(),
+            base_candidate_docs: base_results.candidate_docs,
+            base_matched_lines: base_results.matched_lines,
+            dirty_candidate_docs: dirty_results.candidate_docs,
+            dirty_matched_lines: dirty_results.matched_lines,
+            final_candidate_docs: final_results.candidate_docs,
+            final_matched_lines: final_results.matched_lines,
+            timings: WorkspaceSearchTimings {
+                diff: diff_elapsed,
+                overlay_build: overlay_elapsed,
+                base_search: base_elapsed,
+                dirty_search: dirty_elapsed,
+                merge: merge_elapsed,
+                total: total_started.elapsed(),
+            },
+        })
     }
 
     /// Captures a reusable read-only workspace view pinned to the current base
@@ -491,6 +609,19 @@ fn query_with_remaining_global_limit(
     let mut next_query = query.clone();
     next_query.global_max_results = Some(limit - consumed);
     Some(next_query)
+}
+
+fn empty_search_results() -> SearchResults {
+    SearchResults {
+        candidate_docs: 0,
+        searches_with_match: 0,
+        bytes_searched: 0,
+        matched_lines: 0,
+        matched_occurrences: 0,
+        file_counts: Vec::new(),
+        file_match_counts: Vec::new(),
+        hits: Vec::new(),
+    }
 }
 
 #[cfg(test)]

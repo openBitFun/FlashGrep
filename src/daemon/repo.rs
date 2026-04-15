@@ -1,12 +1,14 @@
 use std::{
     collections::{BTreeMap, HashMap},
+    fs::OpenOptions,
+    io::Write,
     path::{Path, PathBuf},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc, Mutex,
     },
     thread::{self, JoinHandle},
-    time::{Duration, Instant, SystemTime},
+    time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
 use notify::{
@@ -810,17 +812,14 @@ impl RepoRuntime {
                 })
             }
             SearchConsistency::WorkspaceEventual | SearchConsistency::WorkspaceStrict => {
-                self.rescan_pending_directories()?;
-                if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
-                    self.refresh(true)?;
-                } else if self.resync_required.load(Ordering::Relaxed) {
-                    // Keep eventual searches responsive under watcher churn by
-                    // reconciling in the background instead of forcing a
-                    // synchronous full refresh on every query.
+                if self.workspace_reconcile_pending() {
                     self.schedule_background_reconcile(Duration::from_millis(0));
                 }
 
                 let status = self.status_snapshot()?;
+                if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
+                    self.ensure_workspace_strict_ready(&status)?;
+                }
                 match status.phase {
                     RepoPhase::Opening
                     | RepoPhase::MissingIndex
@@ -852,8 +851,8 @@ impl RepoRuntime {
                                 filter.as_ref(),
                             )?
                         };
-                        if !overlay.paths.is_empty() {
-                            self.reconcile_dirty_paths()?;
+                        if matches!(request.consistency, SearchConsistency::WorkspaceEventual) {
+                            self.observe_dirty_diff_if_enabled(&overlay.paths, backend);
                         }
                         Ok(SearchResponse {
                             repo_id: self.repo_id.clone(),
@@ -1051,25 +1050,38 @@ impl RepoRuntime {
         }
     }
 
-    fn reconcile_dirty_paths(&self) -> Result<()> {
-        let current = self.current_dirty_paths();
-        let remaining = self.workspace.reconcile_dirty_diff(&current)?;
-        self.replace_dirty_paths(DirtyPathSet::from_diff(remaining))?;
-        Ok(())
-    }
-
-    fn current_dirty_paths(&self) -> IndexWorktreeDiff {
-        match self.dirty_overlay.lock() {
-            Ok(guard) => guard.paths.to_diff(),
-            Err(poisoned) => poisoned.into_inner().paths.to_diff(),
-        }
-    }
-
     fn current_overlay_snapshot(&self) -> DirtyOverlaySnapshot {
         match self.dirty_overlay.lock() {
             Ok(guard) => guard.snapshot(),
             Err(poisoned) => poisoned.into_inner().snapshot(),
         }
+    }
+
+    fn workspace_reconcile_pending(&self) -> bool {
+        self.resync_required.load(Ordering::Relaxed) || self.has_pending_directory_rescans()
+    }
+
+    fn has_pending_directory_rescans(&self) -> bool {
+        match self.pending_directory_rescans.lock() {
+            Ok(guard) => !guard.is_empty(),
+            Err(poisoned) => !poisoned.into_inner().is_empty(),
+        }
+    }
+
+    fn ensure_workspace_strict_ready(&self, status: &RepoStatus) -> Result<()> {
+        if !status.watcher_healthy {
+            return Err(AppError::Protocol(format!(
+                "repo {} strict search requires a healthy file watcher",
+                self.repo_id
+            )));
+        }
+        if self.workspace_reconcile_pending() {
+            return Err(AppError::Protocol(format!(
+                "repo {} strict search requires a settled workspace state; run refresh or wait for reconcile",
+                self.repo_id
+            )));
+        }
+        Ok(())
     }
 
     fn replace_dirty_paths(&self, dirty: DirtyPathSet) -> Result<()> {
@@ -1144,6 +1156,91 @@ impl RepoRuntime {
             }
         }
         Ok(())
+    }
+
+    fn observe_dirty_diff_if_enabled(&self, watcher_paths: &DirtyPathSet, backend: QueryBackend) {
+        let Some(path) = std::env::var_os("CODGREP_OBSERVE_DIRTY_DIFF_FILE") else {
+            return;
+        };
+
+        let observed_at_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|duration| duration.as_millis())
+            .unwrap_or_default();
+        let watcher = watcher_paths.to_diff();
+        let full = match self.workspace.diff_against_worktree() {
+            Ok(diff) => diff,
+            Err(error) => {
+                let _ = append_dirty_diff_observation(Path::new(&path), &observation_row([
+                    observed_at_ms.to_string(),
+                    sanitize_observation_field(&self.repo_id),
+                    "workspace_eventual".into(),
+                    format!("{backend:?}"),
+                    "diff_error".into(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    String::new(),
+                    sanitize_observation_field(&error.to_string()),
+                ]));
+                return;
+            }
+        };
+
+        let modified_missing = sorted_vec_difference(&full.modified_files, &watcher.modified_files);
+        let modified_extra = sorted_vec_difference(&watcher.modified_files, &full.modified_files);
+        let deleted_missing = sorted_vec_difference(&full.deleted_files, &watcher.deleted_files);
+        let deleted_extra = sorted_vec_difference(&watcher.deleted_files, &full.deleted_files);
+        let new_missing = sorted_vec_difference(&full.new_files, &watcher.new_files);
+        let new_extra = sorted_vec_difference(&watcher.new_files, &full.new_files);
+        let mismatch = !modified_missing.is_empty()
+            || !modified_extra.is_empty()
+            || !deleted_missing.is_empty()
+            || !deleted_extra.is_empty()
+            || !new_missing.is_empty()
+            || !new_extra.is_empty();
+
+        let line = observation_row([
+            observed_at_ms.to_string(),
+            sanitize_observation_field(&self.repo_id),
+            "workspace_eventual".into(),
+            format!("{backend:?}"),
+            if mismatch { "mismatch" } else { "match" }.into(),
+            watcher.modified_files.len().to_string(),
+            watcher.deleted_files.len().to_string(),
+            watcher.new_files.len().to_string(),
+            full.modified_files.len().to_string(),
+            full.deleted_files.len().to_string(),
+            full.new_files.len().to_string(),
+            modified_missing.len().to_string(),
+            modified_extra.len().to_string(),
+            deleted_missing.len().to_string(),
+            deleted_extra.len().to_string(),
+            new_missing.len().to_string(),
+            new_extra.len().to_string(),
+            sanitize_observation_field(&sample_paths(&modified_missing)),
+            sanitize_observation_field(&sample_paths(&modified_extra)),
+            sanitize_observation_field(&sample_paths(&deleted_missing)),
+            sanitize_observation_field(&sample_paths(&deleted_extra)),
+            sanitize_observation_field(&sample_paths(&new_missing)),
+            sanitize_observation_field(&sample_paths(&new_extra)),
+            String::new(),
+        ]);
+        let _ = append_dirty_diff_observation(Path::new(&path), &line);
     }
 
     fn update_overlay_state(&self, dirty: &DirtyPathSet) {
@@ -2009,4 +2106,43 @@ fn scan_roots(repo_root: &Path, args: &PathFilterArgs) -> Vec<PathBuf> {
         .iter()
         .map(|root| normalize_path(root, repo_root))
         .collect()
+}
+
+fn append_dirty_diff_observation(path: &Path, line: &str) -> std::io::Result<()> {
+    let needs_header = !path.exists();
+    let mut file = OpenOptions::new().create(true).append(true).open(path)?;
+    if needs_header {
+        file.write_all(b"ts_ms\trepo_id\tconsistency\tbackend\tstatus\twatcher_modified\twatcher_deleted\twatcher_new\tfull_modified\tfull_deleted\tfull_new\tmodified_missing\tmodified_extra\tdeleted_missing\tdeleted_extra\tnew_missing\tnew_extra\tmodified_missing_sample\tmodified_extra_sample\tdeleted_missing_sample\tdeleted_extra_sample\tnew_missing_sample\tnew_extra_sample\terror\n")?;
+    }
+    file.write_all(line.as_bytes())
+}
+
+fn sanitize_observation_field(value: &str) -> String {
+    value.replace(['\t', '\n', '\r'], " ")
+}
+
+fn observation_row<const N: usize>(fields: [String; N]) -> String {
+    let mut line = fields.join("\t");
+    line.push('\n');
+    line
+}
+
+fn sorted_vec_difference(left: &[String], right: &[String]) -> Vec<String> {
+    let right = right.iter().collect::<std::collections::HashSet<_>>();
+    let mut values = left
+        .iter()
+        .filter(|path| !right.contains(path))
+        .cloned()
+        .collect::<Vec<_>>();
+    values.sort_unstable();
+    values
+}
+
+fn sample_paths(paths: &[String]) -> String {
+    const SAMPLE_LIMIT: usize = 5;
+    paths.iter()
+        .take(SAMPLE_LIMIT)
+        .cloned()
+        .collect::<Vec<_>>()
+        .join("|")
 }

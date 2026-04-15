@@ -43,7 +43,7 @@ pub use search_engine::{SearchBackend, SearchEngine, SearchPolicy, SearchRespons
 )]
 pub use workspace::{
     WorkspaceFreshness, WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions,
-    WorkspaceSnapshot,
+    WorkspaceSearchProfile, WorkspaceSearchTimings, WorkspaceSnapshot,
 };
 
 /// Expert-facing API surface for advanced integration scenarios.
