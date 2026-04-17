@@ -13,7 +13,7 @@ use super::{
     protocol as proto,
     repo::{
         DirtyStats, QueryBackend, RepoPhase, RepoStatus, RepoTaskKind, RepoTaskState,
-        RepoTaskStatus, SearchConsistency,
+        RepoTaskStatus, SearchConsistency, WorkspaceOverlayStatus,
     },
 };
 
@@ -116,8 +116,8 @@ pub(super) fn convert_task_status(task: RepoTaskStatus) -> proto::TaskStatus {
 
 pub(super) fn convert_task_kind(kind: RepoTaskKind) -> proto::TaskKind {
     match kind {
-        RepoTaskKind::BuildIndex => proto::TaskKind::BuildIndex,
-        RepoTaskKind::RebuildIndex => proto::TaskKind::RebuildIndex,
+        RepoTaskKind::BuildBaseSnapshot => proto::TaskKind::BuildBaseSnapshot,
+        RepoTaskKind::RebuildBaseSnapshot => proto::TaskKind::RebuildBaseSnapshot,
         RepoTaskKind::RefreshWorkspace => proto::TaskKind::RefreshWorkspace,
     }
 }
@@ -146,7 +146,7 @@ pub(super) fn convert_query_backend(backend: QueryBackend) -> proto::SearchBacke
     match backend {
         QueryBackend::IndexedSnapshot => proto::SearchBackend::IndexedSnapshot,
         QueryBackend::IndexedClean => proto::SearchBackend::IndexedClean,
-        QueryBackend::IndexedWorkspaceRepair => proto::SearchBackend::IndexedWorkspaceRepair,
+        QueryBackend::IndexedWorkspaceView => proto::SearchBackend::IndexedWorkspaceView,
         QueryBackend::RgFallback => proto::SearchBackend::RgFallback,
         QueryBackend::ScanFallback => proto::SearchBackend::ScanFallback,
     }
@@ -155,11 +155,11 @@ pub(super) fn convert_query_backend(backend: QueryBackend) -> proto::SearchBacke
 pub(super) fn convert_repo_phase(phase: RepoPhase) -> proto::RepoPhase {
     match phase {
         RepoPhase::Opening => proto::RepoPhase::Opening,
-        RepoPhase::MissingIndex => proto::RepoPhase::MissingIndex,
-        RepoPhase::Indexing => proto::RepoPhase::Indexing,
+        RepoPhase::MissingBaseSnapshot => proto::RepoPhase::MissingBaseSnapshot,
+        RepoPhase::BuildingBaseSnapshot => proto::RepoPhase::BuildingBaseSnapshot,
         RepoPhase::ReadyClean => proto::RepoPhase::ReadyClean,
         RepoPhase::ReadyDirty => proto::RepoPhase::ReadyDirty,
-        RepoPhase::Rebuilding => proto::RepoPhase::Rebuilding,
+        RepoPhase::RebuildingBaseSnapshot => proto::RepoPhase::RebuildingBaseSnapshot,
         RepoPhase::Degraded => proto::RepoPhase::Degraded,
     }
 }
@@ -174,7 +174,7 @@ pub(super) fn convert_consistency(consistency: SearchConsistency) -> proto::Cons
 
 pub(super) fn build_config_from_open(
     repo_path: PathBuf,
-    index_path: Option<PathBuf>,
+    storage_root: Option<PathBuf>,
     tokenizer: proto::TokenizerModeConfig,
     corpus_mode: proto::CorpusModeConfig,
     include_hidden: bool,
@@ -183,7 +183,7 @@ pub(super) fn build_config_from_open(
     max_sparse_len: usize,
 ) -> BuildConfig {
     BuildConfig {
-        index_path: index_path.unwrap_or_else(|| repo_path.join(".codgrep-index")),
+        storage_root: storage_root.unwrap_or_else(|| repo_path.join(".codgrep-index-engine")),
         repo_path,
         tokenizer: match tokenizer {
             proto::TokenizerModeConfig::Trigram => TokenizerMode::Trigram,
@@ -204,7 +204,9 @@ pub(super) fn convert_repo_status(status: RepoStatus) -> proto::RepoStatus {
     proto::RepoStatus {
         repo_id: status.repo_id,
         repo_path: status.repo_path.to_string_lossy().into_owned(),
-        index_path: status.index_path.to_string_lossy().into_owned(),
+        storage_root: status.storage_root.to_string_lossy().into_owned(),
+        base_snapshot_root: status.base_snapshot_root.to_string_lossy().into_owned(),
+        workspace_overlay_root: status.workspace_overlay_root.to_string_lossy().into_owned(),
         phase: convert_repo_phase(status.phase),
         snapshot_key: status.snapshot_key,
         last_probe_unix_secs: system_time_to_unix_secs(status.last_probe_at),
@@ -212,8 +214,9 @@ pub(super) fn convert_repo_status(status: RepoStatus) -> proto::RepoStatus {
         dirty_files: convert_dirty_stats(status.dirty_files),
         rebuild_recommended: status.rebuild_recommended,
         active_task_id: status.active_task_id,
-        watcher_healthy: status.watcher_healthy,
+        probe_healthy: status.probe_healthy,
         last_error: status.last_error,
+        overlay: status.overlay.map(convert_workspace_overlay_status),
     }
 }
 
@@ -222,5 +225,24 @@ fn convert_dirty_stats(stats: DirtyStats) -> proto::DirtyFileStats {
         modified: stats.modified,
         deleted: stats.deleted,
         new: stats.new,
+    }
+}
+
+fn convert_workspace_overlay_status(
+    status: WorkspaceOverlayStatus,
+) -> proto::WorkspaceOverlayStatus {
+    proto::WorkspaceOverlayStatus {
+        committed_seq_no: status.committed_seq_no,
+        last_seq_no: status.last_seq_no,
+        uncommitted_ops: status.uncommitted_ops,
+        pending_docs: status.pending_docs,
+        active_segments: status.active_segments,
+        active_delete_segments: status.active_delete_segments,
+        merge_requested: status.merge_requested,
+        merge_running: status.merge_running,
+        merge_attempts: status.merge_attempts,
+        merge_completed: status.merge_completed,
+        merge_failed: status.merge_failed,
+        last_merge_error: status.last_merge_error,
     }
 }

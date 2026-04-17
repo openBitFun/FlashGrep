@@ -1,0 +1,241 @@
+use std::{
+    sync::{Arc, Condvar, Mutex, Weak},
+    thread,
+    time::{Duration, Instant},
+};
+
+use std::sync::atomic::Ordering;
+
+use super::{RepoPhase, RepoRuntime, WorkspaceOverlayMergeEvent};
+
+#[derive(Debug, Default)]
+pub(super) struct MaintenanceWorkerState {
+    pub(super) requested_reasons: u32,
+    pub(super) overlay_merge_due_at: Option<Instant>,
+    pub(super) workspace_probe_due_at: Option<Instant>,
+    pub(super) shutdown: bool,
+}
+
+const MAINTENANCE_REASON_OVERLAY_MERGE: u32 = 1 << 0;
+const MAINTENANCE_REASON_WORKSPACE_POLL: u32 = 1 << 1;
+#[allow(dead_code)]
+const MAINTENANCE_REASON_OVERLAY_REBUILD: u32 = 1 << 2;
+#[allow(dead_code)]
+const MAINTENANCE_REASON_BASE_REBUILD: u32 = 1 << 3;
+#[allow(dead_code)]
+const MAINTENANCE_REASON_BASE_PROMOTE: u32 = 1 << 4;
+const GIT_WORKSPACE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
+const NON_GIT_WORKSPACE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+
+impl RepoRuntime {
+    pub(super) fn start_maintenance_worker(self: &Arc<Self>) {
+        let worker_state = Arc::clone(&self.maintenance_worker);
+        let runtime = Arc::clone(self);
+        let handle = thread::spawn(move || runtime.run_maintenance_worker(worker_state));
+        let mut slot = match self.maintenance_handle.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(handle);
+    }
+
+    fn run_maintenance_worker(
+        self: Arc<Self>,
+        worker_state: Arc<(Mutex<MaintenanceWorkerState>, Condvar)>,
+    ) {
+        loop {
+            let reasons = {
+                let (lock, condvar) = &*worker_state;
+                let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                loop {
+                    if state.shutdown {
+                        break None;
+                    }
+                    if let Some(reasons) = take_ready_maintenance_reasons(&mut state) {
+                        break Some(reasons);
+                    }
+                    let Some(deadline) = next_maintenance_deadline(&state) else {
+                        state = condvar
+                            .wait(state)
+                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        continue;
+                    };
+                    let timeout = deadline.saturating_duration_since(Instant::now());
+                    let (next_state, _) = condvar
+                        .wait_timeout(state, timeout)
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                    state = next_state;
+                }
+            };
+            let Some(reasons) = reasons else {
+                break;
+            };
+            self.run_maintenance_pass(reasons);
+        }
+    }
+
+    fn run_maintenance_pass(&self, reasons: u32) {
+        if reasons & MAINTENANCE_REASON_OVERLAY_MERGE != 0 {
+            self.run_overlay_merge_maintenance();
+        }
+        if reasons & MAINTENANCE_REASON_WORKSPACE_POLL != 0 {
+            self.run_workspace_probe_maintenance();
+        }
+    }
+
+    fn run_overlay_merge_maintenance(&self) {
+        let overlay = match self.workspace_overlay_engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+        .as_ref()
+        .cloned();
+        let Some(overlay) = overlay else {
+            return;
+        };
+        match overlay.run_requested_merge() {
+            Ok(_) => {}
+            Err(error) => {
+                overlay.retry_failed_merge();
+                self.schedule_overlay_merge_retry();
+                eprintln!(
+                    "codgrep: failed to run workspace overlay maintenance for {}: {error}",
+                    self.build_config.repo_path.display()
+                );
+            }
+        }
+    }
+
+    fn run_workspace_probe_maintenance(&self) {
+        let probe_interval = self.workspace_probe_interval();
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return;
+        }
+
+        let state = match self.state.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        let ready_for_probe = matches!(state.phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
+            && state.snapshot_key.is_some();
+
+        if !ready_for_probe || self.has_active_task() {
+            self.schedule_workspace_probe(probe_interval);
+            return;
+        }
+
+        if let Err(error) = self.probe_workspace_overlay() {
+            self.set_probe_healthy(false);
+            self.set_last_error(Some(format!("background workspace poll failed: {error}")));
+        } else {
+            self.set_probe_healthy(true);
+        }
+        self.schedule_workspace_probe(probe_interval);
+    }
+
+    pub(super) fn schedule_maintenance(&self, reasons: u32) {
+        let (lock, condvar) = &*self.maintenance_worker;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.requested_reasons |= reasons;
+        if reasons & MAINTENANCE_REASON_OVERLAY_MERGE != 0 {
+            let due_at = Instant::now() + self.overlay_merge_min_delay;
+            state.overlay_merge_due_at = Some(
+                state
+                    .overlay_merge_due_at
+                    .map_or(due_at, |existing| existing.min(due_at)),
+            );
+        }
+        condvar.notify_one();
+    }
+
+    pub(super) fn schedule_workspace_probe(&self, delay: Duration) {
+        let (lock, condvar) = &*self.maintenance_worker;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.requested_reasons |= MAINTENANCE_REASON_WORKSPACE_POLL;
+        let due_at = Instant::now() + delay;
+        state.workspace_probe_due_at = Some(
+            state
+                .workspace_probe_due_at
+                .map_or(due_at, |existing| existing.min(due_at)),
+        );
+        condvar.notify_one();
+    }
+
+    pub(super) fn workspace_probe_interval(&self) -> Duration {
+        if self.build_config.repo_path.join(".git").exists() {
+            GIT_WORKSPACE_PROBE_INTERVAL
+        } else {
+            NON_GIT_WORKSPACE_PROBE_INTERVAL
+        }
+    }
+
+    fn schedule_overlay_merge_retry(&self) {
+        let (lock, condvar) = &*self.maintenance_worker;
+        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.requested_reasons |= MAINTENANCE_REASON_OVERLAY_MERGE;
+        state.overlay_merge_due_at = Some(Instant::now() + self.overlay_merge_retry_delay);
+        condvar.notify_one();
+    }
+
+    pub(super) fn workspace_overlay_merge_state_hook(
+        &self,
+    ) -> Arc<dyn Fn(WorkspaceOverlayMergeEvent) + Send + Sync> {
+        let runtime = self
+            .self_handle
+            .get()
+            .cloned()
+            .unwrap_or_else(Weak::<RepoRuntime>::new);
+        Arc::new(move |event| {
+            if let Some(runtime) = runtime.upgrade() {
+                if matches!(event, WorkspaceOverlayMergeEvent::Requested) {
+                    runtime.schedule_maintenance(MAINTENANCE_REASON_OVERLAY_MERGE);
+                }
+                runtime.emit_workspace_status_changed();
+            }
+        })
+    }
+}
+
+fn take_ready_maintenance_reasons(state: &mut MaintenanceWorkerState) -> Option<u32> {
+    let mut reasons = state.requested_reasons
+        & !(MAINTENANCE_REASON_OVERLAY_MERGE | MAINTENANCE_REASON_WORKSPACE_POLL);
+    let overlay_merge_ready = state.requested_reasons & MAINTENANCE_REASON_OVERLAY_MERGE != 0
+        && state
+            .overlay_merge_due_at
+            .is_none_or(|due_at| Instant::now() >= due_at);
+    if overlay_merge_ready {
+        reasons |= MAINTENANCE_REASON_OVERLAY_MERGE;
+        state.overlay_merge_due_at = None;
+    }
+    let workspace_probe_ready = state.requested_reasons & MAINTENANCE_REASON_WORKSPACE_POLL != 0
+        && state
+            .workspace_probe_due_at
+            .is_none_or(|due_at| Instant::now() >= due_at);
+    if workspace_probe_ready {
+        reasons |= MAINTENANCE_REASON_WORKSPACE_POLL;
+        state.workspace_probe_due_at = None;
+    }
+    if reasons == 0 {
+        return None;
+    }
+    state.requested_reasons &= !reasons;
+    Some(reasons)
+}
+
+fn next_maintenance_deadline(state: &MaintenanceWorkerState) -> Option<Instant> {
+    let overlay_deadline = if state.requested_reasons & MAINTENANCE_REASON_OVERLAY_MERGE != 0 {
+        state.overlay_merge_due_at
+    } else {
+        None
+    };
+    let workspace_deadline = if state.requested_reasons & MAINTENANCE_REASON_WORKSPACE_POLL != 0 {
+        state.workspace_probe_due_at
+    } else {
+        None
+    };
+    match (overlay_deadline, workspace_deadline) {
+        (Some(left), Some(right)) => Some(left.min(right)),
+        (Some(deadline), None) | (None, Some(deadline)) => Some(deadline),
+        (None, None) => None,
+    }
+}

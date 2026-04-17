@@ -9,9 +9,8 @@ impl WorkspaceIndex {
         let checked_at = std::time::SystemTime::now();
         let base = self.base_snapshot_info().ok();
 
-        match self.open_searcher() {
-            Ok(searcher) => {
-                let diff = searcher.diff_against_worktree()?;
+        match self.diff_against_worktree() {
+            Ok(diff) => {
                 let state = if diff.is_empty() {
                     WorkspaceFreshnessState::Fresh
                 } else {

@@ -91,16 +91,20 @@ impl DaemonService {
                 None,
                 false,
             )),
-            Request::IndexBuild { params } => Ok((
+            Request::BaseSnapshotBuild { params } => Ok((
                 Response::TaskStarted {
-                    task: convert_task_status(self.repos.start_build_index(&params.repo_id)?),
+                    task: convert_task_status(
+                        self.repos.start_build_base_snapshot(&params.repo_id)?,
+                    ),
                 },
                 None,
                 false,
             )),
-            Request::IndexRebuild { params } => Ok((
+            Request::BaseSnapshotRebuild { params } => Ok((
                 Response::TaskStarted {
-                    task: convert_task_status(self.repos.start_rebuild_index(&params.repo_id)?),
+                    task: convert_task_status(
+                        self.repos.start_rebuild_base_snapshot(&params.repo_id)?,
+                    ),
                 },
                 None,
                 false,
@@ -122,11 +126,16 @@ impl DaemonService {
             )),
             Request::OpenRepo { params } => {
                 let build_config =
-                    build_config_from_request(params.repo_path, params.index_path, params.config);
+                    build_config_from_request(params.repo_path, params.storage_root, params.config);
                 let status = self.repos.open_repo(OpenRepoRequest {
                     build_config,
                     refresh_policy: RepoRefreshPolicy {
                         rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
+                        overlay_auto_checkpoint_max_uncommitted_ops: params
+                            .refresh
+                            .overlay_auto_checkpoint_max_uncommitted_ops,
+                        overlay_merge_min_delay_ms: params.refresh.overlay_merge_min_delay_ms,
+                        overlay_merge_retry_delay_ms: params.refresh.overlay_merge_retry_delay_ms,
                     },
                 })?;
                 Ok((
@@ -155,10 +164,10 @@ impl DaemonService {
                 None,
                 false,
             )),
-            Request::BuildIndex { params } => {
-                let (indexed_docs, status) = self.repos.build_index(&params.repo_id)?;
+            Request::BuildBaseSnapshot { params } => {
+                let (indexed_docs, status) = self.repos.build_base_snapshot(&params.repo_id)?;
                 Ok((
-                    Response::RepoBuilt {
+                    Response::RepoBaseSnapshotBuilt {
                         indexed_docs,
                         status: convert_repo_status(status),
                     },
@@ -166,10 +175,10 @@ impl DaemonService {
                     false,
                 ))
             }
-            Request::RebuildIndex { params } => {
-                let (indexed_docs, status) = self.repos.rebuild_index(&params.repo_id)?;
+            Request::RebuildBaseSnapshot { params } => {
+                let (indexed_docs, status) = self.repos.rebuild_base_snapshot(&params.repo_id)?;
                 Ok((
-                    Response::RepoRebuilt {
+                    Response::RepoBaseSnapshotRebuilt {
                         indexed_docs,
                         status: convert_repo_status(status),
                     },
@@ -251,7 +260,7 @@ impl DaemonService {
         params: EnsureRepoParams,
     ) -> Result<(Response, Option<ClientCapabilities>, bool)> {
         let build_config =
-            build_config_from_request(params.repo_path, params.index_path, params.config);
+            build_config_from_request(params.repo_path, params.storage_root, params.config);
         let repo_id = build_config
             .normalized()?
             .repo_path
@@ -261,6 +270,11 @@ impl DaemonService {
             build_config,
             refresh_policy: RepoRefreshPolicy {
                 rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
+                overlay_auto_checkpoint_max_uncommitted_ops: params
+                    .refresh
+                    .overlay_auto_checkpoint_max_uncommitted_ops,
+                overlay_merge_min_delay_ms: params.refresh.overlay_merge_min_delay_ms,
+                overlay_merge_retry_delay_ms: params.refresh.overlay_merge_retry_delay_ms,
             },
         })?;
         if matches!(status.phase, crate::daemon::repo::RepoPhase::Opening) {
@@ -268,8 +282,8 @@ impl DaemonService {
         }
 
         let (indexed_docs, status) = match status.phase {
-            crate::daemon::repo::RepoPhase::MissingIndex => {
-                let (indexed_docs, status) = self.repos.build_index(&repo_id)?;
+            crate::daemon::repo::RepoPhase::MissingBaseSnapshot => {
+                let (indexed_docs, status) = self.repos.build_base_snapshot(&repo_id)?;
                 (Some(indexed_docs), status)
             }
             _ => (None, status),
@@ -305,12 +319,12 @@ fn wait_for_repo_open(
 
 fn build_config_from_request(
     repo_path: PathBuf,
-    index_path: Option<PathBuf>,
+    storage_root: Option<PathBuf>,
     config: super::super::protocol::RepoConfig,
 ) -> crate::config::BuildConfig {
     build_config_from_open(
         repo_path,
-        index_path,
+        storage_root,
         config.tokenizer,
         config.corpus_mode,
         config.include_hidden,
@@ -366,8 +380,8 @@ fn build_server_capabilities(_client: ClientCapabilities) -> ServerCapabilities 
         workspace_ensure: true,
         workspace_list: false,
         workspace_refresh: true,
-        index_build: true,
-        index_rebuild: true,
+        base_snapshot_build: true,
+        base_snapshot_rebuild: true,
         task_status: true,
         task_cancel: true,
         search_query: true,

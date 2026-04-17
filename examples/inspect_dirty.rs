@@ -15,16 +15,16 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     let repo_path = args
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: cargo run --example inspect_dirty -- <repo_path> <index_path>")?;
-    let index_path = args
+        .ok_or("usage: cargo run --example inspect_dirty -- <repo_path> <storage_root>")?;
+    let storage_root = args
         .next()
         .map(PathBuf::from)
-        .ok_or("usage: cargo run --example inspect_dirty -- <repo_path> <index_path>")?;
+        .ok_or("usage: cargo run --example inspect_dirty -- <repo_path> <storage_root>")?;
 
     let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
         build_config: BuildConfig {
             repo_path,
-            index_path,
+            storage_root,
             tokenizer: TokenizerMode::SparseNgram,
             corpus_mode: CorpusMode::RespectIgnore,
             include_hidden: false,

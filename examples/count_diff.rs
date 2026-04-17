@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-use codgrep::{advanced::IndexSearcher, QueryConfig, SearchMode};
+use codgrep::{QueryConfig, SearchEngine, SearchMode, SearchPolicy};
 
 const RG_CHUNK_SIZE: usize = 512;
 
@@ -34,10 +34,14 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let repo = repo.ok_or("--repo is required")?;
-    let index = index.unwrap_or_else(|| repo.join(".codgrep-index"));
+    let index = index.unwrap_or_else(|| repo.join(".codgrep-index-engine"));
     let pattern = pattern.ok_or("--pattern is required")?;
 
-    let searcher = IndexSearcher::open(index)?;
+    let engine = SearchEngine::new(codgrep::BuildConfig {
+        repo_path: repo.clone(),
+        storage_root: index,
+        ..codgrep::BuildConfig::default()
+    });
     let config = QueryConfig {
         regex_pattern: pattern.clone(),
         patterns: vec![pattern.clone()],
@@ -46,13 +50,17 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..QueryConfig::default()
     };
 
-    let codgrep_counts = searcher
+    let codgrep_counts = engine
         .count_matches_by_file_including_zero(&config, None)?
         .into_iter()
         .map(|count| (count.path, count.matched_lines))
         .collect::<BTreeMap<_, _>>();
-    let indexed_paths = searcher.indexed_paths(None);
-    let rg_counts = run_rg_count_by_file(&repo, &pattern, case_insensitive, Some(&indexed_paths))?;
+    let visible_paths = engine.visible_paths(None)?;
+    let total = engine
+        .search(&config, SearchPolicy::IndexOnly)?
+        .results
+        .matched_lines;
+    let rg_counts = run_rg_count_by_file(&repo, &pattern, case_insensitive, Some(&visible_paths))?;
 
     let paths = codgrep_counts
         .keys()
@@ -60,9 +68,9 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .chain(rg_counts.keys().cloned())
         .collect::<BTreeSet<_>>();
 
-    let codgrep_total: usize = codgrep_counts.values().sum();
+    let codgrep_total = total;
     let rg_total: usize = rg_counts.values().sum();
-    println!("indexed_files={}", indexed_paths.len());
+    println!("visible_files={}", visible_paths.len());
     println!("codgrep_total={codgrep_total}");
     println!("rg_total={rg_total}");
 
@@ -86,11 +94,11 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         let whole_repo_total: usize = whole_repo_counts.values().sum();
         println!("whole_repo_rg_total={whole_repo_total}");
 
-        let indexed_path_set = indexed_paths.into_iter().collect::<BTreeSet<_>>();
+        let visible_path_set = visible_paths.into_iter().collect::<BTreeSet<_>>();
         let mut rg_only_files = 0usize;
         let mut rg_only_total = 0usize;
         for (path, count) in whole_repo_counts {
-            if indexed_path_set.contains(&path) || count == 0 {
+            if visible_path_set.contains(&path) || count == 0 {
                 continue;
             }
             rg_only_files += 1;
@@ -110,11 +118,11 @@ fn run_rg_count_by_file(
     repo: &Path,
     pattern: &str,
     case_insensitive: bool,
-    indexed_paths: Option<&[String]>,
+    visible_paths: Option<&[String]>,
 ) -> Result<BTreeMap<String, usize>, Box<dyn std::error::Error>> {
     let mut counts = BTreeMap::new();
-    let chunks: Vec<Vec<String>> = if let Some(indexed_paths) = indexed_paths {
-        indexed_paths
+    let chunks: Vec<Vec<String>> = if let Some(visible_paths) = visible_paths {
+        visible_paths
             .chunks(RG_CHUNK_SIZE)
             .map(|chunk| chunk.to_vec())
             .collect()

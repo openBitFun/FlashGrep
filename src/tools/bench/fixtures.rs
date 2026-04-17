@@ -12,12 +12,11 @@ use crate::{
     config::{BuildConfig, CorpusMode},
     error::{AppError, Result},
     files::{read_text_file, scan_paths, ScanOptions},
-    index::build_index,
 };
 
 use super::{
     cache::{collect_cache_paths_for_target, sanitize_benchmark_name},
-    BenchConfig, DirtyPattern, DirtyWorktreeFixture,
+    ensure_bench_base_snapshot, BenchConfig, DirtyPattern, DirtyWorktreeFixture,
 };
 
 pub(super) fn prepare_dirty_worktree_fixture(
@@ -28,40 +27,51 @@ pub(super) fn prepare_dirty_worktree_fixture(
     required_patterns: &[DirtyPattern],
 ) -> Result<DirtyWorktreeFixture> {
     let fixture_root = suite_dir
-        .join(".codgrep-bench")
+        .join(".codgrep-bench-worktrees")
         .join("worktrees")
         .join(fixture_dir_name(
             fixture_label,
             config.worktree_sample_files,
+            config.worktree_dirty_files,
         ));
     if fixture_root.exists() {
         fs::remove_dir_all(&fixture_root)?;
     }
     fs::create_dir_all(&fixture_root)?;
 
-    let (repo_path, dirty_file) = if source_path.is_dir() {
+    let (repo_path, dirty_files) = if source_path.is_dir() {
         let target = fixture_root.join("repo");
-        let dirty_file = if let Some(limit) = config.worktree_sample_files {
+        let dirty_files = if let Some(limit) = config.worktree_sample_files {
             copy_tree_sampled(source_path, &target, config, required_patterns, limit)?
         } else {
             copy_tree(source_path, &target)?;
-            first_text_file(&target, &target.join("index"), config)?.ok_or_else(|| {
-                AppError::InvalidIndex("no text file available for worktree benchmark".into())
-            })?
+            select_dirty_text_files(
+                &target,
+                &target.join("index"),
+                config,
+                required_patterns,
+                config.worktree_dirty_files,
+            )?
         };
-        (target, dirty_file)
+        (target, dirty_files)
     } else {
+        if config.worktree_dirty_files > 1 {
+            return Err(AppError::InvalidIndex(format!(
+                "single-file worktree benchmark corpus cannot materialize {} dirty files",
+                config.worktree_dirty_files
+            )));
+        }
         let file_name = source_path.file_name().ok_or_else(|| {
             AppError::InvalidIndex("benchmark file corpus is missing a name".into())
         })?;
         let target = fixture_root.join(file_name);
         copy_file(source_path, &target)?;
-        (target.clone(), target)
+        (target.clone(), vec![target])
     };
-    let index_path = fixture_root.join("index");
+    let storage_root = fixture_root.join("index");
     let build_config = BuildConfig {
         repo_path: repo_path.clone(),
-        index_path: index_path.clone(),
+        storage_root: storage_root.clone(),
         tokenizer: config.tokenizer,
         corpus_mode: config.corpus_mode,
         include_hidden: false,
@@ -69,20 +79,22 @@ pub(super) fn prepare_dirty_worktree_fixture(
         min_sparse_len: 3,
         max_sparse_len: 8,
     };
-    let _ = build_index(&build_config)?;
+    let _ = ensure_bench_base_snapshot(&build_config, true)?;
 
-    let contents = read_text_file(&dirty_file)?.ok_or_else(|| {
-        AppError::InvalidIndex(format!(
-            "dirty worktree benchmark file is no longer text: {}",
-            dirty_file.display()
-        ))
-    })?;
-    rewrite_with_fresh_mtime(&dirty_file, &contents)?;
+    for dirty_file in &dirty_files {
+        let contents = read_text_file(dirty_file)?.ok_or_else(|| {
+            AppError::InvalidIndex(format!(
+                "dirty worktree benchmark file is no longer text: {}",
+                dirty_file.display()
+            ))
+        })?;
+        rewrite_with_fresh_mtime(dirty_file, &contents)?;
+    }
 
     let build_cache_paths = if config.cache_mode.is_cold() {
         Some(collect_cache_paths_for_target(
             &repo_path,
-            &index_path,
+            &storage_root,
             config,
             fixture_label,
         )?)
@@ -93,7 +105,7 @@ pub(super) fn prepare_dirty_worktree_fixture(
     let cache_paths = if config.cache_mode.is_cold() {
         Some(collect_cache_paths_for_target(
             &repo_path,
-            &index_path,
+            &storage_root,
             config,
             fixture_label,
         )?)
@@ -103,17 +115,22 @@ pub(super) fn prepare_dirty_worktree_fixture(
 
     Ok(DirtyWorktreeFixture {
         repo_path,
-        index_path,
+        storage_root,
         cache_paths,
         build_cache_paths,
     })
 }
 
-fn fixture_dir_name(fixture_label: &str, worktree_sample_files: Option<usize>) -> String {
-    match worktree_sample_files {
+fn fixture_dir_name(
+    fixture_label: &str,
+    worktree_sample_files: Option<usize>,
+    worktree_dirty_files: usize,
+) -> String {
+    let base = match worktree_sample_files {
         Some(limit) => format!("{}-sample-{limit}", sanitize_benchmark_name(fixture_label)),
         None => sanitize_benchmark_name(fixture_label),
-    }
+    };
+    format!("{base}-dirty-{worktree_dirty_files}")
 }
 
 fn copy_tree_sampled(
@@ -122,7 +139,7 @@ fn copy_tree_sampled(
     config: &BenchConfig,
     required_patterns: &[DirtyPattern],
     limit: usize,
-) -> Result<PathBuf> {
+) -> Result<Vec<PathBuf>> {
     let selection = select_sampled_text_files(source, config, required_patterns, limit)?;
     for path in &selection.selected_files {
         let relative = path.strip_prefix(source).map_err(|error| {
@@ -133,18 +150,24 @@ fn copy_tree_sampled(
         })?;
         copy_file(path, &target.join(relative))?;
     }
-    let dirty_relative = selection.dirty_file.strip_prefix(source).map_err(|error| {
-        AppError::InvalidIndex(format!(
-            "failed to compute dirty benchmark path for {}: {error}",
-            selection.dirty_file.display()
-        ))
-    })?;
-    Ok(target.join(dirty_relative))
+    selection
+        .dirty_files
+        .into_iter()
+        .map(|dirty_file| {
+            let dirty_relative = dirty_file.strip_prefix(source).map_err(|error| {
+                AppError::InvalidIndex(format!(
+                    "failed to compute dirty benchmark path for {}: {error}",
+                    dirty_file.display()
+                ))
+            })?;
+            Ok(target.join(dirty_relative))
+        })
+        .collect()
 }
 
 struct SampledFixtureSelection {
     selected_files: Vec<PathBuf>,
-    dirty_file: PathBuf,
+    dirty_files: Vec<PathBuf>,
 }
 
 fn select_sampled_text_files(
@@ -203,13 +226,20 @@ fn select_sampled_text_files(
         }
     }
 
-    let dirty_file = required_files
-        .first()
+    let dirty_files = selected
+        .iter()
+        .take(config.worktree_dirty_files)
         .cloned()
-        .unwrap_or_else(|| selected[0].clone());
+        .collect::<Vec<_>>();
+    if dirty_files.len() < config.worktree_dirty_files {
+        return Err(AppError::InvalidIndex(format!(
+            "failed to materialize {} dirty benchmark files from sampled fixture",
+            config.worktree_dirty_files
+        )));
+    }
     Ok(SampledFixtureSelection {
         selected_files: selected,
-        dirty_file,
+        dirty_files,
     })
 }
 
@@ -250,14 +280,16 @@ fn first_matching_text_file(
     Ok(None)
 }
 
-fn first_text_file(
+fn select_dirty_text_files(
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     config: &BenchConfig,
-) -> Result<Option<PathBuf>> {
+    required_patterns: &[DirtyPattern],
+    dirty_file_count: usize,
+) -> Result<Vec<PathBuf>> {
     let mut files = scan_paths(
         &[repo_path.to_path_buf()],
-        Some(index_path),
+        Some(storage_root),
         ScanOptions {
             respect_ignore: matches!(config.corpus_mode, CorpusMode::RespectIgnore),
             include_hidden: false,
@@ -269,13 +301,43 @@ fn first_text_file(
     )?;
     files.sort_unstable_by(|left, right| left.path.cmp(&right.path));
 
+    let mut text_files = Vec::new();
     for file in files {
         if read_text_file(&file.path)?.is_some() {
-            return Ok(Some(file.path));
+            text_files.push(file.path);
         }
     }
+    if text_files.is_empty() {
+        return Err(AppError::InvalidIndex(
+            "no text file available for worktree benchmark".into(),
+        ));
+    }
 
-    Ok(None)
+    let required_files = required_match_files(&text_files, required_patterns)?;
+    let mut selected = Vec::new();
+    let mut seen = BTreeSet::new();
+    for path in required_files {
+        if selected.len() >= dirty_file_count {
+            break;
+        }
+        if seen.insert(path.clone()) {
+            selected.push(path);
+        }
+    }
+    for path in text_files {
+        if selected.len() >= dirty_file_count {
+            break;
+        }
+        if seen.insert(path.clone()) {
+            selected.push(path);
+        }
+    }
+    if selected.len() < dirty_file_count {
+        return Err(AppError::InvalidIndex(format!(
+            "failed to materialize {dirty_file_count} dirty benchmark files"
+        )));
+    }
+    Ok(selected)
 }
 
 pub(super) fn copy_tree(source: &Path, target: &Path) -> Result<()> {

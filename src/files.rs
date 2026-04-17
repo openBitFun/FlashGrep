@@ -40,6 +40,7 @@ pub fn is_workspace_internal_path(path: &Path) -> bool {
         matches!(
             component.as_os_str(),
             component if component == OsStr::new(".codgrep-index")
+                || component == OsStr::new(".codgrep-index-engine")
                 || component == OsStr::new(".codgrep-bench")
         )
     })
@@ -48,7 +49,7 @@ pub fn is_workspace_internal_path(path: &Path) -> bool {
 pub fn scan_repository(config: &BuildConfig) -> Result<Vec<RepositoryFile>> {
     scan_paths(
         std::slice::from_ref(&config.repo_path),
-        Some(&config.index_path),
+        Some(&config.storage_root),
         ScanOptions {
             respect_ignore: matches!(config.corpus_mode, CorpusMode::RespectIgnore),
             include_hidden: config.include_hidden,
@@ -97,7 +98,7 @@ pub fn resolve_repo_path(repo_root: &Path, path: &str) -> PathBuf {
 
 pub fn scan_paths(
     roots: &[PathBuf],
-    index_path: Option<&Path>,
+    storage_root: Option<&Path>,
     options: ScanOptions,
     path_filter: Option<&PathFilter>,
 ) -> Result<Vec<RepositoryFile>> {
@@ -116,7 +117,7 @@ pub fn scan_paths(
             continue;
         }
 
-        let walker = build_walker_from_options(root, index_path, &options)?;
+        let walker = build_walker_from_options(root, storage_root, &options)?;
         for entry in walker.build() {
             let entry = entry?;
             if !entry
@@ -139,19 +140,19 @@ pub fn scan_paths(
 
 fn build_walker_from_options(
     root: &Path,
-    index_path: Option<&Path>,
+    storage_root: Option<&Path>,
     options: &ScanOptions,
 ) -> Result<WalkBuilder> {
     let mut builder = WalkBuilder::new(root);
     builder.follow_links(false);
     builder.max_filesize(Some(options.max_file_size));
     builder.max_depth(options.max_depth);
-    let index_path = index_path.map(PathBuf::from);
+    let storage_root = storage_root.map(PathBuf::from);
     builder.filter_entry(move |entry| {
         !is_workspace_internal_path(entry.path())
-            && !index_path
+            && !storage_root
                 .as_ref()
-                .is_some_and(|index_path| entry.path().starts_with(index_path))
+                .is_some_and(|storage_root| entry.path().starts_with(storage_root))
     });
 
     if options.respect_ignore {

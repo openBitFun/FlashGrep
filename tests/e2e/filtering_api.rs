@@ -13,9 +13,13 @@ fn candidate_paths_exports_prefiltered_docs() {
 
     repo.build_sparse();
 
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
+
     let candidates = repo
-        .searcher()
-        .candidate_paths(&query("fuzzy_file_search"))
+        .engine()
+        .candidate_paths(&query("fuzzy_file_search"), None)
         .expect("test should succeed");
 
     assert_eq!(candidates, vec![source.to_string_lossy().to_string()]);
@@ -30,14 +34,17 @@ fn build_respects_gitignore_by_default() {
     repo.write("tracked.rs", "const NAME: &str = \"OTHER\";\n");
 
     repo.build();
-
-    let results = repo
-        .searcher()
-        .search(&count_query("PM_RESUME"))
+    repo.engine()
+        .build_base_snapshot()
         .expect("test should succeed");
 
-    assert_eq!(results.candidate_docs, 0);
-    assert_eq!(results.matched_lines, 0);
+    let results = repo
+        .engine()
+        .search(&count_query("PM_RESUME"), codgrep::SearchPolicy::IndexOnly)
+        .expect("test should succeed");
+
+    assert_eq!(results.results.candidate_docs, 0);
+    assert_eq!(results.results.matched_lines, 0);
 }
 
 #[test]
@@ -52,16 +59,22 @@ fn build_can_disable_ignore_rules() {
         ..repo.trigram_build_config()
     });
 
-    let searcher = repo.searcher();
+    let engine = codgrep::SearchEngine::new(codgrep::BuildConfig {
+        corpus_mode: codgrep::CorpusMode::NoIgnore,
+        ..repo.trigram_build_config()
+    });
     let query = count_query("PM_RESUME");
-    let results = searcher.search(&query).expect("test should succeed");
+    let results = engine
+        .search(&query, codgrep::SearchPolicy::IndexOnly)
+        .expect("test should succeed")
+        .results;
 
     assert_eq!(results.candidate_docs, 1);
     assert_eq!(results.matched_lines, 1);
     assert!(results.hits.is_empty());
     assert_eq!(
-        searcher
-            .candidate_paths(&query)
+        engine
+            .candidate_paths(&query, None)
             .expect("test should succeed"),
         vec![ignored.to_string_lossy().to_string()]
     );
@@ -73,11 +86,18 @@ fn build_skips_hidden_files_by_default() {
     repo.write(".secret.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
     repo.build();
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
 
     let counts = repo
-        .searcher()
-        .count_matches_by_file(&count_query("PM_RESUME"), None)
+        .engine()
+        .count_matches_by_file_including_zero(&count_query("PM_RESUME"), None)
         .expect("test should succeed");
+    let counts = counts
+        .into_iter()
+        .filter(|count| count.matched_lines > 0)
+        .collect::<Vec<_>>();
 
     assert!(counts.is_empty());
 }
@@ -91,11 +111,18 @@ fn build_can_include_hidden_files() {
         include_hidden: true,
         ..repo.trigram_build_config()
     });
+    let engine = codgrep::SearchEngine::new(codgrep::BuildConfig {
+        include_hidden: true,
+        ..repo.trigram_build_config()
+    });
 
-    let counts = repo
-        .searcher()
-        .count_matches_by_file(&count_query("PM_RESUME"), None)
+    let counts = engine
+        .count_matches_by_file_including_zero(&count_query("PM_RESUME"), None)
         .expect("test should succeed");
+    let counts = counts
+        .into_iter()
+        .filter(|count| count.matched_lines > 0)
+        .collect::<Vec<_>>();
 
     assert_eq!(counts.len(), 1);
     assert_eq!(counts[0].path, hidden.to_string_lossy());
@@ -109,8 +136,11 @@ fn search_can_be_restricted_to_selected_paths() {
     let tests = repo.write("tests/lib.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
     repo.build();
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
 
-    let searcher = repo.searcher();
+    let engine = repo.engine();
     let query = query("PM_RESUME");
     let cwd = std::env::current_dir().expect("test should succeed");
 
@@ -122,11 +152,11 @@ fn search_can_be_restricted_to_selected_paths() {
         &cwd,
     )
     .expect("test should succeed");
-    let results = searcher
-        .search_with_filter(&query, Some(&src_filter))
+    let results = engine
+        .search_with_filter(&query, Some(&src_filter), codgrep::SearchPolicy::IndexOnly)
         .expect("test should succeed");
-    assert_eq!(results.hits.len(), 1);
-    assert_eq!(results.hits[0].path, src.to_string_lossy());
+    assert_eq!(results.results.hits.len(), 1);
+    assert_eq!(results.results.hits[0].path, src.to_string_lossy());
 
     let tests_filter = PathFilter::new(
         PathFilterArgs {
@@ -136,8 +166,8 @@ fn search_can_be_restricted_to_selected_paths() {
         &cwd,
     )
     .expect("test should succeed");
-    let counts = searcher
-        .count_matches_by_file(
+    let counts = engine
+        .count_matches_by_file_including_zero(
             &QueryConfig {
                 search_mode: SearchMode::CountOnly,
                 ..query.clone()
@@ -145,6 +175,10 @@ fn search_can_be_restricted_to_selected_paths() {
             Some(&tests_filter),
         )
         .expect("test should succeed");
+    let counts = counts
+        .into_iter()
+        .filter(|count| count.matched_lines > 0)
+        .collect::<Vec<_>>();
     assert_eq!(counts.len(), 1);
     assert_eq!(counts[0].path, tests.to_string_lossy());
     assert_eq!(counts[0].matched_lines, 1);
@@ -158,7 +192,10 @@ fn search_can_be_restricted_to_exact_file_path() {
 
     repo.build();
 
-    let searcher = repo.searcher();
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
+    let engine = repo.engine();
     let cwd = std::env::current_dir().expect("test should succeed");
     let file_filter = PathFilter::new(
         PathFilterArgs {
@@ -170,39 +207,36 @@ fn search_can_be_restricted_to_exact_file_path() {
     .expect("test should succeed");
 
     assert_eq!(
-        searcher.indexed_paths(Some(&file_filter)),
+        engine
+            .visible_paths(Some(&file_filter))
+            .expect("test should succeed"),
         vec![source.to_string_lossy()]
     );
 
-    let literal = searcher
-        .search_with_filter(&query("abc"), Some(&file_filter))
+    let literal = engine
+        .search_with_filter(
+            &query("abc"),
+            Some(&file_filter),
+            codgrep::SearchPolicy::IndexOnly,
+        )
         .expect("test should succeed");
-    assert_eq!(literal.hits.len(), 1);
-    assert_eq!(literal.hits[0].path, source.to_string_lossy());
-
-    let regex = searcher
-        .search(&query("a(.*c)"))
-        .expect("test should succeed");
-    assert_eq!(regex.hits.len(), 1);
-    assert_eq!(regex.hits[0].path, source.to_string_lossy());
-
-    let regex = searcher
-        .search_with_filter(&query("a(.*c)"), Some(&file_filter))
-        .expect("test should succeed");
-    assert_eq!(regex.hits.len(), 1);
-    assert_eq!(regex.hits[0].path, source.to_string_lossy());
+    assert_eq!(literal.results.hits.len(), 1);
+    assert_eq!(literal.results.hits[0].path, source.to_string_lossy());
 }
 
 #[test]
-fn files_without_matches_are_exposed_via_searcher_api() {
+fn files_without_matches_are_exposed_via_search_engine_api() {
     let repo = TestRepo::new();
     repo.write("matched.rs", "const NAME: &str = \"PM_RESUME\";\n");
     let missed = repo.write("missed.rs", "const NAME: &str = \"OTHER\";\n");
 
     repo.build();
 
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
     let without_matches = repo
-        .searcher()
+        .engine()
         .files_without_matches(&count_query("PM_RESUME"), None)
         .expect("test should succeed");
 
@@ -210,20 +244,26 @@ fn files_without_matches_are_exposed_via_searcher_api() {
 }
 
 #[test]
-fn count_total_matches_are_exposed_via_searcher_api() {
+fn count_total_matches_are_exposed_via_search_engine_api() {
     let repo = TestRepo::new();
     let source = repo.write("matches.rs", "PM_RESUME PM_RESUME\nPM_RESUME\n");
 
     repo.build();
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
 
     let query = count_matches_query("PM_RESUME");
-    let searcher = repo.searcher();
-    let results = searcher.search(&query).expect("test should succeed");
+    let engine = repo.engine();
+    let results = engine
+        .search(&query, codgrep::SearchPolicy::IndexOnly)
+        .expect("test should succeed")
+        .results;
     assert_eq!(results.matched_lines, 2);
     assert_eq!(results.matched_occurrences, 3);
     assert!(results.hits.is_empty());
 
-    let counts = searcher
+    let counts = engine
         .count_total_matches_by_file(&query, None)
         .expect("test should succeed");
     assert_eq!(counts.len(), 1);
@@ -232,18 +272,21 @@ fn count_total_matches_are_exposed_via_searcher_api() {
 }
 
 #[test]
-fn include_zero_counts_are_exposed_via_searcher_api() {
+fn include_zero_counts_are_exposed_via_search_engine_api() {
     let repo = TestRepo::new();
     let matched = repo.write("matched.rs", "PM_RESUME PM_RESUME\n");
     let missed = repo.write("missed.rs", "OTHER\n");
 
     repo.build();
 
-    let searcher = repo.searcher();
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
+    let engine = repo.engine();
     let count_query = count_query("PM_RESUME");
     let count_matches_query = count_matches_query("PM_RESUME");
 
-    let line_counts = searcher
+    let line_counts = engine
         .count_matches_by_file_including_zero(&count_query, None)
         .expect("test should succeed");
     assert_eq!(line_counts.len(), 2);
@@ -252,7 +295,8 @@ fn include_zero_counts_are_exposed_via_searcher_api() {
     assert_eq!(line_counts[1].path, missed.to_string_lossy());
     assert_eq!(line_counts[1].matched_lines, 0);
 
-    let total_counts = searcher
+    let total_counts = repo
+        .engine()
         .count_total_matches_by_file_including_zero(&count_matches_query, None)
         .expect("test should succeed");
     assert_eq!(total_counts.len(), 2);

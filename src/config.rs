@@ -67,7 +67,7 @@ impl CorpusMode {
 #[derive(Debug, Clone)]
 pub struct BuildConfig {
     pub repo_path: PathBuf,
-    pub index_path: PathBuf,
+    pub storage_root: PathBuf,
     pub tokenizer: TokenizerMode,
     pub corpus_mode: CorpusMode,
     pub include_hidden: bool,
@@ -80,7 +80,7 @@ impl Default for BuildConfig {
     fn default() -> Self {
         Self {
             repo_path: PathBuf::new(),
-            index_path: PathBuf::new(),
+            storage_root: PathBuf::new(),
             tokenizer: TokenizerMode::SparseNgram,
             corpus_mode: CorpusMode::RespectIgnore,
             include_hidden: false,
@@ -95,7 +95,7 @@ impl BuildConfig {
     pub(crate) fn normalized(&self) -> Result<Self> {
         Ok(Self {
             repo_path: normalize_existing_path(&self.repo_path)?,
-            index_path: normalize_path_from_cwd(&self.index_path)?,
+            storage_root: normalize_path_from_cwd(&self.storage_root)?,
             tokenizer: self.tokenizer,
             corpus_mode: self.corpus_mode,
             include_hidden: self.include_hidden,

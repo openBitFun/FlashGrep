@@ -310,7 +310,7 @@ fn startup_lock_is_stale(path: &Path, stale_after: Duration) -> bool {
 fn build_config_from_ensure(params: &EnsureRepoParams) -> BuildConfig {
     build_config_from_open(
         params.repo_path.clone(),
-        params.index_path.clone(),
+        params.storage_root.clone(),
         params.config.tokenizer,
         params.config.corpus_mode,
         params.config.include_hidden,
@@ -323,7 +323,7 @@ fn build_config_from_ensure(params: &EnsureRepoParams) -> BuildConfig {
 fn build_config_from_open_params(params: &OpenRepoParams) -> BuildConfig {
     build_config_from_open(
         params.repo_path.clone(),
-        params.index_path.clone(),
+        params.storage_root.clone(),
         params.config.tokenizer,
         params.config.corpus_mode,
         params.config.include_hidden,
@@ -335,5 +335,5 @@ fn build_config_from_open_params(params: &OpenRepoParams) -> BuildConfig {
 
 fn daemon_state_file_path_from_build_config(build_config: BuildConfig) -> Result<PathBuf> {
     let build_config = build_config.normalized()?;
-    Ok(build_config.index_path.join(DEFAULT_DAEMON_STATE_FILE))
+    Ok(build_config.storage_root.join(DEFAULT_DAEMON_STATE_FILE))
 }

@@ -5,14 +5,14 @@
 1. 先用字符级倒排索引召回候选文件。
 2. 再只对候选文件执行真实 regex 验证。
 
-当前实现先把最小链路跑通：
+当前实现采用：
 
-- 文件级索引
-- `trigram` 和 `sparse-ngram` 两种 tokenizer 接口
-- `docs.bin` / `doc_terms.bin` / `lookup.bin` / `postings.bin` 四文件落盘
+- Git snapshot 或 repo fingerprint 驱动的 `base snapshot`
+- `dirty catalog` 跟踪工作区变化
+- `published workspace overlay` 表达当前 worktree 的已发布增量视图
 - 保守型 regex 查询规划器
 - 候选召回 + `regex` 精确验证
-- 增量建索引的第一版：复用未变文件的文档级 token 集，只重读和重分词变更文件
+- daemon 驱动的 build / refresh / search / glob 协议
 
 ## 模块布局
 
@@ -20,25 +20,31 @@
   命令行入口；当前只保留服务进程、daemon 管理和 build/bench 运维子命令。
 - `src/files.rs`
   仓库扫描、文本过滤、基础文件元数据采集。
+- `src/index_engine/`
+  base snapshot、workspace overlay、manifest、segment、reader、merge 的核心实现。
+- `src/daemon/`
+  稳定外部协议、repo runtime、状态管理、任务调度。
+- `src/workspace.rs`
+  专家向本地 workspace facade，用于按需打开当前 workspace 视图。
+- `src/search_engine.rs`
+  简化的 build/search facade，适合本地工具和测试。
 - `src/tokenizer/`
   token 抽取策略，当前含 trigram 和 sparse n-gram。
 - `src/planner.rs`
   regex 查询规划，先做保守提取，不覆盖完整语义。
-- `src/index/`
-  索引构建、二进制格式和查询时倒排读取。
 - `src/search.rs`
   搜索结果类型定义。
 
-## 二进制格式
+## 存储布局
 
-- `docs.bin`
-  保存 tokenizer 模式和文档元数据。
-- `doc_terms.bin`
-  保存每个文档去重后的 token hash 集，供增量建索引复用。
-- `lookup.bin`
-  保存定长 lookup entry，支持 `mmap + binary search`。
-- `postings.bin`
-  顺序存 posting list，使用 delta + varint 编码。
+repo 默认把索引数据落在 `.codgrep-index-engine/`：
+
+- `base-snapshot/`
+  只读基线 snapshot，按 snapshot key 分目录保存。
+- `workspace-overlay/`
+  已发布 overlay shard，使用 manifest + segment + delete segment 结构。
+- `dirty-catalog.json`
+  跟踪工作区 dirty/building/ready/failed 状态。
 
 ## 快速开始
 
@@ -111,7 +117,7 @@ cargo run -- bench --suite-dir bench_data
 - `daemon::protocol` 是跨语言/跨进程集成时的规范基线。
 - 下游产品应自己在客户端侧封装 SDK / service facade；`codgrep` 不再内置 Rust SDK facade。
 - `codgrep` 这边的交付物以 daemon 二进制 `cg` 为主；像 BitFun 这类宿主只需要打包 `cg` 并按协议接入。
-- crate 根上仍然存在的历史库导出，仅用于仓库内部与迁移期代码复用，不应当作产品接入面。
+- crate 根上仍然保留若干库导出，主要服务于本地工具、测试和专家向集成，不应当作稳定产品接入面。
 
 入口选择（推荐）：
 
@@ -180,31 +186,32 @@ let response = client.send(Request::Search {
 
 - `daemon::protocol`：唯一稳定外部 contract。
 - `DaemonClient` / `ManagedDaemonClient`：daemon protocol 的低层 transport/client 封装。
-- 其他 crate library API：内部实现、测试、benchmark、迁移期兼容，不作为稳定外部接口。
+- 其他 crate library API：内部实现、测试、benchmark 和专家向辅助，不作为稳定外部接口。
 
 ## Internal Library Notes
 
-crate 根上仍然保留若干历史库导出，主要用于：
+crate 根上仍然保留若干库导出，主要用于：
 
 - daemon 内部实现
 - benchmark / fixture / 测试代码
-- 迁移期的仓库内辅助代码
+- 专家向本地集成和调试
 
-这些库接口不是推荐的外部接入方式，后续会继续收缩；新的外部能力优先补到 daemon protocol，而不是继续扩展库层 facade。
+这些库接口不是推荐的外部接入方式；新的外部能力优先补到 daemon protocol，而不是继续扩展库层 facade。
 
 ## Daemon Overlay
 
-daemon 运行时会在内存里维护一层 dirty overlay：
+daemon 运行时维护两类 workspace 状态：
 
-- `base snapshot` 仍然是磁盘上的主索引。
-- dirty 路径集合、dirty 文档和 dirty `SearchDocumentIndex` 只存在于 daemon 进程内存。
-- daemon 重启或 repo 被关闭后，内存 overlay 会丢失；下次 `open_repo` 时会根据“当前 base snapshot + 当前 worktree”重新计算并重建。
+- `dirty catalog`
+  跟踪当前工作区相对 base snapshot 的变化集合和构建状态。
+- `published overlay`
+  只保存已经构建完成并原子发布、对查询可见的增量层。
 
 这意味着：
 
-- 正确性依旧由当前 worktree 保证。
-- 冷启动 / 重启后会有一段 overlay 恢复时间。
-- `WorkspaceStrict` 在 repo 未 ready 前可能短暂不可用；`WorkspaceEventual` 可以先退到 `rg` / scan fallback。
+- 查询只读取 `base snapshot + published overlay`。
+- 未发布 overlay 在进程重启后允许丢失，daemon 会通过 startup rescan 补回。
+- `WorkspaceStrict` 在 pending dirty 未发布时可能拒绝执行；`WorkspaceEventual` 可以使用当前已发布视图。
 
 ## Benchmark
 
@@ -284,7 +291,6 @@ cargo run -- bench \
 - workspace 查询默认使用“base snapshot + 当前 dirty files 扫描修补”的两层视图，不再依赖持久化 overlay cache。
 - dirty files 当前仍按 `size + mtime` 探测，不是 content hash。
 - 当前没有引入阈值 sidecar；dirty files 始终走 query-time repair。
-- `lookup.bin` 已做 `mmap`，`postings.bin` 仍是按 offset 解码读取。
 - CLI 和库层都不会在后台偷偷重建 base snapshot；如果需要新的 commit base，需要显式调用 build/rebuild 接口。
 
 ## 内部库层状态

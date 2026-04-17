@@ -1,0 +1,1063 @@
+use std::sync::Arc;
+
+use crate::{
+    error::AppError,
+    index_engine::{
+        config::PostingTokenizerConfig,
+        delete::DeleteStore,
+        manifest::{Manifest, ManifestSnapshot, ManifestStore},
+        query::{QueryPlan, QueryRequest},
+        reader::state::{SharedSnapshotState, SnapshotData},
+        segment::{collect_document_posting_terms, SegmentStore},
+        types::DocKey,
+        writer::IndexDocument,
+    },
+    search::{
+        FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine, SearchResults,
+    },
+    Result,
+};
+use regex::RegexBuilder;
+
+#[derive(Debug, Clone, Default)]
+pub struct SearchProfile {
+    pub candidate_docs: usize,
+    pub active_segments: usize,
+}
+
+#[derive(Debug, Clone)]
+pub struct DryRunSegmentProfile {
+    pub segment_id: crate::index_engine::types::SegmentId,
+    pub filtered_doc_ids: usize,
+    pub candidate_doc_ids: usize,
+    pub visible_candidate_docs: usize,
+    pub estimated_verify_bytes: u64,
+}
+
+#[derive(Debug, Clone)]
+pub struct DryRunQueryProfile {
+    pub plan: QueryPlan,
+    pub fallback_to_scan: bool,
+    pub active_segments: usize,
+    pub total_filtered_doc_ids: usize,
+    pub total_candidate_doc_ids: usize,
+    pub candidate_docs: usize,
+    pub estimated_verify_bytes: u64,
+    pub segments: Vec<DryRunSegmentProfile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SnapshotPathEntry {
+    pub logical_path: String,
+    pub size: u64,
+    pub modified_at: u64,
+    pub content_hash: [u8; 32],
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct SnapshotPathCatalog {
+    entries: std::collections::BTreeMap<String, SnapshotPathEntry>,
+}
+
+impl SnapshotPathCatalog {
+    pub fn get(&self, logical_path: &str) -> Option<&SnapshotPathEntry> {
+        self.entries.get(logical_path)
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    pub fn has_path_under(&self, logical_directory: &str) -> bool {
+        if logical_directory.is_empty() {
+            return !self.entries.is_empty();
+        }
+
+        let prefix = format!("{logical_directory}{}", std::path::MAIN_SEPARATOR);
+        self.entries
+            .range(logical_directory.to_string()..)
+            .next()
+            .is_some_and(|(path, _)| path == logical_directory || path.starts_with(&prefix))
+    }
+
+    pub fn iter(&self) -> impl Iterator<Item = (&str, &SnapshotPathEntry)> {
+        self.entries
+            .iter()
+            .map(|(path, entry)| (path.as_str(), entry))
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct SnapshotVisibleKeys {
+    pub live: std::collections::BTreeSet<DocKey>,
+    pub deleted: std::collections::BTreeSet<DocKey>,
+}
+
+pub struct IndexReaderFactory {
+    manifest_store: Arc<dyn ManifestStore>,
+    segment_store: Arc<dyn SegmentStore>,
+    delete_store: Arc<dyn DeleteStore>,
+    snapshots: SharedSnapshotState,
+    tokenizer: PostingTokenizerConfig,
+}
+
+impl IndexReaderFactory {
+    pub(crate) fn new(
+        manifest_store: Arc<dyn ManifestStore>,
+        segment_store: Arc<dyn SegmentStore>,
+        delete_store: Arc<dyn DeleteStore>,
+        snapshots: SharedSnapshotState,
+        tokenizer: PostingTokenizerConfig,
+    ) -> Self {
+        Self {
+            manifest_store,
+            segment_store,
+            delete_store,
+            snapshots,
+            tokenizer,
+        }
+    }
+
+    pub fn open_snapshot(&self) -> Result<IndexSnapshotReader> {
+        let snapshot = self.snapshots.load_refreshed();
+        Ok(IndexSnapshotReader::new(
+            ManifestSnapshot::new(snapshot.manifest.clone()),
+            Arc::clone(&self.segment_store),
+            Arc::clone(&self.delete_store),
+            snapshot,
+            self.tokenizer.clone(),
+        ))
+    }
+
+    pub fn open_committed(&self) -> Result<IndexSnapshotReader> {
+        let snapshot = self.snapshots.load_committed();
+        Ok(IndexSnapshotReader::new(
+            ManifestSnapshot::new(snapshot.manifest.clone()),
+            Arc::clone(&self.segment_store),
+            Arc::clone(&self.delete_store),
+            snapshot,
+            self.tokenizer.clone(),
+        ))
+    }
+
+    pub fn open_persisted_current(&self) -> Result<IndexSnapshotReader> {
+        let manifest = self.manifest_store.load_current()?;
+        Ok(self.open_with_manifest(manifest))
+    }
+
+    pub fn open_at_manifest(
+        &self,
+        manifest_id: crate::index_engine::types::ManifestId,
+    ) -> Result<IndexSnapshotReader> {
+        let manifest = self.manifest_store.load_manifest(&manifest_id)?;
+        if manifest.manifest_id != manifest_id {
+            return Err(AppError::InvalidIndex(format!(
+                "requested manifest {} but loaded {}",
+                manifest_id.0, manifest.manifest_id.0
+            )));
+        }
+        Ok(self.open_with_manifest(manifest))
+    }
+
+    fn open_with_manifest(&self, manifest: Manifest) -> IndexSnapshotReader {
+        IndexSnapshotReader::new(
+            ManifestSnapshot::new(manifest.clone()),
+            Arc::clone(&self.segment_store),
+            Arc::clone(&self.delete_store),
+            SnapshotData {
+                manifest,
+                ..SnapshotData::default()
+            },
+            self.tokenizer.clone(),
+        )
+    }
+}
+
+#[derive(Clone)]
+pub struct IndexSnapshotReader {
+    snapshot: ManifestSnapshot,
+    segment_store: Arc<dyn SegmentStore>,
+    delete_store: Arc<dyn DeleteStore>,
+    data: SnapshotData,
+    tokenizer: PostingTokenizerConfig,
+}
+
+impl IndexSnapshotReader {
+    pub(crate) fn new(
+        snapshot: ManifestSnapshot,
+        segment_store: Arc<dyn SegmentStore>,
+        delete_store: Arc<dyn DeleteStore>,
+        data: SnapshotData,
+        tokenizer: PostingTokenizerConfig,
+    ) -> Self {
+        Self {
+            snapshot,
+            segment_store,
+            delete_store,
+            data,
+            tokenizer,
+        }
+    }
+
+    pub fn manifest(&self) -> &Manifest {
+        self.snapshot.manifest()
+    }
+
+    pub fn visible_documents(&self) -> Result<std::collections::BTreeMap<DocKey, IndexDocument>> {
+        let mut effective_docs = std::collections::BTreeMap::<
+            DocKey,
+            (crate::index_engine::types::SeqNo, IndexDocument),
+        >::new();
+        let mut latest_delete_seq =
+            std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+
+        for delete_segment_ref in &self.snapshot.manifest().active_delete_segments {
+            let reader = self
+                .delete_store
+                .open_delete_segment(delete_segment_ref.id.clone())?;
+            for record in reader.records() {
+                latest_delete_seq
+                    .entry(record.key.clone())
+                    .and_modify(|seq_no| *seq_no = (*seq_no).max(record.seq_no))
+                    .or_insert(record.seq_no);
+            }
+        }
+
+        let mut active_segments = self.snapshot.manifest().active_segments.clone();
+        active_segments.sort_by(|left, right| {
+            right
+                .max_seq_no
+                .cmp(&left.max_seq_no)
+                .then_with(|| right.min_seq_no.cmp(&left.min_seq_no))
+        });
+
+        for segment_ref in &active_segments {
+            let reader = self.segment_store.open_segment(segment_ref.id.clone())?;
+            for doc_id in 0..reader.doc_count() as crate::index_engine::types::SegmentDocId {
+                let document = reader.document(doc_id)?;
+                if latest_delete_seq
+                    .get(&document.key)
+                    .is_some_and(|seq_no| *seq_no > segment_ref.max_seq_no)
+                {
+                    continue;
+                }
+
+                let replace = effective_docs
+                    .get(&document.key)
+                    .is_none_or(|(seq_no, _)| *seq_no < segment_ref.max_seq_no);
+                if replace {
+                    effective_docs.insert(
+                        document.key.clone(),
+                        (segment_ref.max_seq_no, document.clone()),
+                    );
+                }
+            }
+        }
+
+        for key in &self.data.deleted_keys {
+            effective_docs.remove(key);
+        }
+        for (key, entry) in &self.data.docs {
+            effective_docs.insert(key.clone(), (entry.seq_no, entry.document.clone()));
+        }
+
+        Ok(effective_docs
+            .into_iter()
+            .map(|(key, (_, document))| (key, document))
+            .collect())
+    }
+
+    pub fn path_catalog(&self) -> Result<SnapshotPathCatalog> {
+        let mut effective_entries = std::collections::BTreeMap::<
+            DocKey,
+            (crate::index_engine::types::SeqNo, SnapshotPathEntry),
+        >::new();
+        let mut latest_delete_seq =
+            std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+
+        for delete_segment_ref in &self.snapshot.manifest().active_delete_segments {
+            let reader = self
+                .delete_store
+                .open_delete_segment(delete_segment_ref.id.clone())?;
+            for record in reader.records() {
+                latest_delete_seq
+                    .entry(record.key.clone())
+                    .and_modify(|seq_no| *seq_no = (*seq_no).max(record.seq_no))
+                    .or_insert(record.seq_no);
+            }
+        }
+
+        let mut active_segments = self.snapshot.manifest().active_segments.clone();
+        active_segments.sort_by(|left, right| {
+            right
+                .max_seq_no
+                .cmp(&left.max_seq_no)
+                .then_with(|| right.min_seq_no.cmp(&left.min_seq_no))
+        });
+
+        for segment_ref in &active_segments {
+            let reader = self.segment_store.open_segment(segment_ref.id.clone())?;
+            for doc_id in 0..reader.doc_count() as crate::index_engine::types::SegmentDocId {
+                let metadata = reader.doc_metadata(doc_id)?;
+                if latest_delete_seq
+                    .get(metadata.key)
+                    .is_some_and(|seq_no| *seq_no > segment_ref.max_seq_no)
+                {
+                    continue;
+                }
+
+                let replace = effective_entries
+                    .get(metadata.key)
+                    .is_none_or(|(seq_no, _)| *seq_no < segment_ref.max_seq_no);
+                if replace {
+                    effective_entries.insert(
+                        metadata.key.clone(),
+                        (
+                            segment_ref.max_seq_no,
+                            SnapshotPathEntry {
+                                logical_path: metadata.key.logical_path.clone(),
+                                size: metadata.size,
+                                modified_at: metadata.modified_at,
+                                content_hash: metadata.content_hash,
+                            },
+                        ),
+                    );
+                }
+            }
+        }
+
+        for key in &self.data.deleted_keys {
+            effective_entries.remove(key);
+        }
+        for (key, entry) in &self.data.docs {
+            effective_entries.insert(
+                key.clone(),
+                (
+                    entry.seq_no,
+                    SnapshotPathEntry {
+                        logical_path: entry.document.logical_path.clone(),
+                        size: entry.document.size,
+                        modified_at: entry.document.modified_at,
+                        content_hash: entry.document.content_hash,
+                    },
+                ),
+            );
+        }
+
+        Ok(SnapshotPathCatalog {
+            entries: effective_entries
+                .into_iter()
+                .map(|(_, (_, entry))| (entry.logical_path.clone(), entry))
+                .collect(),
+        })
+    }
+
+    pub fn visible_keys(&self) -> Result<SnapshotVisibleKeys> {
+        let mut live = std::collections::BTreeSet::<DocKey>::new();
+        let mut deleted = std::collections::BTreeSet::<DocKey>::new();
+        let mut latest_delete_seq =
+            std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+        let mut seen = std::collections::BTreeSet::<DocKey>::new();
+
+        for delete_segment_ref in &self.snapshot.manifest().active_delete_segments {
+            let reader = self
+                .delete_store
+                .open_delete_segment(delete_segment_ref.id.clone())?;
+            for record in reader.records() {
+                latest_delete_seq
+                    .entry(record.key.clone())
+                    .and_modify(|seq_no| *seq_no = (*seq_no).max(record.seq_no))
+                    .or_insert(record.seq_no);
+            }
+        }
+
+        let mut active_segments = self.snapshot.manifest().active_segments.clone();
+        active_segments.sort_by(|left, right| {
+            right
+                .max_seq_no
+                .cmp(&left.max_seq_no)
+                .then_with(|| right.min_seq_no.cmp(&left.min_seq_no))
+        });
+
+        for segment_ref in &active_segments {
+            let reader = self.segment_store.open_segment(segment_ref.id.clone())?;
+            for doc_id in 0..reader.doc_count() as crate::index_engine::types::SegmentDocId {
+                let key = reader.doc_key(doc_id)?;
+                if seen.contains(key)
+                    || self.data.deleted_keys.contains(key)
+                    || self.data.docs.contains_key(key)
+                {
+                    continue;
+                }
+                if latest_delete_seq
+                    .get(key)
+                    .is_some_and(|seq_no| *seq_no > segment_ref.max_seq_no)
+                {
+                    continue;
+                }
+                seen.insert(key.clone());
+                live.insert(key.clone());
+            }
+        }
+
+        for key in &self.data.deleted_keys {
+            deleted.insert(key.clone());
+        }
+        for key in self.data.docs.keys() {
+            deleted.remove(key);
+            live.insert(key.clone());
+        }
+        for (key, _) in latest_delete_seq {
+            if !live.contains(&key) && !self.data.docs.contains_key(&key) {
+                deleted.insert(key);
+            }
+        }
+
+        Ok(SnapshotVisibleKeys { live, deleted })
+    }
+
+    pub fn search(&self, query: &QueryRequest) -> Result<SearchResults> {
+        let regex = RegexBuilder::new(&query.pattern)
+            .case_insensitive(query.case_insensitive)
+            .build()?;
+        let plan = QueryPlan::build(query.clone(), &self.tokenizer);
+
+        if self.can_use_single_segment_candidate_fast_path() && query.filters.languages.is_empty() {
+            return self.search_single_segment_clean(query, &plan, &regex);
+        }
+
+        let mut results = empty_results();
+        let effective_docs = self.candidate_documents(query, &plan)?;
+
+        results.candidate_docs = effective_docs.len();
+        results.bytes_searched = effective_docs
+            .values()
+            .map(|document| document.source_bytes.len() as u64)
+            .sum();
+
+        for doc in effective_docs.values() {
+            if !matches_filters(doc, query) {
+                results.candidate_docs -= 1;
+                results.bytes_searched -= doc.source_bytes.len() as u64;
+                continue;
+            }
+
+            accumulate_doc_search(doc, query, &regex, &mut results)?;
+            if query.top_k.is_some_and(|limit| results.hits.len() >= limit) {
+                break;
+            }
+        }
+
+        Ok(results)
+    }
+
+    pub fn candidate_paths(&self, query: &QueryRequest) -> Result<Vec<String>> {
+        let plan = QueryPlan::build(query.clone(), &self.tokenizer);
+        Ok(self
+            .candidate_documents(query, &plan)?
+            .into_values()
+            .map(|document| document.logical_path)
+            .collect())
+    }
+
+    pub fn profile_search(&self, query: &QueryRequest) -> Result<SearchProfile> {
+        let results = self.search(query)?;
+        Ok(SearchProfile {
+            candidate_docs: results.candidate_docs,
+            active_segments: self.snapshot.manifest().active_segments.len(),
+        })
+    }
+
+    pub fn dry_run_query(&self, query: &QueryRequest) -> Result<DryRunQueryProfile> {
+        let plan = QueryPlan::build(query.clone(), &self.tokenizer);
+        let mut latest_delete_seq =
+            std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+        let mut latest_live_segment_seq =
+            std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+
+        for delete_segment_ref in &self.snapshot.manifest().active_delete_segments {
+            let reader = self
+                .delete_store
+                .open_delete_segment(delete_segment_ref.id.clone())?;
+            for record in reader.records() {
+                latest_delete_seq
+                    .entry(record.key.clone())
+                    .and_modify(|seq_no| *seq_no = (*seq_no).max(record.seq_no))
+                    .or_insert(record.seq_no);
+            }
+        }
+
+        let mut active_segments = self.snapshot.manifest().active_segments.clone();
+        active_segments.sort_by(|left, right| {
+            right
+                .max_seq_no
+                .cmp(&left.max_seq_no)
+                .then_with(|| right.min_seq_no.cmp(&left.min_seq_no))
+        });
+
+        let mut opened_segments = Vec::with_capacity(active_segments.len());
+        for segment_ref in &active_segments {
+            opened_segments.push((
+                segment_ref.clone(),
+                self.segment_store.open_segment(segment_ref.id.clone())?,
+            ));
+        }
+
+        for (segment_ref, reader) in &opened_segments {
+            for doc_id in reader.collect_doc_ids_for_filters(&query.filters)? {
+                let key = reader.doc_key(doc_id)?;
+                if latest_live_segment_seq.contains_key(key)
+                    || latest_delete_seq
+                        .get(key)
+                        .is_some_and(|seq_no| *seq_no > segment_ref.max_seq_no)
+                {
+                    continue;
+                }
+                latest_live_segment_seq.insert(key.clone(), segment_ref.max_seq_no);
+            }
+        }
+
+        let mut visible_candidates = std::collections::BTreeSet::<DocKey>::new();
+        let mut total_filtered_doc_ids = 0usize;
+        let mut total_candidate_doc_ids = 0usize;
+        let mut estimated_verify_bytes = 0u64;
+        let mut segments = Vec::with_capacity(opened_segments.len());
+
+        for (segment_ref, reader) in &opened_segments {
+            let filtered_doc_ids = reader.collect_doc_ids_for_filters(&query.filters)?;
+            let candidate_ids = reader.collect_candidates(&plan, 0)?;
+            total_filtered_doc_ids += filtered_doc_ids.len();
+            total_candidate_doc_ids += candidate_ids.len();
+            let segment_candidate_doc_ids = candidate_ids.len();
+
+            let mut segment_visible_candidate_docs = 0usize;
+            let mut segment_estimated_verify_bytes = 0u64;
+            for doc_id in candidate_ids {
+                let key = reader.doc_key(doc_id)?;
+                if !matches_key_filters(key, query) {
+                    continue;
+                }
+                if latest_live_segment_seq
+                    .get(key)
+                    .is_some_and(|seq_no| *seq_no != segment_ref.max_seq_no)
+                {
+                    continue;
+                }
+                if latest_delete_seq
+                    .get(key)
+                    .is_some_and(|seq_no| *seq_no > segment_ref.max_seq_no)
+                    || self.data.deleted_keys.contains(key)
+                    || self.data.docs.contains_key(key)
+                {
+                    continue;
+                }
+                let metadata = reader.doc_metadata(doc_id)?;
+                segment_visible_candidate_docs += 1;
+                segment_estimated_verify_bytes += metadata.size;
+                visible_candidates.insert(key.clone());
+            }
+
+            segments.push(DryRunSegmentProfile {
+                segment_id: segment_ref.id.clone(),
+                filtered_doc_ids: filtered_doc_ids.len(),
+                candidate_doc_ids: segment_candidate_doc_ids,
+                visible_candidate_docs: segment_visible_candidate_docs,
+                estimated_verify_bytes: segment_estimated_verify_bytes,
+            });
+            estimated_verify_bytes += segment_estimated_verify_bytes;
+        }
+
+        for (key, entry) in &self.data.docs {
+            if matches_filters(&entry.document, query)
+                && document_matches_query_plan(&entry.document, &plan, &self.tokenizer)
+            {
+                visible_candidates.insert(key.clone());
+                estimated_verify_bytes += entry.document.size;
+            }
+        }
+
+        Ok(DryRunQueryProfile {
+            plan: plan.clone(),
+            fallback_to_scan: plan.fallback_to_scan,
+            active_segments: self.snapshot.manifest().active_segments.len(),
+            total_filtered_doc_ids,
+            total_candidate_doc_ids,
+            candidate_docs: visible_candidates.len(),
+            estimated_verify_bytes,
+            segments,
+        })
+    }
+
+    fn candidate_documents(
+        &self,
+        query: &QueryRequest,
+        plan: &QueryPlan,
+    ) -> Result<std::collections::BTreeMap<DocKey, IndexDocument>> {
+        if self.can_use_single_segment_candidate_fast_path() {
+            return self.candidate_documents_single_segment(query, plan);
+        }
+
+        let mut effective_docs = std::collections::BTreeMap::<DocKey, IndexDocument>::new();
+        let mut latest_delete_seq =
+            std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+        let mut latest_live_segment_seq =
+            std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+
+        for delete_segment_ref in &self.snapshot.manifest().active_delete_segments {
+            let reader = self
+                .delete_store
+                .open_delete_segment(delete_segment_ref.id.clone())?;
+            for record in reader.records() {
+                latest_delete_seq
+                    .entry(record.key.clone())
+                    .and_modify(|seq_no| *seq_no = (*seq_no).max(record.seq_no))
+                    .or_insert(record.seq_no);
+            }
+        }
+
+        let mut active_segments = self.snapshot.manifest().active_segments.clone();
+        active_segments.sort_by(|left, right| {
+            right
+                .max_seq_no
+                .cmp(&left.max_seq_no)
+                .then_with(|| right.min_seq_no.cmp(&left.min_seq_no))
+        });
+
+        let mut opened_segments = Vec::with_capacity(active_segments.len());
+        for segment_ref in &active_segments {
+            opened_segments.push((
+                segment_ref.clone(),
+                self.segment_store.open_segment(segment_ref.id.clone())?,
+            ));
+        }
+
+        for (segment_ref, reader) in &opened_segments {
+            for doc_id in reader.collect_doc_ids_for_filters(&query.filters)? {
+                let key = reader.doc_key(doc_id)?;
+                if latest_live_segment_seq.contains_key(key)
+                    || latest_delete_seq
+                        .get(key)
+                        .is_some_and(|seq_no| *seq_no > segment_ref.max_seq_no)
+                {
+                    continue;
+                }
+                latest_live_segment_seq.insert(key.clone(), segment_ref.max_seq_no);
+            }
+        }
+
+        for (segment_ref, reader) in &opened_segments {
+            let candidate_ids = reader.collect_candidates(plan, 0)?;
+            for doc_id in candidate_ids {
+                let key = reader.doc_key(doc_id)?;
+                if !matches_key_filters(key, query) {
+                    continue;
+                }
+                if latest_live_segment_seq
+                    .get(key)
+                    .is_some_and(|seq_no| *seq_no != segment_ref.max_seq_no)
+                {
+                    continue;
+                }
+                if latest_delete_seq
+                    .get(key)
+                    .is_some_and(|seq_no| *seq_no > segment_ref.max_seq_no)
+                    || self.data.deleted_keys.contains(key)
+                    || self.data.docs.contains_key(key)
+                {
+                    continue;
+                }
+                let document = reader.document(doc_id)?;
+                effective_docs
+                    .entry(key.clone())
+                    .or_insert_with(|| document.clone());
+            }
+        }
+
+        for (key, entry) in &self.data.docs {
+            if document_matches_query_plan(&entry.document, plan, &self.tokenizer) {
+                effective_docs.insert(key.clone(), entry.document.clone());
+            }
+        }
+
+        effective_docs.retain(|_, doc| matches_filters(doc, query));
+        Ok(effective_docs)
+    }
+
+    fn can_use_single_segment_candidate_fast_path(&self) -> bool {
+        self.snapshot.manifest().active_segments.len() == 1
+            && self.snapshot.manifest().active_delete_segments.is_empty()
+            && self.data.deleted_keys.is_empty()
+            && self.data.docs.is_empty()
+    }
+
+    fn candidate_documents_single_segment(
+        &self,
+        query: &QueryRequest,
+        plan: &QueryPlan,
+    ) -> Result<std::collections::BTreeMap<DocKey, IndexDocument>> {
+        let segment_ref = self
+            .snapshot
+            .manifest()
+            .active_segments
+            .first()
+            .ok_or_else(|| {
+                AppError::InvalidIndex("single-segment fast path is missing a segment".into())
+            })?;
+        let reader = self.segment_store.open_segment(segment_ref.id.clone())?;
+        let mut effective_docs = std::collections::BTreeMap::<DocKey, IndexDocument>::new();
+
+        // Clean base snapshots commonly have a single visible segment with no deletes or
+        // overlay state. In that case, avoid a full visibility scan before verifying regexes.
+        for doc_id in reader.collect_candidates(plan, 0)? {
+            let key = reader.doc_key(doc_id)?;
+            if !matches_key_filters(key, query) {
+                continue;
+            }
+
+            let document = reader.document(doc_id)?;
+            if !matches_filters(document, query) {
+                continue;
+            }
+
+            effective_docs.insert(key.clone(), document.clone());
+        }
+
+        Ok(effective_docs)
+    }
+
+    fn search_single_segment_clean(
+        &self,
+        query: &QueryRequest,
+        plan: &QueryPlan,
+        regex: &regex::Regex,
+    ) -> Result<SearchResults> {
+        let segment_ref = self
+            .snapshot
+            .manifest()
+            .active_segments
+            .first()
+            .ok_or_else(|| {
+                AppError::InvalidIndex("single-segment fast path is missing a segment".into())
+            })?;
+        let reader = self.segment_store.open_segment(segment_ref.id.clone())?;
+        let candidate_ids = reader.collect_candidates(plan, 0)?;
+        let mut results = empty_results();
+        for doc_id in candidate_ids {
+            let stored_doc = reader.stored_doc(doc_id)?;
+            if !matches_key_filters(stored_doc.key, query) {
+                continue;
+            }
+            results.candidate_docs += 1;
+            results.bytes_searched += stored_doc.source_bytes.len() as u64;
+            accumulate_search_bytes(
+                &stored_doc.key.logical_path,
+                stored_doc.source_bytes,
+                query,
+                regex,
+                &mut results,
+            )?;
+            if query.top_k.is_some_and(|limit| results.hits.len() >= limit) {
+                return Ok(results);
+            }
+        }
+
+        Ok(results)
+    }
+}
+
+fn matches_filters(doc: &crate::index_engine::writer::IndexDocument, query: &QueryRequest) -> bool {
+    if !matches_key_filters(&doc.key, query) {
+        return false;
+    }
+    if !query.filters.languages.is_empty()
+        && !query
+            .filters
+            .languages
+            .iter()
+            .any(|language| doc.language.as_deref() == Some(language.as_str()))
+    {
+        return false;
+    }
+    true
+}
+
+fn document_matches_query_plan(
+    doc: &IndexDocument,
+    plan: &QueryPlan,
+    tokenizer: &PostingTokenizerConfig,
+) -> bool {
+    if plan.fallback_to_scan || plan.candidate_branches.is_empty() {
+        return true;
+    }
+
+    if !document_matches_literal_sequence_plan(doc, plan) {
+        return false;
+    }
+
+    let terms = collect_document_posting_terms(&doc.source_bytes, tokenizer)
+        .into_iter()
+        .collect::<std::collections::BTreeSet<_>>();
+    plan.candidate_branches.iter().any(|branch| {
+        branch.grams.is_empty() || branch.grams.iter().all(|gram| terms.contains(gram))
+    })
+}
+
+fn document_matches_literal_sequence_plan(doc: &IndexDocument, plan: &QueryPlan) -> bool {
+    let requires_case_fold = plan.request.case_insensitive;
+    let text = String::from_utf8_lossy(&doc.source_bytes);
+    let folded_storage;
+    let haystack = if requires_case_fold {
+        folded_storage = if text.is_ascii() {
+            text.to_ascii_lowercase()
+        } else {
+            text.to_lowercase()
+        };
+        folded_storage.as_str()
+    } else {
+        text.as_ref()
+    };
+
+    plan.candidate_branches.iter().any(|branch| {
+        branch.ordered_literals.is_empty()
+            || literals_match_in_order(haystack, &branch.ordered_literals)
+    })
+}
+
+fn literals_match_in_order(haystack: &str, literals: &[String]) -> bool {
+    let mut search_from = 0usize;
+    for literal in literals {
+        let Some(offset) = haystack[search_from..].find(literal) else {
+            return false;
+        };
+        search_from += offset + literal.len();
+    }
+    true
+}
+
+fn path_matches_prefix(path: &str, prefix: &str) -> bool {
+    path == prefix
+        || path
+            .strip_prefix(prefix)
+            .is_some_and(|suffix| suffix.starts_with(std::path::MAIN_SEPARATOR))
+}
+
+fn matches_key_filters(key: &DocKey, query: &QueryRequest) -> bool {
+    if query
+        .filters
+        .repo
+        .as_ref()
+        .is_some_and(|repo| repo != &key.repo_id)
+    {
+        return false;
+    }
+    if !query.filters.path_prefixes.is_empty()
+        && !query
+            .filters
+            .path_prefixes
+            .iter()
+            .any(|prefix| path_matches_prefix(&key.logical_path, prefix))
+    {
+        return false;
+    }
+    true
+}
+
+fn accumulate_doc_search(
+    doc: &IndexDocument,
+    query: &QueryRequest,
+    regex: &regex::Regex,
+    results: &mut SearchResults,
+) -> Result<()> {
+    accumulate_search_bytes(&doc.logical_path, &doc.source_bytes, query, regex, results)
+}
+
+fn accumulate_search_bytes(
+    path: &str,
+    source_bytes: &[u8],
+    query: &QueryRequest,
+    regex: &regex::Regex,
+    results: &mut SearchResults,
+) -> Result<()> {
+    let text = String::from_utf8_lossy(source_bytes);
+    let mut doc_matched_lines = 0usize;
+    let mut doc_matched_occurrences = 0usize;
+    let mut doc_matches = Vec::new();
+    let materializes_matches = query.mode.materializes_matches();
+    let first_hit_only = matches!(query.mode, crate::search::SearchMode::FirstHitOnly);
+
+    for (line_index, line) in text.lines().enumerate() {
+        if materializes_matches {
+            let matches = regex.find_iter(line).collect::<Vec<_>>();
+            if matches.is_empty() {
+                continue;
+            }
+
+            doc_matched_lines += 1;
+            doc_matched_occurrences += matches.len();
+            for matched in matches {
+                doc_matches.push(FileMatch {
+                    location: MatchLocation {
+                        line: line_index + 1,
+                        column: matched.start() + 1,
+                    },
+                    snippet: line.to_string(),
+                    matched_text: matched.as_str().to_string(),
+                });
+                if first_hit_only {
+                    break;
+                }
+            }
+            if first_hit_only && !doc_matches.is_empty() {
+                break;
+            }
+            continue;
+        }
+
+        let match_count = regex.find_iter(line).count();
+        if match_count == 0 {
+            continue;
+        }
+
+        doc_matched_lines += 1;
+        doc_matched_occurrences += match_count;
+    }
+
+    if doc_matched_lines == 0 {
+        return Ok(());
+    }
+
+    results.searches_with_match += 1;
+    results.matched_lines += doc_matched_lines;
+    results.matched_occurrences += doc_matched_occurrences;
+    results.file_counts.push(FileCount {
+        path: path.to_string(),
+        matched_lines: doc_matched_lines,
+    });
+    results.file_match_counts.push(FileMatchCount {
+        path: path.to_string(),
+        matched_occurrences: doc_matched_occurrences,
+    });
+
+    if materializes_matches {
+        let lines = doc_matches
+            .iter()
+            .cloned()
+            .map(SearchLine::Match)
+            .collect::<Vec<_>>();
+        results.hits.push(SearchHit {
+            path: path.to_string(),
+            matches: doc_matches,
+            lines,
+        });
+    }
+    Ok(())
+}
+
+fn empty_results() -> SearchResults {
+    SearchResults {
+        candidate_docs: 0,
+        searches_with_match: 0,
+        bytes_searched: 0,
+        matched_lines: 0,
+        matched_occurrences: 0,
+        file_counts: Vec::new(),
+        file_match_counts: Vec::new(),
+        hits: Vec::new(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::document_matches_literal_sequence_plan;
+    use crate::{
+        index_engine::{
+            query::{QueryFilters, QueryPlan, QueryRequest},
+            types::{DocKey, RepoId},
+            writer::IndexDocument,
+        },
+        search::SearchMode,
+        TokenizerMode,
+    };
+
+    fn doc(body: &str) -> IndexDocument {
+        let repo_id = RepoId("repo".into());
+        let logical_path = "file.rs".to_string();
+        IndexDocument {
+            key: DocKey {
+                repo_id: repo_id.clone(),
+                logical_path: logical_path.clone(),
+            },
+            repo_id,
+            logical_path,
+            file_name: "file.rs".into(),
+            language: Some("rust".into()),
+            size: body.len() as u64,
+            modified_at: 0,
+            content_hash: [0; 32],
+            source_bytes: Arc::<[u8]>::from(body.as_bytes()),
+        }
+    }
+
+    fn request(pattern: &str, case_insensitive: bool) -> QueryRequest {
+        QueryRequest {
+            pattern: pattern.into(),
+            mode: SearchMode::CountOnly,
+            case_insensitive,
+            top_k: None,
+            filters: QueryFilters::default(),
+        }
+    }
+
+    fn trigram_tokenizer() -> crate::index_engine::config::PostingTokenizerConfig {
+        crate::index_engine::config::PostingTokenizerConfig {
+            mode: TokenizerMode::Trigram,
+            min_sparse_len: 3,
+            max_sparse_len: 8,
+        }
+    }
+
+    #[test]
+    fn ordered_literal_filter_rejects_wrong_order() {
+        let plan = QueryPlan::build(request("foo.*bar", false), &trigram_tokenizer());
+        assert!(document_matches_literal_sequence_plan(
+            &doc("foo hello bar"),
+            &plan
+        ));
+        assert!(!document_matches_literal_sequence_plan(
+            &doc("bar hello foo"),
+            &plan
+        ));
+    }
+
+    #[test]
+    fn ordered_literal_filter_respects_branch_alternation() {
+        let plan = QueryPlan::build(request("foo.*bar|baz.*qux", false), &trigram_tokenizer());
+        assert!(document_matches_literal_sequence_plan(
+            &doc("baz hello qux"),
+            &plan
+        ));
+        assert!(!document_matches_literal_sequence_plan(
+            &doc("qux hello baz"),
+            &plan
+        ));
+    }
+
+    #[test]
+    fn ordered_literal_filter_folds_case_when_requested() {
+        let plan = QueryPlan::build(request("Foo.*BAR", true), &trigram_tokenizer());
+        assert!(document_matches_literal_sequence_plan(
+            &doc("xx foo yy bar zz"),
+            &plan
+        ));
+        assert!(!document_matches_literal_sequence_plan(
+            &doc("xx bar yy foo zz"),
+            &plan
+        ));
+    }
+}

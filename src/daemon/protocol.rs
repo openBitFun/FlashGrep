@@ -3,6 +3,9 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub const DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS: u64 =
+    crate::index_engine::workspace::DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS;
+
 fn default_jsonrpc_version() -> String {
     "2.0".to_string()
 }
@@ -25,12 +28,12 @@ pub enum Request {
     },
     Initialized,
     Ping,
-    #[serde(rename = "index/build")]
-    IndexBuild {
+    #[serde(rename = "base_snapshot/build")]
+    BaseSnapshotBuild {
         params: RepoRef,
     },
-    #[serde(rename = "index/rebuild")]
-    IndexRebuild {
+    #[serde(rename = "base_snapshot/rebuild")]
+    BaseSnapshotRebuild {
         params: RepoRef,
     },
     #[serde(rename = "task/status")]
@@ -53,10 +56,10 @@ pub enum Request {
     RefreshRepo {
         params: RefreshRepoParams,
     },
-    BuildIndex {
+    BuildBaseSnapshot {
         params: RepoRef,
     },
-    RebuildIndex {
+    RebuildBaseSnapshot {
         params: RepoRef,
     },
     Search {
@@ -117,7 +120,8 @@ pub struct RefreshRepoParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OpenRepoParams {
     pub repo_path: PathBuf,
-    pub index_path: Option<PathBuf>,
+    #[serde(default)]
+    pub storage_root: Option<PathBuf>,
     #[serde(default)]
     pub config: RepoConfig,
     #[serde(default)]
@@ -127,7 +131,8 @@ pub struct OpenRepoParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EnsureRepoParams {
     pub repo_path: PathBuf,
-    pub index_path: Option<PathBuf>,
+    #[serde(default)]
+    pub storage_root: Option<PathBuf>,
     #[serde(default)]
     pub config: RepoConfig,
     #[serde(default)]
@@ -235,12 +240,22 @@ impl Default for RepoConfig {
 pub struct RefreshPolicyConfig {
     #[serde(default = "default_rebuild_dirty_threshold")]
     pub rebuild_dirty_threshold: usize,
+    #[serde(default = "default_overlay_auto_checkpoint_max_uncommitted_ops")]
+    pub overlay_auto_checkpoint_max_uncommitted_ops: u64,
+    #[serde(default = "default_overlay_merge_min_delay_ms")]
+    pub overlay_merge_min_delay_ms: u64,
+    #[serde(default = "default_overlay_merge_retry_delay_ms")]
+    pub overlay_merge_retry_delay_ms: u64,
 }
 
 impl Default for RefreshPolicyConfig {
     fn default() -> Self {
         Self {
             rebuild_dirty_threshold: default_rebuild_dirty_threshold(),
+            overlay_auto_checkpoint_max_uncommitted_ops:
+                default_overlay_auto_checkpoint_max_uncommitted_ops(),
+            overlay_merge_min_delay_ms: default_overlay_merge_min_delay_ms(),
+            overlay_merge_retry_delay_ms: default_overlay_merge_retry_delay_ms(),
         }
     }
 }
@@ -380,11 +395,11 @@ pub enum Response {
         task_id: String,
         accepted: bool,
     },
-    RepoBuilt {
+    RepoBaseSnapshotBuilt {
         indexed_docs: usize,
         status: RepoStatus,
     },
-    RepoRebuilt {
+    RepoBaseSnapshotRebuilt {
         indexed_docs: usize,
         status: RepoStatus,
     },
@@ -419,8 +434,8 @@ pub struct ServerCapabilities {
     pub workspace_ensure: bool,
     pub workspace_list: bool,
     pub workspace_refresh: bool,
-    pub index_build: bool,
-    pub index_rebuild: bool,
+    pub base_snapshot_build: bool,
+    pub base_snapshot_rebuild: bool,
     pub task_status: bool,
     pub task_cancel: bool,
     pub search_query: bool,
@@ -474,7 +489,9 @@ pub struct TaskFinishedParams {
 pub struct RepoStatus {
     pub repo_id: String,
     pub repo_path: String,
-    pub index_path: String,
+    pub storage_root: String,
+    pub base_snapshot_root: String,
+    pub workspace_overlay_root: String,
     pub phase: RepoPhase,
     pub snapshot_key: Option<String>,
     pub last_probe_unix_secs: Option<u64>,
@@ -482,19 +499,21 @@ pub struct RepoStatus {
     pub dirty_files: DirtyFileStats,
     pub rebuild_recommended: bool,
     pub active_task_id: Option<String>,
-    pub watcher_healthy: bool,
+    pub probe_healthy: bool,
     pub last_error: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay: Option<WorkspaceOverlayStatus>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RepoPhase {
     Opening,
-    MissingIndex,
-    Indexing,
+    MissingBaseSnapshot,
+    BuildingBaseSnapshot,
     ReadyClean,
     ReadyDirty,
-    Rebuilding,
+    RebuildingBaseSnapshot,
     Degraded,
 }
 
@@ -503,6 +522,23 @@ pub struct DirtyFileStats {
     pub modified: usize,
     pub deleted: usize,
     pub new: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct WorkspaceOverlayStatus {
+    pub committed_seq_no: u64,
+    pub last_seq_no: u64,
+    pub uncommitted_ops: u64,
+    pub pending_docs: usize,
+    pub active_segments: usize,
+    pub active_delete_segments: usize,
+    pub merge_requested: bool,
+    pub merge_running: bool,
+    pub merge_attempts: u64,
+    pub merge_completed: u64,
+    pub merge_failed: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_merge_error: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -525,8 +561,8 @@ pub struct TaskStatus {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TaskKind {
-    BuildIndex,
-    RebuildIndex,
+    BuildBaseSnapshot,
+    RebuildBaseSnapshot,
     RefreshWorkspace,
 }
 
@@ -555,7 +591,7 @@ pub enum TaskPhase {
 pub enum SearchBackend {
     IndexedSnapshot,
     IndexedClean,
-    IndexedWorkspaceRepair,
+    IndexedWorkspaceView,
     RgFallback,
     ScanFallback,
 }
@@ -632,4 +668,16 @@ fn default_max_sparse_len() -> usize {
 
 fn default_rebuild_dirty_threshold() -> usize {
     256
+}
+
+fn default_overlay_auto_checkpoint_max_uncommitted_ops() -> u64 {
+    DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS
+}
+
+fn default_overlay_merge_min_delay_ms() -> u64 {
+    2_000
+}
+
+fn default_overlay_merge_retry_delay_ms() -> u64 {
+    10_000
 }
