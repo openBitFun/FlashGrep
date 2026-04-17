@@ -26,7 +26,7 @@ fn managed_client_spawns_ensures_and_searches() {
     let ensure = managed
         .ensure_repo(EnsureRepoParams {
             repo_path: repo_path.clone(),
-            index_path: None,
+            storage_root: None,
             config: RepoConfig::default(),
             refresh: Default::default(),
         })
@@ -42,7 +42,7 @@ fn managed_client_spawns_ensures_and_searches() {
         .search(
             EnsureRepoParams {
                 repo_path,
-                index_path: None,
+                storage_root: None,
                 config: RepoConfig::default(),
                 refresh: Default::default(),
             },
@@ -108,7 +108,7 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
 
     let ensure_params = EnsureRepoParams {
         repo_path: repo_path.clone(),
-        index_path: None,
+        storage_root: None,
         config: RepoConfig::default(),
         refresh: Default::default(),
     };
@@ -175,7 +175,7 @@ fn managed_client_glob_uses_daemon_protocol_scope() {
         .glob(
             EnsureRepoParams {
                 repo_path: repo_path.clone(),
-                index_path: None,
+                storage_root: None,
                 config: RepoConfig::default(),
                 refresh: Default::default(),
             },
@@ -221,7 +221,7 @@ fn managed_client_can_open_without_ensuring_index() {
     let opened = managed
         .open_repo(OpenRepoParams {
             repo_path,
-            index_path: None,
+            storage_root: None,
             config: RepoConfig::default(),
             refresh: Default::default(),
         })
@@ -229,7 +229,7 @@ fn managed_client_can_open_without_ensuring_index() {
     assert!(matches!(
         opened.status.phase,
         codgrep::daemon::protocol::RepoPhase::Opening
-            | codgrep::daemon::protocol::RepoPhase::MissingIndex
+            | codgrep::daemon::protocol::RepoPhase::MissingBaseSnapshot
             | codgrep::daemon::protocol::RepoPhase::ReadyClean
             | codgrep::daemon::protocol::RepoPhase::ReadyDirty
     ));

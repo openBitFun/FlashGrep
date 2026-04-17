@@ -1,5 +1,3 @@
-use std::process::Command;
-
 use codgrep::{BuildConfig, SearchBackend, SearchEngine, SearchPolicy, TokenizerMode};
 
 use crate::common::{count_matches_query, query, TestRepo};
@@ -8,9 +6,9 @@ use crate::common::{count_matches_query, query, TestRepo};
 fn search_engine_uses_index_when_fresh() {
     let repo = TestRepo::new();
     let source = repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");
-    repo.build();
 
     let engine = SearchEngine::new(repo.trigram_build_config());
+    engine.build_base_snapshot().expect("test should succeed");
     let outcome = engine
         .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
         .expect("test should succeed");
@@ -21,21 +19,33 @@ fn search_engine_uses_index_when_fresh() {
 }
 
 #[test]
-fn search_engine_uses_index_without_checking_freshness() {
+fn search_engine_uses_workspace_snapshot_view_when_worktree_is_dirty() {
     let repo = TestRepo::new();
     let tracked = repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
-    repo.build();
-    let new_file = repo.write("new.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
     let engine = SearchEngine::new(repo.trigram_build_config());
+    engine.build_base_snapshot().expect("test should succeed");
+    let new_file = repo.write("new.rs", "const NAME: &str = \"PM_RESUME\";\n");
     let outcome = engine
         .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Index);
-    assert_eq!(outcome.results.hits.len(), 1);
-    assert_eq!(outcome.results.hits[0].path, tracked.to_string_lossy());
-    assert_ne!(outcome.results.hits[0].path, new_file.to_string_lossy());
+    assert_eq!(outcome.results.hits.len(), 2);
+    let mut paths = outcome
+        .results
+        .hits
+        .iter()
+        .map(|hit| hit.path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            new_file.to_string_lossy().into_owned(),
+            tracked.to_string_lossy().into_owned()
+        ]
+    );
 }
 
 #[test]
@@ -95,10 +105,10 @@ fn search_engine_scan_count_matches_honors_max_count_by_matching_line() {
 fn search_engine_reports_worktree_diff_separately() {
     let repo = TestRepo::new();
     repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
-    repo.build();
-    let new_file = repo.write("new.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
     let engine = SearchEngine::new(repo.trigram_build_config());
+    engine.build_base_snapshot().expect("test should succeed");
+    let new_file = repo.write("new.rs", "const NAME: &str = \"PM_RESUME\";\n");
     let diff = engine.diff_against_worktree().expect("test should succeed");
 
     assert!(diff
@@ -114,11 +124,11 @@ fn search_engine_reports_worktree_diff_separately() {
 fn search_engine_uses_index_by_default_when_preflight_is_disabled() {
     let repo = TestRepo::new();
     repo.write("words.txt", "alpha beta gamma\n");
-    repo.build();
 
     let engine = SearchEngine::new(repo.trigram_build_config());
+    engine.build_base_snapshot().expect("test should succeed");
     let outcome = engine
-        .search(&query("\\w+\\s+\\w+"), SearchPolicy::FallbackToScan)
+        .search(&query("beta"), SearchPolicy::FallbackToScan)
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Index);
@@ -134,24 +144,21 @@ fn search_engine_keeps_relative_build_paths_fresh_after_reopen() {
         .parent()
         .expect("temp repo should have a parent")
         .to_path_buf();
-    let index_path = repo_root.join("idx");
+    let storage_root = repo_root.join("idx");
 
-    let status = Command::new(env!("CARGO_BIN_EXE_cg"))
-        .current_dir(&repo_root)
-        .arg("build")
-        .arg("--repo")
-        .arg("repo")
-        .arg("--index")
-        .arg("idx")
-        .arg("--tokenizer")
-        .arg("trigram")
-        .status()
+    let build_engine = SearchEngine::new(BuildConfig {
+        repo_path: repo.repo.clone(),
+        storage_root: storage_root.clone(),
+        tokenizer: TokenizerMode::Trigram,
+        ..repo.trigram_build_config()
+    });
+    build_engine
+        .build_base_snapshot()
         .expect("test should succeed");
-    assert!(status.success());
 
     let engine = SearchEngine::new(BuildConfig {
         repo_path: repo.repo.clone(),
-        index_path,
+        storage_root,
         tokenizer: TokenizerMode::Trigram,
         ..repo.trigram_build_config()
     });

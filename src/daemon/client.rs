@@ -144,16 +144,16 @@ impl DaemonClient {
         self.send(Request::Glob { params })
     }
 
-    pub fn index_build(&self, repo_id: impl Into<String>) -> Result<Response> {
-        self.send(Request::IndexBuild {
+    pub fn base_snapshot_build(&self, repo_id: impl Into<String>) -> Result<Response> {
+        self.send(Request::BaseSnapshotBuild {
             params: RepoRef {
                 repo_id: repo_id.into(),
             },
         })
     }
 
-    pub fn index_rebuild(&self, repo_id: impl Into<String>) -> Result<Response> {
-        self.send(Request::IndexRebuild {
+    pub fn base_snapshot_rebuild(&self, repo_id: impl Into<String>) -> Result<Response> {
+        self.send(Request::BaseSnapshotRebuild {
             params: RepoRef {
                 repo_id: repo_id.into(),
             },

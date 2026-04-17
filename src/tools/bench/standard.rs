@@ -16,14 +16,14 @@ use super::{
 
 pub(super) fn run_codgrep_benchmark(
     benchmark: BenchmarkCase,
-    index_path: &Path,
+    storage_root: &Path,
     suite_dir: &Path,
     cache_paths: Option<&BenchCachePaths>,
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<RunnerSummary> {
     let target = benchmark.corpus.search_target(suite_dir);
-    let daemon = start_bench_daemon(&benchmark.corpus.repo_path(suite_dir), index_path, config)?;
+    let daemon = start_bench_daemon(&benchmark.corpus.repo_path(suite_dir), storage_root, config)?;
     let mut durations = Vec::with_capacity(config.bench_iter);
     let mut match_count = 0;
 
@@ -103,7 +103,7 @@ pub(super) fn run_rg_benchmark(
 pub(super) fn run_worktree_benchmark(
     benchmark: BenchmarkCase,
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     cache_paths: Option<&BenchCachePaths>,
     build_overlay_each_sample: bool,
     config: &BenchConfig,
@@ -113,7 +113,7 @@ pub(super) fn run_worktree_benchmark(
     let mut candidate_docs = None;
     let mut match_count = 0;
     let daemon = (!build_overlay_each_sample)
-        .then(|| start_bench_daemon(repo_path, index_path, config))
+        .then(|| start_bench_daemon(repo_path, storage_root, config))
         .transpose()?;
 
     for _ in 0..config.warmup_iter {
@@ -121,7 +121,7 @@ pub(super) fn run_worktree_benchmark(
         let _ = run_worktree_once(
             daemon.as_ref(),
             repo_path,
-            index_path,
+            storage_root,
             benchmark,
             build_overlay_each_sample,
             config,
@@ -134,7 +134,7 @@ pub(super) fn run_worktree_benchmark(
         let outcome = run_worktree_once(
             daemon.as_ref(),
             repo_path,
-            index_path,
+            storage_root,
             benchmark,
             build_overlay_each_sample,
             config,
@@ -227,26 +227,51 @@ fn run_worktree_query(
     repo_path: &Path,
     config: &BenchConfig,
 ) -> Result<BitfunOutcome> {
+    let target = relocate_worktree_target(
+        &benchmark.corpus.repo_path(&config.suite_dir),
+        &benchmark.corpus.search_target(&config.suite_dir),
+        repo_path,
+    )?;
     run_daemon_search_count(
         daemon,
         repo_path,
         benchmark.pattern,
         benchmark.case_insensitive,
         config,
-        vec![benchmark.corpus.search_target(&config.suite_dir)],
+        vec![target],
     )
+}
+
+fn relocate_worktree_target(
+    source_repo: &Path,
+    source_target: &Path,
+    fixture_repo: &Path,
+) -> Result<std::path::PathBuf> {
+    if source_target == source_repo {
+        return Ok(fixture_repo.to_path_buf());
+    }
+
+    if let Ok(relative) = source_target.strip_prefix(source_repo) {
+        return Ok(fixture_repo.join(relative));
+    }
+
+    Err(AppError::InvalidIndex(format!(
+        "failed to relocate worktree benchmark target {} into fixture {}",
+        source_target.display(),
+        fixture_repo.display()
+    )))
 }
 
 fn run_worktree_once(
     daemon: Option<&super::BenchDaemon>,
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     benchmark: BenchmarkCase,
     build_overlay_each_sample: bool,
     config: &BenchConfig,
 ) -> Result<BitfunOutcome> {
     if build_overlay_each_sample {
-        let daemon = start_bench_daemon(repo_path, index_path, config)?;
+        let daemon = start_bench_daemon(repo_path, storage_root, config)?;
         run_worktree_query(&daemon, benchmark, repo_path, config)
     } else {
         let daemon = daemon.ok_or_else(|| {

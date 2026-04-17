@@ -1,5 +1,7 @@
+use std::fmt::Write as _;
 use std::io::Write;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
 
 use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 
@@ -9,10 +11,13 @@ use crate::{
         protocol::{
             ConsistencyMode, EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec,
             RefreshRepoParams, RepoConfig, RepoRef, Request, SearchModeConfig, SearchParams,
+            DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
         },
         serve, DaemonClient, ManagedDaemonClient, ServerOptions,
     },
     error::{AppError, Result},
+    index_engine::{EngineConfig, IndexDocument, IndexEngine, RepoId, ShardId},
+    search::SearchMode,
     tools::bench::BenchQueryMode,
     tools::bench::{self, BenchCacheMode, BenchConfig},
 };
@@ -30,16 +35,81 @@ struct Cli {
 enum Commands {
     Build(BuildArgs),
     Bench(BenchArgs),
+    Engine(EngineArgs),
     Serve(ServeArgs),
     Daemon(DaemonArgs),
+}
+
+#[derive(Debug, Args)]
+struct EngineArgs {
+    #[command(subcommand)]
+    command: EngineCommands,
+}
+
+#[derive(Debug, Subcommand)]
+enum EngineCommands {
+    Upsert(EngineUpsertArgs),
+    Delete(EngineDeleteArgs),
+    Refresh(EngineRepoArgs),
+    Flush(EngineRepoArgs),
+    Commit(EngineRepoArgs),
+    Search(EngineSearchArgs),
+    Merge(EngineMergeArgs),
+    Status(EngineRepoArgs),
+}
+
+#[derive(Debug, Args, Clone)]
+struct EngineRepoArgs {
+    #[arg(long)]
+    repo: PathBuf,
+    #[arg(long)]
+    index_root: Option<PathBuf>,
+}
+
+#[derive(Debug, Args)]
+struct EngineUpsertArgs {
+    #[command(flatten)]
+    repo: EngineRepoArgs,
+    #[arg(long)]
+    path: PathBuf,
+    #[arg(long)]
+    language: Option<String>,
+}
+
+#[derive(Debug, Args)]
+struct EngineDeleteArgs {
+    #[command(flatten)]
+    repo: EngineRepoArgs,
+    #[arg(long)]
+    path: PathBuf,
+}
+
+#[derive(Debug, Args)]
+struct EngineSearchArgs {
+    #[command(flatten)]
+    repo: EngineRepoArgs,
+    #[arg(index = 1, value_name = "PATTERN")]
+    pattern: String,
+    #[arg(short = 'i', long = "ignore-case", default_value_t = false)]
+    ignore_case: bool,
+    #[arg(long, default_value_t = false)]
+    committed: bool,
+}
+
+#[derive(Debug, Args)]
+struct EngineMergeArgs {
+    #[command(flatten)]
+    repo: EngineRepoArgs,
+    #[arg(long, default_value_t = 1)]
+    max_segments: usize,
 }
 
 #[derive(Debug, Args)]
 struct BuildArgs {
     #[arg(long)]
     repo: PathBuf,
-    #[arg(long)]
-    index: Option<PathBuf>,
+    #[arg(long = "storage-root")]
+    storage_root: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "sparse-ngram")]
     tokenizer: TokenizerArg,
     #[arg(long, value_enum)]
@@ -90,6 +160,8 @@ struct BenchArgs {
     compare_worktree: bool,
     #[arg(long)]
     worktree_sample_files: Option<usize>,
+    #[arg(long, default_value_t = 1)]
+    worktree_dirty_files: usize,
     #[arg(long, default_value_t = false)]
     rebuild: bool,
     #[arg(long)]
@@ -156,8 +228,8 @@ struct DaemonOpenArgs {
     connect: DaemonConnectArgs,
     #[arg(long)]
     repo: PathBuf,
-    #[arg(long)]
-    index: Option<PathBuf>,
+    #[arg(long = "storage-root")]
+    storage_root: Option<PathBuf>,
     #[arg(long, value_enum, default_value = "sparse-ngram")]
     tokenizer: TokenizerArg,
     #[arg(long, value_enum, default_value = "ignore")]
@@ -172,6 +244,15 @@ struct DaemonOpenArgs {
     max_sparse_len: usize,
     #[arg(long, default_value_t = 256)]
     rebuild_dirty_threshold: usize,
+    #[arg(
+        long,
+        default_value_t = DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS
+    )]
+    overlay_auto_checkpoint_max_uncommitted_ops: u64,
+    #[arg(long, default_value_t = 2_000)]
+    overlay_merge_min_delay_ms: u64,
+    #[arg(long, default_value_t = 10_000)]
+    overlay_merge_retry_delay_ms: u64,
 }
 
 #[derive(Debug, Args)]
@@ -339,12 +420,110 @@ pub(crate) fn run() -> Result<bool> {
             compare_rg: args.compare_rg,
             compare_worktree: args.compare_worktree,
             worktree_sample_files: args.worktree_sample_files,
+            worktree_dirty_files: args.worktree_dirty_files,
             rebuild: args.rebuild,
             raw_output: args.raw_output,
             cold_hook: args.cold_hook,
         }),
+        Commands::Engine(args) => run_engine(args),
         Commands::Serve(args) => run_serve(args),
         Commands::Daemon(args) => run_daemon(args),
+    }
+}
+
+fn run_engine(args: EngineArgs) -> Result<bool> {
+    match args.command {
+        EngineCommands::Upsert(args) => {
+            let repo_root = canonical_or_original(&args.repo.repo);
+            let engine = open_index_engine(&args.repo)?;
+            let document = load_engine_document(&repo_root, &args.path, args.language)?;
+            let stamp = engine.writer().add_document(document)?;
+            println!("upserted seq_no={}", stamp.seq_no);
+            Ok(true)
+        }
+        EngineCommands::Delete(args) => {
+            let repo_root = canonical_or_original(&args.repo.repo);
+            let engine = open_index_engine(&args.repo)?;
+            let logical_path = logical_path_from_repo(&repo_root, &args.path)?;
+            let stamp = engine
+                .writer()
+                .delete_document(&crate::index_engine::DocKey {
+                    repo_id: RepoId(repo_root.to_string_lossy().into_owned()),
+                    logical_path,
+                })?;
+            println!("deleted seq_no={}", stamp.seq_no);
+            Ok(true)
+        }
+        EngineCommands::Refresh(args) => {
+            let engine = open_index_engine(&args)?;
+            let stamp = engine.writer().refresh()?;
+            println!("refreshed seq_no={}", stamp.seq_no);
+            Ok(true)
+        }
+        EngineCommands::Flush(args) => {
+            let engine = open_index_engine(&args)?;
+            let result = engine.writer().flush()?;
+            println!(
+                "flushed max_seq_no={} segments={} delete_segments={}",
+                result.max_seq_no,
+                result.segment_ids.len(),
+                result.delete_segment_ids.len()
+            );
+            Ok(true)
+        }
+        EngineCommands::Commit(args) => {
+            let engine = open_index_engine(&args)?;
+            let stamp = engine.writer().commit()?;
+            println!("committed seq_no={}", stamp.seq_no);
+            Ok(true)
+        }
+        EngineCommands::Search(args) => {
+            let engine = open_index_engine(&args.repo)?;
+            let query = crate::index_engine::query::QueryRequest {
+                pattern: args.pattern,
+                mode: SearchMode::MaterializeMatches,
+                case_insensitive: args.ignore_case,
+                top_k: None,
+                filters: crate::index_engine::query::QueryFilters::default(),
+            };
+            let reader = if args.committed {
+                engine.reader().open_committed()?
+            } else {
+                engine.reader().open_snapshot()?
+            };
+            let results = reader.search(&query)?;
+            print_engine_search_results(&results);
+            Ok(true)
+        }
+        EngineCommands::Merge(args) => {
+            let engine = open_index_engine(&args.repo)?;
+            engine.admin().force_merge(args.max_segments)?;
+            let manifest = engine.admin().manifest()?;
+            println!(
+                "merged generation={} active_segments={} active_delete_segments={}",
+                manifest.generation,
+                manifest.active_segments.len(),
+                manifest.active_delete_segments.len()
+            );
+            Ok(true)
+        }
+        EngineCommands::Status(args) => {
+            let engine = open_index_engine(&args)?;
+            let manifest = engine.admin().manifest()?;
+            let stats = engine.writer().stats();
+            println!(
+                "generation={} committed_seq_no={} manifest_refreshed_seq_no={} writer_last_seq_no={} uncommitted_ops={} pending_docs={} active_segments={} active_delete_segments={}",
+                manifest.generation,
+                manifest.committed_seq_no,
+                manifest.refreshed_seq_no,
+                stats.last_seq_no,
+                stats.last_seq_no.saturating_sub(manifest.committed_seq_no),
+                stats.pending_docs,
+                manifest.active_segments.len(),
+                manifest.active_delete_segments.len()
+            );
+            Ok(true)
+        }
     }
 }
 
@@ -356,7 +535,7 @@ fn run_build(args: BuildArgs) -> Result<bool> {
     };
     let params = EnsureRepoParams {
         repo_path: args.repo,
-        index_path: args.index,
+        storage_root: args.storage_root,
         config: RepoConfig {
             tokenizer: match args.tokenizer {
                 TokenizerArg::Trigram => crate::daemon::protocol::TokenizerModeConfig::Trigram,
@@ -381,7 +560,7 @@ fn run_build(args: BuildArgs) -> Result<bool> {
     match ensured.indexed_docs {
         Some(indexed_docs) => {
             println!(
-                "ensured repo via daemon at {}: indexed {indexed_docs} docs",
+                "ensured repo via daemon at {}: built base snapshot with {indexed_docs} docs",
                 ensured.addr
             );
         }
@@ -393,6 +572,106 @@ fn run_build(args: BuildArgs) -> Result<bool> {
         }
     }
     Ok(true)
+}
+
+fn open_index_engine(args: &EngineRepoArgs) -> Result<IndexEngine> {
+    let repo_root = canonical_or_original(&args.repo);
+    let index_root = args
+        .index_root
+        .clone()
+        .unwrap_or_else(|| repo_root.join(".codgrep-index-engine"));
+    IndexEngine::open(EngineConfig {
+        shard_id: ShardId(repo_root.to_string_lossy().into_owned()),
+        index_root,
+        ..EngineConfig::default()
+    })
+}
+
+fn load_engine_document(
+    repo_root: &Path,
+    path: &Path,
+    language: Option<String>,
+) -> Result<IndexDocument> {
+    let absolute_path = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        repo_root.join(path)
+    };
+    let logical_path = logical_path_from_repo(repo_root, &absolute_path)?;
+    let bytes = std::fs::read(&absolute_path)?;
+    let metadata = std::fs::metadata(&absolute_path)?;
+    let modified_at = metadata
+        .modified()
+        .ok()
+        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+        .map(|duration| duration.as_secs())
+        .unwrap_or_default();
+    let repo_id = RepoId(repo_root.to_string_lossy().into_owned());
+    let mut content_hash = [0u8; 32];
+    let crc = crc32fast::hash(&bytes);
+    content_hash[..4].copy_from_slice(&crc.to_le_bytes());
+    let file_name = absolute_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .ok_or_else(|| {
+            AppError::Protocol(format!("invalid file name: {}", absolute_path.display()))
+        })?
+        .to_string();
+
+    Ok(IndexDocument {
+        key: crate::index_engine::DocKey {
+            repo_id: repo_id.clone(),
+            logical_path: logical_path.clone(),
+        },
+        repo_id,
+        logical_path,
+        file_name,
+        language: language.or_else(|| infer_language(&absolute_path)),
+        size: bytes.len() as u64,
+        modified_at,
+        content_hash,
+        source_bytes: std::sync::Arc::<[u8]>::from(bytes),
+    })
+}
+
+fn logical_path_from_repo(repo_root: &Path, path: &Path) -> Result<String> {
+    let path = canonical_or_original(path);
+    let repo_root = canonical_or_original(repo_root);
+    let relative = path.strip_prefix(&repo_root).map_err(|_| {
+        AppError::Protocol(format!(
+            "path {} is not under repo root {}",
+            path.display(),
+            repo_root.display()
+        ))
+    })?;
+    Ok(relative.to_string_lossy().into_owned())
+}
+
+fn canonical_or_original(path: &Path) -> PathBuf {
+    std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf())
+}
+
+fn infer_language(path: &Path) -> Option<String> {
+    Some(path.extension()?.to_string_lossy().to_ascii_lowercase())
+}
+
+fn print_engine_search_results(results: &crate::search::SearchResults) {
+    println!(
+        "candidate_docs={} searches_with_match={} matched_lines={} matched_occurrences={}",
+        results.candidate_docs,
+        results.searches_with_match,
+        results.matched_lines,
+        results.matched_occurrences
+    );
+    for hit in &results.hits {
+        println!("file {}", hit.path);
+        for file_match in &hit.matches {
+            println!(
+                "  {}:{} {}",
+                file_match.location.line, file_match.location.column, file_match.matched_text
+            );
+        }
+    }
 }
 
 fn run_serve(args: ServeArgs) -> Result<bool> {
@@ -420,7 +699,7 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
             let client = DaemonClient::new(addr);
             let response = client.ensure_repo(crate::daemon::protocol::EnsureRepoParams {
                 repo_path: open.repo_path,
-                index_path: open.index_path,
+                storage_root: open.storage_root,
                 config: open.config,
                 refresh: open.refresh,
             })?;
@@ -434,7 +713,7 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
                     repo_id: args.repo_id,
                 },
             })?;
-            print_daemon_response(&response)?;
+            print_daemon_status_response(&response)?;
             Ok(true)
         }
         DaemonCommands::Refresh(args) => {
@@ -450,7 +729,7 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
         }
         DaemonCommands::Build(args) => {
             let client = DaemonClient::new(args.connect.addr);
-            let response = client.send(Request::BuildIndex {
+            let response = client.send(Request::BuildBaseSnapshot {
                 params: RepoRef {
                     repo_id: args.repo_id,
                 },
@@ -460,7 +739,7 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
         }
         DaemonCommands::Rebuild(args) => {
             let client = DaemonClient::new(args.connect.addr);
-            let response = client.send(Request::RebuildIndex {
+            let response = client.send(Request::RebuildBaseSnapshot {
                 params: RepoRef {
                     repo_id: args.repo_id,
                 },
@@ -561,7 +840,7 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
 fn build_daemon_open_params(args: DaemonOpenArgs) -> OpenRepoParams {
     OpenRepoParams {
         repo_path: args.repo,
-        index_path: args.index,
+        storage_root: args.storage_root,
         config: RepoConfig {
             tokenizer: match args.tokenizer {
                 TokenizerArg::Trigram => crate::daemon::protocol::TokenizerModeConfig::Trigram,
@@ -580,6 +859,10 @@ fn build_daemon_open_params(args: DaemonOpenArgs) -> OpenRepoParams {
         },
         refresh: crate::daemon::protocol::RefreshPolicyConfig {
             rebuild_dirty_threshold: args.rebuild_dirty_threshold,
+            overlay_auto_checkpoint_max_uncommitted_ops: args
+                .overlay_auto_checkpoint_max_uncommitted_ops,
+            overlay_merge_min_delay_ms: args.overlay_merge_min_delay_ms,
+            overlay_merge_retry_delay_ms: args.overlay_merge_retry_delay_ms,
         },
     }
 }
@@ -592,6 +875,98 @@ fn print_daemon_response(response: &crate::daemon::protocol::Response) -> Result
     })?;
     stdout.write_all(b"\n")?;
     Ok(())
+}
+
+fn print_daemon_status_response(response: &crate::daemon::protocol::Response) -> Result<()> {
+    match response {
+        crate::daemon::protocol::Response::RepoStatus { status } => {
+            let stdout = std::io::stdout();
+            let mut stdout = stdout.lock();
+            stdout.write_all(format_repo_status_human(status).as_bytes())?;
+            Ok(())
+        }
+        _ => print_daemon_response(response),
+    }
+}
+
+fn format_repo_status_human(status: &crate::daemon::protocol::RepoStatus) -> String {
+    let mut output = String::new();
+    let _ = writeln!(output, "repo_id: {}", status.repo_id);
+    let _ = writeln!(output, "repo_path: {}", status.repo_path);
+    let _ = writeln!(output, "storage_root: {}", status.storage_root);
+    let _ = writeln!(output, "base_snapshot_root: {}", status.base_snapshot_root);
+    let _ = writeln!(
+        output,
+        "workspace_overlay_root: {}",
+        status.workspace_overlay_root
+    );
+    let _ = writeln!(output, "phase: {:?}", status.phase);
+    let _ = writeln!(
+        output,
+        "snapshot_key: {}",
+        status.snapshot_key.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(
+        output,
+        "last_probe_unix_secs: {}",
+        status
+            .last_probe_unix_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
+    let _ = writeln!(
+        output,
+        "last_rebuild_unix_secs: {}",
+        status
+            .last_rebuild_unix_secs
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".into())
+    );
+    let _ = writeln!(
+        output,
+        "dirty_files: modified={} deleted={} new={}",
+        status.dirty_files.modified, status.dirty_files.deleted, status.dirty_files.new
+    );
+    let _ = writeln!(
+        output,
+        "rebuild_recommended: {}",
+        status.rebuild_recommended
+    );
+    let _ = writeln!(
+        output,
+        "active_task_id: {}",
+        status.active_task_id.as_deref().unwrap_or("-")
+    );
+    let _ = writeln!(output, "probe_healthy: {}", status.probe_healthy);
+    let _ = writeln!(
+        output,
+        "last_error: {}",
+        status.last_error.as_deref().unwrap_or("-")
+    );
+    if let Some(overlay) = &status.overlay {
+        let _ = writeln!(output, "overlay:");
+        let _ = writeln!(output, "  committed_seq_no: {}", overlay.committed_seq_no);
+        let _ = writeln!(output, "  last_seq_no: {}", overlay.last_seq_no);
+        let _ = writeln!(output, "  uncommitted_ops: {}", overlay.uncommitted_ops);
+        let _ = writeln!(output, "  pending_docs: {}", overlay.pending_docs);
+        let _ = writeln!(output, "  active_segments: {}", overlay.active_segments);
+        let _ = writeln!(
+            output,
+            "  active_delete_segments: {}",
+            overlay.active_delete_segments
+        );
+        let _ = writeln!(output, "  merge_requested: {}", overlay.merge_requested);
+        let _ = writeln!(output, "  merge_running: {}", overlay.merge_running);
+        let _ = writeln!(output, "  merge_attempts: {}", overlay.merge_attempts);
+        let _ = writeln!(output, "  merge_completed: {}", overlay.merge_completed);
+        let _ = writeln!(output, "  merge_failed: {}", overlay.merge_failed);
+        let _ = writeln!(
+            output,
+            "  last_merge_error: {}",
+            overlay.last_merge_error.as_deref().unwrap_or("-")
+        );
+    }
+    output
 }
 
 fn combine_daemon_patterns(patterns: &[String], fixed_strings: bool) -> String {
@@ -625,4 +1000,52 @@ fn run_bench(config: BenchConfig) -> Result<bool> {
     let report = bench::run(&config)?;
     bench::print_report(&report);
     Ok(true)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::format_repo_status_human;
+
+    #[test]
+    fn format_repo_status_human_includes_overlay_section() {
+        let status = crate::daemon::protocol::RepoStatus {
+            repo_id: "/tmp/repo".into(),
+            repo_path: "/tmp/repo".into(),
+            storage_root: "/tmp/repo/.codgrep-index-engine".into(),
+            base_snapshot_root: "/tmp/repo/.codgrep-index-engine/base-snapshot".into(),
+            workspace_overlay_root: "/tmp/repo/.codgrep-index-engine/workspace-overlay".into(),
+            phase: crate::daemon::protocol::RepoPhase::ReadyDirty,
+            snapshot_key: Some("snapshot-key".into()),
+            last_probe_unix_secs: Some(1),
+            last_rebuild_unix_secs: Some(2),
+            dirty_files: crate::daemon::protocol::DirtyFileStats {
+                modified: 1,
+                deleted: 2,
+                new: 3,
+            },
+            rebuild_recommended: false,
+            active_task_id: None,
+            probe_healthy: true,
+            last_error: None,
+            overlay: Some(crate::daemon::protocol::WorkspaceOverlayStatus {
+                committed_seq_no: 4,
+                last_seq_no: 5,
+                uncommitted_ops: 1,
+                pending_docs: 0,
+                active_segments: 2,
+                active_delete_segments: 1,
+                merge_requested: true,
+                merge_running: false,
+                merge_attempts: 7,
+                merge_completed: 6,
+                merge_failed: 1,
+                last_merge_error: Some("merge failed".into()),
+            }),
+        };
+
+        let rendered = format_repo_status_human(&status);
+        assert!(rendered.contains("overlay:"));
+        assert!(rendered.contains("merge_attempts: 7"));
+        assert!(rendered.contains("last_merge_error: merge failed"));
+    }
 }

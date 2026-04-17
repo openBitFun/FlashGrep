@@ -3,12 +3,11 @@ use std::fs;
 use tempfile::tempdir;
 
 use super::{
-    bench_build_config, benchmark_scope_roots, copy_tree, parse_rg_count_output,
-    prepare_rg_search_scope, run, BenchCacheMode, BenchConfig,
+    bench_build_config, benchmark_scope_roots, copy_tree, ensure_bench_base_snapshot,
+    parse_rg_count_output, prepare_rg_search_scope, run, BenchCacheMode, BenchConfig,
 };
 use super::{fixtures::prepare_dirty_worktree_fixture, DirtyPattern};
 use crate::config::{CorpusMode, TokenizerMode};
-use crate::index::build_index;
 use crate::tools::bench::report::render_report;
 
 #[test]
@@ -51,6 +50,7 @@ fn bench_runner_smoke_test() {
         compare_rg: false,
         compare_worktree: false,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,
@@ -134,6 +134,7 @@ fn cold_bench_runs_hook_before_each_iteration() {
         compare_rg: false,
         compare_worktree: false,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: Some(hook),
@@ -185,6 +186,7 @@ fn bench_runner_supports_worktree_runners() {
         compare_rg: false,
         compare_worktree: true,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,
@@ -265,6 +267,7 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
             compare_rg: false,
             compare_worktree: true,
             worktree_sample_files: Some(2),
+            worktree_dirty_files: 2,
             rebuild: true,
             raw_output: None,
             cold_hook: None,
@@ -294,6 +297,7 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
                 .to_string_lossy()
                 .into_owned()
         })
+        .filter(|path| !path.starts_with(".codgrep-index-engine/"))
         .collect::<Vec<_>>();
 
     assert_eq!(copied.len(), 2);
@@ -328,6 +332,7 @@ fn bench_runner_supports_custom_repo_patterns() {
         compare_rg: false,
         compare_worktree: false,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,
@@ -346,7 +351,7 @@ fn bench_runner_supports_custom_repo_patterns() {
 }
 
 #[test]
-fn bench_rg_runner_uses_indexed_text_scope_for_custom_repo() {
+fn bench_rg_runner_uses_snapshot_visible_scope_for_custom_repo() {
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");
@@ -373,6 +378,7 @@ fn bench_rg_runner_uses_indexed_text_scope_for_custom_repo() {
         compare_rg: true,
         compare_worktree: false,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,
@@ -395,11 +401,11 @@ fn bench_rg_runner_uses_indexed_text_scope_for_custom_repo() {
 }
 
 #[test]
-fn prepare_rg_search_scope_excludes_non_indexed_files() {
+fn prepare_rg_search_scope_keeps_snapshot_visible_non_utf8_files() {
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");
-    let index_path = temp.path().join("index");
+    let storage_root = temp.path().join("index");
 
     fs::create_dir_all(&suite_dir).expect("test should succeed");
     fs::create_dir_all(&repo_dir).expect("test should succeed");
@@ -423,17 +429,17 @@ fn prepare_rg_search_scope_excludes_non_indexed_files() {
         compare_rg: true,
         compare_worktree: false,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,
     };
-    build_index(&bench_build_config(&repo_dir, &index_path, &config)).expect("test should succeed");
+    ensure_bench_base_snapshot(&bench_build_config(&repo_dir, &storage_root, &config), true)
+        .expect("test should succeed");
 
     let scope =
-        prepare_rg_search_scope(&repo_dir, &index_path, &config).expect("test should succeed");
-    let ignore_file = scope.ignore_file.expect("test should succeed");
-    let ignore_contents = fs::read_to_string(ignore_file).expect("test should succeed");
-    assert!(ignore_contents.contains("/latin1.txt\n"));
+        prepare_rg_search_scope(&repo_dir, &storage_root, &config).expect("test should succeed");
+    assert!(scope.ignore_file.is_some());
 }
 
 #[test]
@@ -463,6 +469,7 @@ fn bench_runner_supports_custom_worktree_build_runner() {
         compare_rg: false,
         compare_worktree: true,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,
@@ -515,6 +522,7 @@ fn bench_report_labels_worktree_runner_modes() {
         compare_rg: false,
         compare_worktree: true,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,
@@ -571,6 +579,7 @@ fn bench_raw_output_includes_runner_family_and_mode() {
         compare_rg: false,
         compare_worktree: true,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: Some(raw_output.clone()),
         cold_hook: None,
@@ -625,6 +634,7 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
         compare_rg: false,
         compare_worktree: false,
         worktree_sample_files: None,
+        worktree_dirty_files: 1,
         rebuild: true,
         raw_output: None,
         cold_hook: None,

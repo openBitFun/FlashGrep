@@ -14,6 +14,7 @@ use std::{
 };
 
 use crate::{
+    base_snapshot_build::{BaseSnapshotBuildMode, BaseSnapshotBuildOptions},
     config::{BuildConfig, CorpusMode, TokenizerMode},
     daemon::{
         protocol::{
@@ -24,7 +25,7 @@ use crate::{
     },
     error::{AppError, Result},
     files::{repo_relative_path, scan_repository},
-    index::{build_index, IndexSearcher},
+    index_engine::{RepoId, WorkspaceBaseSnapshotIndex},
 };
 
 use self::{
@@ -53,6 +54,7 @@ pub(crate) struct BenchConfig {
     pub(crate) compare_rg: bool,
     pub(crate) compare_worktree: bool,
     pub(crate) worktree_sample_files: Option<usize>,
+    pub(crate) worktree_dirty_files: usize,
     pub(crate) rebuild: bool,
     pub(crate) raw_output: Option<PathBuf>,
     pub(crate) cold_hook: Option<String>,
@@ -142,12 +144,12 @@ impl Corpus {
 
 pub(super) fn bench_build_config(
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     config: &BenchConfig,
 ) -> BuildConfig {
     BuildConfig {
         repo_path: repo_path.to_path_buf(),
-        index_path: index_path.to_path_buf(),
+        storage_root: storage_root.to_path_buf(),
         tokenizer: config.tokenizer,
         corpus_mode: config.corpus_mode,
         include_hidden: false,
@@ -165,27 +167,6 @@ pub(super) fn configure_rg_command(command: &mut Command, config: &BenchConfig) 
     if matches!(config.corpus_mode, CorpusMode::NoIgnore) {
         command.arg("--no-ignore");
     }
-}
-
-pub(super) fn bench_index_is_usable(index_path: &Path, expected: &BuildConfig) -> bool {
-    let Ok(searcher) = IndexSearcher::open(index_path.to_path_buf()) else {
-        return false;
-    };
-    if searcher.tokenizer_mode() != expected.tokenizer {
-        return false;
-    }
-    let tokenizer_options = searcher.tokenizer_options();
-    if tokenizer_options.min_sparse_len != expected.min_sparse_len
-        || tokenizer_options.max_sparse_len != expected.max_sparse_len
-    {
-        return false;
-    }
-    let Some(build) = searcher.build_settings() else {
-        return false;
-    };
-    build.corpus_mode == expected.corpus_mode
-        && build.include_hidden == expected.include_hidden
-        && build.max_file_size == expected.max_file_size
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -232,10 +213,16 @@ struct BenchCachePaths {
     index_files: Vec<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy)]
+pub(super) struct BenchBaseSnapshotBuild {
+    pub(super) indexed_docs: usize,
+    pub(super) reused_existing: bool,
+}
+
 #[derive(Debug, Clone)]
 struct DirtyWorktreeFixture {
     repo_path: PathBuf,
-    index_path: PathBuf,
+    storage_root: PathBuf,
     cache_paths: Option<BenchCachePaths>,
     build_cache_paths: Option<BenchCachePaths>,
 }
@@ -433,7 +420,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
         .iter()
         .map(|case| case.corpus)
         .collect::<std::collections::BTreeSet<_>>();
-    let mut index_paths = BTreeMap::new();
+    let mut storage_roots = BTreeMap::new();
     let mut rg_scopes = BTreeMap::new();
     let mut cache_paths = BTreeMap::new();
     let mut dirty_worktree_fixtures = BTreeMap::new();
@@ -442,42 +429,39 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
     for corpus in corpora {
         ensure_corpus_exists(corpus, &config.suite_dir)?;
         let repo_path = corpus.repo_path(&config.suite_dir);
-        let index_path = config.suite_dir.join(".codgrep-bench").join(format!(
+        let storage_root = config.suite_dir.join(".codgrep-bench").join(format!(
             "{}-{}-{}",
             corpus.label(),
             config.corpus_mode.as_str(),
             config.tokenizer.as_str()
         ));
-        let build_config = bench_build_config(&repo_path, &index_path, config);
+        let build_config = bench_build_config(&repo_path, &storage_root, config);
 
-        if config.rebuild && index_path.exists() {
-            fs::remove_dir_all(&index_path)?;
-        }
-        if config.rebuild || !bench_index_is_usable(&index_path, &build_config) {
-            let started = std::time::Instant::now();
-            let docs_indexed = build_index(&build_config)?;
+        let started = std::time::Instant::now();
+        let snapshot = ensure_bench_base_snapshot(&build_config, config.rebuild)?;
+        if config.rebuild || !snapshot.reused_existing {
             corpus_builds.push(CorpusBuildRecord {
                 corpus: corpus.label().to_string(),
                 tokenizer: config.tokenizer,
-                docs_indexed,
+                docs_indexed: snapshot.indexed_docs,
                 duration_secs: started.elapsed().as_secs_f64(),
             });
         }
         rg_scopes.insert(
             corpus,
-            prepare_rg_search_scope(&repo_path, &index_path, config)?,
+            prepare_rg_search_scope(&repo_path, &storage_root, config)?,
         );
         let cache_entry = if config.cache_mode.is_cold() {
             Some(collect_cache_paths(
                 corpus,
                 &repo_path,
-                &index_path,
+                &storage_root,
                 config,
             )?)
         } else {
             None
         };
-        index_paths.insert(corpus, index_path.clone());
+        storage_roots.insert(corpus, storage_root.clone());
         if let Some(cache_entry) = cache_entry {
             cache_paths.insert(corpus, cache_entry);
         }
@@ -508,16 +492,16 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
 
     let mut summaries = Vec::new();
     for benchmark in selected {
-        let index_path = index_paths.get(&benchmark.corpus).ok_or_else(|| {
+        let storage_root = storage_roots.get(&benchmark.corpus).ok_or_else(|| {
             AppError::InvalidIndex(format!(
-                "missing benchmark index for corpus {}",
+                "missing benchmark storage root for corpus {}",
                 benchmark.corpus.label()
             ))
         })?;
         let cache_paths = cache_paths.get(&benchmark.corpus);
         let mut runners = vec![run_codgrep_benchmark(
             benchmark,
-            index_path,
+            storage_root,
             &config.suite_dir,
             cache_paths,
             config,
@@ -552,7 +536,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             runners.push(run_worktree_benchmark(
                 benchmark,
                 &fixture.repo_path,
-                &fixture.index_path,
+                &fixture.storage_root,
                 fixture.build_cache_paths.as_ref(),
                 true,
                 config,
@@ -561,7 +545,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             runners.push(run_worktree_benchmark(
                 benchmark,
                 &fixture.repo_path,
-                &fixture.index_path,
+                &fixture.storage_root,
                 fixture.cache_paths.as_ref(),
                 false,
                 config,
@@ -607,6 +591,22 @@ fn validate_config(config: &BenchConfig) -> Result<()> {
         return Err(AppError::InvalidPattern(
             "--worktree-sample-files must be greater than zero".into(),
         ));
+    }
+    if config.worktree_dirty_files == 0 {
+        return Err(AppError::InvalidPattern(
+            "--worktree-dirty-files must be greater than zero".into(),
+        ));
+    }
+    if config.compare_worktree
+        && config
+            .worktree_sample_files
+            .is_some_and(|limit| limit < config.worktree_dirty_files)
+    {
+        return Err(AppError::InvalidPattern(format!(
+            "--worktree-sample-files ({}) must be >= --worktree-dirty-files ({})",
+            config.worktree_sample_files.unwrap_or_default(),
+            config.worktree_dirty_files
+        )));
     }
     Ok(())
 }
@@ -673,14 +673,14 @@ fn parse_rg_count_output(stdout: &[u8]) -> Result<usize> {
 
 pub(super) fn prepare_rg_search_scope(
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     config: &BenchConfig,
 ) -> Result<RgSearchScope> {
     if repo_path.is_dir() {
         return Ok(RgSearchScope {
             current_dir: Some(repo_path.to_path_buf()),
             target: PathBuf::from("."),
-            ignore_file: prepare_rg_ignore_file(repo_path, index_path, config)?,
+            ignore_file: prepare_rg_ignore_file(repo_path, storage_root, config)?,
         });
     }
 
@@ -693,28 +693,24 @@ pub(super) fn prepare_rg_search_scope(
 
 fn prepare_rg_ignore_file(
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     config: &BenchConfig,
 ) -> Result<Option<PathBuf>> {
     let repo_root = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
-    let indexed = IndexSearcher::open(index_path.to_path_buf())?
-        .indexed_paths(None)
-        .into_iter()
-        .map(|path| canonical_repo_relative_path(Path::new(&path), &repo_root))
-        .collect::<HashSet<_>>();
-    let excluded = scan_repository(&bench_build_config(repo_path, index_path, config))?
+    let visible_paths = bench_visible_paths(repo_path, storage_root, config)?;
+    let excluded = scan_repository(&bench_build_config(repo_path, storage_root, config))?
         .into_iter()
         .filter_map(|file| {
             let rel = canonical_repo_relative_path(&file.path, &repo_root);
-            (!indexed.contains(&rel)).then_some(rel)
+            (!visible_paths.contains(&rel)).then_some(rel)
         })
         .collect::<Vec<_>>();
     if excluded.is_empty() {
         return Ok(None);
     }
 
-    fs::create_dir_all(index_path)?;
-    let ignore_path = index_path.join("bench-rg-exclude.ignore");
+    fs::create_dir_all(storage_root)?;
+    let ignore_path = storage_root.join("bench-rg-exclude.ignore");
     let mut contents = String::new();
     for path in excluded {
         contents.push('/');
@@ -723,6 +719,20 @@ fn prepare_rg_ignore_file(
     }
     fs::write(&ignore_path, contents)?;
     Ok(Some(ignore_path))
+}
+
+fn bench_visible_paths(
+    repo_path: &Path,
+    storage_root: &Path,
+    config: &BenchConfig,
+) -> Result<HashSet<String>> {
+    let build_config = bench_build_config(repo_path, storage_root, config);
+    let snapshot = WorkspaceBaseSnapshotIndex::open_read_only(&build_config)?.open_committed()?;
+    Ok(snapshot
+        .visible_documents()?
+        .into_keys()
+        .map(|key| key.logical_path)
+        .collect())
 }
 
 fn canonical_repo_relative_path(path: &Path, repo_root: &Path) -> String {
@@ -782,13 +792,13 @@ fn codgrep_executable() -> Result<PathBuf> {
 
 pub(super) fn start_bench_daemon(
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     config: &BenchConfig,
 ) -> Result<BenchDaemon> {
     let managed = ManagedDaemonClient::new().with_daemon_program(codgrep_executable()?);
     let ensured = managed.ensure_repo(EnsureRepoParams {
         repo_path: repo_path.to_path_buf(),
-        index_path: Some(index_path.to_path_buf()),
+        storage_root: Some(storage_root.to_path_buf()),
         config: RepoConfig {
             tokenizer: match config.tokenizer {
                 TokenizerMode::Trigram => crate::daemon::protocol::TokenizerModeConfig::Trigram,
@@ -873,6 +883,26 @@ pub(super) fn benchmark_scope_roots(repo_path: &Path, roots: Vec<PathBuf>) -> Ve
         .into_iter()
         .filter_map(|root| normalize_scope_root(repo_path, canonical_repo.as_deref(), root))
         .collect()
+}
+
+pub(super) fn ensure_bench_base_snapshot(
+    build_config: &BuildConfig,
+    rebuild: bool,
+) -> Result<BenchBaseSnapshotBuild> {
+    let build_mode = if rebuild {
+        BaseSnapshotBuildMode::ForceRebuildSnapshot
+    } else {
+        BaseSnapshotBuildMode::ReuseExistingSnapshot
+    };
+    let result = WorkspaceBaseSnapshotIndex::build_with_options(
+        build_config,
+        &RepoId(build_config.repo_path.to_string_lossy().into_owned()),
+        BaseSnapshotBuildOptions::new().with_build_mode(build_mode),
+    )?;
+    Ok(BenchBaseSnapshotBuild {
+        indexed_docs: result.indexed_docs,
+        reused_existing: result.reused_existing,
+    })
 }
 
 fn normalize_scope_root(

@@ -1,49 +1,49 @@
+mod base_snapshot_build;
 mod cli;
 mod config;
 pub mod daemon;
 pub mod error;
 mod files;
-mod index;
+mod git_snapshot;
+pub mod index_engine;
 mod json_output;
 mod path_filter;
 mod path_utils;
 mod planner;
 mod progress;
-mod query_preflight;
+mod query_runtime;
 mod search;
 mod search_engine;
 mod tokenizer;
 mod tools;
 mod workspace;
+mod worktree_diff;
 
 pub use error::{AppError, Result};
 
+#[deprecated(
+    note = "Index lifecycle option types remain available for workspace/base snapshot orchestration, but prefer the daemon process API for external integrations."
+)]
+pub use base_snapshot_build::{BaseSnapshotBuildMode, BaseSnapshotBuildOptions};
 #[deprecated(
     note = "Use the daemon process API (`codgrep::daemon::protocol`); library exports are not the stable external interface."
 )]
 pub use config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode};
 #[deprecated(
-    note = "Use daemon protocol requests for index lifecycle; direct library build functions are not the stable external interface."
-)]
-pub use index::{
-    build_index, build_index_with_options, rebuild_index, rebuild_index_with_options,
-    IndexBuildOptions, RebuildMode,
-};
-#[deprecated(
     note = "Use daemon protocol search responses/results; library search models are not the stable external interface."
 )]
 pub use search::{SearchMode, SearchResults};
-#[deprecated(
-    note = "Use the daemon process API instead of direct library search facades."
-)]
+#[deprecated(note = "Use the daemon process API instead of direct library search facades.")]
 pub use search_engine::{SearchBackend, SearchEngine, SearchPolicy, SearchResponse};
-#[deprecated(
-    note = "Use the daemon process API instead of direct workspace library facades."
-)]
+#[deprecated(note = "Use the daemon process API instead of direct workspace library facades.")]
 pub use workspace::{
     WorkspaceFreshness, WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions,
     WorkspaceSearchProfile, WorkspaceSearchTimings, WorkspaceSnapshot,
 };
+#[deprecated(
+    note = "Use daemon protocol workspace/status APIs; raw worktree diff types are not the stable external contract."
+)]
+pub use worktree_diff::IndexWorktreeDiff;
 
 /// Expert-facing API surface for advanced integration scenarios.
 #[deprecated(
@@ -54,9 +54,7 @@ pub mod advanced {
         read_text_file, repo_relative_path, resolve_repo_path, scan_paths, scan_repository,
         RepositoryFile, ScanOptions,
     };
-    pub use crate::index::{IndexSearcher, IndexWorktreeDiff};
     pub use crate::path_filter::{normalize_path, PathFilter, PathFilterArgs};
-    pub use crate::progress::{IndexProgress, IndexProgressPhase};
     pub use crate::search::{
         FileContext, FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine,
     };
@@ -82,12 +80,8 @@ pub mod advanced {
 )]
 pub mod experimental {
     pub use crate::planner::{plan, PureLiteralAlternation, QueryBranch, QueryPlan};
+    pub use crate::progress::{IndexProgress, IndexProgressPhase};
     pub use crate::tokenizer::{create, hash_token, unique_sorted, Tokenizer, TokenizerOptions};
-
-    /// Low-level on-disk index format helpers.
-    pub mod index_format {
-        pub use crate::index::format::*;
-    }
 }
 
 #[doc(hidden)]

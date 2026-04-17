@@ -7,7 +7,7 @@
 对接入方式的建议是：
 
 - 跨语言 / 跨进程 / 自定义 transport 封装：以本协议为准。
-- Rust 调用方：优先使用 `codgrep::sdk`，避免在产品代码里直接拼 protocol 请求。
+- Rust 调用方：优先使用 `DaemonClient` / `ManagedDaemonClient` 这类基础客户端封装，避免直接拼 protocol 请求。
 
 这个协议面向三类调用方：
 
@@ -36,7 +36,7 @@ v1 采用 `JSON-RPC 2.0` 风格消息：
 - `stdio`：推荐给编辑器 / agent 集成，framing 为 LSP 风格 `Content-Length`
 - `tcp` / `unix socket`：推荐给常驻本地 daemon
 
-Rust SDK 目前默认封装的是本地 daemon 场景；其中 `ManagedDaemonClient` / `codgrep::sdk::ManagedClient` 会按 `index_path/daemon-state.json` 发现或拉起 daemon，并通过同目录下的 `daemon-state.lock` 协调并发启动。
+Rust 侧当前提供的是围绕本地 daemon 的基础客户端封装；其中 `ManagedDaemonClient` 会按 `storage_root/daemon-state.json` 发现或拉起 daemon，并通过同目录下的 `daemon-state.lock` 协调并发启动。
 
 ## 顶层消息
 
@@ -100,12 +100,13 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 协议层不预留宿主产品私有目录名。
 
-当前实现只把下面两类路径视为 `codgrep` 自己的内部产物：
+当前实现只把下面这些路径视为 `codgrep` 自己的内部产物：
 
-- `.codgrep-index`
+- `.codgrep-index-engine`
+- `.codgrep-index`（legacy 兼容保留，仅用于忽略旧产物）
 - `.codgrep-bench`
 
-此外，调用方显式传入的 `index_path` 也会被视为内部路径并从扫描/搜索候选中排除。
+此外，调用方显式传入的 `storage_root` 也会被视为内部路径并从扫描/搜索候选中排除。
 
 ### `RepoStatus`
 
@@ -113,7 +114,9 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 {
   "repo_id": "/path/to/repo",
   "repo_path": "/path/to/repo",
-  "index_path": "/path/to/repo/.codgrep-index",
+  "storage_root": "/path/to/repo/.codgrep-index-engine",
+  "base_snapshot_root": "/path/to/repo/.codgrep-index-engine/base-snapshot",
+  "workspace_overlay_root": "/path/to/repo/.codgrep-index-engine/workspace-overlay",
   "phase": "ready_dirty",
   "snapshot_key": "base-git:abc123+cfg:deadbeef",
   "last_probe_unix_secs": 1710000000,
@@ -144,7 +147,23 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 - `phase` 表示 repo 当前对外可见状态
 - 长任务是否仍在运行，由 `active_task_id` 和 `task/status` 表达
-- `ready_dirty` 表示 daemon 允许在 base index 之上叠加当前 worktree 视图
+- `ready_dirty` 表示 daemon 已经或即将通过 overlay snapshot 表达当前 worktree 增量视图
+- `overlay` 存在时表示 daemon 已打开 workspace overlay engine，并暴露其当前已发布 overlay 与后台维护状态
+
+`overlay` 字段：
+
+- `committed_seq_no`
+- `last_seq_no`
+- `uncommitted_ops`
+- `pending_docs`
+- `active_segments`
+- `active_delete_segments`
+- `merge_requested`
+- `merge_running`
+- `merge_attempts`
+- `merge_completed`
+- `merge_failed`
+- `last_merge_error`
 
 ### `TaskStatus`
 
@@ -152,7 +171,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 {
   "task_id": "task-7",
   "workspace_id": "/path/to/repo",
-  "kind": "build_index",
+  "kind": "build_base_snapshot",
   "state": "running",
   "phase": "tokenizing",
   "message": "Tokenizing repository files",
@@ -168,8 +187,8 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 `kind` 枚举：
 
-- `build_index`
-- `rebuild_index`
+- `build_base_snapshot`
+- `rebuild_base_snapshot`
 - `refresh_workspace`
 
 `state` 枚举：
@@ -188,13 +207,18 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 - `finalizing`
 - `refreshing_overlay`
 
+说明：
+
+- 当前 base snapshot build 主路径通常只会发出 `scanning` 和 `finalizing`。
+- `tokenizing` / `writing` 仍保留在协议里，作为更细粒度构建阶段的前向兼容枚举。
+
 ### `SearchCompleted`
 
 ```json
 {
   "kind": "search_completed",
   "repo_id": "/path/to/repo",
-  "backend": "indexed_workspace_repair",
+  "backend": "indexed_workspace_view",
   "consistency_applied": "workspace_eventual",
   "status": {},
   "results": {
@@ -212,7 +236,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 - `indexed_snapshot`
 - `indexed_clean`
-- `indexed_workspace_repair`
+- `indexed_workspace_view`
 - `rg_fallback`
 - `scan_fallback`
 
@@ -243,13 +267,13 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 - `ensure_repo`
 - `get_repo_status`
 - `refresh_repo`
-- `build_index`
-- `rebuild_index`
+- `build_base_snapshot`
+- `rebuild_base_snapshot`
 - `search`
 - `glob`
 - `close_repo`
-- `index/build`
-- `index/rebuild`
+- `base_snapshot/build`
+- `base_snapshot/rebuild`
 - `task/status`
 - `task/cancel`
 - `shutdown`
@@ -257,8 +281,8 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 其中：
 
-- `build_index` / `rebuild_index` 是同步方法，返回最终 `RepoStatus`
-- `index/build` / `index/rebuild` 是异步方法，立即返回 `TaskStatus`
+- `build_base_snapshot` / `rebuild_base_snapshot` 是同步方法，返回最终 `RepoStatus`
+- `base_snapshot/build` / `base_snapshot/rebuild` 是异步方法，立即返回 `TaskStatus`
 
 ## 会话方法
 
@@ -300,8 +324,8 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
     "workspace_ensure": true,
     "workspace_list": false,
     "workspace_refresh": true,
-    "index_build": true,
-    "index_rebuild": true,
+    "base_snapshot_build": true,
+    "base_snapshot_rebuild": true,
     "task_status": true,
     "task_cancel": true,
     "search_query": true,
@@ -356,11 +380,11 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 - 注册 repo runtime
 - 启动 watcher
-- 不自动 build index
+- 不自动构建 base snapshot
 
 补充约定：
 
-- 如果调用方通过 managed client 打开 repo，daemon 发现/复用默认按 `index_path` 派生的 state file 路径进行。
+- 如果调用方通过 managed client 打开 repo，daemon 发现/复用默认按 `storage_root` 派生的 state file 路径进行。
 - `open_repo` 本身不要求接入方自己先拉起 daemon；这部分可以由 managed client 负责。
 
 请求：
@@ -368,7 +392,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 ```json
 {
   "repo_path": "/path/to/repo",
-  "index_path": null,
+  "storage_root": null,
   "config": {
     "tokenizer": "sparse_ngram",
     "corpus_mode": "respect_ignore",
@@ -378,7 +402,8 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
     "max_sparse_len": 8
   },
   "refresh": {
-    "rebuild_dirty_threshold": 256
+    "rebuild_dirty_threshold": 256,
+    "overlay_auto_checkpoint_max_uncommitted_ops": 256
   }
 }
 ```
@@ -398,7 +423,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 用途：
 
 - 确保 repo 已打开
-- 若缺少索引，同步执行一次 build
+- 若缺少 base snapshot，同步执行一次 build
 
 请求参数与 `open_repo` 相同。
 
@@ -415,7 +440,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 说明：
 
-- `indexed_docs = null` 表示 repo 已打开，且无需新建索引
+- `indexed_docs = null` 表示 repo 已打开，且无需新建 base snapshot
 - 重启后会重新扫描 worktree 并恢复当前状态，这会增加启动阶段耗时，但不会改变对外语义
 
 ### `get_repo_status`
@@ -488,9 +513,9 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 ## 索引方法
 
-### `build_index`
+### `build_base_snapshot`
 
-同步构建缺失索引。
+同步构建缺失的 base snapshot。
 
 请求：
 
@@ -504,23 +529,23 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 ```json
 {
-  "kind": "repo_built",
+  "kind": "repo_base_snapshot_built",
   "indexed_docs": 1234,
   "status": {}
 }
 ```
 
-### `rebuild_index`
+### `rebuild_base_snapshot`
 
-同步重建索引。
+同步重建 base snapshot。
 
-请求参数与 `build_index` 相同。
+请求参数与 `build_base_snapshot` 相同。
 
 响应：
 
 ```json
 {
-  "kind": "repo_rebuilt",
+  "kind": "repo_base_snapshot_rebuilt",
   "indexed_docs": 1234,
   "status": {}
 }
@@ -531,9 +556,9 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 - 如果当前仍有可用 snapshot，重建期间搜索继续使用最近一次可用视图
 - 新索引切换成功后，再更新 repo 状态
 
-### `index/build`
+### `base_snapshot/build`
 
-异步启动一次 build。
+异步启动一次 base snapshot build。
 
 请求：
 
@@ -552,11 +577,11 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 }
 ```
 
-### `index/rebuild`
+### `base_snapshot/rebuild`
 
-异步启动一次 rebuild。
+异步启动一次 base snapshot rebuild。
 
-请求和响应结构与 `index/build` 相同。
+请求和响应结构与 `base_snapshot/build` 相同。
 
 ## 查询方法
 
@@ -713,7 +738,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 {
   "task_id": "task-7",
   "workspace_id": "/path/to/repo",
-  "kind": "build_index",
+  "kind": "build_base_snapshot",
   "phase": "tokenizing",
   "message": "Tokenizing repository files",
   "processed": 120,

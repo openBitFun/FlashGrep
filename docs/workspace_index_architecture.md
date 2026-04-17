@@ -2,137 +2,126 @@
 
 ## Goal
 
-`codgrep` 当前采用面向 agent 代码搜索的两层检索架构：
+`codgrep` 当前 daemon/runtime 主线已经不是“base snapshot + query-time dirty repair”，也不是把 workspace 增量直接暴露给查询线程的可变写路径，而是：
 
 1. `base snapshot`
-   对应某个 Git commit 或 repo fingerprint 的稳定只读索引。
-2. `dirty worktree repair`
-   对当前工作区里相对 base 已变更的少量文件做查询期修补。
+   对应某个 Git `HEAD` 或 repo fingerprint 的稳定基线快照。
+2. `dirty catalog`
+   记录当前工作区相对 base 的 dirty / building / ready / failed 状态。
+3. `published overlay snapshot`
+   只表达已经构建完成并原子发布、对查询可见的 workspace 增量层。
 
-设计目标不是持续维护一套持久化实时增量倒排，而是：
+这套架构的目标是把“工作区变化发现”和“查询可见性”彻底分离：
 
-- 对当前 workspace view 不漏召回。
-- 保持搜索热路径简单。
-- 把复杂度留给真正有收益的场景。
+- 搜索读取 `base + overlay` 两层 snapshot。
+- watcher / reconcile / refresh 只负责更新 dirty catalog，并驱动后台 overlay build。
+- 只有 published overlay 才参与查询。
 
 ## External Contract
 
-对产品/集成方而言，当前推荐把 daemon 协议视为稳定外部 contract；Rust 调用方则优先使用建立在它之上的 `codgrep::sdk`。
+对产品和集成方，稳定外部 contract 仍然是 daemon 协议。
 
-- daemon request/response/notification schema 负责对外暴露能力。
-- `codgrep::sdk` 是 Rust 集成的首选 facade。
-- `WorkspaceIndex` / `WorkspaceSnapshot` / `SearchEngine` 这些库层 facade 主要服务于 daemon 内部实现与迁移期代码。
+- daemon request / response / notification schema 是外部接口。
+- `DaemonClient` / `ManagedDaemonClient` 是 Rust 侧推荐入口。
+- `WorkspaceIndex` / `WorkspaceSnapshot` / `SearchEngine` 是库层 facade，主要服务于本地工具、测试和专家向集成。
 
-## Layering
+## Current Runtime Model
 
 ### Base Snapshot
 
-Base snapshot 继续复用当前工程已有的 generation 目录布局：
+base snapshot 由 `WorkspaceBaseSnapshotIndex` 负责：
 
-- `docs.bin`
-- `doc_terms.bin`
-- `lookup.bin`
-- `postings.bin`
+- snapshot key 由 `HEAD commit + config fingerprint` 或 repo fallback 指定。
+- 数据落在 `index_engine` 的 base shard 路径，而不是旧 `src/index/*` generation layout。
+- build / rebuild 直接产出新的 base snapshot shard。
 
-它是只读、可复用、按 `snapshot_key = HEAD commit + config fingerprint` 缓存的主索引层。
-在非 Git 目录下，会退化为稳定的 repo-scoped fallback snapshot key。
+### Dirty Catalog
 
-### Dirty Worktree Repair
+dirty catalog 由 daemon runtime 负责维护：
 
-库层默认不维护持久化 overlay cache，也不把 dirty subset 落盘成另一份倒排。
+- watcher / reconcile 从当前 worktree 归纳 modified / deleted / new paths。
+- 对每个 path 记录 `dirty / building / ready / failed` 和 observed file version。
+- catalog 只负责表达“哪些路径需要重建或已经发布”，不直接参与查询合并。
 
-查询时直接做两件事：
+### Overlay Snapshot
 
-1. 用 base snapshot 对 clean files 做候选召回。
-2. 对 dirty files 做 query-time repair。
+overlay snapshot 也是 daemon runtime 负责维护，但它只承担已发布查询层职责：
 
-语义：
+- dirty catalog 驱动后台 build/rebuild overlay。
+- overlay 先在后台构建，再一次性 publish。
+- 查询时通过 `WorkspaceSearchView` 合并 `base snapshot + published overlay snapshot`。
 
-- `Modified(path)` 等价于 `shadow base[path] + scan current[path]`
-- `Deleted(path)` 等价于 `shadow base[path]`
-- `Added(path)` 等价于 `scan current[path]`
-- `Renamed(old, new)` 等价于 `delete old + add new`
+`WorkspaceEventual` 模式下，daemon 可以复用当前 overlay 状态；
+`WorkspaceStrict` / refresh 路径则要求当前 workspace 没有 pending dirty，且 overlay 已经发布到可读 snapshot。
+
+### Library Facades
+
+库层 facade 也已经采用 snapshot 语义：
+
+- `WorkspaceIndex::search()` 走 `base + overlay` workspace view。
+- `WorkspaceSnapshot` 固定一份 base snapshot + overlay snapshot 组合。
+- `SearchEngine` 的 build / rebuild 直接委托给 base snapshot build。
+
+仍然保留的 `IndexWorktreeDiff` / freshness probe 仅用于状态观察、诊断和调度，不再驱动旧 `IndexSearcher` 式查询修补。
 
 ## Effective View
 
-逻辑主键使用规范化路径，而不是 `doc_id == docs slot`。
+任一路径 `path` 的有效视图遵循：
 
-对任一路径 `path`：
-
-1. 如果 `path` 在 dirty 集里，使用当前工作区内容。
-2. 如果 `path` 在 dirty 集里且文件已删除，路径不存在。
+1. 如果 published overlay 中有 live document，使用 overlay 版本。
+2. 如果 published overlay 中有 delete tombstone，该路径不存在。
 3. 否则回退到 base snapshot。
 
-查询时的候选集合：
+查询候选集合：
 
 ```text
 EffectiveCandidates =
-    (BaseCandidates - ShadowedDirtyPaths)
-    UNION DirtyExistingPaths
+    (BaseCandidates - OverlayShadowedPaths)
+    UNION OverlayLiveCandidates
 ```
-
-最终 verify 永远读取当前有效路径上的真实内容。
-
-## Runtime Modes
-
-### Library Mode
-
-`WorkspaceIndex` / `WorkspaceSnapshot` 默认采用：
-
-`Base Snapshot + Query-time Dirty Repair`
-
-也就是说：
-
-- base snapshot 落盘并复用。
-- dirty path 集由 query 时或 snapshot 创建时解析。
-- dirty 文档内容在 query 时从当前文件系统读取。
-
-### Daemon Mode
-
-daemon 在进程内会额外维护一层 optional in-memory dirty overlay：
-
-- dirty path 集
-- dirty 文档缓存
-- dirty `SearchDocumentIndex`
-
-这层 overlay：
-
-- 只存在于 daemon 进程内存。
-- 不会持久化到磁盘。
-- daemon 重启或 repo 关闭后会丢失。
-- 下次 `open_repo` 时会通过重新 diff 当前 worktree 来重建。
-
-这意味着 daemon 的运行时路径实际上是：
-
-`Base Snapshot + Optional In-Memory Dirty Overlay`
 
 ## Runtime Modules
 
-当前实现建议关注下面几个模块：
+当前实现建议关注下面这些模块：
 
 ```text
-src/index/
-  builder.rs
-  format.rs
-  searcher.rs
-
+src/index_engine/workspace/base_snapshot.rs
+src/index_engine/workspace/search_view.rs
+src/daemon/repo/catalog.rs
+src/daemon/repo/watcher.rs
 src/workspace.rs
 src/workspace/runtime.rs
-src/daemon/repo.rs
+src/search_engine.rs
+src/git_snapshot.rs
+src/worktree_diff.rs
 ```
 
 职责：
 
-- `builder.rs`
-  构建和复用 commit-addressed base snapshot。
-- `searcher.rs`
-  提供 base snapshot 的倒排查询与 stale/worktree diff 检测。
-- `workspace/runtime.rs`
-  合并 base 候选与 dirty 文件集合，并解析当前工作区文档。
+- `base_snapshot.rs`
+  构建、发布、打开 base snapshot shard。
+- `search_view.rs`
+  合并 base / overlay snapshot 并执行 workspace 查询。
+- `daemon/repo/catalog.rs`
+  计算 base 相对当前工作区的 dirty 集，并构造 rebuild / delta publish 计划。
+- `daemon/repo/dirty_catalog.rs`
+  维护持久化 dirty catalog 和最小状态机。
+- `daemon/repo/watcher.rs`
+  把 watcher / reconcile 结果写入 overlay runtime。
 - `workspace.rs`
-  对外暴露稳定的 workspace facade 与 reusable snapshot 视图。
-- `daemon/repo.rs`
-  维护 watcher、repo runtime 状态，以及 daemon 进程内的 dirty overlay。
+  对外暴露 workspace facade、snapshot view、freshness/status API。
+- `workspace/runtime.rs`
+  辅助 diff、overlay state 构造以及 workspace 级结果合并。
+- `search_engine.rs`
+  提供简化的 build / search facade。
+- `git_snapshot.rs`
+  提供 Git `HEAD`、dirty worktree、HEAD materialization 等辅助能力。
+- `worktree_diff.rs`
+  提供基于 snapshot catalog 的 diff 诊断类型和逻辑。
+
+## Compatibility Boundary
+
+当前主线搜索架构完全建立在 `index_engine` 的 snapshot / overlay 目录和 manifest 之上。
 
 ## Public Library API
 
@@ -157,46 +146,12 @@ impl WorkspaceIndex {
 
 impl WorkspaceSnapshot {
     pub fn base_snapshot_key(&self) -> &str;
-    pub fn dirty_diff(&self) -> &IndexWorktreeDiff;
     pub fn search(&self, query: &QueryConfig) -> Result<SearchResults>;
 }
 ```
 
-## Query Semantics
-
-`WorkspaceIndex::search()` 默认返回的是：
-
-`base snapshot + current dirty files repaired`
-
-这意味着调用方不再需要显式 refresh 某个 overlay cache；只要 base snapshot 已存在，workspace 查询就会直接以当前工作区视图为准。
-
-`WorkspaceSnapshot::search()` 返回的是：
-
-`snapshot creation time captured dirty path set + current file contents on those paths`
-
-也就是说 `WorkspaceSnapshot` 固定的是 dirty path 集，而不是 dirty 文件内容本身。
-
 ## Current Limits
 
-- dirty files 当前按 `size + mtime` 检测，不是 content hash。
-- library facade 里的 dirty files 当前统一走 query-time repair。
-- daemon runtime 会维护一个内存 dirty overlay，用来减少重复 query 的 query-time repair 成本。
-- `WorkspaceSnapshot` 会固定 dirty path 集合，但最终 verify 仍然读取真实文件路径。
-- `lookup.bin` 已做 `mmap`，`postings.bin` 仍是按 offset 解码读取。
-
-## Migration Note
-
-旧的持久化 overlay cache 方案已经移除：
-
-- 不再有 `overlay_key`
-- 不再有 `refresh_overlay()`
-- 不再有 `prune_overlay_cache()`
-- 不再保留 overlay manifest / tombstones / postings 复用路径
-
-当前架构默认采用：
-
-`Base Snapshot + Query-time Dirty Repair`
-
-daemon 长驻模式下则是：
-
-`Base Snapshot + Optional In-Memory Dirty Overlay`
+- daemon runtime 已经按 `base + dirty catalog + published overlay` 工作；库层 `WorkspaceIndex` 仍是偏本地工具语义的按需 workspace facade。
+- dirty catalog 是轻量持久化状态；未发布 overlay 丢失依赖 startup rescan 恢复。
+- query 执行层仍是第一版实现，reader 查询与 verify 还有继续优化空间。

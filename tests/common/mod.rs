@@ -4,10 +4,7 @@ use std::{
     process::Command,
 };
 
-use codgrep::{
-    advanced::IndexSearcher, build_index, BuildConfig, CorpusMode, QueryConfig, SearchMode,
-    TokenizerMode,
-};
+use codgrep::{BuildConfig, CorpusMode, QueryConfig, SearchEngine, SearchMode, TokenizerMode};
 use tempfile::{tempdir, TempDir};
 
 pub struct TestRepo {
@@ -22,7 +19,7 @@ impl TestRepo {
         let repo_dir = temp.path().join("repo");
         fs::create_dir_all(&repo_dir).expect("test should succeed");
         let repo = fs::canonicalize(&repo_dir).expect("test should succeed");
-        let index = repo.join(".codgrep-index");
+        let index = repo.join(".codgrep-index-engine");
         Self {
             _temp: temp,
             repo,
@@ -52,7 +49,7 @@ impl TestRepo {
     pub fn trigram_build_config(&self) -> BuildConfig {
         BuildConfig {
             repo_path: self.repo.clone(),
-            index_path: self.index.clone(),
+            storage_root: self.index.clone(),
             tokenizer: TokenizerMode::Trigram,
             corpus_mode: CorpusMode::RespectIgnore,
             include_hidden: false,
@@ -80,11 +77,13 @@ impl TestRepo {
     }
 
     pub fn build_with(&self, config: BuildConfig) {
-        build_index(&config).expect("test should succeed");
+        SearchEngine::new(config)
+            .build_base_snapshot()
+            .expect("test should succeed");
     }
 
-    pub fn searcher(&self) -> IndexSearcher {
-        IndexSearcher::open(self.index.clone()).expect("test should succeed")
+    pub fn engine(&self) -> SearchEngine {
+        SearchEngine::new(self.trigram_build_config())
     }
 
     pub fn init_git(&self) {

@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use codgrep::{advanced::IndexSearcher, QueryConfig, SearchMode};
+use codgrep::{BuildConfig, QueryConfig, SearchEngine, SearchMode, SearchPolicy};
 
 const RG_CHUNK_SIZE: usize = 512;
 
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let repo = repo.ok_or("--repo is required")?;
-    let index = index.unwrap_or_else(|| repo.join(".codgrep-index"));
+    let index = index.unwrap_or_else(|| repo.join(".codgrep-index-engine"));
     let pattern = pattern.ok_or("--pattern is required")?;
     let config = QueryConfig {
         regex_pattern: pattern.clone(),
@@ -41,14 +41,18 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..QueryConfig::default()
     };
 
-    let searcher = IndexSearcher::open(index.clone())?;
+    let engine = SearchEngine::new(BuildConfig {
+        repo_path: repo.clone(),
+        storage_root: index.clone(),
+        ..BuildConfig::default()
+    });
 
     let candidate_started = Instant::now();
-    let candidate_paths = searcher.candidate_paths(&config)?;
+    let candidate_paths = engine.candidate_paths(&config, None)?;
     let candidate_secs = candidate_started.elapsed().as_secs_f64();
 
     let full_started = Instant::now();
-    let full = searcher.search(&config)?;
+    let full = engine.search(&config, SearchPolicy::IndexOnly)?.results;
     let full_secs = full_started.elapsed().as_secs_f64();
 
     let (rg_match_count, rg_secs) = if skip_rg {

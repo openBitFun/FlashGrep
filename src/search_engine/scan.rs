@@ -8,21 +8,15 @@ use crate::{
     config::{BuildConfig, QueryConfig},
     error::{AppError, Result},
     files::{is_text_file, RepositoryFile, ScanOptions},
-    index::{
-        format::DocMeta,
-        searcher::{
-            verify::{
-                build_matcher, requires_multiline_verification,
-                verify_candidate_sources_with_resolver, VerifyCandidateSource,
-            },
-            CountVerifyKind, CountVerifyPlan, LinePrefilter,
-        },
-    },
     planner::plan,
+    query_runtime::{
+        build_matcher, requires_multiline_verification, verify_candidate_sources_with_resolver,
+        CountVerifyKind, CountVerifyPlan, LinePrefilter, VerifyCandidateSource,
+    },
     search::{FileMatch, MatchLocation, SearchHit, SearchLine, SearchResults},
 };
 
-use super::document::{SearchDocument, SearchDocumentIndex, SearchDocumentSource};
+use super::document::{SearchDocument, SearchDocumentSource};
 
 const PARALLEL_DOC_THRESHOLD: usize = 16;
 const PARALLEL_BYTE_THRESHOLD: u64 = 8 * 1024 * 1024;
@@ -173,14 +167,6 @@ pub(crate) fn search_documents(
     }
 }
 
-pub(crate) fn search_document_index(
-    config: &QueryConfig,
-    index: &SearchDocumentIndex,
-    filter: Option<&crate::path_filter::PathFilter>,
-) -> Result<SearchResults> {
-    index.search(config, filter)
-}
-
 pub(crate) fn scan_options(config: &BuildConfig) -> ScanOptions {
     ScanOptions {
         respect_ignore: matches!(config.corpus_mode, crate::config::CorpusMode::RespectIgnore),
@@ -300,6 +286,12 @@ struct MultiLiteralDocumentOutcome {
     matched_occurrences: usize,
     bytes_searched: u64,
     matches: Vec<FileMatch>,
+}
+
+#[derive(Debug, Clone)]
+struct ScannedDocMeta {
+    doc_id: u32,
+    path: String,
 }
 
 fn should_parallel_scan_documents(documents: &[SearchDocument]) -> bool {
@@ -459,7 +451,7 @@ fn trim_line_terminator_bytes(line: &[u8]) -> &[u8] {
     line.strip_suffix(b"\r").unwrap_or(line)
 }
 
-fn repository_docs(documents: &[SearchDocument]) -> Result<Vec<DocMeta>> {
+fn repository_docs(documents: &[SearchDocument]) -> Result<Vec<ScannedDocMeta>> {
     documents
         .iter()
         .enumerate()
@@ -467,11 +459,9 @@ fn repository_docs(documents: &[SearchDocument]) -> Result<Vec<DocMeta>> {
             let doc_id = u32::try_from(index).map_err(|_| {
                 AppError::ValueOutOfRange(format!("scanned document id {index} exceeds u32 range"))
             })?;
-            Ok(DocMeta {
+            Ok(ScannedDocMeta {
                 doc_id,
                 path: document.logical_path.clone(),
-                size: document.size,
-                mtime_nanos: document.mtime_nanos,
             })
         })
         .collect()

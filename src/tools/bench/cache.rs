@@ -9,29 +9,29 @@ use crate::{
     config::CorpusMode,
     error::{AppError, Result},
     files::{scan_paths, ScanOptions},
-    index::format::IndexLayout,
+    index_engine::WorkspaceBaseSnapshotIndex,
 };
 
-use super::{BenchCachePaths, BenchConfig, CacheRunner, Corpus};
+use super::{bench_build_config, BenchCachePaths, BenchConfig, CacheRunner, Corpus};
 
 pub(super) fn collect_cache_paths(
     corpus: Corpus,
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     config: &BenchConfig,
 ) -> Result<BenchCachePaths> {
-    collect_cache_paths_for_target(repo_path, index_path, config, corpus.label())
+    collect_cache_paths_for_target(repo_path, storage_root, config, corpus.label())
 }
 
 pub(super) fn collect_cache_paths_for_target(
     repo_path: &Path,
-    index_path: &Path,
+    storage_root: &Path,
     config: &BenchConfig,
     label: &str,
 ) -> Result<BenchCachePaths> {
     let corpus_files = scan_paths(
         &[repo_path.to_path_buf()],
-        Some(index_path),
+        Some(storage_root),
         ScanOptions {
             respect_ignore: matches!(config.corpus_mode, CorpusMode::RespectIgnore),
             include_hidden: false,
@@ -51,18 +51,17 @@ pub(super) fn collect_cache_paths_for_target(
         )));
     }
 
-    let index_files = WalkDir::new(index_path)
-        .into_iter()
-        .filter_map(std::result::Result::ok)
-        .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
-        .collect::<Vec<_>>();
+    let build_config = bench_build_config(repo_path, storage_root, config);
+    let mut index_files = runtime_index_files(storage_root);
+    let base_snapshot_root = WorkspaceBaseSnapshotIndex::index_root(&build_config);
+    index_files.extend(runtime_index_files(&base_snapshot_root));
+    index_files.sort();
+    index_files.dedup();
     if index_files.is_empty() {
-        let layout = IndexLayout::resolve(index_path)?;
         return Err(AppError::InvalidIndex(format!(
-            "no index files found under {} (resolved data path: {})",
-            index_path.display(),
-            layout.data_path.display()
+            "no bench runtime index files found under {} or {}",
+            storage_root.display(),
+            base_snapshot_root.display()
         )));
     }
 
@@ -70,6 +69,18 @@ pub(super) fn collect_cache_paths_for_target(
         corpus_files,
         index_files,
     })
+}
+
+fn runtime_index_files(root: &Path) -> Vec<PathBuf> {
+    if !root.exists() {
+        return Vec::new();
+    }
+    WalkDir::new(root)
+        .into_iter()
+        .filter_map(std::result::Result::ok)
+        .filter(|entry| entry.file_type().is_file())
+        .map(|entry| entry.into_path())
+        .collect()
 }
 
 pub(super) fn sanitize_benchmark_name(name: &str) -> String {

@@ -298,7 +298,7 @@ mod tests {
             Request::OpenRepo {
                 params: OpenRepoParams {
                     repo_path: repo_path.clone(),
-                    index_path: None,
+                    storage_root: None,
                     config: RepoConfig::default(),
                     refresh: Default::default(),
                 },
@@ -331,7 +331,7 @@ mod tests {
         send_request(
             &mut writer,
             Some(3),
-            Request::IndexBuild {
+            Request::BaseSnapshotBuild {
                 params: crate::daemon::protocol::RepoRef {
                     repo_id: repo_id.clone(),
                 },

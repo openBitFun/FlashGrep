@@ -1,0 +1,642 @@
+use std::{
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+    time::Duration,
+};
+
+use crate::{
+    config::CorpusMode,
+    error::{AppError, Result},
+    files::{scan_paths, ScanOptions},
+    index_engine::query::QueryFilters,
+    path_filter::{normalize_path, PathFilter, PathFilterArgs},
+};
+
+use super::{
+    DirtyOverlaySnapshot, QueryBackend, RepoPhase, RepoRuntime, RepoStatus, SearchConsistency,
+    SearchRequest, SearchResponse,
+};
+
+struct SearchActivityGuard<'a> {
+    runtime: &'a RepoRuntime,
+}
+
+impl Drop for SearchActivityGuard<'_> {
+    fn drop(&mut self) {
+        self.runtime.active_searches.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+impl RepoRuntime {
+    fn begin_search_activity(&self) -> SearchActivityGuard<'_> {
+        self.active_searches.fetch_add(1, Ordering::Relaxed);
+        SearchActivityGuard { runtime: self }
+    }
+
+    pub(super) fn refresh(&self, force: bool) -> Result<RepoStatus> {
+        if force || self.workspace_probe_pending() {
+            self.refresh_workspace_overlay()?;
+        }
+        self.status_snapshot()
+    }
+
+    pub(super) fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
+        let _search_activity = self.begin_search_activity();
+        let scope =
+            normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
+        let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
+        let query_filters = build_query_filters(&self.build_config.repo_path, &scope);
+        match request.consistency {
+            SearchConsistency::SnapshotOnly => {
+                let status = self.status_snapshot()?;
+                let can_search_opening_snapshot =
+                    matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
+                if matches!(
+                    status.phase,
+                    RepoPhase::Opening
+                        | RepoPhase::MissingBaseSnapshot
+                        | RepoPhase::BuildingBaseSnapshot
+                        | RepoPhase::RebuildingBaseSnapshot
+                ) && !can_search_opening_snapshot
+                {
+                    let (backend, results) = if request.allow_scan_fallback {
+                        (
+                            QueryBackend::ScanFallback,
+                            self.scan_search_fallback(&request.query, filter.as_ref())?,
+                        )
+                    } else {
+                        return Err(AppError::InvalidIndex(
+                            "base snapshot is missing; rebuild the base snapshot".into(),
+                        ));
+                    };
+                    return Ok(SearchResponse {
+                        repo_id: self.repo_id.clone(),
+                        backend,
+                        consistency_applied: request.consistency,
+                        status,
+                        results,
+                    });
+                }
+                let base_snapshot = self.open_base_snapshot_reader()?;
+                let (backend, results) = match self.workspace_search_view.search_current_snapshot(
+                    &request.query,
+                    &query_filters,
+                    filter.as_ref(),
+                    base_snapshot.as_ref(),
+                ) {
+                    Ok(results) => (QueryBackend::IndexedSnapshot, results),
+                    Err(AppError::InvalidIndex(_)) if request.allow_scan_fallback => (
+                        QueryBackend::ScanFallback,
+                        self.scan_search_fallback(&request.query, filter.as_ref())?,
+                    ),
+                    Err(AppError::Io(error))
+                        if error.kind() == std::io::ErrorKind::NotFound
+                            && request.allow_scan_fallback =>
+                    {
+                        (
+                            QueryBackend::ScanFallback,
+                            self.scan_search_fallback(&request.query, filter.as_ref())?,
+                        )
+                    }
+                    Err(error) => return Err(error),
+                };
+                Ok(SearchResponse {
+                    repo_id: self.repo_id.clone(),
+                    backend,
+                    consistency_applied: request.consistency,
+                    status,
+                    results,
+                })
+            }
+            SearchConsistency::WorkspaceEventual | SearchConsistency::WorkspaceStrict => {
+                self.schedule_workspace_probe(Duration::from_millis(0));
+
+                let status = self.status_snapshot()?;
+                if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
+                    self.ensure_workspace_strict_ready(&status)?;
+                }
+                let can_search_opening_snapshot =
+                    matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
+                match status.phase {
+                    RepoPhase::Opening if !can_search_opening_snapshot => {
+                        self.search_during_transition(&request, &scope, filter.as_ref(), status)
+                    }
+                    RepoPhase::MissingBaseSnapshot
+                    | RepoPhase::BuildingBaseSnapshot
+                    | RepoPhase::RebuildingBaseSnapshot => {
+                        self.search_during_transition(&request, &scope, filter.as_ref(), status)
+                    }
+                    RepoPhase::Opening | RepoPhase::ReadyClean | RepoPhase::ReadyDirty => {
+                        let overlay_engine = match self.workspace_overlay_engine.lock() {
+                            Ok(guard) => guard,
+                            Err(poisoned) => poisoned.into_inner(),
+                        }
+                        .as_ref()
+                        .cloned();
+                        let overlay_engine_present = overlay_engine.is_some();
+                        let overlay_snapshot = overlay_engine
+                            .as_ref()
+                            .map(|overlay| match overlay.open_snapshot() {
+                                Ok(snapshot) => Ok(Some(snapshot)),
+                                Err(AppError::InvalidIndex(_)) => Ok(None),
+                                Err(AppError::Io(error))
+                                    if error.kind() == std::io::ErrorKind::NotFound =>
+                                {
+                                    Ok(None)
+                                }
+                                Err(error) => Err(error),
+                            })
+                            .transpose()?
+                            .flatten();
+                        let base_snapshot = match self.open_base_snapshot_reader() {
+                            Ok(snapshot) => snapshot,
+                            Err(AppError::InvalidIndex(_)) => None,
+                            Err(AppError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                None
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        let workspace_snapshot = self
+                            .workspace_search_view
+                            .open_workspace_query_snapshot(base_snapshot, overlay_snapshot)?;
+                        let tracked_dirty = self.dirty_catalog_visible_paths();
+                        let mut response_status = status.clone();
+                        super::status::apply_repo_status_dirty_fields(
+                            &mut response_status,
+                            self.rebuild_dirty_threshold,
+                            tracked_dirty.stats(),
+                        );
+                        let backend = if tracked_dirty.is_empty() {
+                            QueryBackend::IndexedClean
+                        } else {
+                            QueryBackend::IndexedWorkspaceView
+                        };
+                        let overlay_snapshot_missing =
+                            overlay_engine_present && !workspace_snapshot.has_overlay_snapshot();
+                        if matches!(request.consistency, SearchConsistency::WorkspaceStrict)
+                            && overlay_snapshot_missing
+                        {
+                            return Err(AppError::Protocol(format!(
+                                "repo {} strict search requires a readable workspace overlay snapshot; run refresh or wait for background probe",
+                                self.repo_id
+                            )));
+                        }
+                        if !workspace_snapshot.has_base_snapshot() {
+                            self.schedule_workspace_probe(Duration::from_millis(0));
+                            return self.search_during_transition(
+                                &request,
+                                &scope,
+                                filter.as_ref(),
+                                response_status,
+                            );
+                        }
+                        if overlay_snapshot_missing {
+                            self.schedule_workspace_probe(Duration::from_millis(0));
+                        }
+                        let results = match workspace_snapshot.search(
+                            &self.workspace_search_view,
+                            &request.query,
+                            &query_filters,
+                            filter.as_ref(),
+                        ) {
+                            Ok(results) => results,
+                            Err(AppError::InvalidIndex(_))
+                                if matches!(
+                                    request.consistency,
+                                    SearchConsistency::WorkspaceEventual
+                                ) =>
+                            {
+                                self.schedule_workspace_probe(Duration::from_millis(0));
+                                match self.workspace_search_view.search_workspace_snapshots(
+                                    &request.query,
+                                    &query_filters,
+                                    filter.as_ref(),
+                                    workspace_snapshot.base_snapshot(),
+                                    None,
+                                ) {
+                                    Ok(results) => results,
+                                    Err(AppError::InvalidIndex(_)) => {
+                                        return self.search_during_transition(
+                                            &request,
+                                            &scope,
+                                            filter.as_ref(),
+                                            response_status,
+                                        );
+                                    }
+                                    Err(AppError::Io(error))
+                                        if error.kind() == std::io::ErrorKind::NotFound =>
+                                    {
+                                        return self.search_during_transition(
+                                            &request,
+                                            &scope,
+                                            filter.as_ref(),
+                                            response_status,
+                                        );
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            Err(AppError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound
+                                    && matches!(
+                                        request.consistency,
+                                        SearchConsistency::WorkspaceEventual
+                                    ) =>
+                            {
+                                self.schedule_workspace_probe(Duration::from_millis(0));
+                                match self.workspace_search_view.search_workspace_snapshots(
+                                    &request.query,
+                                    &query_filters,
+                                    filter.as_ref(),
+                                    workspace_snapshot.base_snapshot(),
+                                    None,
+                                ) {
+                                    Ok(results) => results,
+                                    Err(AppError::InvalidIndex(_)) => {
+                                        return self.search_during_transition(
+                                            &request,
+                                            &scope,
+                                            filter.as_ref(),
+                                            response_status,
+                                        );
+                                    }
+                                    Err(AppError::Io(error))
+                                        if error.kind() == std::io::ErrorKind::NotFound =>
+                                    {
+                                        return self.search_during_transition(
+                                            &request,
+                                            &scope,
+                                            filter.as_ref(),
+                                            response_status,
+                                        );
+                                    }
+                                    Err(error) => return Err(error),
+                                }
+                            }
+                            Err(error) => return Err(error),
+                        };
+                        Ok(SearchResponse {
+                            repo_id: self.repo_id.clone(),
+                            backend,
+                            consistency_applied: request.consistency,
+                            status: response_status,
+                            results,
+                        })
+                    }
+                    RepoPhase::Degraded => Err(AppError::Protocol(
+                        status
+                            .last_error
+                            .unwrap_or_else(|| "repo runtime is degraded".into()),
+                    )),
+                }
+            }
+        }
+    }
+
+    pub(super) fn glob(&self, request: super::GlobRequest) -> Result<super::GlobResponse> {
+        let scope =
+            normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
+        let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
+        let cache_key = glob_scope_cache_key(&scope);
+        let cache_epoch = self.glob_cache_epoch.load(Ordering::Relaxed);
+        if let Some(paths) = self.lookup_glob_cache(cache_epoch, &cache_key) {
+            return Ok(super::GlobResponse {
+                repo_id: self.repo_id.clone(),
+                status: self.status_snapshot()?,
+                paths,
+            });
+        }
+        let paths = match super::run_rg_glob(&self.build_config, &scope, filter.as_ref()) {
+            Ok(paths) => paths,
+            Err(_) => {
+                let roots = scan_roots(&self.build_config.repo_path, &scope);
+                let mut paths = scan_paths(
+                    &roots,
+                    Some(&self.build_config.storage_root),
+                    ScanOptions {
+                        respect_ignore: matches!(
+                            self.build_config.corpus_mode,
+                            CorpusMode::RespectIgnore
+                        ),
+                        include_hidden: self.build_config.include_hidden,
+                        max_file_size: self.build_config.max_file_size,
+                        max_depth: None,
+                        ignore_files: Vec::new(),
+                    },
+                    filter.as_ref(),
+                )?
+                .into_iter()
+                .map(|file| file.path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+                paths.sort_unstable();
+                paths
+            }
+        };
+        if self.glob_cache_epoch.load(Ordering::Relaxed) == cache_epoch {
+            self.store_glob_cache(cache_epoch, cache_key, &paths);
+        }
+        Ok(super::GlobResponse {
+            repo_id: self.repo_id.clone(),
+            status: self.status_snapshot()?,
+            paths,
+        })
+    }
+
+    pub(super) fn current_overlay_snapshot(&self) -> DirtyOverlaySnapshot {
+        match self.dirty_overlay.lock() {
+            Ok(guard) => guard.snapshot(),
+            Err(poisoned) => poisoned.into_inner().snapshot(),
+        }
+    }
+
+    pub(super) fn workspace_probe_pending(&self) -> bool {
+        self.workspace_probe_pending.load(Ordering::Relaxed)
+    }
+
+    fn ensure_workspace_strict_ready(&self, status: &RepoStatus) -> Result<()> {
+        if !status.probe_healthy && !self.strict_snapshot_ready()? {
+            return Err(AppError::Protocol(format!(
+                "repo {} strict search requires a healthy workspace probe loop",
+                self.repo_id
+            )));
+        }
+        if self.workspace_probe_pending() && !self.strict_snapshot_ready()? {
+            return Err(AppError::Protocol(format!(
+                "repo {} strict search requires a settled workspace state; run refresh or wait for background probe",
+                self.repo_id
+            )));
+        }
+        Ok(())
+    }
+
+    fn strict_snapshot_ready(&self) -> Result<bool> {
+        if self.dirty_catalog_has_pending() {
+            return Ok(false);
+        }
+
+        let base_ready = match self.open_base_snapshot_reader() {
+            Ok(Some(_)) => true,
+            Ok(None) => false,
+            Err(AppError::InvalidIndex(_)) => false,
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
+            Err(error) => return Err(error),
+        };
+        if !base_ready {
+            return Ok(false);
+        }
+
+        let overlay_engine = match self.workspace_overlay_engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if let Some(overlay_index) = overlay_engine.as_ref() {
+            return match overlay_index.open_snapshot() {
+                Ok(_) => Ok(true),
+                Err(AppError::InvalidIndex(_)) => Ok(false),
+                Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    Ok(false)
+                }
+                Err(error) => Err(error),
+            };
+        }
+
+        Ok(self.current_overlay_snapshot().paths.is_empty()
+            && self.dirty_catalog_visible_paths().is_empty())
+    }
+
+    pub(super) fn rebuild_dirty_paths_from_overlay_snapshot(
+        &self,
+        overlay_snapshot: &crate::index_engine::IndexSnapshotReader,
+    ) -> Result<super::DirtyPathSet> {
+        let visible = overlay_snapshot.visible_keys()?;
+        let base_catalog = self.base_snapshot_catalog()?;
+        let mut dirty = super::DirtyPathSet::default();
+
+        for key in visible.live {
+            let path = self
+                .build_config
+                .repo_path
+                .join(&key.logical_path)
+                .to_string_lossy()
+                .into_owned();
+            if base_catalog
+                .as_ref()
+                .and_then(|catalog| catalog.get(&key.logical_path))
+                .is_some()
+            {
+                dirty.modified.insert(path);
+            } else {
+                dirty.new.insert(path);
+            }
+        }
+
+        for key in visible.deleted {
+            if base_catalog
+                .as_ref()
+                .and_then(|catalog| catalog.get(&key.logical_path))
+                .is_some()
+            {
+                dirty.deleted.insert(
+                    self.build_config
+                        .repo_path
+                        .join(&key.logical_path)
+                        .to_string_lossy()
+                        .into_owned(),
+                );
+            }
+        }
+
+        Ok(dirty)
+    }
+
+    pub(super) fn replace_dirty_overlay_paths(&self, dirty: super::DirtyPathSet) {
+        let mut overlay = match self.dirty_overlay.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        overlay.paths = dirty;
+    }
+
+    fn lookup_glob_cache(&self, epoch: u64, key: &str) -> Option<Vec<String>> {
+        let mut cache = match self.glob_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cache.epoch != epoch {
+            cache.epoch = epoch;
+            cache.entries.clear();
+            return None;
+        }
+        cache.entries.get(key).cloned()
+    }
+
+    fn store_glob_cache(&self, epoch: u64, key: String, paths: &[String]) {
+        const MAX_GLOB_CACHE_ENTRIES: usize = 32;
+
+        let mut cache = match self.glob_cache.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if cache.epoch != epoch {
+            cache.epoch = epoch;
+            cache.entries.clear();
+        }
+        if !cache.entries.contains_key(&key) && cache.entries.len() >= MAX_GLOB_CACHE_ENTRIES {
+            cache.entries.clear();
+        }
+        cache.entries.insert(key, paths.to_vec());
+    }
+
+    fn search_during_transition(
+        &self,
+        request: &SearchRequest,
+        scope: &PathFilterArgs,
+        filter: Option<&PathFilter>,
+        status: RepoStatus,
+    ) -> Result<SearchResponse> {
+        if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
+            return Err(AppError::Protocol(format!(
+                "repo {} is not ready yet ({})",
+                self.repo_id,
+                repo_phase_label(status.phase)
+            )));
+        }
+
+        match super::run_rg_search(&self.build_config, &request.query, scope) {
+            Ok(results) => Ok(SearchResponse {
+                repo_id: self.repo_id.clone(),
+                backend: QueryBackend::RgFallback,
+                consistency_applied: request.consistency,
+                status: self.status_snapshot()?,
+                results,
+            }),
+            Err(_) => Ok(SearchResponse {
+                repo_id: self.repo_id.clone(),
+                backend: QueryBackend::ScanFallback,
+                consistency_applied: request.consistency,
+                status: self.status_snapshot()?,
+                results: self.scan_search_fallback(&request.query, filter)?,
+            }),
+        }
+    }
+
+    fn scan_search_fallback(
+        &self,
+        query: &crate::config::QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<crate::search::SearchResults> {
+        self.search_engine.scan_search_with_filter(query, filter)
+    }
+}
+
+fn repo_phase_label(phase: RepoPhase) -> &'static str {
+    match phase {
+        RepoPhase::Opening => "opening",
+        RepoPhase::MissingBaseSnapshot => "missing_base_snapshot",
+        RepoPhase::BuildingBaseSnapshot => "building_base_snapshot",
+        RepoPhase::ReadyClean => "ready_clean",
+        RepoPhase::ReadyDirty => "ready_dirty",
+        RepoPhase::RebuildingBaseSnapshot => "rebuilding_base_snapshot",
+        RepoPhase::Degraded => "degraded",
+    }
+}
+
+fn build_path_filter(repo_root: &PathBuf, args: &PathFilterArgs) -> Result<Option<PathFilter>> {
+    let has_scope = !args.roots.is_empty()
+        || !args.globs.is_empty()
+        || !args.iglobs.is_empty()
+        || !args.type_add.is_empty()
+        || !args.type_clear.is_empty()
+        || !args.types.is_empty()
+        || !args.type_not.is_empty();
+    if !has_scope {
+        return Ok(None);
+    }
+    Ok(Some(PathFilter::new(args.clone(), repo_root)?))
+}
+
+fn normalize_repo_scope_args(repo_root: &Path, args: &PathFilterArgs) -> Result<PathFilterArgs> {
+    let mut normalized = args.clone();
+    normalized.roots = args
+        .roots
+        .iter()
+        .map(|root| {
+            let normalized = normalize_path(root, repo_root);
+            if normalized == *repo_root || normalized.starts_with(repo_root) {
+                Ok(normalized)
+            } else {
+                Err(AppError::Protocol(format!(
+                    "scope root escapes repo boundary: {}",
+                    normalized.to_string_lossy()
+                )))
+            }
+        })
+        .collect::<Result<Vec<_>>>()?;
+    Ok(normalized)
+}
+
+fn glob_scope_cache_key(args: &PathFilterArgs) -> String {
+    fn append_path_list(key: &mut String, values: &[PathBuf]) {
+        for value in values {
+            key.push('\u{1f}');
+            key.push_str(&value.to_string_lossy());
+        }
+    }
+
+    fn append_string_list(key: &mut String, values: &[String]) {
+        for value in values {
+            key.push('\u{1f}');
+            key.push_str(value);
+        }
+    }
+
+    let mut key = String::new();
+    append_path_list(&mut key, &args.roots);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.globs);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.iglobs);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.type_add);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.type_clear);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.types);
+    key.push('\u{1e}');
+    append_string_list(&mut key, &args.type_not);
+    key
+}
+
+fn scan_roots(repo_root: &Path, args: &PathFilterArgs) -> Vec<PathBuf> {
+    if args.roots.is_empty() {
+        return vec![repo_root.to_path_buf()];
+    }
+    args.roots
+        .iter()
+        .map(|root| normalize_path(root, repo_root))
+        .collect()
+}
+
+fn build_query_filters(repo_root: &Path, args: &PathFilterArgs) -> QueryFilters {
+    let mut path_prefixes = args
+        .roots
+        .iter()
+        .filter_map(|root| {
+            let normalized = normalize_path(root, repo_root);
+            let relative = normalized.strip_prefix(repo_root).ok()?;
+            if relative.as_os_str().is_empty() {
+                return None;
+            }
+            Some(relative.to_string_lossy().into_owned())
+        })
+        .collect::<Vec<_>>();
+    path_prefixes.sort_unstable();
+    path_prefixes.dedup();
+
+    QueryFilters {
+        path_prefixes,
+        ..QueryFilters::default()
+    }
+}

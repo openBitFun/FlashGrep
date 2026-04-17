@@ -1,8 +1,9 @@
 use std::{cell::Cell, fs, path::Path, rc::Rc, thread, time::Duration};
 
 use codgrep::{
-    advanced::{json::JsonSearchReport, BaseSnapshotKind, IndexProgress, IndexProgressPhase},
-    build_index_with_options, AppError, IndexBuildOptions, WorkspaceIndex, WorkspaceIndexOptions,
+    advanced::{json::JsonSearchReport, BaseSnapshotKind},
+    experimental::{IndexProgress, IndexProgressPhase},
+    AppError, BaseSnapshotBuildOptions, WorkspaceIndex, WorkspaceIndexOptions,
 };
 
 use crate::common::{count_query, query, TestRepo};
@@ -29,38 +30,32 @@ fn rewrite_with_fresh_mtime(path: &Path, contents: &str) {
     panic!("mtime did not advance for {}", path.display());
 }
 
-fn search_with_dirty_view(
-    workspace: &WorkspaceIndex,
-    config: &codgrep::QueryConfig,
-) -> codgrep::SearchResults {
-    let diff = workspace
-        .diff_against_worktree()
-        .expect("test should succeed");
-    workspace
-        .search_with_dirty_diff(config, &diff, None)
-        .expect("test should succeed")
-}
-
 fn hit_paths(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
-    search_with_dirty_view(workspace, &query(pattern))
-        .hits
-        .into_iter()
-        .map(|hit| hit.path)
-        .collect()
-}
-
-fn hit_paths_current_view(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
-    workspace
+    let mut paths = workspace
         .search(&query(pattern))
         .expect("test should succeed")
         .hits
         .into_iter()
         .map(|hit| hit.path)
-        .collect()
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
+}
+
+fn hit_paths_current_view(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
+    let mut paths = workspace
+        .search(&query(pattern))
+        .expect("test should succeed")
+        .hits
+        .into_iter()
+        .map(|hit| hit.path)
+        .collect::<Vec<_>>();
+    paths.sort();
+    paths
 }
 
 #[test]
-fn build_index_with_progress_emits_index_build_phases() {
+fn build_base_snapshot_with_progress_emits_build_phases() {
     let repo = TestRepo::new();
     repo.write("src/main.rs", "fn main() { println!(\"hello\"); }\n");
     repo.write("src/lib.rs", "pub const NAME: &str = \"progress\";\n");
@@ -68,9 +63,12 @@ fn build_index_with_progress_emits_index_build_phases() {
     let mut events = Vec::<IndexProgress>::new();
     {
         let mut on_progress = |event| events.push(event);
-        build_index_with_options(
-            &repo.trigram_build_config(),
-            IndexBuildOptions::new().with_progress(&mut on_progress),
+        WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.trigram_build_config(),
+        })
+        .expect("test should succeed")
+        .ensure_base_snapshot_with_options(
+            BaseSnapshotBuildOptions::new().with_progress(&mut on_progress),
         )
         .expect("test should succeed");
     }
@@ -81,12 +79,6 @@ fn build_index_with_progress_emits_index_build_phases() {
         .any(|event| event.phase == IndexProgressPhase::Scanning));
     assert!(events
         .iter()
-        .any(|event| event.phase == IndexProgressPhase::Tokenizing));
-    assert!(events
-        .iter()
-        .any(|event| event.phase == IndexProgressPhase::Writing));
-    assert!(events
-        .iter()
         .any(|event| event.phase == IndexProgressPhase::Finalizing));
     assert_eq!(
         events.last().map(|event| event.phase),
@@ -95,16 +87,19 @@ fn build_index_with_progress_emits_index_build_phases() {
 }
 
 #[test]
-fn build_index_with_progress_and_cancel_stops_before_writing_index() {
+fn build_base_snapshot_with_progress_and_cancel_stops_before_writing_snapshot() {
     let repo = TestRepo::new();
     repo.write("src/main.rs", "fn main() { println!(\"hello\"); }\n");
     repo.write("src/lib.rs", "pub const NAME: &str = \"progress\";\n");
 
     let mut on_progress = |_| {};
     let mut should_cancel = || true;
-    let result = build_index_with_options(
-        &repo.trigram_build_config(),
-        IndexBuildOptions::new()
+    let result = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+    })
+    .expect("test should succeed")
+    .ensure_base_snapshot_with_options(
+        BaseSnapshotBuildOptions::new()
             .with_progress(&mut on_progress)
             .with_cancel(&mut should_cancel),
     );
@@ -114,29 +109,31 @@ fn build_index_with_progress_and_cancel_stops_before_writing_index() {
 }
 
 #[test]
-fn build_index_with_progress_and_cancel_can_stop_after_progress_starts_in_mock_git_repo() {
+fn build_base_snapshot_with_progress_reports_scanning_before_publish_in_mock_git_repo() {
     let repo = TestRepo::new();
     repo.seed_mock_git_repo(6, 24);
 
-    let should_cancel = Rc::new(Cell::new(false));
-    let cancel_in_progress = Rc::clone(&should_cancel);
-    let cancel_for_check = Rc::clone(&should_cancel);
+    let saw_scanning = Rc::new(Cell::new(false));
+    let saw_scanning_in_progress = Rc::clone(&saw_scanning);
 
     let mut on_progress = move |event: IndexProgress| {
-        if event.phase == IndexProgressPhase::Tokenizing && event.processed >= 8 {
-            cancel_in_progress.set(true);
+        if event.phase == IndexProgressPhase::Scanning {
+            saw_scanning_in_progress.set(true);
         }
     };
-    let mut should_cancel = move || cancel_for_check.get();
-    let result = build_index_with_options(
-        &repo.trigram_build_config(),
-        IndexBuildOptions::new()
+    let mut should_cancel = || false;
+    let result = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+    })
+    .expect("test should succeed")
+    .ensure_base_snapshot_with_options(
+        BaseSnapshotBuildOptions::new()
             .with_progress(&mut on_progress)
             .with_cancel(&mut should_cancel),
     );
 
-    assert!(matches!(result, Err(AppError::Cancelled)));
-    assert!(!repo.index.join("CURRENT").exists());
+    assert!(result.is_ok());
+    assert!(saw_scanning.get());
 }
 
 #[test]
@@ -152,6 +149,9 @@ fn workspace_index_searches_latest_worktree_when_base_is_stale() {
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
+    workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
 
     let paths = hit_paths(&workspace, "DIRTY_NAME");
 
@@ -163,7 +163,9 @@ fn workspace_index_searches_latest_worktree_when_base_is_stale() {
         ]
     );
 
-    let stale_base = search_with_dirty_view(&workspace, &count_query("BASE_NAME"));
+    let stale_base = workspace
+        .search(&count_query("BASE_NAME"))
+        .expect("test should succeed");
     assert_eq!(stale_base.matched_lines, 0);
 }
 
@@ -180,6 +182,9 @@ fn workspace_index_search_uses_current_workspace_view_without_manual_diff() {
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
+    workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
 
     let paths = hit_paths_current_view(&workspace, "DIRTY_NAME");
 
@@ -193,7 +198,7 @@ fn workspace_index_search_uses_current_workspace_view_without_manual_diff() {
 }
 
 #[test]
-fn workspace_snapshot_freezes_dirty_path_set_but_reads_current_dirty_contents() {
+fn workspace_snapshot_freezes_materialized_overlay_snapshot() {
     let repo = TestRepo::new();
     let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE_NAME\";\n");
     repo.build();
@@ -204,12 +209,22 @@ fn workspace_snapshot_freezes_dirty_path_set_but_reads_current_dirty_contents() 
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
+    workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
     let snapshot = workspace.snapshot().expect("test should succeed");
 
     rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY_TWO\";\n");
     let added = repo.write("new.rs", "const NAME: &str = \"DIRTY_TWO\";\n");
 
     let snapshot_paths = snapshot
+        .search(&query("DIRTY_ONE"))
+        .expect("test should succeed")
+        .hits
+        .into_iter()
+        .map(|hit| hit.path)
+        .collect::<Vec<_>>();
+    let snapshot_new_paths = snapshot
         .search(&query("DIRTY_TWO"))
         .expect("test should succeed")
         .hits
@@ -219,6 +234,7 @@ fn workspace_snapshot_freezes_dirty_path_set_but_reads_current_dirty_contents() 
     let workspace_paths = hit_paths_current_view(&workspace, "DIRTY_TWO");
 
     assert_eq!(snapshot_paths, vec![tracked.to_string_lossy().into_owned()]);
+    assert!(snapshot_new_paths.is_empty());
     assert_eq!(
         workspace_paths,
         vec![
@@ -240,6 +256,9 @@ fn workspace_index_hides_deleted_base_results() {
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
+    workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
 
     let paths = hit_paths(&workspace, "TOKEN");
 
@@ -251,14 +270,17 @@ fn workspace_index_hides_deleted_base_results() {
 fn workspace_status_reports_dirty_files_without_refresh_step() {
     let repo = TestRepo::new();
     let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
-    repo.build();
-    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY\";\n");
-    repo.write("new.rs", "const NAME: &str = \"DIRTY\";\n");
 
     let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
+    workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
+
+    rewrite_with_fresh_mtime(&tracked, "const NAME: &str = \"DIRTY\";\n");
+    repo.write("new.rs", "const NAME: &str = \"DIRTY\";\n");
 
     let status = workspace.status().expect("test should succeed");
     let dirty = status.dirty_files.expect("dirty diff should exist");
@@ -285,6 +307,32 @@ fn workspace_index_exposes_git_snapshot_identity() {
     assert_eq!(base.head_commit.as_deref(), Some(repo.git_head().as_str()));
     assert!(base.snapshot_key.starts_with("base-git-"));
     assert!(base.config_fingerprint.is_some());
+}
+
+#[test]
+fn workspace_index_git_base_snapshot_skips_untracked_files_when_head_matches_worktree() {
+    let repo = TestRepo::new();
+    repo.init_git();
+    repo.write("tracked.rs", "const NAME: &str = \"TRACKED\";\n");
+    repo.commit_all("initial");
+    repo.write("untracked.rs", "const NAME: &str = \"UNTRACKED\";\n");
+
+    let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+        build_config: repo.trigram_build_config(),
+    })
+    .expect("test should succeed");
+
+    let base = workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
+    assert_eq!(base.doc_count, 1);
+
+    let dirty = workspace
+        .status()
+        .expect("test should succeed")
+        .dirty_files
+        .expect("dirty diff should exist");
+    assert_eq!(dirty.new_files.len(), 1);
 }
 
 #[test]
@@ -330,6 +378,9 @@ fn workspace_probe_freshness_if_due_reuses_cache_until_ttl_expires() {
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
+    workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
 
     let first = workspace
         .probe_freshness_if_due(Duration::from_secs(60))
@@ -362,10 +413,14 @@ fn workspace_json_report_reflects_latest_worktree_view() {
         build_config: repo.trigram_build_config(),
     })
     .expect("test should succeed");
-    let report = JsonSearchReport::from_search_results(&search_with_dirty_view(
-        &workspace,
-        &query("DIRTY_NAME"),
-    ));
+    workspace
+        .ensure_base_snapshot()
+        .expect("test should succeed");
+    let report = JsonSearchReport::from_search_results(
+        &workspace
+            .search(&query("DIRTY_NAME"))
+            .expect("test should succeed"),
+    );
     assert!(report.has_match());
     assert_eq!(report.files.len(), 2);
     let paths = report

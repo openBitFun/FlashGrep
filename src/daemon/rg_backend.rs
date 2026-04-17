@@ -340,7 +340,7 @@ fn build_rg_scope_command(build_config: &BuildConfig, scope: &PathFilterArgs) ->
         command.arg("-T").arg(name);
     }
     if let Some(exclude_glob) =
-        rg_index_exclude_glob(&build_config.repo_path, &build_config.index_path)
+        rg_storage_root_exclude_glob(&build_config.repo_path, &build_config.storage_root)
     {
         command.arg("-g").arg(format!("!{exclude_glob}"));
     }
@@ -361,7 +361,7 @@ fn build_rg_files_command(build_config: &BuildConfig) -> Command {
         command.arg("--hidden");
     }
     if let Some(exclude_glob) =
-        rg_index_exclude_glob(&build_config.repo_path, &build_config.index_path)
+        rg_storage_root_exclude_glob(&build_config.repo_path, &build_config.storage_root)
     {
         command.arg("-g").arg(format!("!{exclude_glob}"));
     }
@@ -411,8 +411,8 @@ fn rg_scope_roots(repo_root: &Path, roots: &[PathBuf]) -> Vec<PathBuf> {
         .collect()
 }
 
-fn rg_index_exclude_glob(repo_root: &Path, index_path: &Path) -> Option<String> {
-    let relative = index_path.strip_prefix(repo_root).ok()?;
+fn rg_storage_root_exclude_glob(repo_root: &Path, storage_root: &Path) -> Option<String> {
+    let relative = storage_root.strip_prefix(repo_root).ok()?;
     if relative.as_os_str().is_empty() {
         return None;
     }

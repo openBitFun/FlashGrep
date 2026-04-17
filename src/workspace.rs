@@ -5,6 +5,7 @@ mod freshness;
 mod runtime;
 
 use std::{
+    collections::BTreeSet,
     io::ErrorKind,
     path::PathBuf,
     sync::{Arc, Mutex},
@@ -12,20 +13,24 @@ use std::{
 };
 
 use crate::{
+    base_snapshot_build::{BaseSnapshotBuildMode, BaseSnapshotBuildOptions},
     config::BuildConfig,
     error::{AppError, Result},
-    index::{build_index_with_options, IndexBuildOptions, IndexSearcher, IndexWorktreeDiff},
-    path_filter::PathFilter,
-    query_preflight::{evaluate_index_query_preflight, preflight_enabled},
-    search::SearchResults,
-    search_engine::{
-        search_document_index, search_documents, SearchBackend, SearchDocumentIndex, SearchResponse,
+    index_engine::{
+        query::{QueryFilters, QueryRequest},
+        reader::IndexSnapshotReader,
+        WorkspaceBaseSnapshotIndex, WorkspaceSearchView,
     },
+    path_filter::PathFilter,
+    search::SearchResults,
+    search_engine::{search_documents, SearchBackend, SearchResponse},
+    worktree_diff::IndexWorktreeDiff,
     TokenizerMode,
 };
 
 use self::runtime::{
-    load_search_document, merge_search_results, overlay_search_scope, scan_text_repository_files,
+    build_overlay_snapshot_state, diff_against_base_snapshot, merge_search_results,
+    reconcile_dirty_paths_against_current_diff, scan_text_repository_files,
 };
 
 /// Options for opening a [`WorkspaceIndex`].
@@ -49,7 +54,7 @@ pub struct BaseSnapshotInfo {
     /// Stable cache key for the base snapshot.
     pub snapshot_key: String,
     /// Root directory that stores base snapshot index data.
-    pub index_path: PathBuf,
+    pub base_snapshot_root: PathBuf,
     /// Repository root for this workspace.
     pub repo_path: PathBuf,
     /// Tokenizer used by the base snapshot.
@@ -150,27 +155,18 @@ pub struct WorkspaceIndex {
     inner: Arc<WorkspaceIndexInner>,
 }
 
-/// Read-only workspace query view pinned to one base snapshot and dirty path set.
-///
-/// The dirty path set is captured when the snapshot is created. Matching still
-/// reads the current on-disk contents for those paths at query time.
+/// Read-only workspace query view pinned to one base snapshot and one overlay snapshot.
 #[derive(Clone)]
 pub struct WorkspaceSnapshot {
-    searcher: Arc<IndexSearcher>,
-    dirty: IndexWorktreeDiff,
+    build_config: BuildConfig,
     base_snapshot_key: String,
+    base_snapshot: IndexSnapshotReader,
+    overlay_snapshot: Option<IndexSnapshotReader>,
 }
 
 struct WorkspaceIndexInner {
     options: WorkspaceIndexOptions,
-    cached_searcher: Mutex<Option<CachedBaseSearcher>>,
     cached_freshness: Mutex<Option<CachedFreshnessProbe>>,
-}
-
-#[derive(Clone)]
-struct CachedBaseSearcher {
-    snapshot_key: String,
-    searcher: Arc<IndexSearcher>,
 }
 
 #[derive(Clone)]
@@ -187,7 +183,6 @@ impl WorkspaceIndex {
                 options: WorkspaceIndexOptions {
                     build_config: options.build_config.normalized()?,
                 },
-                cached_searcher: Mutex::new(None),
                 cached_freshness: Mutex::new(None),
             }),
         })
@@ -195,32 +190,30 @@ impl WorkspaceIndex {
 
     /// Ensures that a base snapshot exists and returns its identity metadata.
     pub fn ensure_base_snapshot(&self) -> Result<BaseSnapshotInfo> {
-        self.ensure_base_snapshot_with_options(IndexBuildOptions::default())
+        self.ensure_base_snapshot_with_options(BaseSnapshotBuildOptions::default())
     }
 
     pub fn ensure_base_snapshot_with_options(
         &self,
-        options: IndexBuildOptions<'_>,
+        options: BaseSnapshotBuildOptions<'_>,
     ) -> Result<BaseSnapshotInfo> {
         self.clear_freshness_probe_cache();
-        build_index_with_options(&self.inner.options.build_config, options)?;
-        self.clear_cached_searcher();
+        let _ = WorkspaceBaseSnapshotIndex::build_with_options(
+            &self.inner.options.build_config,
+            &self.repo_id(),
+            BaseSnapshotBuildOptions {
+                build_mode: BaseSnapshotBuildMode::ForceRebuildSnapshot,
+                ..options
+            },
+        )?;
         self.base_snapshot_info()
-    }
-
-    fn clear_cached_searcher(&self) {
-        let mut cached_searcher = match self.inner.cached_searcher.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        *cached_searcher = None;
     }
 
     /// Reports the current base snapshot and worktree diff state.
     pub fn status(&self) -> Result<IndexStatus> {
         let base = self.base_snapshot_info().ok();
-        let dirty_files = match self.open_searcher() {
-            Ok(searcher) => Some(searcher.diff_against_worktree()?),
+        let dirty_files = match self.diff_against_worktree() {
+            Ok(diff) => Some(diff),
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => None,
             Err(error) => return Err(error),
         };
@@ -254,8 +247,8 @@ impl WorkspaceIndex {
 
     /// Searches the current effective workspace view.
     ///
-    /// This resolves the current dirty diff on demand and searches against
-    /// `base snapshot + current dirty files repaired`.
+    /// This resolves the current worktree diff on demand, materializes the
+    /// workspace overlay snapshot, and searches `base snapshot + overlay snapshot`.
     pub fn search(&self, query: &crate::QueryConfig) -> Result<SearchResults> {
         self.search_with_filter(query, None)
     }
@@ -266,10 +259,18 @@ impl WorkspaceIndex {
         query: &crate::QueryConfig,
         filter: Option<&PathFilter>,
     ) -> Result<SearchResults> {
-        match self.open_searcher() {
-            Ok(searcher) => {
-                let dirty = searcher.diff_against_worktree()?;
-                search_workspace_view(&searcher, query, &dirty, filter)
+        match self.open_base_snapshot_reader() {
+            Ok(base_snapshot) => {
+                let dirty = self.diff_against_worktree()?;
+                let search_view = self.workspace_search_view()?;
+                let overlay_snapshot = self.materialize_overlay_snapshot_for_diff(&dirty)?;
+                search_workspace_view(
+                    &search_view,
+                    &base_snapshot,
+                    overlay_snapshot.as_ref(),
+                    query,
+                    filter,
+                )
             }
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 self.scan_search_with_filter(query, filter)
@@ -284,55 +285,39 @@ impl WorkspaceIndex {
         filter: Option<&PathFilter>,
     ) -> Result<WorkspaceSearchProfile> {
         let total_started = Instant::now();
-        let searcher = self.open_searcher()?;
+        let base_snapshot = self.open_base_snapshot_reader()?;
+        let search_view = self.workspace_search_view()?;
 
         let diff_started = Instant::now();
-        let diff = searcher.diff_against_worktree()?;
+        let diff = self.diff_against_worktree()?;
         let diff_elapsed = diff_started.elapsed();
 
-        if diff.is_empty() {
-            let base_started = Instant::now();
-            let base_results = searcher.search_with_filter(query, filter)?;
-            let base_elapsed = base_started.elapsed();
-            return Ok(WorkspaceSearchProfile {
-                diff,
-                shadowed_base_paths: 0,
-                dirty_documents: 0,
-                base_candidate_docs: base_results.candidate_docs,
-                base_matched_lines: base_results.matched_lines,
-                dirty_candidate_docs: 0,
-                dirty_matched_lines: 0,
-                final_candidate_docs: base_results.candidate_docs,
-                final_matched_lines: base_results.matched_lines,
-                timings: WorkspaceSearchTimings {
-                    diff: diff_elapsed,
-                    overlay_build: Duration::ZERO,
-                    base_search: base_elapsed,
-                    dirty_search: Duration::ZERO,
-                    merge: Duration::ZERO,
-                    total: total_started.elapsed(),
-                },
-            });
-        }
-
         let overlay_started = Instant::now();
-        let scope = overlay_search_scope(&diff, filter)?;
+        let overlay_snapshot = self.materialize_overlay_snapshot_for_diff(&diff)?;
         let overlay_elapsed = overlay_started.elapsed();
 
+        let workspace_snapshot = search_view
+            .open_workspace_query_snapshot(Some(base_snapshot.clone()), overlay_snapshot.clone())?;
+
         let base_started = Instant::now();
-        let base_results = searcher.search_with_path_overrides(
+        let base_results = search_view.search_base_snapshot(
             query,
+            &QueryFilters::default(),
             filter,
-            None,
-            Some(&scope.shadowed_base_paths),
+            workspace_snapshot.shadowed_base_paths(),
+            workspace_snapshot.base_snapshot(),
         )?;
         let base_elapsed = base_started.elapsed();
 
         let dirty_started = Instant::now();
         let dirty_results = match query_with_remaining_global_limit(query, &base_results) {
-            Some(dirty_query) if !scope.dirty_documents.is_empty() => {
-                search_documents(&dirty_query, &scope.dirty_documents)?
-            }
+            Some(dirty_query) if workspace_snapshot.has_overlay_snapshot() => search_view
+                .search_overlay_snapshot(
+                    &dirty_query,
+                    &QueryFilters::default(),
+                    filter,
+                    workspace_snapshot.overlay_snapshot(),
+                )?,
             _ => empty_search_results(),
         };
         let dirty_elapsed = dirty_started.elapsed();
@@ -351,10 +336,11 @@ impl WorkspaceIndex {
         };
         let merge_elapsed = merge_started.elapsed();
 
+        let dirty_documents = diff.modified_files.len() + diff.new_files.len();
         Ok(WorkspaceSearchProfile {
             diff,
-            shadowed_base_paths: scope.shadowed_base_paths.len(),
-            dirty_documents: scope.dirty_documents.len(),
+            shadowed_base_paths: workspace_snapshot.shadowed_base_paths_len(),
+            dirty_documents,
             base_candidate_docs: base_results.candidate_docs,
             base_matched_lines: base_results.matched_lines,
             dirty_candidate_docs: dirty_results.candidate_docs,
@@ -373,42 +359,27 @@ impl WorkspaceIndex {
     }
 
     /// Captures a reusable read-only workspace view pinned to the current base
-    /// snapshot and dirty path set.
+    /// snapshot and the corresponding materialized overlay snapshot.
     pub fn snapshot(&self) -> Result<WorkspaceSnapshot> {
-        let searcher = match self.open_searcher() {
-            Ok(searcher) => searcher,
+        let base_snapshot = match self.open_base_snapshot_reader() {
+            Ok(base_snapshot) => base_snapshot,
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 return Err(AppError::InvalidIndex(format!(
-                    "index does not exist at {}",
-                    self.inner.options.build_config.index_path.display()
+                    "base snapshot does not exist at {}",
+                    self.inner.options.build_config.storage_root.display()
                 )));
             }
             Err(error) => return Err(error),
         };
-        let dirty = searcher.diff_against_worktree()?;
-        let base_snapshot_key = self.current_snapshot_key_on_disk()?;
+        let dirty = self.diff_against_worktree()?;
+        let base_snapshot_key = self.current_base_snapshot_key()?;
+        let overlay_snapshot = self.materialize_overlay_snapshot_for_diff(&dirty)?;
         Ok(WorkspaceSnapshot {
-            searcher,
-            dirty,
+            build_config: self.inner.options.build_config.clone(),
             base_snapshot_key,
+            base_snapshot,
+            overlay_snapshot,
         })
-    }
-
-    /// Searches against the base snapshot plus a caller-maintained dirty overlay diff.
-    pub fn search_with_dirty_diff(
-        &self,
-        query: &crate::QueryConfig,
-        dirty: &IndexWorktreeDiff,
-        filter: Option<&PathFilter>,
-    ) -> Result<SearchResults> {
-        match self.open_searcher() {
-            Ok(searcher) => search_workspace_view(&searcher, query, dirty, filter),
-            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => search_documents(
-                query,
-                &scan_text_repository_files(&self.inner.options.build_config, filter)?,
-            ),
-            Err(error) => Err(error),
-        }
     }
 
     /// Searches only the current base snapshot and reuses the cached searcher when available.
@@ -418,25 +389,16 @@ impl WorkspaceIndex {
         filter: Option<&PathFilter>,
         allow_scan_fallback: bool,
     ) -> Result<SearchResponse> {
-        match self.open_searcher() {
-            Ok(searcher) => {
-                let query_prefers_scan = if preflight_enabled() {
-                    let preflight = evaluate_index_query_preflight(&searcher, query, filter, None)?;
-                    preflight.reason.requires_scan_backend()
-                } else {
-                    false
-                };
-                if allow_scan_fallback && query_prefers_scan {
-                    return Ok(SearchResponse {
-                        backend: SearchBackend::Scan,
-                        results: self.scan_search_with_filter(query, filter)?,
-                    });
-                }
-                Ok(SearchResponse {
-                    backend: SearchBackend::Index,
-                    results: searcher.search_with_filter(query, filter)?,
-                })
-            }
+        match self.open_base_snapshot_reader() {
+            Ok(base_snapshot) => Ok(SearchResponse {
+                backend: SearchBackend::Index,
+                results: self.workspace_search_view()?.search_current_snapshot(
+                    query,
+                    &QueryFilters::default(),
+                    filter,
+                    Some(&base_snapshot),
+                )?,
+            }),
             Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
                 if allow_scan_fallback {
                     return Ok(SearchResponse {
@@ -445,8 +407,8 @@ impl WorkspaceIndex {
                     });
                 }
                 Err(AppError::InvalidIndex(format!(
-                    "index does not exist at {}",
-                    self.inner.options.build_config.index_path.display()
+                    "base snapshot does not exist at {}",
+                    self.inner.options.build_config.storage_root.display()
                 )))
             }
             Err(error) => Err(error),
@@ -464,49 +426,11 @@ impl WorkspaceIndex {
         )
     }
 
-    pub(crate) fn search_with_dirty_overlay(
-        &self,
-        query: &crate::QueryConfig,
-        shadowed_base_paths: &std::collections::HashSet<String>,
-        dirty_index: &SearchDocumentIndex,
-        filter: Option<&PathFilter>,
-    ) -> Result<SearchResults> {
-        match self.open_searcher() {
-            Ok(searcher) => {
-                search_workspace_overlay(&searcher, query, shadowed_base_paths, dirty_index, filter)
-            }
-            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                search_document_index(query, dirty_index, filter)
-            }
-            Err(error) => Err(error),
-        }
-    }
-
     /// Returns the current full worktree diff. Prefer this only for initialization
     /// or recovery; regular daemon queries should use dirty-path overlays.
     pub fn diff_against_worktree(&self) -> Result<IndexWorktreeDiff> {
-        self.open_searcher()?.diff_against_worktree()
-    }
-
-    pub(crate) fn classify_dirty_paths<I>(&self, paths: I) -> Result<IndexWorktreeDiff>
-    where
-        I: IntoIterator<Item = String>,
-    {
-        match self.open_searcher() {
-            Ok(searcher) => searcher.classify_dirty_paths(paths),
-            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => {
-                Ok(IndexWorktreeDiff::default())
-            }
-            Err(error) => Err(error),
-        }
-    }
-
-    pub(crate) fn has_indexed_path_under(&self, path: &str) -> Result<bool> {
-        match self.open_searcher() {
-            Ok(searcher) => Ok(searcher.has_indexed_path_under(path)),
-            Err(AppError::Io(error)) if error.kind() == ErrorKind::NotFound => Ok(false),
-            Err(error) => Err(error),
-        }
+        let catalog = self.open_base_path_catalog()?;
+        diff_against_base_snapshot(&self.inner.options.build_config, &catalog)
     }
 
     /// Reconciles a caller-maintained dirty overlay against the current base snapshot.
@@ -515,25 +439,42 @@ impl WorkspaceIndex {
             return Ok(IndexWorktreeDiff::default());
         }
 
-        let searcher = self.open_searcher()?;
-        searcher.reconcile_dirty_paths(dirty)
+        let current = self.diff_against_worktree()?;
+        Ok(reconcile_dirty_paths_against_current_diff(dirty, &current))
     }
 
-    pub(crate) fn load_dirty_document(
+    fn repo_id(&self) -> crate::index_engine::RepoId {
+        crate::index_engine::RepoId(
+            self.inner
+                .options
+                .build_config
+                .repo_path
+                .to_string_lossy()
+                .into_owned(),
+        )
+    }
+
+    fn workspace_search_view(&self) -> Result<WorkspaceSearchView> {
+        WorkspaceSearchView::open(self.inner.options.build_config.clone())
+    }
+
+    fn materialize_overlay_snapshot_for_diff(
         &self,
-        path: &str,
-    ) -> Result<Option<crate::search_engine::SearchDocument>> {
-        load_search_document(path.to_string(), PathBuf::from(path))
+        dirty: &IndexWorktreeDiff,
+    ) -> Result<Option<IndexSnapshotReader>> {
+        if dirty.is_empty() {
+            return Ok(None);
+        }
+        let overlay_state =
+            build_overlay_snapshot_state(&self.repo_id(), &self.inner.options.build_config, dirty)?;
+        self.materialize_overlay_snapshot_reader(&overlay_state)
+            .map(Some)
     }
 }
 
 impl WorkspaceSnapshot {
     pub fn base_snapshot_key(&self) -> &str {
         &self.base_snapshot_key
-    }
-
-    pub fn dirty_diff(&self) -> &IndexWorktreeDiff {
-        &self.dirty
     }
 
     pub fn search(&self, query: &crate::QueryConfig) -> Result<SearchResults> {
@@ -545,53 +486,165 @@ impl WorkspaceSnapshot {
         query: &crate::QueryConfig,
         filter: Option<&PathFilter>,
     ) -> Result<SearchResults> {
-        search_workspace_view(&self.searcher, query, &self.dirty, filter)
+        let search_view = WorkspaceSearchView::open(self.build_config.clone())?;
+        let base_info = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
+            .ok_or_else(|| {
+                AppError::InvalidIndex("base snapshot shard metadata is missing".into())
+            })?;
+        if base_info.snapshot_key != self.base_snapshot_key {
+            return Err(AppError::Protocol(format!(
+                "snapshot handle {} is stale; current base snapshot is {}",
+                self.base_snapshot_key, base_info.snapshot_key
+            )));
+        }
+        let _base_snapshot = WorkspaceBaseSnapshotIndex::open_if_matching(
+            &self.build_config,
+            &self.base_snapshot_key,
+        )?
+        .ok_or_else(|| {
+            AppError::InvalidIndex(format!(
+                "base snapshot shard marker is missing or stale for {}",
+                self.build_config.repo_path.display()
+            ))
+        })?
+        .open_committed()?;
+        search_workspace_view(
+            &search_view,
+            &self.base_snapshot,
+            self.overlay_snapshot.as_ref(),
+            query,
+            filter,
+        )
+    }
+
+    pub fn visible_paths(&self, filter: Option<&PathFilter>) -> Result<Vec<String>> {
+        workspace_visible_paths(
+            &self.build_config,
+            &self.base_snapshot,
+            self.overlay_snapshot.as_ref(),
+            filter,
+        )
+    }
+
+    pub fn candidate_paths(
+        &self,
+        query: &crate::QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<Vec<String>> {
+        workspace_candidate_paths(
+            &self.build_config,
+            &workspace_query_request(query),
+            &self.base_snapshot,
+            self.overlay_snapshot.as_ref(),
+            filter,
+        )
     }
 }
 
 fn search_workspace_view(
-    searcher: &IndexSearcher,
+    search_view: &WorkspaceSearchView,
+    base_snapshot: &crate::index_engine::reader::IndexSnapshotReader,
+    overlay_snapshot: Option<&crate::index_engine::reader::IndexSnapshotReader>,
     query: &crate::QueryConfig,
-    dirty: &IndexWorktreeDiff,
     filter: Option<&PathFilter>,
 ) -> Result<SearchResults> {
-    if dirty.is_empty() {
-        return searcher.search_with_filter(query, filter);
-    }
-    let scope = overlay_search_scope(dirty, filter)?;
-    let base_results = searcher.search_with_path_overrides(
-        query,
-        filter,
-        None,
-        Some(&scope.shadowed_base_paths),
-    )?;
-    if scope.dirty_documents.is_empty() {
-        return Ok(base_results);
-    }
-    let Some(dirty_query) = query_with_remaining_global_limit(query, &base_results) else {
-        return Ok(base_results);
-    };
-    let dirty_results = search_documents(&dirty_query, &scope.dirty_documents)?;
-    Ok(merge_search_results(base_results, dirty_results))
+    let workspace_snapshot = search_view
+        .open_workspace_query_snapshot(Some(base_snapshot.clone()), overlay_snapshot.cloned())?;
+    workspace_snapshot.search(search_view, query, &QueryFilters::default(), filter)
 }
 
-fn search_workspace_overlay(
-    searcher: &IndexSearcher,
-    query: &crate::QueryConfig,
-    shadowed_base_paths: &std::collections::HashSet<String>,
-    dirty_index: &SearchDocumentIndex,
+fn workspace_visible_paths(
+    build_config: &BuildConfig,
+    base_snapshot: &IndexSnapshotReader,
+    overlay_snapshot: Option<&IndexSnapshotReader>,
     filter: Option<&PathFilter>,
-) -> Result<SearchResults> {
-    let base_results =
-        searcher.search_with_path_overrides(query, filter, None, Some(shadowed_base_paths))?;
-    if dirty_index.is_empty() {
-        return Ok(base_results);
+) -> Result<Vec<String>> {
+    let shadowed_base_paths = overlay_snapshot
+        .map(|snapshot| snapshot.visible_keys())
+        .transpose()?
+        .map(|keys| {
+            keys.live
+                .into_iter()
+                .chain(keys.deleted)
+                .map(|key| key.logical_path)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut paths = BTreeSet::new();
+
+    for document in base_snapshot.visible_documents()?.into_values() {
+        if shadowed_base_paths.contains(&document.logical_path) {
+            continue;
+        }
+        push_visible_path(&mut paths, build_config, &document.logical_path, filter);
     }
-    let Some(dirty_query) = query_with_remaining_global_limit(query, &base_results) else {
-        return Ok(base_results);
-    };
-    let dirty_results = search_document_index(&dirty_query, dirty_index, filter)?;
-    Ok(merge_search_results(base_results, dirty_results))
+
+    if let Some(overlay_snapshot) = overlay_snapshot {
+        for document in overlay_snapshot.visible_documents()?.into_values() {
+            push_visible_path(&mut paths, build_config, &document.logical_path, filter);
+        }
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+fn workspace_candidate_paths(
+    build_config: &BuildConfig,
+    query: &QueryRequest,
+    base_snapshot: &IndexSnapshotReader,
+    overlay_snapshot: Option<&IndexSnapshotReader>,
+    filter: Option<&PathFilter>,
+) -> Result<Vec<String>> {
+    let shadowed_base_paths = overlay_snapshot
+        .map(|snapshot| snapshot.visible_keys())
+        .transpose()?
+        .map(|keys| {
+            keys.live
+                .into_iter()
+                .chain(keys.deleted)
+                .map(|key| key.logical_path)
+                .collect::<std::collections::HashSet<_>>()
+        })
+        .unwrap_or_default();
+    let mut paths = BTreeSet::new();
+
+    for logical_path in base_snapshot.candidate_paths(query)? {
+        if shadowed_base_paths.contains(&logical_path) {
+            continue;
+        }
+        push_visible_path(&mut paths, build_config, &logical_path, filter);
+    }
+
+    if let Some(overlay_snapshot) = overlay_snapshot {
+        for logical_path in overlay_snapshot.candidate_paths(query)? {
+            push_visible_path(&mut paths, build_config, &logical_path, filter);
+        }
+    }
+
+    Ok(paths.into_iter().collect())
+}
+
+pub(crate) fn workspace_query_request(query: &crate::QueryConfig) -> QueryRequest {
+    QueryRequest {
+        pattern: query.regex_pattern.clone(),
+        mode: query.search_mode,
+        case_insensitive: query.case_insensitive,
+        top_k: query.global_max_results,
+        filters: QueryFilters::default(),
+    }
+}
+
+fn push_visible_path(
+    paths: &mut BTreeSet<String>,
+    build_config: &BuildConfig,
+    logical_path: &str,
+    filter: Option<&PathFilter>,
+) {
+    let absolute = build_config.repo_path.join(logical_path);
+    if filter.is_some_and(|filter| !filter.matches_file(&absolute)) {
+        return;
+    }
+    paths.insert(absolute.to_string_lossy().into_owned());
 }
 
 fn query_with_remaining_global_limit(
@@ -632,9 +685,12 @@ mod tests {
 
     use super::{BaseSnapshotKind, WorkspaceFreshnessState, WorkspaceIndex, WorkspaceIndexOptions};
     use crate::{
-        build_index,
         config::{BuildConfig, CorpusMode, TokenizerMode},
-        index::IndexWorktreeDiff,
+        index_engine::WorkspaceBaseSnapshotIndex,
+        search_engine::SearchBackend,
+        search_engine::SearchEngine,
+        worktree_diff::IndexWorktreeDiff,
+        QueryConfig,
     };
 
     struct TestRepo {
@@ -649,7 +705,7 @@ mod tests {
             let repo_dir = temp.path().join("repo");
             fs::create_dir_all(&repo_dir).expect("repo dir should succeed");
             let repo = fs::canonicalize(&repo_dir).expect("repo dir should canonicalize");
-            let index = repo.join(".codgrep-index");
+            let index = repo.join(".codgrep-index-engine");
             Self {
                 _temp: temp,
                 repo,
@@ -678,7 +734,7 @@ mod tests {
         fn build_config(&self) -> BuildConfig {
             BuildConfig {
                 repo_path: self.repo.clone(),
-                index_path: self.index.clone(),
+                storage_root: self.index.clone(),
                 tokenizer: TokenizerMode::Trigram,
                 corpus_mode: CorpusMode::RespectIgnore,
                 include_hidden: false,
@@ -689,7 +745,18 @@ mod tests {
         }
 
         fn build(&self) {
-            build_index(&self.build_config()).expect("build should succeed");
+            SearchEngine::new(self.build_config())
+                .build_base_snapshot()
+                .expect("build should succeed");
+        }
+    }
+
+    fn query(pattern: &str) -> QueryConfig {
+        QueryConfig {
+            regex_pattern: pattern.into(),
+            patterns: vec![pattern.into()],
+            fixed_strings: true,
+            ..QueryConfig::default()
         }
     }
 
@@ -797,6 +864,123 @@ mod tests {
     }
 
     #[test]
+    fn ensure_base_snapshot_publishes_base_shard_metadata_used_by_base_snapshot_info() {
+        let repo = TestRepo::new();
+        repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+
+        let base = workspace
+            .ensure_base_snapshot()
+            .expect("base snapshot should build");
+        let metadata = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&repo.build_config())
+            .expect("metadata should load")
+            .expect("metadata should exist");
+        assert_eq!(metadata.snapshot_key, base.snapshot_key);
+        assert_eq!(metadata.doc_count, Some(1));
+        assert_eq!(metadata.tokenizer, Some(repo.build_config().tokenizer));
+        assert!(metadata.config_fingerprint.is_some());
+        assert!(
+            !repo.index.join("CURRENT").exists(),
+            "workspace base snapshot should not depend on legacy CURRENT"
+        );
+
+        let metadata_backed = workspace
+            .base_snapshot_info()
+            .expect("base snapshot info should use base shard metadata");
+        assert_eq!(metadata_backed.snapshot_key, base.snapshot_key);
+        assert_eq!(metadata_backed.doc_count, 1);
+        assert_eq!(metadata_backed.tokenizer, repo.build_config().tokenizer);
+    }
+
+    #[test]
+    fn ensure_base_snapshot_publishes_one_compact_base_segment() {
+        let repo = TestRepo::new();
+        repo.write("src/a.rs", "const A: &str = \"AAAA\";\n");
+        repo.write("src/b.rs", "const B: &str = \"BBBB\";\n");
+        repo.write("src/c.rs", "const C: &str = \"CCCC\";\n");
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+        workspace
+            .ensure_base_snapshot()
+            .expect("base snapshot should build");
+
+        let snapshot = WorkspaceBaseSnapshotIndex::open_read_only(&repo.build_config())
+            .expect("base snapshot should open")
+            .open_committed()
+            .expect("committed base snapshot should open");
+        assert_eq!(snapshot.manifest().active_segments.len(), 1);
+
+        let manifest_count = fs::read_dir(
+            WorkspaceBaseSnapshotIndex::index_root(&repo.build_config()).join("manifests"),
+        )
+        .expect("manifests dir should exist")
+        .filter_map(|entry| entry.ok())
+        .count();
+        assert_eq!(manifest_count, 1);
+    }
+
+    #[test]
+    fn workspace_search_and_snapshot_use_base_shard_without_legacy_index() {
+        let repo = TestRepo::new();
+        let tracked = repo.write("base.rs", "const NAME: &str = \"BASE\";\n");
+
+        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
+            build_config: repo.build_config(),
+        })
+        .expect("workspace should open");
+        workspace
+            .ensure_base_snapshot()
+            .expect("base snapshot should build");
+
+        assert!(
+            !repo.index.join("CURRENT").exists(),
+            "workspace search should not require legacy CURRENT"
+        );
+
+        let snapshot_search = workspace
+            .search_snapshot_with_filter(&query("BASE"), None, false)
+            .expect("snapshot search should succeed");
+        assert_eq!(snapshot_search.backend, SearchBackend::Index);
+        assert_eq!(snapshot_search.results.matched_lines, 1);
+
+        let snapshot = workspace.snapshot().expect("snapshot should succeed");
+        repo.write("base.rs", "const NAME: &str = \"DIRTY\";\n");
+
+        let live_results = workspace
+            .search(&query("DIRTY"))
+            .expect("workspace search should see dirty contents");
+        assert_eq!(live_results.matched_lines, 1);
+
+        let pinned_results = snapshot
+            .search(&query("BASE"))
+            .expect("snapshot search should use pinned base snapshot");
+        assert_eq!(pinned_results.matched_lines, 1);
+
+        let stale_snapshot = workspace
+            .ensure_base_snapshot()
+            .expect("rebuild should succeed");
+        assert_eq!(
+            stale_snapshot.snapshot_key,
+            workspace
+                .base_snapshot_info()
+                .expect("base snapshot info should succeed")
+                .snapshot_key
+        );
+        let error = snapshot
+            .search(&query("BASE"))
+            .expect_err("stale snapshot should fail once base snapshot changes");
+        assert!(matches!(error, crate::AppError::Protocol(_)));
+        assert!(tracked.exists());
+    }
+
+    #[test]
     fn reconcile_dirty_diff_keeps_only_paths_that_are_still_dirty() {
         let repo = TestRepo::new();
         let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
@@ -826,45 +1010,6 @@ mod tests {
             vec![removed.to_string_lossy().into_owned()]
         );
         assert!(reconciled.new_files.is_empty());
-    }
-
-    #[test]
-    fn classify_dirty_paths_batches_mixed_changes() {
-        let repo = TestRepo::new();
-        let tracked = repo.write("tracked.rs", "const NAME: &str = \"BASE\";\n");
-        let removed = repo.write("removed.rs", "const NAME: &str = \"REMOVED\";\n");
-        repo.build();
-
-        let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
-            build_config: repo.build_config(),
-        })
-        .expect("workspace should open");
-
-        repo.write("tracked.rs", "const NAME: &str = \"DIRTY\";\n");
-        fs::remove_file(&removed).expect("remove should succeed");
-        let added = repo.write("added.rs", "const NAME: &str = \"ADDED\";\n");
-
-        let classified = workspace
-            .classify_dirty_paths([
-                tracked.to_string_lossy().into_owned(),
-                removed.to_string_lossy().into_owned(),
-                added.to_string_lossy().into_owned(),
-                added.to_string_lossy().into_owned(),
-            ])
-            .expect("classify should succeed");
-
-        assert_eq!(
-            classified.modified_files,
-            vec![tracked.to_string_lossy().into_owned()]
-        );
-        assert_eq!(
-            classified.deleted_files,
-            vec![removed.to_string_lossy().into_owned()]
-        );
-        assert_eq!(
-            classified.new_files,
-            vec![added.to_string_lossy().into_owned()]
-        );
     }
 
     #[test]
