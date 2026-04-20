@@ -9,7 +9,7 @@ use std::{
 use memmap2::Mmap;
 
 use crate::index_engine::segment::{
-    advise_mmap_sequential, ordered_posting_keys, TermDictEntry, TermDictionary,
+    advise_mmap_random, ordered_posting_keys, TermDictEntry, TermDictionary,
 };
 use crate::{AppError, Result};
 
@@ -70,7 +70,7 @@ impl PostingLists {
         let version = verify_postings_header(path, term_dict.len())?;
         let postings_file = File::open(path)?;
         let postings_mmap = unsafe { Mmap::map(&postings_file)? };
-        advise_mmap_sequential(&postings_mmap);
+        advise_mmap_random(&postings_mmap);
         Ok(Self {
             storage: PostingListStorage::Lazy(FileBackedPostingLists {
                 postings_mmap,

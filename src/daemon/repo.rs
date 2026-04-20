@@ -400,13 +400,16 @@ impl RepoManager {
     }
 
     #[cfg(test)]
-    pub(crate) fn clear_dirty_overlay_for_tests(&self, repo_id: &str) -> Result<()> {
+    pub(crate) fn clear_published_overlay_paths_cache_for_tests(
+        &self,
+        repo_id: &str,
+    ) -> Result<()> {
         let runtime = self.repo(repo_id)?;
-        let mut overlay = match runtime.dirty_overlay.lock() {
+        let mut published_overlay_paths_cache = match runtime.published_overlay_paths_cache.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        *overlay = DirtyOverlayState::default();
+        *published_overlay_paths_cache = DirtyPathSet::default();
         Ok(())
     }
 
@@ -442,7 +445,7 @@ struct RepoRuntime {
     maintenance_worker: Arc<(Mutex<MaintenanceWorkerState>, Condvar)>,
     maintenance_handle: Mutex<Option<JoinHandle<()>>>,
     state: Mutex<RepoState>,
-    dirty_overlay: Mutex<DirtyOverlayState>,
+    published_overlay_paths_cache: Mutex<DirtyPathSet>,
     glob_cache: Mutex<GlobCacheState>,
     glob_cache_epoch: AtomicU64,
     active_searches: AtomicU64,
@@ -486,16 +489,6 @@ struct DirtyPathSet {
     modified: std::collections::HashSet<String>,
     deleted: std::collections::HashSet<String>,
     new: std::collections::HashSet<String>,
-}
-
-#[derive(Debug, Clone, Default)]
-struct DirtyOverlayState {
-    paths: DirtyPathSet,
-}
-
-#[derive(Debug, Clone)]
-struct DirtyOverlaySnapshot {
-    paths: DirtyPathSet,
 }
 
 #[derive(Debug, Default)]
@@ -542,7 +535,7 @@ impl RepoRuntime {
             )),
             maintenance_handle: Mutex::new(None),
             state: Mutex::new(RepoState::default()),
-            dirty_overlay: Mutex::new(DirtyOverlayState::default()),
+            published_overlay_paths_cache: Mutex::new(DirtyPathSet::default()),
             glob_cache: Mutex::new(GlobCacheState::default()),
             glob_cache_epoch: AtomicU64::new(0),
             active_searches: AtomicU64::new(0),

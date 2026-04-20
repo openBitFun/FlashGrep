@@ -20,6 +20,7 @@ use crate::{
     search::{FileContext, FileMatch, MatchLocation, SearchLine, SearchMode},
 };
 
+use super::literal::{count_unique_match_lines, PureLiteralMatcher};
 use super::query::LinePrefilter;
 pub(crate) use super::shared::build_regex_matcher as build_matcher;
 use super::shared::{
@@ -28,7 +29,9 @@ use super::shared::{
 };
 
 const MAX_LOOK_AHEAD: usize = 128;
-const VERIFY_PARALLEL_THRESHOLD: usize = 512;
+// Materializing matches is more expensive than posting-list recall, and on large repos we still
+// want parallel verification once candidate sets reach the low hundreds.
+const VERIFY_PARALLEL_THRESHOLD: usize = 128;
 
 #[derive(Debug, Clone)]
 pub(crate) enum VerifyCandidateSource {
@@ -39,6 +42,7 @@ pub(crate) enum VerifyCandidateSource {
 #[derive(Debug, Clone)]
 pub(crate) struct VerifyPlan {
     matcher: RegexMatcher,
+    literal_matcher: Option<PureLiteralMatcher>,
     line_prefilter: Option<LinePrefilter>,
     multiline_verifier: bool,
     mode: SearchMode,
@@ -55,6 +59,14 @@ impl VerifyPlan {
     ) -> Result<Self> {
         Ok(Self {
             matcher: build_matcher(config, multiline_verifier)?,
+            literal_matcher: if config.max_count.is_none()
+                && config.before_context == 0
+                && config.after_context == 0
+            {
+                PureLiteralMatcher::compile(config, multiline_verifier)?
+            } else {
+                None
+            },
             line_prefilter: (!multiline_verifier).then_some(line_prefilter).flatten(),
             multiline_verifier,
             mode: config.search_mode,
@@ -67,6 +79,7 @@ impl VerifyPlan {
     pub(crate) fn create_runtime(&self) -> VerifyRuntime<'_> {
         VerifyRuntime {
             matcher: &self.matcher,
+            literal_matcher: self.literal_matcher.as_ref(),
             line_prefilter: self.line_prefilter.as_ref(),
             verifier: build_verifier(
                 self.multiline_verifier,
@@ -113,69 +126,70 @@ where
     F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
 {
     validate_doc_ids(doc_count, candidate_ids)?;
-    let mut outcomes = if global_max_results.is_none()
-        && should_parallel_verify(candidate_ids.len())
-    {
-        let results = candidate_ids
-            .par_iter()
-            .enumerate()
-            .map_init(
-                || {
-                    (
-                        matcher.clone(),
-                        build_verifier(
-                            multiline_verifier,
-                            mode,
-                            max_count,
-                            before_context,
-                            after_context,
-                        ),
-                    )
-                },
-                |(matcher, verifier), (ordinal, &doc_id)| {
-                    validate_doc_id(doc_count, doc_id)?;
-                    let source = resolve_source(doc_id)?;
-                    let outcome = verify_source(&source, matcher, line_prefilter, verifier, mode)?;
-                    Ok(SearchTaskOutcome {
-                        ordinal,
-                        doc_id,
-                        outcome,
-                    })
-                },
-            )
-            .collect::<Vec<Result<SearchTaskOutcome>>>();
+    let mut outcomes =
+        if global_max_results.is_none() && should_parallel_verify(candidate_ids.len()) {
+            let results = candidate_ids
+                .par_iter()
+                .enumerate()
+                .map_init(
+                    || {
+                        (
+                            matcher.clone(),
+                            build_verifier(
+                                multiline_verifier,
+                                mode,
+                                max_count,
+                                before_context,
+                                after_context,
+                            ),
+                        )
+                    },
+                    |(matcher, verifier), (ordinal, &doc_id)| {
+                        validate_doc_id(doc_count, doc_id)?;
+                        let source = resolve_source(doc_id)?;
+                        let outcome =
+                            verify_source(&source, matcher, None, line_prefilter, verifier, mode)?;
+                        Ok(SearchTaskOutcome {
+                            ordinal,
+                            doc_id,
+                            outcome,
+                        })
+                    },
+                )
+                .collect::<Vec<Result<SearchTaskOutcome>>>();
 
-        let mut outcomes = Vec::with_capacity(results.len());
-        for result in results {
-            outcomes.push(result?);
-        }
-        outcomes
-    } else {
-        let mut verifier = build_verifier(
-            multiline_verifier,
-            mode,
-            max_count,
-            before_context,
-            after_context,
-        );
-        let mut outcomes = Vec::with_capacity(candidate_ids.len());
-        let mut consumed_results = 0usize;
-        for (ordinal, &doc_id) in candidate_ids.iter().enumerate() {
-            validate_doc_id(doc_count, doc_id)?;
-            let source = resolve_source(doc_id)?;
-            let outcome = verify_source(&source, matcher, line_prefilter, &mut verifier, mode)?;
-            consumed_results += outcome_result_units(mode, &outcome);
-            outcomes.push(SearchTaskOutcome {
-                ordinal,
-                doc_id,
-                outcome,
-            });
-            if global_max_results.is_some_and(|limit| consumed_results >= limit) {
-                break;
+            let mut outcomes = Vec::with_capacity(results.len());
+            for result in results {
+                outcomes.push(result?);
             }
-        }
-        return Ok(outcomes);
-    };
+            outcomes
+        } else {
+            let mut verifier = build_verifier(
+                multiline_verifier,
+                mode,
+                max_count,
+                before_context,
+                after_context,
+            );
+            let mut outcomes = Vec::with_capacity(candidate_ids.len());
+            let mut consumed_results = 0usize;
+            for (ordinal, &doc_id) in candidate_ids.iter().enumerate() {
+                validate_doc_id(doc_count, doc_id)?;
+                let source = resolve_source(doc_id)?;
+                let outcome =
+                    verify_source(&source, matcher, None, line_prefilter, &mut verifier, mode)?;
+                consumed_results += outcome_result_units(mode, &outcome);
+                outcomes.push(SearchTaskOutcome {
+                    ordinal,
+                    doc_id,
+                    outcome,
+                });
+                if global_max_results.is_some_and(|limit| consumed_results >= limit) {
+                    break;
+                }
+            }
+            return Ok(outcomes);
+        };
     outcomes.sort_unstable_by_key(|task| task.ordinal);
     Ok(outcomes)
 }
@@ -205,6 +219,7 @@ pub(crate) struct SearchTaskOutcome {
 
 pub(crate) struct VerifyRuntime<'a> {
     matcher: &'a RegexMatcher,
+    literal_matcher: Option<&'a PureLiteralMatcher>,
     line_prefilter: Option<&'a LinePrefilter>,
     verifier: Searcher,
     mode: SearchMode,
@@ -218,6 +233,7 @@ impl VerifyRuntime<'_> {
         verify_source(
             source,
             self.matcher,
+            self.literal_matcher,
             self.line_prefilter,
             &mut self.verifier,
             self.mode,
@@ -288,16 +304,73 @@ fn verify_slice(
 fn verify_source(
     source: &VerifyCandidateSource,
     matcher: &RegexMatcher,
+    literal_matcher: Option<&PureLiteralMatcher>,
     line_prefilter: Option<&LinePrefilter>,
     verifier: &mut Searcher,
     mode: SearchMode,
 ) -> Result<VerifyOutcome> {
+    if let (Some(matcher), VerifyCandidateSource::Bytes(bytes)) = (literal_matcher, source) {
+        return Ok(verify_literal_bytes(bytes, matcher, mode));
+    }
     match source {
         VerifyCandidateSource::Path(path) => {
             verify_path(path, matcher, line_prefilter, verifier, mode)
         }
         VerifyCandidateSource::Bytes(bytes) => {
             verify_slice(bytes, matcher, line_prefilter, verifier, mode)
+        }
+    }
+}
+
+fn verify_literal_bytes(
+    bytes: &[u8],
+    matcher: &PureLiteralMatcher,
+    mode: SearchMode,
+) -> VerifyOutcome {
+    match mode {
+        SearchMode::CountOnly | SearchMode::CountMatches => {
+            let stats = matcher.count(bytes);
+            VerifyOutcome {
+                matched_lines: stats.matched_lines,
+                matched_occurrences: stats.matched_occurrences,
+                bytes_searched: stats.bytes_searched,
+                matches: Vec::new(),
+                lines: Vec::new(),
+            }
+        }
+        SearchMode::FirstHitOnly => {
+            let matches = matcher.collect_matches(bytes, true);
+            let matched_lines = count_unique_match_lines(&matches);
+            let matched_occurrences = matches.len();
+            let lines = matches
+                .iter()
+                .cloned()
+                .map(SearchLine::Match)
+                .collect::<Vec<_>>();
+            VerifyOutcome {
+                matched_lines,
+                matched_occurrences,
+                bytes_searched: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                matches,
+                lines,
+            }
+        }
+        SearchMode::MaterializeMatches => {
+            let matches = matcher.collect_matches(bytes, false);
+            let matched_lines = count_unique_match_lines(&matches);
+            let matched_occurrences = matches.len();
+            let lines = matches
+                .iter()
+                .cloned()
+                .map(SearchLine::Match)
+                .collect::<Vec<_>>();
+            VerifyOutcome {
+                matched_lines,
+                matched_occurrences,
+                bytes_searched: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+                matches,
+                lines,
+            }
         }
     }
 }

@@ -2,14 +2,16 @@
 
 ## Goal
 
-`codgrep` 当前 daemon/runtime 主线已经不是“base snapshot + query-time dirty repair”，也不是把 workspace 增量直接暴露给查询线程的可变写路径，而是：
+`codgrep` 当前 daemon/runtime 主线已经不是“base snapshot + query-time dirty repair”，也不是把 workspace 增量直接暴露给查询线程的可变写路径。查询真相源只剩两层只读 snapshot：
 
 1. `base snapshot`
    对应某个 Git `HEAD` 或 repo fingerprint 的稳定基线快照。
-2. `dirty catalog`
-   记录当前工作区相对 base 的 dirty / building / ready / failed 状态。
-3. `published overlay snapshot`
+2. `published overlay snapshot`
    只表达已经构建完成并原子发布、对查询可见的 workspace 增量层。
+
+daemon runtime 仍然还维护一份 `dirty catalog`，
+记录当前工作区相对 base 的 dirty / building / ready / failed 状态，
+但它只负责调度和恢复，不参与查询正确性。
 
 这套架构的目标是把“工作区变化发现”和“查询可见性”彻底分离：
 
@@ -41,7 +43,7 @@ dirty catalog 由 daemon runtime 负责维护：
 
 - watcher / reconcile 从当前 worktree 归纳 modified / deleted / new paths。
 - 对每个 path 记录 `dirty / building / ready / failed` 和 observed file version。
-- catalog 只负责表达“哪些路径需要重建或已经发布”，不直接参与查询合并。
+- catalog 只负责表达“哪些路径需要重建或已经发布”，不直接参与查询合并，也不是查询真相源。
 
 ### Overlay Snapshot
 

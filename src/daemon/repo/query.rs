@@ -13,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    DirtyOverlaySnapshot, QueryBackend, RepoPhase, RepoRuntime, RepoStatus, SearchConsistency,
-    SearchRequest, SearchResponse,
+    QueryBackend, RepoPhase, RepoRuntime, RepoStatus, SearchConsistency, SearchRequest,
+    SearchResponse,
 };
 
 struct SearchActivityGuard<'a> {
@@ -344,10 +344,10 @@ impl RepoRuntime {
         })
     }
 
-    pub(super) fn current_overlay_snapshot(&self) -> DirtyOverlaySnapshot {
-        match self.dirty_overlay.lock() {
-            Ok(guard) => guard.snapshot(),
-            Err(poisoned) => poisoned.into_inner().snapshot(),
+    pub(super) fn cached_published_overlay_paths(&self) -> super::DirtyPathSet {
+        match self.published_overlay_paths_cache.lock() {
+            Ok(guard) => guard.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
         }
     }
 
@@ -402,7 +402,7 @@ impl RepoRuntime {
             };
         }
 
-        Ok(self.current_overlay_snapshot().paths.is_empty()
+        Ok(self.cached_published_overlay_paths().is_empty()
             && self.dirty_catalog_visible_paths().is_empty())
     }
 
@@ -451,12 +451,15 @@ impl RepoRuntime {
         Ok(dirty)
     }
 
-    pub(super) fn replace_dirty_overlay_paths(&self, dirty: super::DirtyPathSet) {
-        let mut overlay = match self.dirty_overlay.lock() {
+    pub(super) fn replace_published_overlay_paths_cache(
+        &self,
+        published_overlay_paths: super::DirtyPathSet,
+    ) {
+        let mut cache = match self.published_overlay_paths_cache.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        overlay.paths = dirty;
+        *cache = published_overlay_paths;
     }
 
     fn lookup_glob_cache(&self, epoch: u64, key: &str) -> Option<Vec<String>> {

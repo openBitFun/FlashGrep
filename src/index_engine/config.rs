@@ -38,6 +38,8 @@ pub struct MergePolicyConfig {
     pub max_segments: usize,
     pub floor_segment_bytes: u64,
     pub max_merged_segment_bytes: u64,
+    // Reserved for future ratio-based delete heuristics. The current merge policy ignores this
+    // field and only uses delete-segment presence plus max_segments tiered merging.
     pub deleted_ratio_threshold_percent: u8,
 }
 

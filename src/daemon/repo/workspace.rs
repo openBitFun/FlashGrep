@@ -6,7 +6,7 @@ use crate::{
     worktree_diff::DirtyPathKind,
 };
 
-use super::{DirtyOverlaySnapshot, DirtyOverlayState, DirtyPathSet, RepoPhase, RepoRuntime};
+use super::{DirtyPathSet, RepoPhase, RepoRuntime};
 use crate::daemon::repo::status::apply_workspace_dirty_status;
 
 impl DirtyPathSet {
@@ -74,19 +74,11 @@ impl DirtyPathSet {
     }
 }
 
-impl DirtyOverlayState {
-    pub(super) fn snapshot(&self) -> DirtyOverlaySnapshot {
-        DirtyOverlaySnapshot {
-            paths: self.paths.clone(),
-        }
-    }
-}
-
 impl RepoRuntime {
     pub(super) fn refresh_workspace_overlay(&self) -> Result<()> {
         match self.current_base_snapshot_key() {
             Ok(Some(snapshot_key)) => {
-                let plan = self.build_overlay_refresh_plan_from_worktree()?;
+                let plan = self.plan_overlay_full_rebuild_from_worktree()?;
                 self.apply_refreshed_overlay(snapshot_key, plan);
                 Ok(())
             }
@@ -113,9 +105,9 @@ impl RepoRuntime {
     pub(super) fn probe_workspace_overlay(&self) -> Result<bool> {
         match self.current_base_snapshot_key() {
             Ok(Some(snapshot_key)) => {
-                let plan = match self.build_overlay_incremental_probe_plan()? {
+                let plan = match self.plan_overlay_update_from_incremental_probe()? {
                     Some(plan) => plan,
-                    None => self.build_overlay_refresh_plan_from_worktree()?,
+                    None => self.plan_overlay_full_rebuild_from_worktree()?,
                 };
                 self.apply_refreshed_overlay(snapshot_key, plan);
                 Ok(true)
@@ -205,11 +197,12 @@ impl RepoRuntime {
 
     fn clear_overlay(&self) {
         {
-            let mut overlay = match self.dirty_overlay.lock() {
+            let mut published_overlay_paths_cache = match self.published_overlay_paths_cache.lock()
+            {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            *overlay = DirtyOverlayState::default();
+            *published_overlay_paths_cache = DirtyPathSet::default();
         }
         self.reset_workspace_overlay_engine();
         self.invalidate_glob_cache();

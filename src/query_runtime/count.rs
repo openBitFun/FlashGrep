@@ -12,6 +12,7 @@ use rayon::prelude::*;
 use crate::{config::QueryConfig, error::Result};
 
 use super::{
+    literal::PureLiteralMatcher,
     query::LinePrefilter,
     shared::{
         build_line_starts, build_regex_matcher, configure_verifier_searcher, line_index_for_offset,
@@ -21,7 +22,9 @@ use super::{
 };
 
 const MAX_LOOK_AHEAD: usize = 128;
-const VERIFY_PARALLEL_THRESHOLD: usize = 512;
+// Count queries over large monorepos often end up with a few hundred candidates. Waiting until
+// 512 docs to parallelize leaves too much verify work on a single thread.
+const VERIFY_PARALLEL_THRESHOLD: usize = 128;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CountKind {
@@ -32,6 +35,7 @@ pub(crate) enum CountKind {
 #[derive(Debug)]
 pub(crate) struct VerifyPlan {
     matcher: RegexMatcher,
+    literal_matcher: Option<PureLiteralMatcher>,
     line_prefilter: Option<LinePrefilter>,
     count_kind: CountKind,
     multiline_verifier: bool,
@@ -47,6 +51,11 @@ impl VerifyPlan {
     ) -> Result<Self> {
         Ok(Self {
             matcher: build_regex_matcher(config, multiline_verifier)?,
+            literal_matcher: if config.max_count.is_none() {
+                PureLiteralMatcher::compile(config, multiline_verifier)?
+            } else {
+                None
+            },
             line_prefilter: (!multiline_verifier).then_some(line_prefilter).flatten(),
             count_kind,
             multiline_verifier,
@@ -177,6 +186,19 @@ impl VerifyRuntime<'_> {
     }
 
     fn verify_source(&mut self, source: &VerifyCandidateSource) -> Result<DocCountStats> {
+        if let Some(matcher) = self.plan.literal_matcher.as_ref() {
+            let VerifyCandidateSource::Bytes(bytes) = source else {
+                return self.verify_path(match source {
+                    VerifyCandidateSource::Path(path) => path,
+                    VerifyCandidateSource::Bytes(_) => unreachable!(),
+                });
+            };
+            let stats = matcher.count(bytes);
+            return Ok(DocCountStats {
+                matched_lines: stats.matched_lines,
+                matched_occurrences: stats.matched_occurrences,
+            });
+        }
         match source {
             VerifyCandidateSource::Path(path) => self.verify_path(path),
             VerifyCandidateSource::Bytes(bytes) => self.verify_slice(bytes),

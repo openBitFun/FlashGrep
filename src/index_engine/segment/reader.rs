@@ -1,8 +1,10 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
+    env,
     fs::{self, File},
     path::{Path, PathBuf},
     sync::{Arc, OnceLock},
+    time::Instant,
 };
 
 use memmap2::Mmap;
@@ -13,8 +15,8 @@ use crate::{
         query::{QueryFilters, QueryPlan},
         segment::{
             advise_mmap_sequential, read_index_document_from_stored_slice,
-            read_stored_document_view, read_stored_fields_layout, PostingLists, SegmentDocAddress,
-            StoredFieldsLayout,
+            read_stored_document_view, read_stored_fields_layout, FileSegmentDocTable,
+            PostingLists, SegmentDocRecord, StoredFieldsLayout,
         },
         types::{DocKey, SegmentDocId},
         writer::IndexDocument,
@@ -23,6 +25,8 @@ use crate::{
 };
 
 use super::SegmentMeta;
+
+const DOC_CACHE_CHUNK_SIZE: usize = 256;
 
 pub trait SegmentReader: Send + Sync {
     fn meta(&self) -> &SegmentMeta;
@@ -172,25 +176,36 @@ impl SegmentReader for MemorySegmentReader {
 #[derive(Debug)]
 pub struct FileSegmentReader {
     meta: SegmentMeta,
-    doc_addresses: Vec<SegmentDocAddress>,
+    doc_table: FileSegmentDocTable,
     posting_lists: PostingLists,
-    path_doc_ids: BTreeMap<String, Vec<SegmentDocId>>,
+    path_doc_ids: OnceLock<BTreeMap<String, Vec<SegmentDocId>>>,
     stored_fields_path: Option<PathBuf>,
     stored_fields_mmap: Option<Mmap>,
     stored_fields_layout: Option<StoredFieldsLayout>,
     repo_root: Option<PathBuf>,
-    decoded_documents: Vec<OnceLock<IndexDocument>>,
-    decoded_metadata: Vec<OnceLock<StoredDocMetadataValue>>,
+    decoded_keys: LazyDocCache<DocKey>,
+    decoded_source_bytes: LazyDocCache<Arc<[u8]>>,
+    decoded_documents: LazyDocCache<IndexDocument>,
+    decoded_metadata: LazyDocCache<StoredDocMetadataValue>,
+}
+
+#[derive(Debug)]
+struct LazyDocCache<T> {
+    len: usize,
+    chunk_size: usize,
+    chunks: Vec<OnceLock<Box<[OnceLock<T>]>>>,
 }
 
 impl FileSegmentReader {
     pub fn new(
         meta: SegmentMeta,
-        doc_addresses: Vec<SegmentDocAddress>,
+        doc_table: FileSegmentDocTable,
         posting_lists: PostingLists,
         stored_fields_path: Option<PathBuf>,
         repo_root: Option<PathBuf>,
     ) -> Result<Self> {
+        let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
+        let stored_fields_started = Instant::now();
         let (stored_fields_mmap, stored_fields_layout) = if let Some(path) = &stored_fields_path {
             let stored_fields_file = File::open(path)?;
             let stored_fields_mmap = unsafe { Mmap::map(&stored_fields_file)? };
@@ -200,30 +215,65 @@ impl FileSegmentReader {
         } else {
             (None, None)
         };
-        let decoded_documents = (0..doc_addresses.len())
-            .map(|_| OnceLock::new())
-            .collect::<Vec<_>>();
-        let decoded_metadata = (0..doc_addresses.len())
-            .map(|_| OnceLock::new())
-            .collect::<Vec<_>>();
-        let path_doc_ids = build_path_doc_ids(
-            doc_addresses
-                .iter()
-                .enumerate()
-                .map(|(doc_id, doc)| (doc.key.logical_path.as_str(), doc_id as SegmentDocId)),
-        );
+        let stored_fields_elapsed = stored_fields_started.elapsed();
+        let path_doc_ids_started = Instant::now();
+        let decoded_keys = LazyDocCache::new(doc_table.len());
+        let decoded_source_bytes = LazyDocCache::new(doc_table.len());
+        let decoded_documents = LazyDocCache::new(doc_table.len());
+        let decoded_metadata = LazyDocCache::new(doc_table.len());
+        if profile_open {
+            eprintln!(
+                "segment_reader_new id={} stored_fields_ms={:.3} cache_init_ms={:.3} doc_count={}",
+                meta.segment_id.0,
+                stored_fields_elapsed.as_secs_f64() * 1000.0,
+                path_doc_ids_started.elapsed().as_secs_f64() * 1000.0,
+                doc_table.len(),
+            );
+        }
         Ok(Self {
             meta,
-            doc_addresses,
+            doc_table,
             posting_lists,
-            path_doc_ids,
+            path_doc_ids: OnceLock::new(),
             stored_fields_path,
             stored_fields_mmap,
             stored_fields_layout,
             repo_root,
+            decoded_keys,
+            decoded_source_bytes,
             decoded_documents,
             decoded_metadata,
         })
+    }
+
+    fn path_doc_ids(&self) -> Result<&BTreeMap<String, Vec<SegmentDocId>>> {
+        if let Some(path_doc_ids) = self.path_doc_ids.get() {
+            return Ok(path_doc_ids);
+        }
+
+        let started = Instant::now();
+        let mut entries = Vec::with_capacity(self.doc_table.len());
+        for doc_id in 0..self.doc_table.len() {
+            let key = self.doc_key(doc_id as SegmentDocId)?;
+            entries.push((key.logical_path.as_str(), doc_id as SegmentDocId));
+        }
+        let path_doc_ids = build_path_doc_ids(entries);
+        let _ = self.path_doc_ids.set(path_doc_ids);
+        let path_doc_ids = self.path_doc_ids.get().ok_or_else(|| {
+            AppError::Protocol(format!(
+                "failed to initialize path doc ids for {}",
+                self.segment_source_label()
+            ))
+        })?;
+        if env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some() {
+            eprintln!(
+                "segment_path_doc_ids id={} build_ms={:.3} doc_count={}",
+                self.meta.segment_id.0,
+                started.elapsed().as_secs_f64() * 1000.0,
+                self.doc_table.len(),
+            );
+        }
+        Ok(path_doc_ids)
     }
 
     fn stored_slice(&self, doc_id: usize) -> Result<&[u8]> {
@@ -233,13 +283,11 @@ impl FileSegmentReader {
                 self.meta.segment_id.0
             ))
         })?;
-        let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
-        let start = usize::try_from(address.stored_offset)
+        let record = self.doc_record(doc_id)?;
+        let start = usize::try_from(record.stored_offset)
             .map_err(|_| AppError::ValueOutOfRange("stored offset exceeds usize range".into()))?;
         let end = start
-            .checked_add(address.stored_len as usize)
+            .checked_add(record.stored_len as usize)
             .ok_or_else(|| AppError::InvalidIndex("stored field slice overflow".into()))?;
         stored_fields_mmap.get(start..end).ok_or_else(|| {
             AppError::InvalidIndex(format!(
@@ -249,40 +297,43 @@ impl FileSegmentReader {
         })
     }
 
+    fn doc_record(&self, doc_id: usize) -> Result<SegmentDocRecord> {
+        self.doc_table.record(doc_id)
+    }
+
     fn load_document(&self, doc_id: usize) -> Result<IndexDocument> {
-        let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
-        if let Some(stored_fields_layout) = self.stored_fields_layout {
-            return read_index_document_from_stored_slice(
-                self.stored_slice(doc_id)?,
-                &address.key,
-                stored_fields_layout,
-            );
+        let record = self.doc_record(doc_id)?;
+        let key = self.doc_key(doc_id as SegmentDocId)?;
+        if record.stored_len > 0 {
+            if let Some(stored_fields_layout) = self.stored_fields_layout {
+                return read_index_document_from_stored_slice(
+                    self.stored_slice(doc_id)?,
+                    key,
+                    stored_fields_layout,
+                );
+            }
         }
 
         Ok(IndexDocument {
-            key: address.key.clone(),
-            repo_id: address.key.repo_id.clone(),
-            logical_path: address.key.logical_path.clone(),
-            file_name: file_name_from_logical_path(&address.key.logical_path),
-            language: language_from_logical_path(&address.key.logical_path),
-            size: address.size,
-            modified_at: address.modified_at,
-            content_hash: address.content_hash,
-            source_bytes: self.read_source_bytes_from_repo(address)?,
+            key: key.clone(),
+            repo_id: key.repo_id.clone(),
+            logical_path: key.logical_path.clone(),
+            file_name: file_name_from_logical_path(&key.logical_path),
+            language: language_from_logical_path(&key.logical_path),
+            size: record.size,
+            modified_at: record.modified_at,
+            content_hash: record.content_hash,
+            source_bytes: self.source_bytes(doc_id as SegmentDocId)?,
         })
     }
 
     fn load_metadata(&self, doc_id: usize) -> Result<StoredDocMetadataValue> {
-        let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
-        if address.metadata_embedded {
+        let record = self.doc_record(doc_id)?;
+        if record.metadata_embedded {
             return Ok(StoredDocMetadataValue {
-                size: address.size,
-                modified_at: address.modified_at,
-                content_hash: address.content_hash,
+                size: record.size,
+                modified_at: record.modified_at,
+                content_hash: record.content_hash,
             });
         }
         let stored_fields_layout = self.stored_fields_layout.ok_or_else(|| {
@@ -299,11 +350,16 @@ impl FileSegmentReader {
         })
     }
 
-    fn read_source_bytes_from_repo(&self, address: &SegmentDocAddress) -> Result<Arc<[u8]>> {
-        let path = self.repo_path_for_key(&address.key)?;
+    fn read_source_bytes_from_repo(&self, key: &DocKey) -> Result<Arc<[u8]>> {
+        let path = self.repo_path_for_key(key)?;
         match fs::read(&path) {
             Ok(bytes) => Ok(Arc::<[u8]>::from(bytes)),
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
                 Ok(Arc::<[u8]>::from(Vec::<u8>::new()))
             }
             Err(error) => Err(error.into()),
@@ -319,6 +375,41 @@ impl FileSegmentReader {
         })?;
         let document = read_stored_document_view(self.stored_slice(doc_id)?, stored_fields_layout)?;
         document.source_bytes.decode()
+    }
+
+    fn load_source_bytes(&self, doc_id: usize) -> Result<Arc<[u8]>> {
+        if let Some(_stored_fields_layout) = self.stored_fields_layout {
+            if self.doc_record(doc_id)?.stored_len > 0 {
+                return self.read_source_bytes_from_store(doc_id);
+            }
+        }
+        let key = self.doc_key(doc_id as SegmentDocId)?;
+        self.read_source_bytes_from_repo(key)
+    }
+
+    fn source_bytes(&self, doc_id: SegmentDocId) -> Result<Arc<[u8]>> {
+        let doc_id = doc_id as usize;
+        let cache = self.decoded_source_bytes.get(doc_id)?;
+        if let Some(bytes) = cache.get() {
+            return Ok(Arc::clone(bytes));
+        }
+        let bytes = self.load_source_bytes(doc_id)?;
+        if cache.set(Arc::clone(&bytes)).is_err() {
+            let bytes = cache.get().ok_or_else(|| {
+                AppError::Protocol(format!(
+                    "failed to initialize cached segment source {doc_id} from {}",
+                    self.segment_source_label()
+                ))
+            })?;
+            return Ok(Arc::clone(bytes));
+        }
+        let bytes = cache.get().ok_or_else(|| {
+            AppError::Protocol(format!(
+                "failed to read cached segment source {doc_id} from {}",
+                self.segment_source_label()
+            ))
+        })?;
+        Ok(Arc::clone(bytes))
     }
 
     fn repo_path_for_key(&self, key: &DocKey) -> Result<PathBuf> {
@@ -350,13 +441,16 @@ impl SegmentReader for FileSegmentReader {
     }
 
     fn doc_count(&self) -> usize {
-        self.doc_addresses.len()
+        self.doc_table.len()
     }
 
     fn collect_doc_ids_for_filters(&self, filters: &QueryFilters) -> Result<Vec<SegmentDocId>> {
+        if filters.path_prefixes.is_empty() {
+            return Ok((0..self.doc_table.len() as SegmentDocId).collect());
+        }
         Ok(collect_doc_ids_for_filters_impl(
-            self.doc_addresses.len() as SegmentDocId,
-            &self.path_doc_ids,
+            self.doc_table.len() as SegmentDocId,
+            self.path_doc_ids()?,
             &filters.path_prefixes,
         ))
     }
@@ -365,24 +459,23 @@ impl SegmentReader for FileSegmentReader {
         let candidate_ids = collect_candidate_ids(
             &self.posting_lists,
             plan,
-            self.doc_addresses.len() as SegmentDocId,
+            self.doc_table.len() as SegmentDocId,
         )?;
+        if plan.request.filters.path_prefixes.is_empty() {
+            return Ok(candidate_ids);
+        }
         Ok(filter_candidate_ids_by_path_prefixes(
             candidate_ids,
-            &self.path_doc_ids,
+            self.path_doc_ids()?,
             &plan.request.filters.path_prefixes,
         ))
     }
 
     fn document(&self, doc_id: SegmentDocId) -> Result<&IndexDocument> {
         let doc_id = doc_id as usize;
-        let slot = self.doc_addresses.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
+        let slot = self.decoded_documents.get(doc_id)?;
         let _ = slot;
-        let cache = self.decoded_documents.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
+        let cache = self.decoded_documents.get(doc_id)?;
         if let Some(document) = cache.get() {
             return Ok(document);
         }
@@ -404,23 +497,35 @@ impl SegmentReader for FileSegmentReader {
     }
 
     fn doc_key(&self, doc_id: SegmentDocId) -> Result<&DocKey> {
-        self.doc_addresses
-            .get(doc_id as usize)
-            .map(|doc| &doc.key)
-            .ok_or_else(|| AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds")))
+        let doc_id = doc_id as usize;
+        let cache = self.decoded_keys.get(doc_id)?;
+        if let Some(key) = cache.get() {
+            return Ok(key);
+        }
+        let key = self.doc_table.doc_key(doc_id)?;
+        if cache.set(key).is_err() {
+            return cache.get().ok_or_else(|| {
+                AppError::Protocol(format!(
+                    "failed to initialize cached segment key {doc_id} from {}",
+                    self.segment_source_label()
+                ))
+            });
+        }
+        cache.get().ok_or_else(|| {
+            AppError::Protocol(format!(
+                "failed to read cached segment key {doc_id} from {}",
+                self.segment_source_label()
+            ))
+        })
     }
 
     fn doc_metadata(&self, doc_id: SegmentDocId) -> Result<StoredDocMetadata<'_>> {
         let doc_id = doc_id as usize;
-        let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
-        let cache = self.decoded_metadata.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
+        let key = self.doc_key(doc_id as SegmentDocId)?;
+        let cache = self.decoded_metadata.get(doc_id)?;
         if let Some(metadata) = cache.get() {
             return Ok(StoredDocMetadata {
-                key: &address.key,
+                key,
                 size: metadata.size,
                 modified_at: metadata.modified_at,
                 content_hash: metadata.content_hash,
@@ -435,7 +540,7 @@ impl SegmentReader for FileSegmentReader {
                 ))
             })?;
             return Ok(StoredDocMetadata {
-                key: &address.key,
+                key,
                 size: metadata.size,
                 modified_at: metadata.modified_at,
                 content_hash: metadata.content_hash,
@@ -448,7 +553,7 @@ impl SegmentReader for FileSegmentReader {
             ))
         })?;
         Ok(StoredDocMetadata {
-            key: &address.key,
+            key,
             size: metadata.size,
             modified_at: metadata.modified_at,
             content_hash: metadata.content_hash,
@@ -456,40 +561,59 @@ impl SegmentReader for FileSegmentReader {
     }
 
     fn stored_doc(&self, doc_id: SegmentDocId) -> Result<StoredDocRef<'_>> {
-        let doc_id = doc_id as usize;
-        let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
-        let source_bytes = if let Some(stored_fields_layout) = self.stored_fields_layout {
-            let document =
-                read_stored_document_view(self.stored_slice(doc_id)?, stored_fields_layout)?;
-            document.source_bytes.decode()?
-        } else {
-            self.read_source_bytes_from_repo(address)?
-        };
-        Ok(StoredDocRef {
-            key: &address.key,
-            source_bytes,
-        })
+        let key = self.doc_key(doc_id)?;
+        let source_bytes = self.source_bytes(doc_id)?;
+        Ok(StoredDocRef { key, source_bytes })
     }
 
     fn verify_source(&self, doc_id: SegmentDocId) -> Result<SegmentVerifySource> {
-        let doc_id = doc_id as usize;
-        let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
-        })?;
-        if self.stored_fields_layout.is_none() {
-            let path = self.repo_path_for_key(&address.key)?;
-            if !path.is_file() {
-                return Ok(SegmentVerifySource::Bytes(Arc::<[u8]>::from(
-                    Vec::<u8>::new(),
-                )));
-            }
-            return Ok(SegmentVerifySource::Path(path));
+        Ok(SegmentVerifySource::Bytes(self.source_bytes(doc_id)?))
+    }
+}
+
+impl<T> LazyDocCache<T> {
+    fn new(len: usize) -> Self {
+        let chunk_count = if len == 0 {
+            0
+        } else {
+            len.div_ceil(DOC_CACHE_CHUNK_SIZE)
+        };
+        Self {
+            len,
+            chunk_size: DOC_CACHE_CHUNK_SIZE,
+            chunks: (0..chunk_count).map(|_| OnceLock::new()).collect(),
         }
-        Ok(SegmentVerifySource::Bytes(
-            self.read_source_bytes_from_store(doc_id)?,
-        ))
+    }
+
+    fn get(&self, doc_id: usize) -> Result<&OnceLock<T>> {
+        if doc_id >= self.len {
+            return Err(AppError::InvalidIndex(format!(
+                "segment doc {doc_id} is out of bounds"
+            )));
+        }
+        let chunk_index = doc_id / self.chunk_size;
+        let chunk_offset = doc_id % self.chunk_size;
+        let chunk_len = self.chunk_len(chunk_index);
+        let chunk = self
+            .chunks
+            .get(chunk_index)
+            .ok_or_else(|| {
+                AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
+            })?
+            .get_or_init(|| {
+                (0..chunk_len)
+                    .map(|_| OnceLock::new())
+                    .collect::<Vec<_>>()
+                    .into_boxed_slice()
+            });
+        chunk
+            .get(chunk_offset)
+            .ok_or_else(|| AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds")))
+    }
+
+    fn chunk_len(&self, chunk_index: usize) -> usize {
+        let chunk_start = chunk_index * self.chunk_size;
+        self.len.saturating_sub(chunk_start).min(self.chunk_size)
     }
 }
 

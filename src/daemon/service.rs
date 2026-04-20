@@ -305,11 +305,11 @@ mod tests {
             .expect("mark workspace probe pending should succeed");
     }
 
-    fn clear_dirty_overlay(service: &DaemonService, repo_id: &str) {
+    fn clear_published_overlay_paths_cache(service: &DaemonService, repo_id: &str) {
         service
             .repos
-            .clear_dirty_overlay_for_tests(repo_id)
-            .expect("clear dirty overlay should succeed");
+            .clear_published_overlay_paths_cache_for_tests(repo_id)
+            .expect("clear published overlay paths cache should succeed");
     }
 
     fn glob_repo(service: &DaemonService, repo_id: &str, scope: PathScope) -> Response {
@@ -634,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn snapshot_only_search_uses_base_snapshot_without_dirty_overlay() {
+    fn snapshot_only_search_uses_base_snapshot_without_published_overlay() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -686,7 +686,8 @@ mod tests {
     }
 
     #[test]
-    fn ready_status_and_search_recover_from_overlay_snapshot_when_dirty_overlay_is_empty() {
+    fn ready_status_and_search_recover_from_overlay_snapshot_when_published_overlay_paths_cache_is_empty(
+    ) {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -708,7 +709,7 @@ mod tests {
         assert_eq!(refreshed.dirty_files.modified, 1);
         wait_for_workspace_overlay_match_count(&repo_path, "SNAPSHOT_DIRTY", 1);
 
-        clear_dirty_overlay(&service, &repo_id);
+        clear_published_overlay_paths_cache(&service, &repo_id);
 
         let status = get_status(&service, &repo_id);
         assert!(matches!(
@@ -740,7 +741,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_delta_uses_overlay_snapshot_truth_when_dirty_overlay_mirror_is_empty() {
+    fn watcher_delta_uses_overlay_snapshot_truth_when_published_overlay_paths_cache_is_empty() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -765,7 +766,7 @@ mod tests {
         assert_eq!(refreshed.dirty_files.modified, 1);
         wait_for_workspace_overlay_match_count(&repo_path, "FIRST_DIRTY_TOKEN_20260416", 1);
 
-        clear_dirty_overlay(&service, &repo_id);
+        clear_published_overlay_paths_cache(&service, &repo_id);
 
         fs::write(
             &second,
@@ -2100,7 +2101,7 @@ mod tests {
     }
 
     #[test]
-    fn reopened_daemon_materializes_fixed_string_phrase_from_dirty_overlay() {
+    fn reopened_daemon_materializes_fixed_string_phrase_from_published_overlay() {
         let _serial = daemon_test_serial();
         let setup_service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2212,7 +2213,7 @@ mod tests {
     }
 
     #[test]
-    fn dirty_overlay_uses_latest_contents_after_multiple_edits() {
+    fn published_overlay_uses_latest_contents_after_multiple_edits() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2277,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn repeated_dirty_overlay_searches_remain_stable() {
+    fn repeated_published_overlay_searches_remain_stable() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2424,7 +2425,7 @@ mod tests {
     }
 
     #[test]
-    fn path_scoped_search_limits_dirty_overlay_results() {
+    fn path_scoped_search_limits_published_overlay_results() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");

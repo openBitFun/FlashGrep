@@ -18,6 +18,7 @@ fn run() -> codgrep::Result<()> {
     let mut pattern: Option<String> = None;
     let mut ignore_case = false;
     let mut mode = SearchMode::CountOnly;
+    let mut repeat = 1usize;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -25,10 +26,25 @@ fn run() -> codgrep::Result<()> {
             "--repo" => repo_path = args.next().map(PathBuf::from),
             "--storage-root" => storage_root = args.next().map(PathBuf::from),
             "--pattern" => pattern = args.next(),
+            "--repeat" => {
+                let value = args.next().ok_or_else(|| {
+                    codgrep::AppError::Protocol(
+                        "usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [--mode count|count-matches|first|materialize] [--repeat <n>] [-i]".into(),
+                    )
+                })?;
+                repeat = value.parse::<usize>().map_err(|error| {
+                    codgrep::AppError::Protocol(format!("invalid --repeat value {value}: {error}"))
+                })?;
+                if repeat == 0 {
+                    return Err(codgrep::AppError::Protocol(
+                        "--repeat must be greater than 0".into(),
+                    ));
+                }
+            }
             "--mode" => {
                 let value = args.next().ok_or_else(|| {
                     codgrep::AppError::Protocol(
-                        "usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [--mode count|count-matches|first|materialize] [-i]".into(),
+                        "usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [--mode count|count-matches|first|materialize] [--repeat <n>] [-i]".into(),
                     )
                 })?;
                 mode = match value.as_str() {
@@ -57,7 +73,7 @@ fn run() -> codgrep::Result<()> {
     })?;
     let storage_root = storage_root.unwrap_or_else(|| repo_path.join(".codgrep-index-engine"));
     let pattern = pattern.ok_or_else(|| {
-        codgrep::AppError::Protocol("usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [--mode count|count-matches|first|materialize] [-i]".into())
+        codgrep::AppError::Protocol("usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [--mode count|count-matches|first|materialize] [--repeat <n>] [-i]".into())
     })?;
 
     let build_config = BuildConfig {
@@ -71,22 +87,35 @@ fn run() -> codgrep::Result<()> {
         max_sparse_len: 8,
     };
     let snapshot = WorkspaceBaseSnapshotIndex::open_read_only(&build_config)?.open_committed()?;
-    let started = Instant::now();
-    let results = snapshot.search(&QueryRequest {
+    let query = QueryRequest {
         pattern: pattern.clone(),
         mode,
         case_insensitive: ignore_case,
         top_k: None,
         filters: QueryFilters::default(),
-    })?;
-    let elapsed = started.elapsed().as_secs_f64();
-
+    };
+    let mut last_results = None;
+    for iteration in 1..=repeat {
+        let started = Instant::now();
+        let results = snapshot.search(&query)?;
+        let elapsed = started.elapsed().as_secs_f64();
+        println!("iteration={iteration}");
+        println!("elapsed_secs={elapsed:.6}");
+        println!("candidate_docs={}", results.candidate_docs);
+        println!("searches_with_match={}", results.searches_with_match);
+        println!("matched_lines={}", results.matched_lines);
+        println!("matched_occurrences={}", results.matched_occurrences);
+        println!("hits={}", results.hits.len());
+        last_results = Some(results);
+    }
     println!("pattern={pattern}");
-    println!("elapsed_secs={elapsed:.6}");
-    println!("candidate_docs={}", results.candidate_docs);
-    println!("searches_with_match={}", results.searches_with_match);
-    println!("matched_lines={}", results.matched_lines);
-    println!("matched_occurrences={}", results.matched_occurrences);
-    println!("hits={}", results.hits.len());
+    println!("repeat={repeat}");
+    if let Some(results) = last_results {
+        println!("final_candidate_docs={}", results.candidate_docs);
+        println!("final_searches_with_match={}", results.searches_with_match);
+        println!("final_matched_lines={}", results.matched_lines);
+        println!("final_matched_occurrences={}", results.matched_occurrences);
+        println!("final_hits={}", results.hits.len());
+    }
     Ok(())
 }

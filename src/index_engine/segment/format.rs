@@ -1,16 +1,20 @@
 use std::{
-    fs,
+    env,
+    fs::{self, File},
     io::{Cursor, Read, Write},
     path::Path,
     sync::Arc,
+    time::Instant,
 };
 
+use memmap2::Mmap;
 use serde::{Deserialize, Serialize};
 use zstd::bulk::{compress as zstd_compress, decompress as zstd_decompress};
 
 use crate::index_engine::{
     delete::DeleteRecord,
-    types::{DeleteSegmentId, DocKey, SegmentId, SeqNo},
+    segment::{advise_mmap_random, advise_mmap_sequential},
+    types::{DeleteSegmentId, DocKey, RepoId, SegmentId, SeqNo},
     writer::IndexDocument,
 };
 use crate::{AppError, Result};
@@ -19,6 +23,7 @@ pub(crate) const SEGMENT_META_FILE: &str = "SEGMENT_META.json";
 pub(crate) const DOCS_FILE: &str = "docs.bin";
 pub(crate) const STORED_FIELDS_FILE: &str = "stored_fields.bin";
 pub(crate) const PATH_MAP_FILE: &str = "path_map.bin";
+pub(crate) const PATH_OFFSETS_FILE: &str = "path_offsets.bin";
 
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
 const DOCS_VERSION_V1: u32 = 1;
@@ -31,6 +36,12 @@ const STORED_SOURCE_ENCODING_ZSTD: u8 = 1;
 const STORED_SOURCE_ZSTD_LEVEL: i32 = 3;
 const STORED_SOURCE_COMPRESSION_ENABLED: bool = false;
 const STORED_SOURCE_MIN_COMPRESS_BYTES: usize = 4 * 1024;
+const PATH_MAP_HEADER_LEN: usize = 16;
+const DOCS_HEADER_LEN: usize = 16;
+const DOC_RECORD_LEN_V1: usize = 16;
+const DOC_RECORD_LEN_V2: usize = 64;
+const PATH_OFFSETS_MAGIC: &[u8; 8] = b"CGPTOF01";
+const PATH_OFFSETS_VERSION: u32 = 1;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentMeta {
@@ -72,15 +83,24 @@ struct DocRecord {
     content_hash: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SegmentDocAddress {
-    pub key: DocKey,
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentDocRecord {
+    pub path_index: u32,
     pub stored_offset: u64,
     pub stored_len: u32,
     pub size: u64,
     pub modified_at: u64,
     pub content_hash: [u8; 32],
     pub metadata_embedded: bool,
+}
+
+#[derive(Debug)]
+pub struct FileSegmentDocTable {
+    path_map_mmap: Mmap,
+    docs_mmap: Mmap,
+    doc_count: usize,
+    docs_version: u32,
+    path_entry_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -155,6 +175,7 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
     let mut path_map = Vec::new();
     write_header(&mut path_map, PATH_MAP_MAGIC)?;
     write_u32(&mut path_map, documents.len() as u32)?;
+    let mut path_entry_offsets = Vec::with_capacity(documents.len());
 
     let mut stored_fields = Vec::new();
     write_header(&mut stored_fields, STORED_FIELDS_MAGIC_V2)?;
@@ -163,6 +184,7 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
     let mut doc_records = Vec::with_capacity(documents.len());
 
     for (path_index, document) in documents.iter().enumerate() {
+        path_entry_offsets.push(path_map.len() as u64);
         write_string(&mut path_map, &document.repo_id.0)?;
         write_string(&mut path_map, &document.logical_path)?;
 
@@ -203,41 +225,41 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
     }
 
     fs::write(dir.join(PATH_MAP_FILE), path_map)?;
+    write_path_offsets_file(&dir.join(PATH_OFFSETS_FILE), &path_entry_offsets)?;
     fs::write(dir.join(STORED_FIELDS_FILE), stored_fields)?;
     fs::write(dir.join(DOCS_FILE), docs)?;
     Ok(())
 }
 
 pub(crate) fn read_segment_documents(dir: &Path) -> Result<Vec<IndexDocument>> {
-    let paths = read_segment_paths(dir)?;
-
     let stored_fields_bytes = fs::read(dir.join(STORED_FIELDS_FILE))?;
     let mut stored_cursor = Cursor::new(stored_fields_bytes.as_slice());
     let stored_fields_layout = read_stored_fields_header(&mut stored_cursor)?;
     let stored_doc_count = read_u32(&mut stored_cursor)? as usize;
 
-    let addresses = read_segment_doc_addresses(dir)?;
-    let doc_count = addresses.len();
-    if doc_count != stored_doc_count || doc_count != paths.len() {
+    let table = FileSegmentDocTable::open(dir)?;
+    let doc_count = table.len();
+    if doc_count != stored_doc_count {
         return Err(AppError::InvalidIndex(format!(
-            "segment file count mismatch: docs={doc_count}, stored={stored_doc_count}, paths={}",
-            paths.len()
+            "segment file count mismatch: docs={doc_count}, stored={stored_doc_count}",
         )));
     }
 
     let mut documents = Vec::with_capacity(doc_count);
-    for address in addresses {
-        let start = usize::try_from(address.stored_offset)
+    for doc_id in 0..doc_count {
+        let record = table.record(doc_id)?;
+        let key = table.doc_key(doc_id)?;
+        let start = usize::try_from(record.stored_offset)
             .map_err(|_| AppError::ValueOutOfRange("stored offset exceeds usize range".into()))?;
         let end = start
-            .checked_add(address.stored_len as usize)
+            .checked_add(record.stored_len as usize)
             .ok_or_else(|| AppError::InvalidIndex("stored field slice overflow".into()))?;
         let slice = stored_fields_bytes
             .get(start..end)
             .ok_or_else(|| AppError::InvalidIndex("stored field slice out of range".into()))?;
         documents.push(read_index_document_from_stored_slice(
             slice,
-            &address.key,
+            &key,
             stored_fields_layout,
         )?);
     }
@@ -245,52 +267,285 @@ pub(crate) fn read_segment_documents(dir: &Path) -> Result<Vec<IndexDocument>> {
     Ok(documents)
 }
 
-pub(crate) fn read_segment_doc_addresses(dir: &Path) -> Result<Vec<SegmentDocAddress>> {
-    let paths = read_segment_paths(dir)?;
-    let docs_bytes = fs::read(dir.join(DOCS_FILE))?;
-    let mut docs_cursor = Cursor::new(docs_bytes.as_slice());
-    let docs_version = read_docs_header(&mut docs_cursor)?;
-    let doc_count = read_u32(&mut docs_cursor)? as usize;
-    if doc_count != paths.len() {
-        return Err(AppError::InvalidIndex(format!(
-            "segment file count mismatch: docs={doc_count}, paths={}",
-            paths.len()
-        )));
+fn load_or_create_path_offsets(
+    dir: &Path,
+    path_map_mmap: &Mmap,
+    path_count: usize,
+) -> Result<(Vec<usize>, &'static str)> {
+    match read_path_offsets_file(&dir.join(PATH_OFFSETS_FILE), path_count) {
+        Ok(offsets) => return Ok((offsets, "sidecar")),
+        Err(error) if is_path_offsets_rebuildable_error(&error) => {}
+        Err(error) => return Err(error),
     }
 
-    let mut addresses = Vec::with_capacity(doc_count);
-    for _ in 0..doc_count {
-        let path_index = read_u32(&mut docs_cursor)? as usize;
-        let stored_offset = read_u64(&mut docs_cursor)?;
-        let stored_len = read_u32(&mut docs_cursor)?;
-        let (size, modified_at, content_hash, metadata_embedded) =
-            if docs_version >= DOCS_VERSION_V2 {
-                let size = read_u64(&mut docs_cursor)?;
-                let modified_at = read_u64(&mut docs_cursor)?;
-                let mut content_hash = [0u8; 32];
-                docs_cursor.read_exact(&mut content_hash)?;
-                (size, modified_at, content_hash, true)
-            } else {
-                (0, 0, [0u8; 32], false)
-            };
-        let (repo_id, logical_path) = paths.get(path_index).cloned().ok_or_else(|| {
+    advise_mmap_sequential(path_map_mmap);
+    let mut path_map_cursor = Cursor::new(path_map_mmap.as_ref());
+    read_header(&mut path_map_cursor, PATH_MAP_MAGIC)?;
+    let scanned_path_count = read_u32(&mut path_map_cursor)? as usize;
+    if scanned_path_count != path_count {
+        return Err(AppError::InvalidIndex(format!(
+            "path map count mismatch while rebuilding offsets: expected {path_count}, got {scanned_path_count}"
+        )));
+    }
+    let mut offsets = Vec::with_capacity(path_count);
+    for _ in 0..path_count {
+        let entry_offset = usize::try_from(path_map_cursor.position())
+            .map_err(|_| AppError::ValueOutOfRange("path map offset exceeds usize range".into()))?;
+        offsets.push(entry_offset);
+        skip_length_prefixed_string(&mut path_map_cursor, "repo id")?;
+        skip_length_prefixed_string(&mut path_map_cursor, "logical path")?;
+    }
+
+    let encoded_offsets = offsets
+        .iter()
+        .map(|offset| {
+            u64::try_from(*offset)
+                .map_err(|_| AppError::ValueOutOfRange("path offset exceeds u64 range".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let _ = write_path_offsets_file(&dir.join(PATH_OFFSETS_FILE), &encoded_offsets);
+    Ok((offsets, "scanned"))
+}
+
+fn read_path_offsets_file(path: &Path, expected_count: usize) -> Result<Vec<usize>> {
+    let bytes = fs::read(path)?;
+    if bytes.len() < 16 {
+        return Err(AppError::InvalidIndex(format!(
+            "path offsets file is truncated: {}",
+            path.display()
+        )));
+    }
+    let mut cursor = Cursor::new(bytes.as_slice());
+    let mut magic = [0u8; 8];
+    cursor.read_exact(&mut magic)?;
+    if &magic != PATH_OFFSETS_MAGIC {
+        return Err(AppError::InvalidIndex(format!(
+            "path offsets magic mismatch: {}",
+            path.display()
+        )));
+    }
+    let version = read_u32(&mut cursor)?;
+    if version != PATH_OFFSETS_VERSION {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported path offsets version {version}: {}",
+            path.display()
+        )));
+    }
+    let count = read_u32(&mut cursor)? as usize;
+    if count != expected_count {
+        return Err(AppError::InvalidIndex(format!(
+            "path offsets count mismatch: expected {expected_count}, got {count}"
+        )));
+    }
+    let expected_len = 16usize
+        .checked_add(count.checked_mul(8).ok_or_else(|| {
+            AppError::ValueOutOfRange("path offsets file size exceeds usize range".into())
+        })?)
+        .ok_or_else(|| {
+            AppError::ValueOutOfRange("path offsets file size exceeds usize range".into())
+        })?;
+    if bytes.len() < expected_len {
+        return Err(AppError::InvalidIndex(format!(
+            "path offsets file is truncated: expected {expected_len} bytes, got {}",
+            bytes.len()
+        )));
+    }
+    let mut offsets = Vec::with_capacity(count);
+    for _ in 0..count {
+        let offset = read_u64(&mut cursor)?;
+        offsets
+            .push(usize::try_from(offset).map_err(|_| {
+                AppError::ValueOutOfRange("path offset exceeds usize range".into())
+            })?);
+    }
+    Ok(offsets)
+}
+
+pub(crate) fn write_path_offsets_file(path: &Path, offsets: &[u64]) -> Result<()> {
+    let mut buffer = Vec::with_capacity(
+        16usize
+            .checked_add(offsets.len().checked_mul(8).ok_or_else(|| {
+                AppError::ValueOutOfRange("path offsets file size exceeds usize range".into())
+            })?)
+            .ok_or_else(|| {
+                AppError::ValueOutOfRange("path offsets file size exceeds usize range".into())
+            })?,
+    );
+    buffer.write_all(PATH_OFFSETS_MAGIC)?;
+    write_u32(&mut buffer, PATH_OFFSETS_VERSION)?;
+    write_u32(
+        &mut buffer,
+        u32::try_from(offsets.len()).map_err(|_| {
+            AppError::ValueOutOfRange("path offsets count exceeds u32 range".into())
+        })?,
+    )?;
+    for offset in offsets {
+        write_u64(&mut buffer, *offset)?;
+    }
+
+    let tmp_path = path.with_extension("tmp");
+    fs::write(&tmp_path, &buffer)?;
+    fs::rename(tmp_path, path)?;
+    Ok(())
+}
+
+fn is_path_offsets_rebuildable_error(error: &AppError) -> bool {
+    match error {
+        AppError::InvalidIndex(_) => true,
+        AppError::Io(io_error) => io_error.kind() == std::io::ErrorKind::NotFound,
+        _ => false,
+    }
+}
+
+impl FileSegmentDocTable {
+    pub fn open(dir: &Path) -> Result<Self> {
+        let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
+
+        let path_map_started = Instant::now();
+        let path_map_file = File::open(dir.join(PATH_MAP_FILE))?;
+        let path_map_mmap = unsafe { Mmap::map(&path_map_file)? };
+        if path_map_mmap.len() < PATH_MAP_HEADER_LEN {
+            return Err(AppError::InvalidIndex(format!(
+                "path map file is truncated: expected at least {PATH_MAP_HEADER_LEN} bytes, got {}",
+                path_map_mmap.len()
+            )));
+        }
+        let mut path_map_cursor = Cursor::new(path_map_mmap.as_ref());
+        read_header(&mut path_map_cursor, PATH_MAP_MAGIC)?;
+        let path_count = read_u32(&mut path_map_cursor)? as usize;
+        let (path_entry_offsets, path_offsets_source) =
+            load_or_create_path_offsets(dir, &path_map_mmap, path_count)?;
+        let path_map_scan_elapsed = path_map_started.elapsed();
+        advise_mmap_random(&path_map_mmap);
+
+        let docs_started = Instant::now();
+        let docs_file = File::open(dir.join(DOCS_FILE))?;
+        let docs_mmap = unsafe { Mmap::map(&docs_file)? };
+        advise_mmap_sequential(&docs_mmap);
+        if docs_mmap.len() < DOCS_HEADER_LEN {
+            return Err(AppError::InvalidIndex(format!(
+                "docs file is truncated: expected at least {DOCS_HEADER_LEN} bytes, got {}",
+                docs_mmap.len()
+            )));
+        }
+        let mut docs_cursor = Cursor::new(docs_mmap.as_ref());
+        let docs_version = read_docs_header(&mut docs_cursor)?;
+        let doc_count = read_u32(&mut docs_cursor)? as usize;
+        let docs_header_elapsed = docs_started.elapsed();
+        if doc_count != path_count {
+            return Err(AppError::InvalidIndex(format!(
+                "segment file count mismatch: docs={doc_count}, paths={path_count}",
+            )));
+        }
+
+        let record_len = doc_record_len_for_version(docs_version)?;
+        let expected_docs_len = DOCS_HEADER_LEN
+            .checked_add(doc_count.checked_mul(record_len).ok_or_else(|| {
+                AppError::ValueOutOfRange("docs file size exceeds usize range".into())
+            })?)
+            .ok_or_else(|| {
+                AppError::ValueOutOfRange("docs file size exceeds usize range".into())
+            })?;
+        if docs_mmap.len() < expected_docs_len {
+            return Err(AppError::InvalidIndex(format!(
+                "docs file is truncated: expected at least {expected_docs_len} bytes, got {}",
+                docs_mmap.len()
+            )));
+        }
+
+        if profile_open {
+            eprintln!(
+                "segment_doc_table dir={} path_offsets={} path_map_open_ms={:.3} docs_header_ms={:.3} doc_count={}",
+                dir.display(),
+                path_offsets_source,
+                path_map_scan_elapsed.as_secs_f64() * 1000.0,
+                docs_header_elapsed.as_secs_f64() * 1000.0,
+                doc_count,
+            );
+        }
+
+        Ok(Self {
+            path_map_mmap,
+            docs_mmap,
+            doc_count,
+            docs_version,
+            path_entry_offsets,
+        })
+    }
+
+    pub fn len(&self) -> usize {
+        self.doc_count
+    }
+
+    pub fn record(&self, doc_id: usize) -> Result<SegmentDocRecord> {
+        if doc_id >= self.doc_count {
+            return Err(AppError::InvalidIndex(format!(
+                "segment doc {doc_id} is out of bounds"
+            )));
+        }
+        let record_len = doc_record_len_for_version(self.docs_version)?;
+        let start = DOCS_HEADER_LEN
+            .checked_add(doc_id.checked_mul(record_len).ok_or_else(|| {
+                AppError::ValueOutOfRange("docs offset exceeds usize range".into())
+            })?)
+            .ok_or_else(|| AppError::ValueOutOfRange("docs offset exceeds usize range".into()))?;
+        let end = start
+            .checked_add(record_len)
+            .ok_or_else(|| AppError::InvalidIndex("docs record slice overflow".into()))?;
+        let bytes = self.docs_mmap.get(start..end).ok_or_else(|| {
+            AppError::InvalidIndex(format!("segment doc {doc_id} is out of range"))
+        })?;
+
+        let path_index = read_u32_from_slice(bytes, 0)?;
+        let stored_offset = read_u64_from_slice(bytes, 4)?;
+        let stored_len = read_u32_from_slice(bytes, 12)?;
+        if self.docs_version >= DOCS_VERSION_V2 {
+            let size = read_u64_from_slice(bytes, 16)?;
+            let modified_at = read_u64_from_slice(bytes, 24)?;
+            let content_hash = read_fixed_32_from_slice(bytes, 32)?;
+            Ok(SegmentDocRecord {
+                path_index,
+                stored_offset,
+                stored_len,
+                size,
+                modified_at,
+                content_hash,
+                metadata_embedded: true,
+            })
+        } else {
+            Ok(SegmentDocRecord {
+                path_index,
+                stored_offset,
+                stored_len,
+                size: 0,
+                modified_at: 0,
+                content_hash: [0u8; 32],
+                metadata_embedded: false,
+            })
+        }
+    }
+
+    pub fn doc_key(&self, doc_id: usize) -> Result<DocKey> {
+        let record = self.record(doc_id)?;
+        let (repo_id, logical_path) = self.path_entry(record.path_index as usize)?;
+        Ok(DocKey {
+            repo_id: RepoId(repo_id),
+            logical_path,
+        })
+    }
+
+    fn path_entry(&self, path_index: usize) -> Result<(String, String)> {
+        let offset = *self.path_entry_offsets.get(path_index).ok_or_else(|| {
             AppError::InvalidIndex(format!("path index {path_index} is out of bounds"))
         })?;
-        let repo_id = crate::index_engine::types::RepoId(repo_id);
-        addresses.push(SegmentDocAddress {
-            key: DocKey {
-                repo_id,
-                logical_path,
-            },
-            stored_offset,
-            stored_len,
-            size,
-            modified_at,
-            content_hash,
-            metadata_embedded,
-        });
+        let slice = self.path_map_mmap.get(offset..).ok_or_else(|| {
+            AppError::InvalidIndex(format!("path map offset {offset} is out of range"))
+        })?;
+        let mut cursor = Cursor::new(slice);
+        let repo_id = read_string(&mut cursor)?;
+        let logical_path = read_string(&mut cursor)?;
+        Ok((repo_id, logical_path))
     }
-    Ok(addresses)
 }
 
 pub(crate) fn read_index_document_from_stored_slice(
@@ -362,20 +617,6 @@ pub(crate) fn read_stored_document_view(
 pub(crate) fn read_stored_fields_layout(bytes: &[u8]) -> Result<StoredFieldsLayout> {
     let mut cursor = Cursor::new(bytes);
     read_stored_fields_header(&mut cursor)
-}
-
-fn read_segment_paths(dir: &Path) -> Result<Vec<(String, String)>> {
-    let path_map_bytes = fs::read(dir.join(PATH_MAP_FILE))?;
-    let mut path_map = Cursor::new(path_map_bytes.as_slice());
-    read_header(&mut path_map, PATH_MAP_MAGIC)?;
-    let path_count = read_u32(&mut path_map)? as usize;
-    let mut paths = Vec::with_capacity(path_count);
-    for _ in 0..path_count {
-        let repo_id = read_string(&mut path_map)?;
-        let logical_path = read_string(&mut path_map)?;
-        paths.push((repo_id, logical_path));
-    }
-    Ok(paths)
 }
 
 fn write_header(buffer: &mut Vec<u8>, magic: &[u8; 8]) -> Result<()> {
@@ -504,6 +745,58 @@ fn maybe_compress_source_bytes(value: &[u8]) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     }
     Ok(Some(compressed))
+}
+
+fn doc_record_len_for_version(version: u32) -> Result<usize> {
+    match version {
+        DOCS_VERSION_V1 => Ok(DOC_RECORD_LEN_V1),
+        DOCS_VERSION_V2 => Ok(DOC_RECORD_LEN_V2),
+        other => Err(AppError::InvalidIndex(format!(
+            "unsupported docs file version: {other}"
+        ))),
+    }
+}
+
+fn skip_length_prefixed_string(cursor: &mut Cursor<&[u8]>, field: &str) -> Result<()> {
+    let len = read_u32(cursor)? as u64;
+    let next = cursor
+        .position()
+        .checked_add(len)
+        .ok_or_else(|| AppError::InvalidIndex(format!("{field} cursor overflow")))?;
+    if next > cursor.get_ref().len() as u64 {
+        return Err(AppError::InvalidIndex(format!(
+            "{field} is out of range in path map"
+        )));
+    }
+    cursor.set_position(next);
+    Ok(())
+}
+
+fn read_u32_from_slice(slice: &[u8], offset: usize) -> Result<u32> {
+    let bytes = slice
+        .get(offset..offset + 4)
+        .ok_or_else(|| AppError::InvalidIndex("u32 slice is out of range".into()))?;
+    let mut raw = [0u8; 4];
+    raw.copy_from_slice(bytes);
+    Ok(u32::from_le_bytes(raw))
+}
+
+fn read_u64_from_slice(slice: &[u8], offset: usize) -> Result<u64> {
+    let bytes = slice
+        .get(offset..offset + 8)
+        .ok_or_else(|| AppError::InvalidIndex("u64 slice is out of range".into()))?;
+    let mut raw = [0u8; 8];
+    raw.copy_from_slice(bytes);
+    Ok(u64::from_le_bytes(raw))
+}
+
+fn read_fixed_32_from_slice(slice: &[u8], offset: usize) -> Result<[u8; 32]> {
+    let bytes = slice
+        .get(offset..offset + 32)
+        .ok_or_else(|| AppError::InvalidIndex("fixed 32-byte slice is out of range".into()))?;
+    let mut raw = [0u8; 32];
+    raw.copy_from_slice(bytes);
+    Ok(raw)
 }
 
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {

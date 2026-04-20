@@ -137,6 +137,9 @@ impl WorkspaceSearchView {
         base_snapshot: Option<&IndexSnapshotReader>,
         overlay_snapshot: Option<&IndexSnapshotReader>,
     ) -> Result<SearchResults> {
+        // Workspace query truth comes only from the read-only base snapshot plus the currently
+        // published overlay snapshot. Dirty catalog/runtime state may schedule future publishes,
+        // but it does not participate in query result correctness.
         WorkspaceQuerySnapshot {
             base_snapshot: base_snapshot.cloned(),
             overlay_snapshot: overlay_snapshot.cloned(),

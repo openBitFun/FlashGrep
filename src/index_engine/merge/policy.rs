@@ -27,6 +27,10 @@ impl TieredMergePolicy {
 
 impl MergePolicy for TieredMergePolicy {
     fn pick_merges(&self, manifest: &Manifest, stats: &MergeStats) -> Vec<MergeTask> {
+        // Current policy intentionally stays minimal:
+        // - If any delete segment exists, compact deletes into the affected live segments first.
+        // - Otherwise, if live segment count exceeds max_segments, run a simple tiered merge.
+        // It does not yet score merges by deleted-doc ratio or other heuristics.
         if stats.delete_segment_count > 0 {
             let Some(max_delete_seq_no) = manifest
                 .active_delete_segments

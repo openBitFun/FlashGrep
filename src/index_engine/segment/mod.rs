@@ -9,13 +9,13 @@ mod term_dict;
 mod writer;
 
 pub(crate) use format::{
-    read_index_document_from_stored_slice, read_segment_doc_addresses, read_segment_meta,
-    read_stored_document_view, read_stored_fields_layout, write_segment_documents,
-    write_segment_meta, SegmentDocAddress, StoredFieldsLayout, DOCS_FILE, PATH_MAP_FILE,
-    SEGMENT_META_FILE, STORED_FIELDS_FILE,
+    read_index_document_from_stored_slice, read_segment_meta, read_stored_document_view,
+    read_stored_fields_layout, write_path_offsets_file, write_segment_documents,
+    write_segment_meta, FileSegmentDocTable, SegmentDocRecord, StoredFieldsLayout, DOCS_FILE,
+    PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE, STORED_FIELDS_FILE,
 };
 pub use format::{DeleteSegmentBuildOutput, DeleteSegmentMeta, SegmentBuildOutput, SegmentMeta};
-pub(crate) use mmap::advise_mmap_sequential;
+pub(crate) use mmap::{advise_mmap_random, advise_mmap_sequential};
 pub(crate) use postings::encoded_posting_len;
 #[cfg(test)]
 pub(crate) use postings::read_postings_file;

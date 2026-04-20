@@ -870,7 +870,7 @@ fn build_daemon_open_params(args: DaemonOpenArgs) -> OpenRepoParams {
 fn print_daemon_response(response: &crate::daemon::protocol::Response) -> Result<()> {
     let stdout = std::io::stdout();
     let mut stdout = stdout.lock();
-    serde_json::to_writer_pretty(&mut stdout, response).map_err(|error| {
+    serde_json::to_writer(&mut stdout, response).map_err(|error| {
         AppError::Protocol(format!("failed to encode daemon response: {error}"))
     })?;
     stdout.write_all(b"\n")?;

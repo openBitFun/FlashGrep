@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::Arc,
+    sync::{Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -25,9 +25,9 @@ use crate::{
         manifest::{FileManifestStore, Manifest, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
-            collect_document_posting_terms, write_segment_meta, FileSegmentStore,
-            PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE,
-            SEGMENT_META_FILE,
+            collect_document_posting_terms, write_path_offsets_file, write_segment_meta,
+            FileSegmentStore, PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE,
+            PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
         },
         writer::IndexDocument,
         DocKey, GitRevision, ManifestId, RepoId, SegmentId, ShardId,
@@ -82,6 +82,7 @@ struct WorkspaceBaseSnapshotMetadataFile {
 
 pub struct WorkspaceBaseSnapshotIndex {
     reader: Arc<IndexReaderFactory>,
+    committed_reader: OnceLock<IndexSnapshotReader>,
 }
 
 pub(crate) struct WorkspaceBaseSnapshotBuildResult {
@@ -117,6 +118,8 @@ struct BulkBaseSegmentWriter {
     segment_id: SegmentId,
     tokenizer: PostingTokenizerConfig,
     path_map: BufWriter<File>,
+    path_entry_offsets: Vec<u64>,
+    path_map_len: u64,
     docs: BufWriter<File>,
     posting_buckets: PostingBuckets,
     doc_count: u32,
@@ -170,6 +173,8 @@ impl BulkBaseSegmentWriter {
             segment_id,
             tokenizer,
             path_map,
+            path_entry_offsets: Vec::new(),
+            path_map_len: COUNT_OFFSET + 4,
             docs,
             posting_buckets: PostingBuckets::new(index_root),
             doc_count: 0,
@@ -184,8 +189,16 @@ impl BulkBaseSegmentWriter {
             posting_terms,
         } = prepared;
 
+        self.path_entry_offsets.push(self.path_map_len);
         write_string_to(&mut self.path_map, &document.repo_id.0)?;
         write_string_to(&mut self.path_map, &document.logical_path)?;
+        let repo_id_len = encoded_string_len(&document.repo_id.0)?;
+        let logical_path_len = encoded_string_len(&document.logical_path)?;
+        self.path_map_len = self
+            .path_map_len
+            .checked_add(repo_id_len)
+            .and_then(|len| len.checked_add(logical_path_len))
+            .ok_or_else(|| AppError::ValueOutOfRange("path map offset overflow".into()))?;
 
         write_u32_to(&mut self.docs, doc_id)?;
         write_u64_to(&mut self.docs, 0)?;
@@ -233,6 +246,10 @@ impl BulkBaseSegmentWriter {
         posting_buckets.finish(
             &segment_dir.join("term_dict.bin"),
             &segment_dir.join("postings.bin"),
+        )?;
+        write_path_offsets_file(
+            &segment_dir.join(PATH_OFFSETS_FILE),
+            &self.path_entry_offsets,
         )?;
         write_segment_meta(&segment_dir.join(SEGMENT_META_FILE), &meta)?;
 
@@ -471,7 +488,10 @@ impl WorkspaceBaseSnapshotIndex {
             SharedSnapshotState::new(),
             config.tokenizer.clone(),
         ));
-        Ok(Self { reader })
+        Ok(Self {
+            reader,
+            committed_reader: OnceLock::new(),
+        })
     }
 
     pub(crate) fn marker_matches(
@@ -659,7 +679,24 @@ impl WorkspaceBaseSnapshotIndex {
     }
 
     pub fn open_committed(&self) -> Result<IndexSnapshotReader> {
-        self.reader.open_persisted_current()
+        if let Some(reader) = self.committed_reader.get() {
+            return Ok(reader.clone());
+        }
+
+        let reader = self.reader.open_persisted_current()?;
+        if self.committed_reader.set(reader.clone()).is_err() {
+            let cached = self.committed_reader.get().ok_or_else(|| {
+                AppError::Protocol(
+                    "failed to initialize cached committed base snapshot reader".into(),
+                )
+            })?;
+            return Ok(cached.clone());
+        }
+
+        let cached = self.committed_reader.get().ok_or_else(|| {
+            AppError::Protocol("failed to read cached committed base snapshot reader".into())
+        })?;
+        Ok(cached.clone())
     }
 
     fn engine_config(build_config: &BuildConfig) -> EngineConfig {
@@ -1306,6 +1343,13 @@ fn write_string_to(writer: &mut impl Write, value: &str) -> Result<()> {
     write_u32_to(writer, len)?;
     writer.write_all(bytes)?;
     Ok(())
+}
+
+fn encoded_string_len(value: &str) -> Result<u64> {
+    let bytes = value.as_bytes();
+    let len = u32::try_from(bytes.len())
+        .map_err(|_| AppError::ValueOutOfRange("string length exceeds u32 range".into()))?;
+    Ok(u64::from(len) + 4)
 }
 
 fn write_bytes_to(writer: &mut impl Write, value: &[u8]) -> Result<()> {

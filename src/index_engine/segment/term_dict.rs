@@ -11,7 +11,7 @@ use crate::{
     config::TokenizerMode,
     index_engine::{
         config::PostingTokenizerConfig,
-        segment::{advise_mmap_sequential, encoded_posting_len},
+        segment::{advise_mmap_random, encoded_posting_len},
         writer::IndexDocument,
     },
     tokenizer::{create, TokenizerOptions},
@@ -208,7 +208,7 @@ impl TermDictionary {
     pub fn open(path: &Path) -> Result<Self> {
         let file = File::open(path)?;
         let mmap = unsafe { Mmap::map(&file)? };
-        advise_mmap_sequential(&mmap);
+        advise_mmap_random(&mmap);
         let (count, bucket_ranges) = verify_term_dict_bytes(&mmap)?;
         Ok(Self {
             mmap,

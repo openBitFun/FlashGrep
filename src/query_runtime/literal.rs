@@ -1,0 +1,213 @@
+use aho_corasick::{AhoCorasick, MatchKind};
+use regex_syntax::{
+    hir::{Hir, HirKind},
+    parse,
+};
+
+use crate::{
+    config::QueryConfig,
+    error::{AppError, Result},
+    search::{FileMatch, MatchLocation},
+};
+
+use super::shared::{build_line_starts, line_index_for_offset, trim_line_terminator_bytes};
+
+#[derive(Debug, Clone)]
+pub(crate) struct PureLiteralMatcher {
+    matcher: AhoCorasick,
+}
+
+#[derive(Debug, Clone, Copy, Default)]
+pub(crate) struct LiteralScanStats {
+    pub(crate) matched_lines: usize,
+    pub(crate) matched_occurrences: usize,
+    pub(crate) bytes_searched: u64,
+}
+
+impl PureLiteralMatcher {
+    pub(crate) fn compile(config: &QueryConfig, multiline_verifier: bool) -> Result<Option<Self>> {
+        if multiline_verifier || config.word_regexp || config.line_regexp {
+            return Ok(None);
+        }
+
+        let Some(literals) = collect_pure_literals(config)? else {
+            return Ok(None);
+        };
+        if config.case_insensitive && !literals.iter().all(|literal| literal.is_ascii()) {
+            return Ok(None);
+        }
+
+        let matcher = AhoCorasick::builder()
+            .match_kind(MatchKind::LeftmostFirst)
+            .ascii_case_insensitive(config.case_insensitive)
+            .build(&literals)
+            .map_err(|error| AppError::InvalidPattern(error.to_string()))?;
+        Ok(Some(Self { matcher }))
+    }
+
+    pub(crate) fn count(&self, bytes: &[u8]) -> LiteralScanStats {
+        let mut matched_lines = 0usize;
+        let mut matched_occurrences = 0usize;
+        let mut current_line_start = 0usize;
+        let mut current_line_end = next_line_end(bytes, current_line_start);
+        let mut current_line_has_match = false;
+
+        for matched in self.matcher.find_iter(bytes) {
+            while matched.start() >= current_line_end && current_line_start < bytes.len() {
+                current_line_start = current_line_end;
+                current_line_end = next_line_end(bytes, current_line_start);
+                current_line_has_match = false;
+            }
+            if !current_line_has_match {
+                matched_lines += 1;
+                current_line_has_match = true;
+            }
+            matched_occurrences += 1;
+        }
+
+        LiteralScanStats {
+            matched_lines,
+            matched_occurrences,
+            bytes_searched: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
+        }
+    }
+
+    pub(crate) fn collect_matches(&self, bytes: &[u8], first_only: bool) -> Vec<FileMatch> {
+        let line_starts = build_line_starts(bytes);
+        let mut matches = Vec::new();
+        for matched in self.matcher.find_iter(bytes) {
+            matches.push(build_file_match(
+                bytes,
+                matched.start(),
+                matched.end(),
+                &line_starts,
+            ));
+            if first_only {
+                break;
+            }
+        }
+        matches
+    }
+}
+
+pub(crate) fn count_unique_match_lines(matches: &[FileMatch]) -> usize {
+    let mut lines = 0usize;
+    let mut last_line = None;
+    for matched in matches {
+        if last_line != Some(matched.location.line) {
+            lines += 1;
+            last_line = Some(matched.location.line);
+        }
+    }
+    lines
+}
+
+fn collect_pure_literals(config: &QueryConfig) -> Result<Option<Vec<String>>> {
+    let patterns = if config.patterns.is_empty() {
+        vec![config.regex_pattern.as_str()]
+    } else {
+        config.patterns.iter().map(String::as_str).collect()
+    };
+
+    let mut literals = Vec::new();
+    for pattern in patterns {
+        if config.fixed_strings {
+            literals.push(pattern.to_owned());
+            continue;
+        }
+
+        let Some(pattern_literals) = extract_pure_literals(pattern)? else {
+            return Ok(None);
+        };
+        literals.extend(pattern_literals);
+    }
+
+    if literals.is_empty()
+        || literals
+            .iter()
+            .any(|literal| literal.is_empty() || literal.contains(['\n', '\r']))
+    {
+        return Ok(None);
+    }
+    Ok(Some(literals))
+}
+
+fn extract_pure_literals(pattern: &str) -> Result<Option<Vec<String>>> {
+    let hir = parse(pattern).map_err(|error| AppError::InvalidPattern(error.to_string()))?;
+    let literals = match hir.kind() {
+        HirKind::Alternation(branches) => branches
+            .iter()
+            .map(extract_pure_literal)
+            .collect::<Option<Vec<_>>>(),
+        _ => extract_pure_literal(&hir).map(|literal| vec![literal]),
+    };
+    Ok(literals)
+}
+
+fn extract_pure_literal(hir: &Hir) -> Option<String> {
+    match hir.kind() {
+        HirKind::Literal(literal) => Some(String::from_utf8_lossy(&literal.0).into_owned()),
+        HirKind::Capture(capture) => extract_pure_literal(&capture.sub),
+        HirKind::Concat(parts) => {
+            let mut literal = String::new();
+            for part in parts {
+                literal.push_str(&extract_pure_literal(part)?);
+            }
+            Some(literal)
+        }
+        _ => None,
+    }
+}
+
+fn next_line_end(bytes: &[u8], start: usize) -> usize {
+    if start >= bytes.len() {
+        return bytes.len();
+    }
+    start + memchr::memchr(b'\n', &bytes[start..]).map_or(bytes.len() - start, |index| index + 1)
+}
+
+fn build_file_match(bytes: &[u8], start: usize, end: usize, line_starts: &[usize]) -> FileMatch {
+    let line_index = line_index_for_offset(start, line_starts);
+    let line_start = line_starts[line_index];
+    let line_end = line_starts
+        .get(line_index + 1)
+        .copied()
+        .unwrap_or(bytes.len());
+    let snippet = trim_line_terminator_bytes(&bytes[line_start..line_end]);
+
+    FileMatch {
+        location: MatchLocation {
+            line: line_index + 1,
+            column: start.saturating_sub(line_start) + 1,
+        },
+        snippet: String::from_utf8_lossy(snippet).into_owned(),
+        matched_text: String::from_utf8_lossy(&bytes[start..end]).into_owned(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::PureLiteralMatcher;
+    use crate::{config::QueryConfig, search::SearchMode};
+
+    fn literal_matcher(pattern: &str) -> PureLiteralMatcher {
+        PureLiteralMatcher::compile(
+            &QueryConfig {
+                regex_pattern: pattern.into(),
+                search_mode: SearchMode::CountOnly,
+                ..QueryConfig::default()
+            },
+            false,
+        )
+        .expect("literal matcher should compile")
+        .expect("literal matcher should exist")
+    }
+
+    #[test]
+    fn count_occurrences_preserves_all_matches() {
+        let matcher = literal_matcher("ui");
+        let stats = matcher.count(b"ui ui ui\nalpha\nui beta ui\n");
+        assert_eq!(stats.matched_lines, 2);
+        assert_eq!(stats.matched_occurrences, 5);
+    }
+}

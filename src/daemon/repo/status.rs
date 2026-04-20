@@ -137,7 +137,7 @@ impl RepoRuntime {
         self.glob_cache_epoch.fetch_add(1, Ordering::Relaxed);
     }
 
-    pub(super) fn snapshot_overlay_dirty_paths(&self) -> Result<Option<DirtyPathSet>> {
+    pub(super) fn snapshot_published_overlay_paths(&self) -> Result<Option<DirtyPathSet>> {
         let overlay = match self.workspace_overlay_engine.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -158,15 +158,18 @@ impl RepoRuntime {
     }
 
     pub(super) fn published_overlay_paths(&self) -> Result<DirtyPathSet> {
-        if let Some(dirty) = self.snapshot_overlay_dirty_paths()? {
-            return Ok(dirty);
+        // Query correctness comes from the published overlay snapshot itself. The in-memory cache
+        // is only a fallback mirror for status/strict-readiness paths when the published snapshot
+        // is temporarily unavailable.
+        if let Some(published_overlay_paths) = self.snapshot_published_overlay_paths()? {
+            return Ok(published_overlay_paths);
         }
-        Ok(self.current_overlay_snapshot().paths)
+        Ok(self.cached_published_overlay_paths())
     }
 
     pub(super) fn update_overlay_state(&self) {
-        let published_dirty = match self.published_overlay_paths() {
-            Ok(dirty) => dirty,
+        let published_overlay_paths = match self.published_overlay_paths() {
+            Ok(paths) => paths,
             Err(error) => {
                 self.mark_workspace_probe_pending_with_error(format!(
                     "failed to derive workspace overlay state: {error}"
@@ -174,7 +177,7 @@ impl RepoRuntime {
                 return;
             }
         };
-        self.replace_dirty_overlay_paths(published_dirty);
+        self.replace_published_overlay_paths_cache(published_overlay_paths);
         let dirty_stats = self.dirty_catalog_stats();
         let mut state = match self.state.lock() {
             Ok(guard) => guard,

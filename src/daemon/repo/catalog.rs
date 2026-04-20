@@ -24,13 +24,20 @@ use super::{
     WorkspaceOverlayIngestBatch, WorkspaceOverlaySnapshotState,
 };
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OverlayUpdateMode {
+    NoChange,
+    Rebuild,
+    ApplyDelta,
+}
+
 impl RepoRuntime {
     pub(super) fn preload_base_snapshot_catalog(&self) -> Result<()> {
         let _ = self.base_snapshot_catalog()?;
         Ok(())
     }
 
-    pub(super) fn build_overlay_refresh_plan_from_worktree(
+    pub(super) fn plan_overlay_full_rebuild_from_worktree(
         &self,
     ) -> Result<WorkspaceOverlayWritePlan> {
         let dirty = self.diff_against_base_snapshot_worktree()?;
@@ -38,45 +45,37 @@ impl RepoRuntime {
         self.build_overlay_rebuild_plan(dirty)
     }
 
-    pub(super) fn build_overlay_incremental_probe_plan(
+    pub(super) fn plan_overlay_update_from_incremental_probe(
         &self,
     ) -> Result<Option<WorkspaceOverlayWritePlan>> {
         let Some(dirty) = self.diff_against_base_snapshot_incremental()? else {
             return Ok(None);
         };
         self.reconcile_dirty_catalog(&dirty)?;
-        let published_dirty = self.published_overlay_paths()?;
+        let published_overlay_paths = self.published_overlay_paths()?;
         let pending_dirty = self.dirty_catalog_pending_paths();
-        let overlay_snapshot_available =
-            self.snapshot_overlay_dirty_paths()?.is_some() || dirty.is_empty();
+        let published_overlay_snapshot_available =
+            self.snapshot_published_overlay_paths()?.is_some() || dirty.is_empty();
 
-        if dirty == published_dirty {
-            if !pending_dirty.is_empty() {
-                return self
-                    .build_overlay_delta_plan(dirty, pending_dirty)
-                    .map(Some);
-            }
-            return if overlay_snapshot_available {
-                Ok(None)
-            } else {
-                self.build_overlay_rebuild_plan(dirty).map(Some)
-            };
+        // Incremental probe rules:
+        // - If the current dirty set already matches the published overlay and nothing is pending,
+        //   keep the current published snapshot if it is readable.
+        // - If any previously published overlay path became clean back to base, force a rebuild.
+        //   Delta publish can add/update/delete overlay entries, but it cannot retract already
+        //   published overlay-visible paths that should disappear entirely.
+        // - Otherwise publish only the pending delta paths.
+        match decide_overlay_update_mode(
+            &dirty,
+            &published_overlay_paths,
+            &pending_dirty,
+            published_overlay_snapshot_available,
+        ) {
+            OverlayUpdateMode::NoChange => Ok(None),
+            OverlayUpdateMode::Rebuild => self.build_overlay_rebuild_plan(dirty).map(Some),
+            OverlayUpdateMode::ApplyDelta => self
+                .build_overlay_delta_plan(dirty, pending_dirty)
+                .map(Some),
         }
-
-        if dirty.has_paths_cleaned_since(&published_dirty) {
-            return self.build_overlay_rebuild_plan(dirty).map(Some);
-        }
-
-        if pending_dirty.is_empty() {
-            return if overlay_snapshot_available {
-                Ok(None)
-            } else {
-                self.build_overlay_rebuild_plan(dirty).map(Some)
-            };
-        }
-
-        self.build_overlay_delta_plan(dirty, pending_dirty)
-            .map(Some)
     }
 
     pub(super) fn build_overlay_rebuild_plan(
@@ -591,4 +590,71 @@ fn current_file_content_hash(path: &Path) -> Result<[u8; 32]> {
     let crc = crc32fast::hash(&bytes);
     content_hash[..4].copy_from_slice(&crc.to_le_bytes());
     Ok(content_hash)
+}
+
+fn decide_overlay_update_mode(
+    dirty: &DirtyPathSet,
+    published_overlay_paths: &DirtyPathSet,
+    pending_dirty: &DirtyPathSet,
+    published_overlay_snapshot_available: bool,
+) -> OverlayUpdateMode {
+    if dirty == published_overlay_paths {
+        if pending_dirty.is_empty() {
+            return if published_overlay_snapshot_available {
+                OverlayUpdateMode::NoChange
+            } else {
+                OverlayUpdateMode::Rebuild
+            };
+        }
+        return OverlayUpdateMode::ApplyDelta;
+    }
+
+    if dirty.has_paths_cleaned_since(published_overlay_paths) {
+        return OverlayUpdateMode::Rebuild;
+    }
+
+    if pending_dirty.is_empty() {
+        return if published_overlay_snapshot_available {
+            OverlayUpdateMode::NoChange
+        } else {
+            OverlayUpdateMode::Rebuild
+        };
+    }
+
+    OverlayUpdateMode::ApplyDelta
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{decide_overlay_update_mode, DirtyPathSet, OverlayUpdateMode};
+
+    fn dirty_paths(modified: &[&str], deleted: &[&str], new: &[&str]) -> DirtyPathSet {
+        DirtyPathSet {
+            modified: modified.iter().map(|path| (*path).to_string()).collect(),
+            deleted: deleted.iter().map(|path| (*path).to_string()).collect(),
+            new: new.iter().map(|path| (*path).to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn clean_back_to_base_requires_overlay_rebuild() {
+        let dirty = dirty_paths(&[], &[], &[]);
+        let published_overlay_paths = dirty_paths(&["/repo/tracked.rs"], &[], &[]);
+        let pending_dirty = dirty_paths(&[], &[], &[]);
+
+        let mode =
+            decide_overlay_update_mode(&dirty, &published_overlay_paths, &pending_dirty, true);
+
+        assert_eq!(mode, OverlayUpdateMode::Rebuild);
+    }
+
+    #[test]
+    fn incremental_probe_keeps_published_snapshot_when_nothing_changed() {
+        let dirty = dirty_paths(&["/repo/tracked.rs"], &[], &[]);
+        let pending_dirty = dirty_paths(&[], &[], &[]);
+
+        let mode = decide_overlay_update_mode(&dirty, &dirty, &pending_dirty, true);
+
+        assert_eq!(mode, OverlayUpdateMode::NoChange);
+    }
 }

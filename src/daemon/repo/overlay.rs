@@ -59,6 +59,13 @@ impl WorkspaceOverlayWritePlan {
 
 impl RepoRuntime {
     pub(super) fn apply_overlay_write_plan(&self, plan: WorkspaceOverlayWritePlan) {
+        // Developer view of the overlay write path:
+        // 1. Reconcile/probe builds a write plan from the current worktree and dirty catalog.
+        // 2. Apply the plan to the overlay storage as either a full rebuild or an incremental
+        //    publish.
+        // 3. Mark the published paths as ready in the dirty catalog.
+        // 4. Refresh the published-overlay cache from the visible snapshot so status and fallback
+        //    readers mirror the query-visible state.
         let _write_guard = self
             .overlay_write_lock
             .lock()
@@ -78,7 +85,7 @@ impl RepoRuntime {
             self.handle_workspace_overlay_engine_error("mark dirty catalog ready", &error);
             return;
         }
-        self.replace_dirty_overlay_paths(planned_dirty);
+        self.replace_published_overlay_paths_cache(planned_dirty);
         self.update_overlay_state();
     }
 

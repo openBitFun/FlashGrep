@@ -1,8 +1,9 @@
 use std::{
     collections::HashMap,
-    fs,
+    env, fs,
     path::{Path, PathBuf},
     sync::RwLock,
+    time::Instant,
 };
 
 use crate::index_engine::segment::reader::FileSegmentReader;
@@ -12,8 +13,8 @@ use crate::{
 };
 
 use super::{
-    build_posting_lists, read_segment_doc_addresses, read_segment_meta, write_postings_file,
-    write_segment_documents, write_segment_meta, write_term_dict_file, MemorySegmentReader,
+    build_posting_lists, read_segment_meta, write_postings_file, write_segment_documents,
+    write_segment_meta, write_term_dict_file, FileSegmentDocTable, MemorySegmentReader,
     PostingLists, SegmentBuildOutput, SegmentMeta, SegmentReaderHandle, TermDictionary, DOCS_FILE,
     PATH_MAP_FILE, SEGMENT_META_FILE, STORED_FIELDS_FILE,
 };
@@ -124,18 +125,37 @@ impl SegmentStore for FileSegmentStore {
         }
 
         let segment_dir = self.segment_dir(&id);
+        let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
         let meta = read_segment_meta(&segment_dir.join(SEGMENT_META_FILE))?;
-        let doc_addresses = read_segment_doc_addresses(&segment_dir)?;
+        let doc_addresses_started = Instant::now();
+        let doc_table = FileSegmentDocTable::open(&segment_dir)?;
+        let doc_addresses_elapsed = doc_addresses_started.elapsed();
+        let term_dict_started = Instant::now();
         let term_dict = TermDictionary::open(&segment_dir.join(TERM_DICT_FILE))?;
+        let term_dict_elapsed = term_dict_started.elapsed();
+        let postings_started = Instant::now();
         let posting_lists = PostingLists::open_lazy(term_dict, &segment_dir.join(POSTINGS_FILE))?;
+        let postings_elapsed = postings_started.elapsed();
         let stored_fields_path = segment_dir.join(STORED_FIELDS_FILE);
+        let reader_started = Instant::now();
         let reader = std::sync::Arc::new(FileSegmentReader::new(
             meta,
-            doc_addresses,
+            doc_table,
             posting_lists,
             stored_fields_path.exists().then_some(stored_fields_path),
             self.repo_root.clone(),
         )?);
+        let reader_elapsed = reader_started.elapsed();
+        if profile_open {
+            eprintln!(
+                "segment_open id={} doc_addresses_ms={:.3} term_dict_ms={:.3} postings_ms={:.3} reader_new_ms={:.3}",
+                id.0,
+                doc_addresses_elapsed.as_secs_f64() * 1000.0,
+                term_dict_elapsed.as_secs_f64() * 1000.0,
+                postings_elapsed.as_secs_f64() * 1000.0,
+                reader_elapsed.as_secs_f64() * 1000.0,
+            );
+        }
         let mut cache = self
             .cache
             .write()

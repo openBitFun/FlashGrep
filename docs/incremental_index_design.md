@@ -2,28 +2,28 @@
 
 ## Goal
 
-`codgrep` 的增量索引运行时采用三层模型：
+`codgrep` 的增量索引运行时有三块状态，但查询真相源只有两层只读 snapshot：
 
 1. `base snapshot`
    只读、稳定、锚定某个 Git snapshot 或 repo fingerprint。
 2. `dirty catalog`
    记录工作区里哪些路径变了、当前处于 `dirty / building / ready_overlay / failed` 哪个状态。
-3. `published overlay`
+3. `published overlay snapshot`
    只包含已经构建完成并原子发布、对查询可见的 workspace 增量层。
 
-目标不是让查询线程参与构建，而是把“变化发现”“后台构建”“查询可见”拆成三条边界清晰的流程。
+目标不是让查询线程参与构建，而是把“变化发现”“后台构建”“查询可见”拆成三条边界清晰的流程；查询线程始终只读 `base snapshot + published overlay snapshot`。
 
 ## Design Principles
 
-### 1. Query Reads Published Snapshots Only
+### 1. Query Truth Is Base Snapshot + Published Overlay Snapshot
 
 查询线程只读取：
 
 - base snapshot
-- 当前 published overlay manifest
-- published overlay 所引用的 segment / delete segment
+- 当前 published overlay snapshot
+- published overlay snapshot 所引用的 manifest / segment / delete segment
 
-查询不会读取 dirty catalog 的中间状态，也不会等待后台构建完成。
+查询不会读取 dirty catalog、中间 staging，或任何 runtime cache，也不会等待后台构建完成。
 
 ### 2. Dirty Detection Is Separate From Query Visibility
 

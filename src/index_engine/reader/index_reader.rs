@@ -25,7 +25,10 @@ use crate::{
 };
 use regex::RegexBuilder;
 
-const SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD: usize = 15_000;
+// Single-segment snapshots are common for base builds. Keeping this threshold in the tens of
+// thousands makes medium candidate sets serialize verification on one thread, which is too slow
+// for monorepo queries even when posting recall is already selective.
+const SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD: usize = 128;
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchProfile {
