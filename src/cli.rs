@@ -55,6 +55,7 @@ enum EngineCommands {
     Commit(EngineRepoArgs),
     Search(EngineSearchArgs),
     Merge(EngineMergeArgs),
+    Vacuum(EngineRepoArgs),
     Status(EngineRepoArgs),
 }
 
@@ -505,6 +506,12 @@ fn run_engine(args: EngineArgs) -> Result<bool> {
                 manifest.active_segments.len(),
                 manifest.active_delete_segments.len()
             );
+            Ok(true)
+        }
+        EngineCommands::Vacuum(args) => {
+            let engine = open_index_engine(&args)?;
+            let removed = engine.admin().vacuum()?;
+            println!("vacuumed files={removed}");
             Ok(true)
         }
         EngineCommands::Status(args) => {

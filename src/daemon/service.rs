@@ -231,6 +231,40 @@ mod tests {
             .expect("git commit should succeed");
     }
 
+    fn git_current_branch(repo_path: &std::path::Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["branch", "--show-current"])
+            .output()
+            .expect("git branch should succeed");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("branch output should decode")
+            .trim()
+            .to_string()
+    }
+
+    fn git_checkout(repo_path: &std::path::Path, target: &str) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["checkout", "-q", target])
+            .status()
+            .expect("git checkout should succeed");
+        assert!(status.success(), "git checkout {target} should succeed");
+    }
+
+    fn git_checkout_new_branch(repo_path: &std::path::Path, branch: &str) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["checkout", "-q", "-b", branch])
+            .status()
+            .expect("git checkout -b should succeed");
+        assert!(status.success(), "git checkout -b {branch} should succeed");
+    }
+
     fn query(pattern: &str) -> QuerySpec {
         QuerySpec {
             pattern: pattern.into(),
@@ -358,6 +392,7 @@ mod tests {
         consistency: ConsistencyMode,
         expected: usize,
     ) -> (SearchBackend, RepoStatusPayload) {
+        let mut last_observed = None;
         for _ in 0..SEARCH_WAIT_ATTEMPTS {
             match service.handle_request_only(Request::Search {
                 params: crate::daemon::protocol::SearchParams {
@@ -374,7 +409,14 @@ mod tests {
                     status,
                     ..
                 }) if results.matched_lines == expected => return (backend, status),
-                Ok(Response::SearchCompleted { .. }) => {}
+                Ok(Response::SearchCompleted {
+                    backend,
+                    results,
+                    status,
+                    ..
+                }) => {
+                    last_observed = Some((backend, results.matched_lines, status));
+                }
                 Err(crate::error::AppError::InvalidIndex(_)) => {}
                 Err(crate::error::AppError::Io(error))
                     if error.kind() == std::io::ErrorKind::NotFound => {}
@@ -383,7 +425,33 @@ mod tests {
             }
             thread::sleep(Duration::from_millis(50));
         }
-        panic!("timed out waiting for search count");
+        panic!(
+            "timed out waiting for search count for pattern {pattern} expecting {expected}; last observed: {last_observed:?}"
+        );
+    }
+
+    fn assert_search_count_now(
+        service: &DaemonService,
+        repo_id: &str,
+        pattern: &str,
+        consistency: ConsistencyMode,
+        expected: usize,
+    ) -> (SearchBackend, RepoStatusPayload) {
+        match search_repo(service, repo_id, pattern, consistency) {
+            Response::SearchCompleted {
+                backend,
+                results,
+                status,
+                ..
+            } => {
+                assert_eq!(
+                    results.matched_lines, expected,
+                    "unexpected immediate search count for pattern {pattern}"
+                );
+                (backend, status)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
     }
 
     fn wait_for_search_with_params_count(
@@ -789,10 +857,10 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(
-            backend,
-            SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
-        ));
+        assert!(
+            !matches!(backend, SearchBackend::IndexedSnapshot),
+            "dirty eventual search must not fall back to stale base-only results"
+        );
 
         let (backend, status) = wait_for_search_count(
             &service,
@@ -801,10 +869,10 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(
-            backend,
-            SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
-        ));
+        assert!(
+            !matches!(backend, SearchBackend::IndexedSnapshot),
+            "dirty eventual search must not fall back to stale base-only results"
+        );
         assert_eq!(status.dirty_files.modified, 2);
     }
 
@@ -1928,6 +1996,151 @@ mod tests {
     }
 
     #[test]
+    fn workspace_eventual_search_stays_stable_while_overlay_merge_is_pending() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        let tracked = repo_path.join("tracked.rs");
+        fs::write(&tracked, "const NAME: &str = \"MERGE_STABLE_OLD\";\n")
+            .expect("write should succeed");
+
+        let repo_id = match service
+            .handle_request_only(Request::OpenRepo {
+                params: OpenRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: None,
+                    config: RepoConfig::default(),
+                    refresh: crate::daemon::protocol::RefreshPolicyConfig {
+                        rebuild_dirty_threshold: 256,
+                        overlay_auto_checkpoint_max_uncommitted_ops: 1,
+                        overlay_merge_min_delay_ms: 500,
+                        overlay_merge_retry_delay_ms: 100,
+                    },
+                },
+            })
+            .expect("open repo should succeed")
+        {
+            Response::RepoOpened { repo_id, .. } => repo_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        build_repo(&service, &repo_id);
+
+        fs::write(&tracked, "const NAME: &str = \"MERGE_STABLE_NEW\";\n")
+            .expect("rewrite should succeed");
+
+        let requested = wait_for_status(&service, &repo_id, |status| {
+            status.overlay.as_ref().is_some_and(|overlay| {
+                overlay.committed_seq_no >= 1 && overlay.merge_requested && !overlay.merge_running
+            })
+        });
+        assert!(requested
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.merge_requested));
+
+        let mut saw_requested = false;
+        for _ in 0..12 {
+            let (_, new_status) = assert_search_count_now(
+                &service,
+                &repo_id,
+                "MERGE_STABLE_NEW",
+                ConsistencyMode::WorkspaceEventual,
+                1,
+            );
+            let _ = assert_search_count_now(
+                &service,
+                &repo_id,
+                "MERGE_STABLE_OLD",
+                ConsistencyMode::WorkspaceEventual,
+                0,
+            );
+            if new_status
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| overlay.merge_requested || overlay.merge_running)
+            {
+                saw_requested = true;
+            }
+            if new_status
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| !overlay.merge_requested && !overlay.merge_running)
+            {
+                break;
+            }
+            thread::sleep(Duration::from_millis(40));
+        }
+        assert!(saw_requested);
+
+        let settled = wait_for_status(&service, &repo_id, |status| {
+            status
+                .overlay
+                .as_ref()
+                .is_some_and(|overlay| !overlay.merge_requested && !overlay.merge_running)
+        });
+        assert!(settled
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.merge_failed == 0));
+    }
+
+    #[test]
+    fn workspace_eventual_search_stays_stable_during_forced_overlay_rebuild() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        let tracked = repo_path.join("tracked.rs");
+        fs::write(&tracked, "const NAME: &str = \"REBUILD_STABLE_BASE\";\n")
+            .expect("write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+
+        fs::write(&tracked, "const NAME: &str = \"REBUILD_STABLE_DIRTY\";\n")
+            .expect("rewrite should succeed");
+        let refreshed = refresh_repo(&service, &repo_id, true);
+        assert!(matches!(
+            refreshed.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
+        wait_for_workspace_overlay_match_count(&repo_path, "REBUILD_STABLE_DIRTY", 1);
+
+        clear_workspace_overlay_engine(&service, &repo_id);
+        clear_published_overlay_paths_cache(&service, &repo_id);
+        mark_workspace_probe_pending(&service, &repo_id);
+
+        for _ in 0..12 {
+            let _ = assert_search_count_now(
+                &service,
+                &repo_id,
+                "REBUILD_STABLE_DIRTY",
+                ConsistencyMode::WorkspaceEventual,
+                1,
+            );
+            let _ = assert_search_count_now(
+                &service,
+                &repo_id,
+                "REBUILD_STABLE_BASE",
+                ConsistencyMode::WorkspaceEventual,
+                0,
+            );
+            thread::sleep(Duration::from_millis(30));
+        }
+
+        let status = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+                && status.dirty_files.modified == 1
+        });
+        assert!(status.probe_healthy);
+        assert_eq!(status.dirty_files.deleted, 0);
+        assert_eq!(status.dirty_files.new, 0);
+    }
+
+    #[test]
     fn watcher_reconciles_batched_tracked_file_updates() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
@@ -2275,6 +2488,88 @@ mod tests {
             backend,
             SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
         ));
+    }
+
+    #[test]
+    fn repeated_incremental_edits_converge_to_expected_overlay_state() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        let tracked = repo_path.join("tracked.rs");
+        fs::write(&tracked, "const VALUE: &str = \"REPEAT_BASE\";\n")
+            .expect("write should succeed");
+
+        let repo_id = match service
+            .handle_request_only(Request::OpenRepo {
+                params: OpenRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: None,
+                    config: RepoConfig::default(),
+                    refresh: crate::daemon::protocol::RefreshPolicyConfig {
+                        rebuild_dirty_threshold: 256,
+                        overlay_auto_checkpoint_max_uncommitted_ops: 1,
+                        overlay_merge_min_delay_ms: 50,
+                        overlay_merge_retry_delay_ms: 25,
+                    },
+                },
+            })
+            .expect("open repo should succeed")
+        {
+            Response::RepoOpened { repo_id, .. } => repo_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        build_repo(&service, &repo_id);
+
+        let mut latest = String::new();
+        let mut prior_tokens = Vec::new();
+        for index in 0..8 {
+            latest = format!("REPEAT_EDIT_TOKEN_{index}");
+            if index > 0 {
+                prior_tokens.push(format!("REPEAT_EDIT_TOKEN_{}", index - 1));
+            }
+            fs::write(&tracked, format!("const VALUE: &str = \"{latest}\";\n"))
+                .expect("rewrite should succeed");
+        }
+
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            &latest,
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+
+        let settled = wait_for_status(&service, &repo_id, |status| {
+            status.overlay.as_ref().is_some_and(|overlay| {
+                !overlay.merge_requested
+                    && !overlay.merge_running
+                    && overlay.active_delete_segments == 0
+                    && overlay.active_segments == 1
+            })
+        });
+        let overlay = settled.overlay.expect("overlay stats should be present");
+        assert_eq!(overlay.active_segments, 1);
+        assert_eq!(overlay.active_delete_segments, 0);
+        assert_eq!(overlay.merge_failed, 0);
+
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "REPEAT_BASE",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
+        for token in prior_tokens {
+            let _ = wait_for_search_count(
+                &service,
+                &repo_id,
+                &token,
+                ConsistencyMode::WorkspaceEventual,
+                0,
+            );
+        }
     }
 
     #[test]
@@ -2832,5 +3127,258 @@ mod tests {
                 | crate::daemon::protocol::RepoPhase::ReadyDirty
                 | crate::daemon::protocol::RepoPhase::ReadyClean
         ));
+    }
+
+    #[test]
+    #[ignore = "known gap: tracked directory restore can temporarily lose stable query results without refresh"]
+    fn watcher_reconciles_tracked_directory_delete_and_restore_without_refresh() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        let nested = repo_path.join("nested");
+        fs::create_dir_all(&nested).expect("nested dir should succeed");
+        let first = nested.join("first.rs");
+        let second = nested.join("second.rs");
+        fs::write(&first, "const NAME: &str = \"DIR_DELETE_ALPHA\";\n")
+            .expect("first write should succeed");
+        fs::write(&second, "const NAME: &str = \"DIR_DELETE_BETA\";\n")
+            .expect("second write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+
+        fs::remove_dir_all(&nested).expect("tracked dir delete should succeed");
+
+        let status = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+                && status.dirty_files.deleted == 2
+        });
+        assert_exact_dirty_stats(&status, 0, 2, 0);
+
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "DIR_DELETE_ALPHA",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "DIR_DELETE_BETA",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
+
+        fs::create_dir_all(&nested).expect("nested dir restore should succeed");
+        fs::write(&first, "const NAME: &str = \"DIR_DELETE_ALPHA\";\n")
+            .expect("first restore should succeed");
+        fs::write(&second, "const NAME: &str = \"DIR_DELETE_BETA\";\n")
+            .expect("second restore should succeed");
+
+        let status = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+                && status.dirty_files.modified == 0
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
+        });
+        assert_exact_dirty_stats(&status, 0, 0, 0);
+
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "DIR_DELETE_ALPHA",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "DIR_DELETE_BETA",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+    }
+
+    #[test]
+    fn git_branch_checkout_reconciles_large_worktree_switches() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        let tracked = repo_path.join("tracked.rs");
+        let old_dir = repo_path.join("old");
+        fs::create_dir_all(&old_dir).expect("old dir should succeed");
+        fs::write(&tracked, "const NAME: &str = \"MAIN_TOKEN\";\n")
+            .expect("tracked write should succeed");
+        fs::write(
+            old_dir.join("legacy.rs"),
+            "const NAME: &str = \"LEGACY_BRANCH_TOKEN\";\n",
+        )
+        .expect("legacy write should succeed");
+
+        init_git_repo(&repo_path);
+        git_commit_all(&repo_path, "base");
+        let main_branch = git_current_branch(&repo_path);
+
+        let storage_root = temp.path().join("storage");
+        let repo_id = match service
+            .handle_request_only(Request::OpenRepo {
+                params: OpenRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: Some(storage_root),
+                    config: RepoConfig::default(),
+                    refresh: Default::default(),
+                },
+            })
+            .expect("open repo should succeed")
+        {
+            Response::RepoOpened { repo_id, .. } => repo_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        build_repo(&service, &repo_id);
+        let status = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+                && status.dirty_files.modified == 0
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
+        });
+        assert!(status.probe_healthy);
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "MAIN_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "LEGACY_BRANCH_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+
+        git_checkout_new_branch(&repo_path, "feature");
+        fs::remove_dir_all(&old_dir).expect("old dir delete should succeed");
+        fs::write(&tracked, "const NAME: &str = \"FEATURE_TOKEN\";\n")
+            .expect("tracked rewrite should succeed");
+        fs::create_dir_all(repo_path.join("feature")).expect("feature dir should succeed");
+        fs::write(
+            repo_path.join("feature/new.rs"),
+            "const NAME: &str = \"FEATURE_DIR_TOKEN\";\n",
+        )
+        .expect("feature file write should succeed");
+        git_commit_all(&repo_path, "feature");
+
+        git_checkout(&repo_path, "feature");
+        let status = refresh_repo(&service, &repo_id, true);
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
+
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "FEATURE_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "FEATURE_DIR_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "MAIN_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
+        let status = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+                && status.dirty_files.modified >= 1
+                && status.dirty_files.deleted >= 1
+                && status.dirty_files.new >= 1
+        });
+        assert!(status.probe_healthy);
+
+        git_checkout(&repo_path, &main_branch);
+        let status = refresh_repo(&service, &repo_id, true);
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyClean
+                | crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
+
+        let status = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+                && status.dirty_files.modified == 0
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
+        });
+        assert!(status.probe_healthy);
+
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "MAIN_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "FEATURE_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "FEATURE_DIR_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
+    }
+
+    #[test]
+    fn atomic_rename_replace_updates_tracked_file_contents() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        let tracked = repo_path.join("tracked.rs");
+        fs::write(&tracked, "const VALUE: &str = \"ATOMIC_BASE\";\n")
+            .expect("tracked write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+
+        let temp_file = repo_path.join(".tracked.rs.tmp");
+        fs::write(&temp_file, "const VALUE: &str = \"ATOMIC_REPLACED\";\n")
+            .expect("temp write should succeed");
+        fs::rename(&temp_file, &tracked).expect("atomic replace should succeed");
+
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "ATOMIC_REPLACED",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "ATOMIC_BASE",
+            ConsistencyMode::WorkspaceEventual,
+            0,
+        );
     }
 }

@@ -52,12 +52,25 @@ impl Reclaimer {
         index_root: &Path,
         manifest_store: &dyn ManifestStore,
     ) -> Result<Vec<GcCandidate>> {
+        self.plan_with_pins(index_root, manifest_store, &BTreeSet::new())
+    }
+
+    pub fn plan_with_pins(
+        &self,
+        index_root: &Path,
+        manifest_store: &dyn ManifestStore,
+        pinned_manifest_ids: &BTreeSet<ManifestId>,
+    ) -> Result<Vec<GcCandidate>> {
         let manifests = self.load_manifests(manifest_store)?;
         if manifests.is_empty() {
             return Ok(Vec::new());
         }
 
-        let retained = retained_manifests(&manifests, self.retained_history_manifests);
+        let retained = retained_manifests(
+            &manifests,
+            self.retained_history_manifests,
+            pinned_manifest_ids,
+        );
         let retained_ids = retained
             .iter()
             .map(|manifest| manifest.manifest_id.clone())
@@ -178,7 +191,11 @@ impl Reclaimer {
     }
 }
 
-fn retained_manifests(manifests: &[Manifest], retained_history_manifests: usize) -> Vec<Manifest> {
+fn retained_manifests(
+    manifests: &[Manifest],
+    retained_history_manifests: usize,
+    pinned_manifest_ids: &BTreeSet<ManifestId>,
+) -> Vec<Manifest> {
     if manifests.is_empty() {
         return Vec::new();
     }
@@ -189,6 +206,14 @@ fn retained_manifests(manifests: &[Manifest], retained_history_manifests: usize)
         .take(retained_history_manifests + 1)
         .cloned()
         .collect::<Vec<_>>();
+    retained.extend(
+        manifests
+            .iter()
+            .filter(|manifest| pinned_manifest_ids.contains(&manifest.manifest_id))
+            .cloned(),
+    );
+    retained.sort_unstable_by_key(|manifest| manifest.generation);
+    retained.dedup_by(|right, left| right.manifest_id == left.manifest_id);
     retained.sort_unstable_by_key(|manifest| manifest.generation);
     retained
 }

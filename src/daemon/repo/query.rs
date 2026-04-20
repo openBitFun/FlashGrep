@@ -133,7 +133,6 @@ impl RepoRuntime {
                         }
                         .as_ref()
                         .cloned();
-                        let overlay_engine_present = overlay_engine.is_some();
                         let overlay_snapshot = overlay_engine
                             .as_ref()
                             .map(|overlay| match overlay.open_snapshot() {
@@ -158,10 +157,15 @@ impl RepoRuntime {
                             }
                             Err(error) => return Err(error),
                         };
+                        let tracked_dirty = self.dirty_catalog_visible_paths();
+                        let overlay_snapshot = if tracked_dirty.is_empty() {
+                            None
+                        } else {
+                            overlay_snapshot
+                        };
                         let workspace_snapshot = self
                             .workspace_search_view
                             .open_workspace_query_snapshot(base_snapshot, overlay_snapshot)?;
-                        let tracked_dirty = self.dirty_catalog_visible_paths();
                         let mut response_status = status.clone();
                         super::status::apply_repo_status_dirty_fields(
                             &mut response_status,
@@ -173,15 +177,27 @@ impl RepoRuntime {
                         } else {
                             QueryBackend::IndexedWorkspaceView
                         };
-                        let overlay_snapshot_missing =
-                            overlay_engine_present && !workspace_snapshot.has_overlay_snapshot();
+                        let overlay_snapshot_missing = !workspace_snapshot.has_overlay_snapshot();
+                        let overlay_snapshot_unavailable_for_dirty =
+                            !tracked_dirty.is_empty() && !workspace_snapshot.has_overlay_snapshot();
                         if matches!(request.consistency, SearchConsistency::WorkspaceStrict)
-                            && overlay_snapshot_missing
+                            && overlay_snapshot_unavailable_for_dirty
                         {
                             return Err(AppError::Protocol(format!(
                                 "repo {} strict search requires a readable workspace overlay snapshot; run refresh or wait for background probe",
                                 self.repo_id
                             )));
+                        }
+                        if overlay_snapshot_unavailable_for_dirty
+                            && matches!(request.consistency, SearchConsistency::WorkspaceEventual)
+                        {
+                            self.schedule_workspace_probe(Duration::from_millis(0));
+                            return self.search_during_transition(
+                                &request,
+                                &scope,
+                                filter.as_ref(),
+                                response_status,
+                            );
                         }
                         if !workspace_snapshot.has_base_snapshot() {
                             self.schedule_workspace_probe(Duration::from_millis(0));

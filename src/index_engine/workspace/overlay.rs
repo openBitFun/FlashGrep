@@ -286,7 +286,7 @@ impl WorkspaceOverlayIndex {
         }
         (self.merge_state_hook)(WorkspaceOverlayMergeEvent::StateChanged);
 
-        let merge_result = self.engine.admin().maybe_merge();
+        let merge_result = self.engine.admin().maintain();
         if let Err(error) = &merge_result {
             eprintln!("codgrep: workspace overlay background merge failed: {error}");
         }
@@ -298,11 +298,10 @@ impl WorkspaceOverlayIndex {
             };
             state.running = false;
             match &merge_result {
-                Ok(true) => {
-                    state.merge_completed += 1;
+                Ok(stats) => {
+                    state.merge_completed += stats.merge_tasks;
                     state.last_merge_error = None;
                 }
-                Ok(false) => {}
                 Err(error) => {
                     state.merge_failed += 1;
                     state.last_merge_error = Some(error.to_string());
@@ -310,7 +309,7 @@ impl WorkspaceOverlayIndex {
             }
         }
         (self.merge_state_hook)(WorkspaceOverlayMergeEvent::StateChanged);
-        merge_result.map(|_| true)
+        merge_result.map(|stats| stats.merge_tasks > 0 || stats.vacuumed_files > 0)
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
@@ -593,7 +592,7 @@ mod tests {
     use crate::{
         config::{BuildConfig, CorpusMode, TokenizerMode},
         index_engine::{
-            config::{EngineConfig, PostingTokenizerConfig},
+            config::{EngineConfig, MergePolicyConfig, PostingTokenizerConfig},
             query::{QueryFilters, QueryRequest},
             writer::IndexEngine,
             RepoId, ShardId,
@@ -1058,5 +1057,125 @@ mod tests {
             .search(&query("LIVE"))
             .expect("search should succeed");
         assert_eq!(results.matched_lines, 0);
+    }
+
+    #[test]
+    fn run_requested_merge_drains_overlay_until_stable() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        let repo_id = RepoId("repo".into());
+        let overlay = WorkspaceOverlayIndex::new_with_policy(
+            IndexEngine::open(EngineConfig {
+                shard_id: ShardId("overlay-maintain-test".into()),
+                index_root: WorkspaceOverlayIndex::index_root(&build_config(&repo)),
+                merge_policy: MergePolicyConfig {
+                    max_segments: 1,
+                    ..MergePolicyConfig::default()
+                },
+                ..EngineConfig::default()
+            })
+            .expect("open engine"),
+            WorkspaceOverlayPublishPolicy::RefreshAndCheckpoint,
+        );
+
+        let a_path = repo.join("a.rs");
+        let b_path = repo.join("b.rs");
+        let c_path = repo.join("c.rs");
+
+        let add_a = WorkspaceOverlayIngestBatch::from_paths(
+            &repo_id,
+            &repo,
+            &HashSet::new(),
+            &HashSet::from([a_path.to_string_lossy().into_owned()]),
+            &HashSet::new(),
+            &HashMap::from([(
+                a_path.to_string_lossy().into_owned(),
+                loaded_doc(&a_path, "const VALUE: &str = \"ALPHA\";\n"),
+            )]),
+        )
+        .expect("build add batch");
+        overlay.ingest_batch(&add_a).expect("ingest add batch");
+
+        let add_b = WorkspaceOverlayIngestBatch::from_paths(
+            &repo_id,
+            &repo,
+            &HashSet::new(),
+            &HashSet::from([b_path.to_string_lossy().into_owned()]),
+            &HashSet::new(),
+            &HashMap::from([(
+                b_path.to_string_lossy().into_owned(),
+                loaded_doc(&b_path, "const VALUE: &str = \"BETA\";\n"),
+            )]),
+        )
+        .expect("build add batch");
+        overlay.ingest_batch(&add_b).expect("ingest add batch");
+
+        let delete_a = WorkspaceOverlayIngestBatch::from_deleted_paths(
+            &repo_id,
+            &repo,
+            &[a_path.to_string_lossy().into_owned()],
+        )
+        .expect("build delete batch");
+        overlay
+            .ingest_batch(&delete_a)
+            .expect("ingest delete batch");
+
+        let add_c = WorkspaceOverlayIngestBatch::from_paths(
+            &repo_id,
+            &repo,
+            &HashSet::new(),
+            &HashSet::from([c_path.to_string_lossy().into_owned()]),
+            &HashSet::new(),
+            &HashMap::from([(
+                c_path.to_string_lossy().into_owned(),
+                loaded_doc(&c_path, "const VALUE: &str = \"GAMMA\";\n"),
+            )]),
+        )
+        .expect("build add batch");
+        overlay.ingest_batch(&add_c).expect("ingest add batch");
+
+        let merged = overlay
+            .run_requested_merge()
+            .expect("overlay merge should succeed");
+        assert!(merged);
+
+        let manifest = overlay
+            .engine
+            .admin()
+            .manifest()
+            .expect("manifest should load");
+        assert_eq!(manifest.active_segments.len(), 1);
+        assert!(manifest.active_delete_segments.is_empty());
+
+        let stats = overlay.runtime_stats().expect("runtime stats should load");
+        assert_eq!(stats.merge_completed, 2);
+
+        let alpha = overlay
+            .engine
+            .reader()
+            .open_committed()
+            .expect("open committed snapshot")
+            .search(&query("ALPHA"))
+            .expect("search should succeed");
+        assert_eq!(alpha.matched_lines, 0);
+
+        let beta = overlay
+            .engine
+            .reader()
+            .open_committed()
+            .expect("open committed snapshot")
+            .search(&query("BETA"))
+            .expect("search should succeed");
+        assert_eq!(beta.matched_lines, 1);
+
+        let gamma = overlay
+            .engine
+            .reader()
+            .open_committed()
+            .expect("open committed snapshot")
+            .search(&query("GAMMA"))
+            .expect("search should succeed");
+        assert_eq!(gamma.matched_lines, 1);
     }
 }

@@ -52,6 +52,12 @@ pub struct WriterStats {
     pub pending_docs: usize,
 }
 
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MaintenanceStats {
+    pub merge_tasks: u64,
+    pub vacuumed_files: usize,
+}
+
 #[derive(Debug, Clone)]
 struct PendingDocument {
     seq_no: SeqNo,
@@ -591,11 +597,24 @@ impl IndexAdmin {
         Ok(true)
     }
 
+    pub fn maintain(&self) -> Result<MaintenanceStats> {
+        let mut merge_tasks = 0u64;
+        while self.maybe_merge()? {
+            merge_tasks += 1;
+        }
+        let vacuumed_files = self.vacuum()?;
+        Ok(MaintenanceStats {
+            merge_tasks,
+            vacuumed_files,
+        })
+    }
+
     pub fn force_merge(&self, max_segments: usize) -> Result<()> {
         let manifest = self.manifest()?;
         if manifest.active_segments.len() <= max_segments
             && manifest.active_delete_segments.is_empty()
         {
+            let _ = self.vacuum()?;
             return Ok(());
         }
         self.execute_merge_task(
@@ -612,18 +631,27 @@ impl IndexAdmin {
                     .map(|segment| segment.id.clone())
                     .collect(),
             },
-        )
+        )?;
+        let _ = self.vacuum()?;
+        Ok(())
     }
 
-    pub fn vacuum(&self) -> Result<()> {
+    pub fn vacuum(&self) -> Result<usize> {
         let reclaimer = Reclaimer::default();
-        let candidates = reclaimer.plan(&self.index_root, self.manifest_store.as_ref())?;
+        let pinned_manifest_ids = self.snapshots.pinned_manifest_ids();
+        let candidates = reclaimer.plan_with_pins(
+            &self.index_root,
+            self.manifest_store.as_ref(),
+            &pinned_manifest_ids,
+        )?;
+        let candidate_count = candidates.len();
         reclaimer.execute(
             &candidates,
             self.manifest_store.as_ref(),
             self.segment_store.as_ref(),
             self.delete_store.as_ref(),
-        )
+        )?;
+        Ok(candidate_count)
     }
 
     pub fn recover(&self) -> Result<()> {
@@ -961,10 +989,11 @@ fn now_unix_ms() -> u64 {
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
+    use std::{fs, sync::Arc};
 
     use crate::{
         index_engine::{
+            config::MergePolicyConfig,
             query::{QueryFilters, QueryRequest},
             types::{DocKey, RepoId},
             EngineConfig, IndexEngine,
@@ -1296,6 +1325,161 @@ mod tests {
         assert_eq!(
             committed
                 .search(&query("NEW"))
+                .expect("search should succeed")
+                .matched_lines,
+            1
+        );
+    }
+
+    #[test]
+    fn vacuum_retains_artifacts_needed_by_pinned_readers() {
+        let temp = tempdir().expect("tempdir should succeed");
+        let config = EngineConfig {
+            index_root: temp.path().to_path_buf(),
+            ..EngineConfig::default()
+        };
+        let engine = IndexEngine::open(config.clone()).expect("engine should open");
+        let writer = engine.writer();
+        let admin = engine.admin();
+        let readers = engine.reader();
+
+        writer
+            .add_document(test_doc("src/old.rs", "const NAME: &str = \"OLD\";\n"))
+            .expect("add should succeed");
+        writer.commit().expect("commit should succeed");
+        let manifest1 = admin.manifest().expect("manifest should load");
+        let manifest1_path = config
+            .index_root
+            .join("manifests")
+            .join(format!("{}.json", manifest1.manifest_id.0));
+        let segment1_path = config
+            .index_root
+            .join("segments")
+            .join(&manifest1.active_segments[0].id.0);
+
+        let pinned_reader = readers
+            .open_at_manifest(manifest1.manifest_id.clone())
+            .expect("manifest reader should open");
+
+        writer
+            .delete_document(&DocKey {
+                repo_id: RepoId("repo".into()),
+                logical_path: "src/old.rs".into(),
+            })
+            .expect("delete should succeed");
+        writer.commit().expect("commit should succeed");
+
+        writer
+            .add_document(test_doc("src/new.rs", "const NAME: &str = \"NEW\";\n"))
+            .expect("add should succeed");
+        writer.commit().expect("commit should succeed");
+
+        let maintain = admin.maintain().expect("maintenance should succeed");
+        assert!(maintain.merge_tasks >= 1);
+        assert!(manifest1_path.exists());
+
+        writer
+            .add_document(test_doc("src/later.rs", "const NAME: &str = \"LATER\";\n"))
+            .expect("add should succeed");
+        writer.commit().expect("commit should succeed");
+
+        let removed_while_pinned = admin.vacuum().expect("vacuum should succeed");
+        assert!(removed_while_pinned > 0);
+        assert!(manifest1_path.exists());
+        assert!(segment1_path.exists());
+        assert_eq!(
+            pinned_reader
+                .search(&query("OLD"))
+                .expect("search should succeed")
+                .matched_lines,
+            1
+        );
+
+        drop(pinned_reader);
+
+        let removed_after_drop = admin.vacuum().expect("vacuum should succeed");
+        assert!(removed_after_drop > 0);
+        assert!(!manifest1_path.exists());
+        assert!(!segment1_path.exists());
+    }
+
+    #[test]
+    fn maintain_drains_multi_step_merges_and_vacuums_stale_files() {
+        let temp = tempdir().expect("tempdir should succeed");
+        let config = EngineConfig {
+            index_root: temp.path().to_path_buf(),
+            merge_policy: MergePolicyConfig {
+                max_segments: 1,
+                ..MergePolicyConfig::default()
+            },
+            ..EngineConfig::default()
+        };
+        let engine = IndexEngine::open(config.clone()).expect("engine should open");
+        let writer = engine.writer();
+        let admin = engine.admin();
+
+        writer
+            .add_document(test_doc("src/a.rs", "const NAME: &str = \"ALPHA\";\n"))
+            .expect("add should succeed");
+        writer.commit().expect("commit should succeed");
+
+        writer
+            .add_document(test_doc("src/b.rs", "const NAME: &str = \"BETA\";\n"))
+            .expect("add should succeed");
+        writer.commit().expect("commit should succeed");
+
+        writer
+            .delete_document(&DocKey {
+                repo_id: RepoId("repo".into()),
+                logical_path: "src/a.rs".into(),
+            })
+            .expect("delete should succeed");
+        writer.commit().expect("commit should succeed");
+
+        writer
+            .add_document(test_doc("src/c.rs", "const NAME: &str = \"GAMMA\";\n"))
+            .expect("add should succeed");
+        writer.commit().expect("commit should succeed");
+
+        let before = admin.manifest().expect("manifest should load");
+        assert_eq!(before.active_segments.len(), 3);
+        assert_eq!(before.active_delete_segments.len(), 1);
+
+        let stats = admin.maintain().expect("maintenance should succeed");
+        assert_eq!(stats.merge_tasks, 2);
+        assert!(stats.vacuumed_files > 0);
+
+        let after = admin.manifest().expect("manifest should load");
+        assert_eq!(after.active_segments.len(), 1);
+        assert!(after.active_delete_segments.is_empty());
+
+        let manifest_count = fs::read_dir(config.index_root.join("manifests"))
+            .expect("manifests dir should exist")
+            .filter_map(|entry| entry.ok())
+            .count();
+        assert_eq!(manifest_count, 2);
+
+        let committed = engine
+            .reader()
+            .open_committed()
+            .expect("committed snapshot should open");
+        assert_eq!(
+            committed
+                .search(&query("ALPHA"))
+                .expect("search should succeed")
+                .matched_lines,
+            0
+        );
+        assert_eq!(
+            committed
+                .search(&query("BETA"))
+                .expect("search should succeed")
+                .matched_lines,
+            1
+        );
+        assert_eq!(
+            committed
+                .search(&query("GAMMA"))
                 .expect("search should succeed")
                 .matched_lines,
             1

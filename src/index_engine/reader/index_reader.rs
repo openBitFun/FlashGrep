@@ -8,7 +8,7 @@ use crate::{
         delete::DeleteStore,
         manifest::{Manifest, ManifestSnapshot, ManifestStore},
         query::{QueryPlan, QueryRequest},
-        reader::state::{SharedSnapshotState, SnapshotData},
+        reader::state::{SharedSnapshotState, SnapshotData, SnapshotLease},
         segment::{collect_document_posting_terms, SegmentStore, SegmentVerifySource},
         types::DocKey,
         writer::IndexDocument,
@@ -135,10 +135,14 @@ impl IndexReaderFactory {
 
     pub fn open_snapshot(&self) -> Result<IndexSnapshotReader> {
         let snapshot = self.snapshots.load_refreshed();
+        let lease = self
+            .snapshots
+            .acquire_lease(snapshot.manifest.manifest_id.clone());
         Ok(IndexSnapshotReader::new(
             ManifestSnapshot::new(snapshot.manifest.clone()),
             Arc::clone(&self.segment_store),
             Arc::clone(&self.delete_store),
+            lease,
             snapshot,
             self.tokenizer.clone(),
         ))
@@ -146,10 +150,14 @@ impl IndexReaderFactory {
 
     pub fn open_committed(&self) -> Result<IndexSnapshotReader> {
         let snapshot = self.snapshots.load_committed();
+        let lease = self
+            .snapshots
+            .acquire_lease(snapshot.manifest.manifest_id.clone());
         Ok(IndexSnapshotReader::new(
             ManifestSnapshot::new(snapshot.manifest.clone()),
             Arc::clone(&self.segment_store),
             Arc::clone(&self.delete_store),
+            lease,
             snapshot,
             self.tokenizer.clone(),
         ))
@@ -175,10 +183,12 @@ impl IndexReaderFactory {
     }
 
     fn open_with_manifest(&self, manifest: Manifest) -> IndexSnapshotReader {
+        let lease = self.snapshots.acquire_lease(manifest.manifest_id.clone());
         IndexSnapshotReader::new(
             ManifestSnapshot::new(manifest.clone()),
             Arc::clone(&self.segment_store),
             Arc::clone(&self.delete_store),
+            lease,
             SnapshotData {
                 manifest,
                 ..SnapshotData::default()
@@ -193,6 +203,7 @@ pub struct IndexSnapshotReader {
     snapshot: ManifestSnapshot,
     segment_store: Arc<dyn SegmentStore>,
     delete_store: Arc<dyn DeleteStore>,
+    _lease: SnapshotLease,
     data: SnapshotData,
     tokenizer: PostingTokenizerConfig,
 }
@@ -202,6 +213,7 @@ impl IndexSnapshotReader {
         snapshot: ManifestSnapshot,
         segment_store: Arc<dyn SegmentStore>,
         delete_store: Arc<dyn DeleteStore>,
+        lease: SnapshotLease,
         data: SnapshotData,
         tokenizer: PostingTokenizerConfig,
     ) -> Self {
@@ -209,6 +221,7 @@ impl IndexSnapshotReader {
             snapshot,
             segment_store,
             delete_store,
+            _lease: lease,
             data,
             tokenizer,
         }
