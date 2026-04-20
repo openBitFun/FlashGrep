@@ -37,6 +37,7 @@ pub(crate) fn resolve_git_head(
 
 pub(crate) struct GitHeadPathEntry {
     pub logical_path: String,
+    pub object_id: String,
     pub size: u64,
 }
 
@@ -111,16 +112,20 @@ pub(crate) fn head_tracked_entries(
         let mut fields = meta.split_whitespace();
         let _mode = fields.next();
         let object_type = fields.next();
-        let _object_id = fields.next();
+        let object_id = fields.next();
         let size = fields.next();
         if object_type != Some("blob") {
             continue;
         }
+        let Some(object_id) = object_id.filter(|value| !value.is_empty()) else {
+            continue;
+        };
         let Some(size) = size.and_then(|value| value.parse::<u64>().ok()) else {
             continue;
         };
         entries.push(GitHeadPathEntry {
             logical_path: String::from_utf8_lossy(path).into_owned(),
+            object_id: object_id.to_string(),
             size,
         });
     }

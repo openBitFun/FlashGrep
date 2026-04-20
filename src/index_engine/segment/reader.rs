@@ -15,8 +15,9 @@ use crate::{
         query::{QueryFilters, QueryPlan},
         segment::{
             advise_mmap_sequential, read_index_document_from_stored_slice,
-            read_stored_document_view, read_stored_fields_layout, FileSegmentDocTable,
-            PostingLists, SegmentDocRecord, StoredFieldsLayout,
+            read_stored_document_view, read_stored_fields_layout,
+            read_stored_source_bytes_view, FileSegmentDocTable, PostingLists, SegmentDocRecord,
+            StoredFieldsLayout,
         },
         types::{DocKey, SegmentDocId},
         writer::IndexDocument,
@@ -182,6 +183,8 @@ pub struct FileSegmentReader {
     stored_fields_path: Option<PathBuf>,
     stored_fields_mmap: Option<Mmap>,
     stored_fields_layout: Option<StoredFieldsLayout>,
+    base_sources_path: Option<PathBuf>,
+    base_sources_mmap: Option<Mmap>,
     repo_root: Option<PathBuf>,
     decoded_keys: LazyDocCache<DocKey>,
     decoded_source_bytes: LazyDocCache<Arc<[u8]>>,
@@ -202,6 +205,7 @@ impl FileSegmentReader {
         doc_table: FileSegmentDocTable,
         posting_lists: PostingLists,
         stored_fields_path: Option<PathBuf>,
+        base_sources_path: Option<PathBuf>,
         repo_root: Option<PathBuf>,
     ) -> Result<Self> {
         let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
@@ -214,6 +218,14 @@ impl FileSegmentReader {
             (Some(stored_fields_mmap), Some(stored_fields_layout))
         } else {
             (None, None)
+        };
+        let base_sources_mmap = if let Some(path) = &base_sources_path {
+            let base_sources_file = File::open(path)?;
+            let base_sources_mmap = unsafe { Mmap::map(&base_sources_file)? };
+            advise_mmap_sequential(&base_sources_mmap);
+            Some(base_sources_mmap)
+        } else {
+            None
         };
         let stored_fields_elapsed = stored_fields_started.elapsed();
         let path_doc_ids_started = Instant::now();
@@ -238,6 +250,8 @@ impl FileSegmentReader {
             stored_fields_path,
             stored_fields_mmap,
             stored_fields_layout,
+            base_sources_path,
+            base_sources_mmap,
             repo_root,
             decoded_keys,
             decoded_source_bytes,
@@ -377,11 +391,36 @@ impl FileSegmentReader {
         document.source_bytes.decode()
     }
 
+    fn read_source_bytes_from_base_store(&self, doc_id: usize) -> Result<Arc<[u8]>> {
+        let base_sources_mmap = self.base_sources_mmap.as_ref().ok_or_else(|| {
+            AppError::InvalidIndex(format!(
+                "segment {} does not have base source storage",
+                self.meta.segment_id.0
+            ))
+        })?;
+        let record = self.doc_record(doc_id)?;
+        let start = usize::try_from(record.stored_offset)
+            .map_err(|_| AppError::ValueOutOfRange("stored offset exceeds usize range".into()))?;
+        let end = start
+            .checked_add(record.stored_len as usize)
+            .ok_or_else(|| AppError::InvalidIndex("base source slice overflow".into()))?;
+        let slice = base_sources_mmap.get(start..end).ok_or_else(|| {
+            AppError::InvalidIndex(format!(
+                "base source slice out of range for {}",
+                self.segment_source_label()
+            ))
+        })?;
+        read_stored_source_bytes_view(slice)?.decode()
+    }
+
     fn load_source_bytes(&self, doc_id: usize) -> Result<Arc<[u8]>> {
         if let Some(_stored_fields_layout) = self.stored_fields_layout {
             if self.doc_record(doc_id)?.stored_len > 0 {
                 return self.read_source_bytes_from_store(doc_id);
             }
+        }
+        if self.base_sources_mmap.is_some() && self.doc_record(doc_id)?.stored_len > 0 {
+            return self.read_source_bytes_from_base_store(doc_id);
         }
         let key = self.doc_key(doc_id as SegmentDocId)?;
         self.read_source_bytes_from_repo(key)
@@ -426,6 +465,11 @@ impl FileSegmentReader {
         self.stored_fields_path
             .as_ref()
             .map(|path| path.display().to_string())
+            .or_else(|| {
+                self.base_sources_path
+                    .as_ref()
+                    .map(|path| path.display().to_string())
+            })
             .or_else(|| {
                 self.repo_root
                     .as_ref()

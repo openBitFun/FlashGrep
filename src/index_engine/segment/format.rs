@@ -614,6 +614,26 @@ pub(crate) fn read_stored_document_view(
     })
 }
 
+pub(crate) fn read_stored_source_bytes_view(
+    slice: &[u8],
+) -> Result<StoredSourceBytes<'_>> {
+    let mut reader = StoredSliceReader::new(slice);
+    let encoding = reader.read_bytes(1)?[0];
+    let source_len = reader.read_u32()?;
+    let payload_len = reader.read_u32()? as usize;
+    let payload = reader.read_bytes(payload_len)?;
+    match encoding {
+        STORED_SOURCE_ENCODING_RAW => Ok(StoredSourceBytes::Raw(payload)),
+        STORED_SOURCE_ENCODING_ZSTD => Ok(StoredSourceBytes::Zstd {
+            compressed: payload,
+            uncompressed_len: source_len,
+        }),
+        value => Err(AppError::InvalidIndex(format!(
+            "invalid stored source encoding: {value}"
+        ))),
+    }
+}
+
 pub(crate) fn read_stored_fields_layout(bytes: &[u8]) -> Result<StoredFieldsLayout> {
     let mut cursor = Cursor::new(bytes);
     read_stored_fields_header(&mut cursor)
@@ -728,6 +748,21 @@ pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Resul
     write_u32(writer, len)?;
     writer.write_all(value)?;
     Ok(())
+}
+
+pub(crate) fn encoded_source_bytes_len(value: &[u8]) -> Result<u64> {
+    let payload_len = if let Some(compressed) = maybe_compress_source_bytes(value)? {
+        compressed.len()
+    } else {
+        value.len()
+    };
+    let total = 1usize
+        .checked_add(4)
+        .and_then(|len| len.checked_add(4))
+        .and_then(|len| len.checked_add(payload_len))
+        .ok_or_else(|| AppError::ValueOutOfRange("stored source length exceeds usize range".into()))?;
+    u64::try_from(total)
+        .map_err(|_| AppError::ValueOutOfRange("stored source length exceeds u64 range".into()))
 }
 
 fn maybe_compress_source_bytes(value: &[u8]) -> Result<Option<Vec<u8>>> {

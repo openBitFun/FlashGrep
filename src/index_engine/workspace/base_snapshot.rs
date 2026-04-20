@@ -1,5 +1,7 @@
 use std::{
-    collections::HashMap,
+    cmp::Reverse,
+    collections::BinaryHeap,
+    collections::{BTreeMap, HashMap},
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
@@ -25,9 +27,10 @@ use crate::{
         manifest::{FileManifestStore, Manifest, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
-            collect_document_posting_terms, write_path_offsets_file, write_segment_meta,
-            FileSegmentStore, PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE,
-            PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
+            collect_document_posting_terms_from_text, encoded_source_bytes_len,
+            write_path_offsets_file, write_segment_meta, write_source_bytes, FileSegmentStore,
+            PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE,
+            PATH_OFFSETS_FILE, SEGMENT_META_FILE,
         },
         writer::IndexDocument,
         DocKey, GitRevision, ManifestId, RepoId, SegmentId, ShardId,
@@ -43,7 +46,8 @@ const BASE_SNAPSHOT_PREPARE_PARALLEL_DOC_THRESHOLD: usize = 64;
 const BASE_SNAPSHOT_PREPARE_PARALLEL_BYTE_THRESHOLD: u64 = 8 * 1024 * 1024;
 const BASE_SNAPSHOT_POSTING_BUCKET_COUNT: usize = 64;
 const BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES: usize = 128 * 1024 * 1024;
-const BASE_SNAPSHOT_SEGMENT_ID: &str = "seg-0000000000000001-base";
+const BASE_SNAPSHOT_SHARD_COUNT: usize = 16;
+const BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN: usize = 512 * 1024;
 const BASE_SNAPSHOT_MANIFEST_ID: &str = "manifest-0000000000000001";
 const SEGMENT_SCHEMA_FINGERPRINT: &str = "segment-publish-v1";
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
@@ -51,6 +55,7 @@ const DOCS_VERSION: u32 = 2;
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
 const SEGMENT_FILE_VERSION: u32 = 1;
 const COUNT_OFFSET: u64 = 12;
+const BASE_SOURCES_FILE: &str = "base_sources.bin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBaseSnapshotMetadata {
@@ -61,6 +66,16 @@ pub struct WorkspaceBaseSnapshotMetadata {
     pub head_commit: Option<String>,
     pub config_fingerprint: Option<String>,
     pub repo_root: Option<String>,
+    pub shards: Vec<WorkspaceBaseSnapshotShardMetadata>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WorkspaceBaseSnapshotShardMetadata {
+    pub shard_id: u32,
+    pub fingerprint: String,
+    pub segment_id: String,
+    pub doc_count: usize,
+    pub size_bytes: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -78,6 +93,17 @@ struct WorkspaceBaseSnapshotMetadataFile {
     config_fingerprint: Option<String>,
     #[serde(default)]
     repo_root: Option<String>,
+    #[serde(default)]
+    shards: Vec<WorkspaceBaseSnapshotShardMetadataFile>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct WorkspaceBaseSnapshotShardMetadataFile {
+    shard_id: u32,
+    fingerprint: String,
+    segment_id: String,
+    doc_count: usize,
+    size_bytes: u64,
 }
 
 pub struct WorkspaceBaseSnapshotIndex {
@@ -105,12 +131,26 @@ struct BaseSnapshotInputFile {
     size: u64,
     mtime_nanos: u64,
     source: BaseSnapshotFileSource,
+    fingerprint: BaseSnapshotFileFingerprint,
 }
 
 #[derive(Clone)]
 enum BaseSnapshotFileSource {
     Worktree,
     GitHeadBlob { head_commit: String },
+}
+
+#[derive(Clone)]
+enum BaseSnapshotFileFingerprint {
+    Worktree { mtime_nanos: u64 },
+    GitObject { object_id: String, size: u64 },
+}
+
+#[derive(Clone)]
+struct BaseSnapshotShardBuild {
+    shard_id: u32,
+    fingerprint: String,
+    files: Vec<BaseSnapshotInputFile>,
 }
 
 struct BulkBaseSegmentWriter {
@@ -121,6 +161,8 @@ struct BulkBaseSegmentWriter {
     path_entry_offsets: Vec<u64>,
     path_map_len: u64,
     docs: BufWriter<File>,
+    base_sources: BufWriter<File>,
+    base_sources_len: u64,
     posting_buckets: PostingBuckets,
     doc_count: u32,
     total_source_bytes: u64,
@@ -129,6 +171,24 @@ struct BulkBaseSegmentWriter {
 struct PreparedBaseDocument {
     document: IndexDocument,
     posting_terms: Vec<u64>,
+}
+
+struct ShardBuildOutcome {
+    segment_ref: Option<SegmentRef>,
+    shard_metadata: Option<WorkspaceBaseSnapshotShardMetadata>,
+    doc_count: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PostingRecord {
+    term: u64,
+    doc_id: u32,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+struct PostingRunHead {
+    record: PostingRecord,
+    run_index: usize,
 }
 
 struct PostingBuckets {
@@ -164,6 +224,8 @@ impl BulkBaseSegmentWriter {
 
         let mut path_map = BufWriter::new(File::create(segment_dir.join(PATH_MAP_FILE))?);
         let mut docs = BufWriter::new(File::create(segment_dir.join(DOCS_FILE))?);
+        let base_sources = BufWriter::new(File::create(segment_dir.join(BASE_SOURCES_FILE))?);
+        let posting_buckets = PostingBuckets::new(&segment_dir);
 
         write_segment_header(&mut path_map, PATH_MAP_MAGIC)?;
         write_segment_header_with_version(&mut docs, DOCS_MAGIC, DOCS_VERSION)?;
@@ -176,7 +238,9 @@ impl BulkBaseSegmentWriter {
             path_entry_offsets: Vec::new(),
             path_map_len: COUNT_OFFSET + 4,
             docs,
-            posting_buckets: PostingBuckets::new(index_root),
+            base_sources,
+            base_sources_len: 0,
+            posting_buckets,
             doc_count: 0,
             total_source_bytes: 0,
         })
@@ -200,9 +264,25 @@ impl BulkBaseSegmentWriter {
             .and_then(|len| len.checked_add(logical_path_len))
             .ok_or_else(|| AppError::ValueOutOfRange("path map offset overflow".into()))?;
 
+        let stored_offset = self.base_sources_len;
+        write_source_bytes(&mut self.base_sources, &document.source_bytes)?;
+        let stored_len = self
+            .base_sources_len
+            .checked_add(encoded_source_bytes_len(&document.source_bytes)?)
+            .ok_or_else(|| AppError::ValueOutOfRange("base source offset overflow".into()))?;
+        let stored_len = stored_len
+            .checked_sub(stored_offset)
+            .ok_or_else(|| AppError::InvalidIndex("base source length underflow".into()))?;
+        let stored_len = u32::try_from(stored_len)
+            .map_err(|_| AppError::ValueOutOfRange("base source length exceeds u32 range".into()))?;
+        self.base_sources_len = self
+            .base_sources_len
+            .checked_add(u64::from(stored_len))
+            .ok_or_else(|| AppError::ValueOutOfRange("base source offset overflow".into()))?;
+
         write_u32_to(&mut self.docs, doc_id)?;
-        write_u64_to(&mut self.docs, 0)?;
-        write_u32_to(&mut self.docs, 0)?;
+        write_u64_to(&mut self.docs, stored_offset)?;
+        write_u32_to(&mut self.docs, stored_len)?;
         write_u64_to(&mut self.docs, document.size)?;
         write_u64_to(&mut self.docs, document.modified_at)?;
         self.docs.write_all(&document.content_hash)?;
@@ -224,6 +304,7 @@ impl BulkBaseSegmentWriter {
 
         self.path_map.flush()?;
         self.docs.flush()?;
+        self.base_sources.flush()?;
 
         if self.doc_count == 0 {
             fs::remove_dir_all(&self.segment_dir)?;
@@ -407,8 +488,7 @@ impl SpilledPostingBuckets {
             .writers
             .get_mut(bucket_id)
             .ok_or_else(|| AppError::InvalidIndex(format!("missing posting bucket {bucket_id}")))?;
-        write_u64_to(writer, term)?;
-        write_u32_to(writer, doc_id)?;
+        write_spilled_posting_record(writer, PostingRecord { term, doc_id })?;
         Ok(())
     }
 
@@ -426,25 +506,22 @@ impl SpilledPostingBuckets {
 
         let mut term_dict_writer = TermDictStreamWriter::create(term_dict_path)?;
         let mut postings_writer = PostingsStreamWriter::create(postings_path)?;
+        let run_root = bucket_dir.join("runs");
+        fs::create_dir_all(&run_root)?;
 
-        for bucket_path in &bucket_paths {
+        for (bucket_id, bucket_path) in bucket_paths.iter().enumerate() {
             if fs::metadata(bucket_path).map_or(true, |metadata| metadata.len() == 0) {
+                let _ = fs::remove_file(bucket_path);
                 continue;
             }
-
-            let mut terms = HashMap::<u64, Vec<u32>>::new();
-            let mut reader = BufReader::new(File::open(bucket_path)?);
-            while let Some((term, doc_id)) = read_spilled_posting_record(&mut reader)? {
-                terms.entry(term).or_default().push(doc_id);
-            }
-
-            let mut keys = terms.keys().cloned().collect::<Vec<_>>();
-            keys.sort_unstable();
-            for key in keys {
-                let doc_ids = terms.get(&key).expect("posting key must exist");
-                let postings_offset = postings_writer.push_doc_ids(doc_ids)?;
-                term_dict_writer.push_entry(key, postings_offset)?;
-            }
+            let run_paths = write_sorted_posting_runs(
+                bucket_path,
+                &run_root,
+                bucket_id,
+                BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN,
+            )?;
+            fs::remove_file(bucket_path)?;
+            merge_sorted_posting_runs(&run_paths, &mut term_dict_writer, &mut postings_writer)?;
         }
 
         term_dict_writer.finish()?;
@@ -552,6 +629,7 @@ impl WorkspaceBaseSnapshotIndex {
                 head_commit: None,
                 config_fingerprint: None,
                 repo_root: None,
+                shards: Vec::new(),
             }),
         )
     }
@@ -603,8 +681,9 @@ impl WorkspaceBaseSnapshotIndex {
         cleanup_unpublished_base_snapshot_builds(build_config)?;
         let staging_root = next_staging_root(build_config);
         fs::create_dir_all(&staging_root)?;
+        let previous_snapshot = reusable_base_snapshot_shards(build_config)?;
 
-        let doc_count = if let Some(head_commit) = head_commit {
+        let (doc_count, shards) = if let Some(head_commit) = head_commit {
             check_cancel(should_cancel)?;
             if tracked_worktree_matches_head(&build_config.repo_path, should_cancel)? {
                 let files = tracked_worktree_files(
@@ -613,15 +692,16 @@ impl WorkspaceBaseSnapshotIndex {
                     build_config.max_file_size,
                     should_cancel,
                 )?;
-                build_single_segment_base_snapshot(
+                build_sharded_base_snapshot(
                     &staging_root,
                     build_config,
                     repo_id,
                     &build_config.repo_path,
-                    &base_snapshot_input_files_from_repository_files(
+                    base_snapshot_input_files_from_repository_files(
                         &files,
                         &build_config.repo_path,
                     ),
+                    previous_snapshot.as_ref(),
                 )?
             } else {
                 let files = build_head_snapshot_input_files(
@@ -631,12 +711,13 @@ impl WorkspaceBaseSnapshotIndex {
                     build_config.max_file_size,
                     should_cancel,
                 )?;
-                build_single_segment_base_snapshot(
+                build_sharded_base_snapshot(
                     &staging_root,
                     build_config,
                     repo_id,
                     &build_config.repo_path,
-                    &files,
+                    files,
+                    previous_snapshot.as_ref(),
                 )?
             }
         } else {
@@ -652,12 +733,13 @@ impl WorkspaceBaseSnapshotIndex {
                 },
                 None,
             )?;
-            build_single_segment_base_snapshot(
+            build_sharded_base_snapshot(
                 &staging_root,
                 build_config,
                 repo_id,
                 &build_config.repo_path,
-                &base_snapshot_input_files_from_repository_files(&files, &build_config.repo_path),
+                base_snapshot_input_files_from_repository_files(&files, &build_config.repo_path),
+                previous_snapshot.as_ref(),
             )?
         };
 
@@ -672,6 +754,7 @@ impl WorkspaceBaseSnapshotIndex {
                 head_commit: head_commit.map(str::to_string),
                 config_fingerprint: Some(build_config_fingerprint(build_config)),
                 repo_root: Some(canonical_repo_root(&build_config.repo_path)),
+                shards,
             },
         )?;
         publish_staged_base_snapshot(build_config, &staging_root)?;
@@ -733,6 +816,17 @@ impl WorkspaceBaseSnapshotIndex {
                     head_commit: metadata.head_commit,
                     config_fingerprint: metadata.config_fingerprint,
                     repo_root: metadata.repo_root,
+                    shards: metadata
+                        .shards
+                        .into_iter()
+                        .map(|shard| WorkspaceBaseSnapshotShardMetadata {
+                            shard_id: shard.shard_id,
+                            fingerprint: shard.fingerprint,
+                            segment_id: shard.segment_id,
+                            doc_count: shard.doc_count,
+                            size_bytes: shard.size_bytes,
+                        })
+                        .collect(),
                 }))
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
@@ -831,27 +925,309 @@ impl WorkspaceBaseSnapshotIndex {
     }
 }
 
-fn build_single_segment_base_snapshot(
+struct ReusableBaseSnapshotShards {
+    index_root: PathBuf,
+    manifest_segments: HashMap<String, SegmentRef>,
+    shards_by_id: HashMap<u32, WorkspaceBaseSnapshotShardMetadata>,
+}
+
+fn reusable_base_snapshot_shards(
+    build_config: &BuildConfig,
+) -> Result<Option<ReusableBaseSnapshotShards>> {
+    let Some(metadata) = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(build_config)? else {
+        return Ok(None);
+    };
+    if metadata.shards.is_empty()
+        || metadata.tokenizer != Some(build_config.tokenizer)
+        || metadata.config_fingerprint.as_deref() != Some(&build_config_fingerprint(build_config))
+        || metadata.repo_root.as_deref() != Some(&canonical_repo_root(&build_config.repo_path))
+    {
+        return Ok(None);
+    }
+
+    let index_root = WorkspaceBaseSnapshotIndex::index_root(build_config);
+    let manifest = FileManifestStore::open(&index_root)?.load_current()?;
+    let manifest_segments = manifest
+        .active_segments
+        .into_iter()
+        .map(|segment| (segment.id.0.clone(), segment))
+        .collect::<HashMap<_, _>>();
+    let shards_by_id = metadata
+        .shards
+        .into_iter()
+        .map(|shard| (shard.shard_id, shard))
+        .collect::<HashMap<_, _>>();
+    Ok(Some(ReusableBaseSnapshotShards {
+        index_root,
+        manifest_segments,
+        shards_by_id,
+    }))
+}
+
+fn build_sharded_base_snapshot(
+    index_root: &Path,
+    build_config: &BuildConfig,
+    repo_id: &RepoId,
+    repo_root: &Path,
+    files: Vec<BaseSnapshotInputFile>,
+    previous_snapshot: Option<&ReusableBaseSnapshotShards>,
+) -> Result<(usize, Vec<WorkspaceBaseSnapshotShardMetadata>)> {
+    fs::create_dir_all(index_root)?;
+    let _ = FileDeleteStore::open(index_root)?;
+    let shard_builds = partition_base_snapshot_shards(files);
+    let outcomes = shard_builds
+        .into_par_iter()
+        .map(|shard| {
+            build_or_reuse_base_snapshot_shard(
+                index_root,
+                build_config,
+                repo_id,
+                repo_root,
+                shard,
+                previous_snapshot,
+            )
+        })
+        .collect::<Vec<_>>();
+
+    let mut active_segments = Vec::new();
+    let mut shard_metadata = Vec::new();
+    let mut doc_count = 0usize;
+    for outcome in outcomes {
+        let outcome = outcome?;
+        doc_count = doc_count.saturating_add(outcome.doc_count);
+        if let Some(segment_ref) = outcome.segment_ref {
+            active_segments.push(segment_ref);
+        }
+        if let Some(metadata) = outcome.shard_metadata {
+            shard_metadata.push(metadata);
+        }
+    }
+
+    active_segments.sort_unstable_by(|left, right| left.id.0.cmp(&right.id.0));
+    let committed_seq_no = if active_segments.is_empty() { 0 } else { 1 };
+    let manifest_store = FileManifestStore::open(index_root)?;
+    manifest_store.publish(&Manifest {
+        manifest_id: ManifestId(BASE_SNAPSHOT_MANIFEST_ID.into()),
+        generation: 1,
+        created_at_unix_ms: now_unix_ms(),
+        committed_seq_no,
+        refreshed_seq_no: committed_seq_no,
+        writer_epoch: 0,
+        schema_fingerprint: SEGMENT_SCHEMA_FINGERPRINT.into(),
+        active_segments,
+        active_delete_segments: Vec::new(),
+    })?;
+
+    shard_metadata.sort_unstable_by_key(|shard| shard.shard_id);
+    Ok((doc_count, shard_metadata))
+}
+
+fn build_or_reuse_base_snapshot_shard(
+    index_root: &Path,
+    build_config: &BuildConfig,
+    repo_id: &RepoId,
+    repo_root: &Path,
+    shard: BaseSnapshotShardBuild,
+    previous_snapshot: Option<&ReusableBaseSnapshotShards>,
+) -> Result<ShardBuildOutcome> {
+    if let Some(reused) = maybe_link_reusable_base_snapshot_shard(
+        index_root,
+        shard.shard_id,
+        &shard.fingerprint,
+        previous_snapshot,
+    )? {
+        return Ok(ShardBuildOutcome {
+            segment_ref: Some(reused.segment_ref.clone()),
+            shard_metadata: Some(WorkspaceBaseSnapshotShardMetadata {
+                shard_id: shard.shard_id,
+                fingerprint: shard.fingerprint,
+                segment_id: reused.segment_ref.id.0,
+                doc_count: reused.doc_count,
+                size_bytes: reused.segment_ref.size_bytes,
+            }),
+            doc_count: reused.doc_count,
+        });
+    }
+
+    let segment_id = base_snapshot_segment_id(shard.shard_id, &shard.fingerprint);
+    let Some(segment_ref) = build_base_snapshot_segment(
+        index_root,
+        build_config,
+        repo_id,
+        repo_root,
+        &shard.files,
+        segment_id,
+    )?
+    else {
+        return Ok(ShardBuildOutcome {
+            segment_ref: None,
+            shard_metadata: None,
+            doc_count: 0,
+        });
+    };
+
+    Ok(ShardBuildOutcome {
+        doc_count: segment_ref.doc_count as usize,
+        shard_metadata: Some(WorkspaceBaseSnapshotShardMetadata {
+            shard_id: shard.shard_id,
+            fingerprint: shard.fingerprint,
+            segment_id: segment_ref.id.0.clone(),
+            doc_count: segment_ref.doc_count as usize,
+            size_bytes: segment_ref.size_bytes,
+        }),
+        segment_ref: Some(segment_ref),
+    })
+}
+
+struct LinkedReusableShard {
+    segment_ref: SegmentRef,
+    doc_count: usize,
+}
+
+fn maybe_link_reusable_base_snapshot_shard(
+    staging_root: &Path,
+    shard_id: u32,
+    fingerprint: &str,
+    previous_snapshot: Option<&ReusableBaseSnapshotShards>,
+) -> Result<Option<LinkedReusableShard>> {
+    let Some(previous_snapshot) = previous_snapshot else {
+        return Ok(None);
+    };
+    let Some(previous_shard) = previous_snapshot.shards_by_id.get(&shard_id) else {
+        return Ok(None);
+    };
+    if previous_shard.fingerprint != fingerprint {
+        return Ok(None);
+    }
+    let Some(segment_ref) = previous_snapshot
+        .manifest_segments
+        .get(&previous_shard.segment_id)
+        .cloned()
+    else {
+        return Ok(None);
+    };
+    let source_segment_dir = previous_snapshot
+        .index_root
+        .join("segments")
+        .join(&previous_shard.segment_id);
+    if !source_segment_dir.exists() {
+        return Ok(None);
+    }
+    link_segment_dir_into_staging(
+        &source_segment_dir,
+        &staging_root
+            .join("segments")
+            .join(&previous_shard.segment_id),
+    )?;
+    Ok(Some(LinkedReusableShard {
+        segment_ref,
+        doc_count: previous_shard.doc_count,
+    }))
+}
+
+fn partition_base_snapshot_shards(files: Vec<BaseSnapshotInputFile>) -> Vec<BaseSnapshotShardBuild> {
+    let mut shards = BTreeMap::<u32, Vec<BaseSnapshotInputFile>>::new();
+    for file in files {
+        shards
+            .entry(base_snapshot_shard_id(&file.logical_path))
+            .or_default()
+            .push(file);
+    }
+
+    shards
+        .into_iter()
+        .map(|(shard_id, mut shard_files)| {
+            shard_files.sort_unstable_by(|left, right| left.logical_path.cmp(&right.logical_path));
+            let fingerprint = base_snapshot_shard_fingerprint(&shard_files);
+            BaseSnapshotShardBuild {
+                shard_id,
+                fingerprint,
+                files: shard_files,
+            }
+        })
+        .collect()
+}
+
+fn base_snapshot_shard_id(logical_path: &str) -> u32 {
+    let mut hasher = crc32fast::Hasher::new();
+    hasher.update(logical_path.as_bytes());
+    (hasher.finalize() % BASE_SNAPSHOT_SHARD_COUNT as u32) as u32
+}
+
+fn base_snapshot_shard_fingerprint(files: &[BaseSnapshotInputFile]) -> String {
+    let mut left = crc32fast::Hasher::new();
+    let mut right = crc32fast::Hasher::new();
+    left.update(b"base-shard-fingerprint-v1:left");
+    right.update(b"base-shard-fingerprint-v1:right");
+    for file in files {
+        update_base_snapshot_shard_hasher(&mut left, file, b"L");
+        update_base_snapshot_shard_hasher(&mut right, file, b"R");
+    }
+    format!("{:08x}{:08x}", left.finalize(), right.finalize())
+}
+
+fn update_base_snapshot_shard_hasher(
+    hasher: &mut crc32fast::Hasher,
+    file: &BaseSnapshotInputFile,
+    kind_prefix: &[u8],
+) {
+    hasher.update(kind_prefix);
+    hasher.update(file.logical_path.as_bytes());
+    hasher.update(&[0]);
+    hasher.update(&file.size.to_le_bytes());
+    match &file.fingerprint {
+        BaseSnapshotFileFingerprint::Worktree { mtime_nanos, .. } => {
+            hasher.update(b"worktree");
+            hasher.update(&mtime_nanos.to_le_bytes());
+        }
+        BaseSnapshotFileFingerprint::GitObject { object_id, size } => {
+            hasher.update(b"git-object");
+            hasher.update(object_id.as_bytes());
+            hasher.update(&size.to_le_bytes());
+        }
+    }
+}
+
+fn base_snapshot_segment_id(shard_id: u32, fingerprint: &str) -> SegmentId {
+    SegmentId(format!("seg-base-{shard_id:04}-{fingerprint}"))
+}
+
+fn link_segment_dir_into_staging(source_dir: &Path, dest_dir: &Path) -> Result<()> {
+    fs::create_dir_all(dest_dir)?;
+    for entry in fs::read_dir(source_dir)? {
+        let entry = entry?;
+        let source = entry.path();
+        if entry.file_type()?.is_dir() {
+            return Err(AppError::InvalidIndex(format!(
+                "unexpected nested directory in base segment {}",
+                source.display()
+            )));
+        }
+        let destination = dest_dir.join(entry.file_name());
+        match fs::hard_link(&source, &destination) {
+            Ok(()) => {}
+            Err(_) => {
+                fs::copy(&source, &destination)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn build_base_snapshot_segment(
     index_root: &Path,
     build_config: &BuildConfig,
     repo_id: &RepoId,
     repo_root: &Path,
     files: &[BaseSnapshotInputFile],
-) -> Result<usize> {
-    fs::create_dir_all(index_root)?;
-    let _ = FileDeleteStore::open(index_root)?;
-
-    let segment_id = SegmentId(BASE_SNAPSHOT_SEGMENT_ID.into());
+    segment_id: SegmentId,
+) -> Result<Option<SegmentRef>> {
     let mut builder = BulkBaseSegmentWriter::new(
         index_root,
         segment_id,
         PostingTokenizerConfig::from(build_config),
     )?;
 
-    let mut files = files.to_vec();
-    files.sort_unstable_by(|left, right| left.logical_path.cmp(&right.logical_path));
-
-    let mut doc_count = 0usize;
     for chunk in files.chunks(BASE_SNAPSHOT_PREPARE_CHUNK_DOCS) {
         let prepared = if should_parallel_prepare_base_documents(chunk) {
             chunk
@@ -870,26 +1246,10 @@ fn build_single_segment_base_snapshot(
                 continue;
             };
             builder.add_document(prepared_document)?;
-            doc_count += 1;
         }
     }
 
-    let active_segments = builder.finish()?.into_iter().collect::<Vec<_>>();
-    let committed_seq_no = if active_segments.is_empty() { 0 } else { 1 };
-    let manifest_store = FileManifestStore::open(index_root)?;
-    manifest_store.publish(&Manifest {
-        manifest_id: ManifestId(BASE_SNAPSHOT_MANIFEST_ID.into()),
-        generation: 1,
-        created_at_unix_ms: now_unix_ms(),
-        committed_seq_no,
-        refreshed_seq_no: committed_seq_no,
-        writer_epoch: 0,
-        schema_fingerprint: SEGMENT_SCHEMA_FINGERPRINT.into(),
-        active_segments,
-        active_delete_segments: Vec::new(),
-    })?;
-
-    Ok(doc_count)
+    builder.finish()
 }
 
 fn write_marker_for_root(index_root: &Path, snapshot_key: &str) -> Result<()> {
@@ -914,6 +1274,17 @@ fn write_metadata_file_for_root(
         head_commit: metadata.head_commit.clone(),
         config_fingerprint: metadata.config_fingerprint.clone(),
         repo_root: metadata.repo_root.clone(),
+        shards: metadata
+            .shards
+            .iter()
+            .map(|shard| WorkspaceBaseSnapshotShardMetadataFile {
+                shard_id: shard.shard_id,
+                fingerprint: shard.fingerprint.clone(),
+                segment_id: shard.segment_id.clone(),
+                doc_count: shard.doc_count,
+                size_bytes: shard.size_bytes,
+            })
+            .collect(),
     })
     .map_err(|error| {
         AppError::Protocol(format!(
@@ -1118,6 +1489,9 @@ fn base_snapshot_input_files_from_repository_files(
             size: file.size,
             mtime_nanos: file.mtime_nanos,
             source: BaseSnapshotFileSource::Worktree,
+            fingerprint: BaseSnapshotFileFingerprint::Worktree {
+                mtime_nanos: file.mtime_nanos,
+            },
         })
         .collect()
 }
@@ -1141,12 +1515,12 @@ fn build_head_snapshot_input_files(
             continue;
         }
 
+        let worktree_metadata = fs::metadata(&path).ok();
         let use_worktree = !dirty_paths.contains(&entry.logical_path)
-            && fs::metadata(&path)
-                .map(|metadata| metadata.is_file() && metadata.len() == entry.size)
-                .unwrap_or(false);
-        if use_worktree {
-            let metadata = fs::metadata(&path)?;
+            && worktree_metadata
+                .as_ref()
+                .is_some_and(|metadata| metadata.is_file() && metadata.len() == entry.size);
+        if let Some(metadata) = worktree_metadata.filter(|_| use_worktree) {
             files.push(BaseSnapshotInputFile {
                 path,
                 logical_path: entry.logical_path,
@@ -1158,6 +1532,10 @@ fn build_head_snapshot_input_files(
                     .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
                     .unwrap_or_default(),
                 source: BaseSnapshotFileSource::Worktree,
+                fingerprint: BaseSnapshotFileFingerprint::GitObject {
+                    object_id: entry.object_id,
+                    size: metadata.len(),
+                },
             });
         } else {
             files.push(BaseSnapshotInputFile {
@@ -1167,6 +1545,10 @@ fn build_head_snapshot_input_files(
                 mtime_nanos: 0,
                 source: BaseSnapshotFileSource::GitHeadBlob {
                     head_commit: head_commit.to_string(),
+                },
+                fingerprint: BaseSnapshotFileFingerprint::GitObject {
+                    object_id: entry.object_id,
+                    size: entry.size,
                 },
             });
         }
@@ -1222,7 +1604,7 @@ fn repository_file_to_index_document(
         logical_path: logical_path.clone(),
     };
     let source_bytes = Arc::<[u8]>::from(read_base_snapshot_file_source_bytes(file)?);
-    if !is_indexable_source_bytes(&source_bytes) {
+    if has_binary_source_bytes(&source_bytes) {
         return Ok(None);
     }
     let mut content_hash = [0u8; 32];
@@ -1260,7 +1642,10 @@ fn prepare_base_document(
     let Some(document) = repository_file_to_index_document(repo_id, repo_root, file)? else {
         return Ok(None);
     };
-    let mut posting_terms = collect_document_posting_terms(&document.source_bytes, tokenizer);
+    let Some(text) = indexable_source_text(&document.source_bytes) else {
+        return Ok(None);
+    };
+    let mut posting_terms = collect_document_posting_terms_from_text(text, tokenizer);
     posting_terms.sort_unstable();
     posting_terms.dedup();
     Ok(Some(PreparedBaseDocument {
@@ -1279,9 +1664,15 @@ fn should_parallel_prepare_base_documents(files: &[BaseSnapshotInputFile]) -> bo
             >= BASE_SNAPSHOT_PREPARE_PARALLEL_BYTE_THRESHOLD
 }
 
-fn is_indexable_source_bytes(bytes: &[u8]) -> bool {
+fn has_binary_source_bytes(bytes: &[u8]) -> bool {
     let probe_len = bytes.len().min(8 * 1024);
-    !bytes[..probe_len].contains(&0) && std::str::from_utf8(bytes).is_ok()
+    bytes[..probe_len].contains(&0)
+}
+
+fn indexable_source_text(bytes: &[u8]) -> Option<&str> {
+    (!has_binary_source_bytes(bytes))
+        .then(|| std::str::from_utf8(bytes).ok())
+        .flatten()
 }
 
 fn posting_bucket_id(term: u64) -> usize {
@@ -1301,6 +1692,140 @@ fn read_spilled_posting_record(reader: &mut impl Read) -> Result<Option<(u64, u3
     };
     let doc_id = read_u32_from(reader)?;
     Ok(Some((term, doc_id)))
+}
+
+fn write_spilled_posting_record(writer: &mut impl Write, record: PostingRecord) -> Result<()> {
+    write_u64_to(writer, record.term)?;
+    write_u32_to(writer, record.doc_id)?;
+    Ok(())
+}
+
+fn read_posting_record(reader: &mut impl Read) -> Result<Option<PostingRecord>> {
+    read_spilled_posting_record(reader)
+        .map(|record| record.map(|(term, doc_id)| PostingRecord { term, doc_id }))
+}
+
+fn write_sorted_posting_runs(
+    bucket_path: &Path,
+    run_root: &Path,
+    bucket_id: usize,
+    max_records_per_run: usize,
+) -> Result<Vec<PathBuf>> {
+    let mut reader = BufReader::new(File::open(bucket_path)?);
+    let mut run_paths = Vec::new();
+    let mut records = Vec::with_capacity(max_records_per_run.max(1));
+
+    loop {
+        records.clear();
+        while records.len() < max_records_per_run.max(1) {
+            let Some(record) = read_posting_record(&mut reader)? else {
+                break;
+            };
+            records.push(record);
+        }
+        if records.is_empty() {
+            break;
+        }
+
+        records.sort_unstable_by_key(|record| (record.term, record.doc_id));
+        let run_path = run_root.join(format!(
+            "bucket-{bucket_id:03}-run-{:06}.bin",
+            run_paths.len()
+        ));
+        let mut writer = BufWriter::new(File::create(&run_path)?);
+        for record in &records {
+            write_spilled_posting_record(&mut writer, *record)?;
+        }
+        writer.flush()?;
+        run_paths.push(run_path);
+    }
+
+    Ok(run_paths)
+}
+
+fn merge_sorted_posting_runs(
+    run_paths: &[PathBuf],
+    term_dict_writer: &mut TermDictStreamWriter,
+    postings_writer: &mut PostingsStreamWriter,
+) -> Result<()> {
+    if run_paths.is_empty() {
+        return Ok(());
+    }
+
+    let mut readers = run_paths
+        .iter()
+        .map(|path| Ok(Some(BufReader::new(File::open(path)?))))
+        .collect::<Result<Vec<_>>>()?;
+    let mut heap = BinaryHeap::<Reverse<PostingRunHead>>::new();
+    for (run_index, reader_slot) in readers.iter_mut().enumerate() {
+        let Some(reader) = reader_slot.as_mut() else {
+            continue;
+        };
+        if let Some(record) = read_posting_record(reader)? {
+            heap.push(Reverse(PostingRunHead { record, run_index }));
+        } else {
+            *reader_slot = None;
+            fs::remove_file(&run_paths[run_index])?;
+        }
+    }
+
+    let mut current_term = None;
+    let mut current_doc_ids = Vec::new();
+
+    while let Some(Reverse(head)) = heap.pop() {
+        let term = head.record.term;
+        if current_term != Some(term) {
+            flush_streamed_posting_term(
+                current_term,
+                &current_doc_ids,
+                term_dict_writer,
+                postings_writer,
+            )?;
+            current_term = Some(term);
+            current_doc_ids.clear();
+        }
+        if current_doc_ids.last().copied() != Some(head.record.doc_id) {
+            current_doc_ids.push(head.record.doc_id);
+        }
+
+        let run_index = head.run_index;
+        let Some(reader) = readers.get_mut(run_index).and_then(Option::as_mut) else {
+            return Err(AppError::InvalidIndex(format!(
+                "missing posting run reader for index {run_index}"
+            )));
+        };
+        if let Some(record) = read_posting_record(reader)? {
+            heap.push(Reverse(PostingRunHead { record, run_index }));
+        } else {
+            readers[run_index] = None;
+            fs::remove_file(&run_paths[run_index])?;
+        }
+    }
+
+    flush_streamed_posting_term(
+        current_term,
+        &current_doc_ids,
+        term_dict_writer,
+        postings_writer,
+    )?;
+    Ok(())
+}
+
+fn flush_streamed_posting_term(
+    term: Option<u64>,
+    doc_ids: &[u32],
+    term_dict_writer: &mut TermDictStreamWriter,
+    postings_writer: &mut PostingsStreamWriter,
+) -> Result<()> {
+    let Some(term) = term else {
+        return Ok(());
+    };
+    if doc_ids.is_empty() {
+        return Ok(());
+    }
+    let postings_offset = postings_writer.push_doc_ids(doc_ids)?;
+    term_dict_writer.push_entry(term, postings_offset)?;
+    Ok(())
 }
 
 fn write_segment_header(writer: &mut BufWriter<File>, magic: &[u8; 8]) -> Result<()> {
@@ -1400,10 +1925,25 @@ fn now_unix_nanos() -> u128 {
 
 #[cfg(test)]
 mod tests {
+    #[cfg(unix)]
+    use std::os::unix::fs::MetadataExt;
+    use std::path::Path;
+
     use tempfile::TempDir;
 
-    use super::{estimated_term_entry_bytes, PostingBuckets, PostingBucketsState};
-    use crate::index_engine::segment::{read_postings_file, read_term_dict_file};
+    use super::{
+        base_snapshot_input_files_from_repository_files, estimated_term_entry_bytes,
+        merge_sorted_posting_runs, reusable_base_snapshot_shards, write_sorted_posting_runs,
+        write_spilled_posting_record, BaseSnapshotInputFile, PostingBuckets, PostingBucketsState,
+        PostingRecord, WorkspaceBaseSnapshotIndex,
+    };
+    use crate::base_snapshot_build::BaseSnapshotBuildOptions;
+    use crate::config::{BuildConfig, CorpusMode, TokenizerMode};
+    use crate::files::{scan_paths, ScanOptions};
+    use crate::index_engine::segment::{
+        read_postings_file, read_term_dict_file, PostingsStreamWriter, TermDictStreamWriter,
+    };
+    use crate::index_engine::RepoId;
 
     #[test]
     fn posting_buckets_keep_postings_in_memory_below_threshold() {
@@ -1452,6 +1992,225 @@ mod tests {
                 .expect("posting lookup")
                 .as_deref(),
             Some(&[0][..])
+        );
+        assert!(!temp.path().join("posting-buckets").exists());
+    }
+
+    #[test]
+    fn spilled_posting_runs_merge_preserves_postings_across_multiple_runs() {
+        let temp = TempDir::new().expect("temp dir");
+        let bucket_path = temp.path().join("bucket-000.bin");
+        let mut bucket_writer = std::io::BufWriter::new(
+            std::fs::File::create(&bucket_path).expect("bucket create should succeed"),
+        );
+        for record in [
+            PostingRecord {
+                term: 0x00666564,
+                doc_id: 3,
+            },
+            PostingRecord {
+                term: 0x00636261,
+                doc_id: 0,
+            },
+            PostingRecord {
+                term: 0x00666564,
+                doc_id: 4,
+            },
+            PostingRecord {
+                term: 0x00636261,
+                doc_id: 1,
+            },
+            PostingRecord {
+                term: 0x00636261,
+                doc_id: 2,
+            },
+        ] {
+            write_spilled_posting_record(&mut bucket_writer, record)
+                .expect("write spilled record should succeed");
+        }
+        use std::io::Write as _;
+        bucket_writer.flush().expect("bucket flush should succeed");
+
+        let run_root = temp.path().join("runs");
+        std::fs::create_dir_all(&run_root).expect("run root should succeed");
+        let run_paths = write_sorted_posting_runs(&bucket_path, &run_root, 0, 2)
+            .expect("run split should succeed");
+        assert!(run_paths.len() > 1);
+        std::fs::remove_file(&bucket_path).expect("bucket remove should succeed");
+
+        let term_dict_path = temp.path().join("term_dict.bin");
+        let postings_path = temp.path().join("postings.bin");
+        let mut term_dict_writer =
+            TermDictStreamWriter::create(&term_dict_path).expect("term dict create should succeed");
+        let mut postings_writer =
+            PostingsStreamWriter::create(&postings_path).expect("postings create should succeed");
+        merge_sorted_posting_runs(&run_paths, &mut term_dict_writer, &mut postings_writer)
+            .expect("run merge should succeed");
+        term_dict_writer
+            .finish()
+            .expect("term dict finish should succeed");
+        postings_writer
+            .finish()
+            .expect("postings finish should succeed");
+
+        let keys = read_term_dict_file(&term_dict_path).expect("read term dict");
+        let postings = read_postings_file(&postings_path, &keys).expect("read postings");
+        assert_eq!(keys.len(), 2);
+        assert_eq!(
+            postings
+                .get(&0x00636261)
+                .expect("posting lookup")
+                .as_deref(),
+            Some(&[0, 1, 2][..])
+        );
+        assert_eq!(
+            postings
+                .get(&0x00666564)
+                .expect("posting lookup")
+                .as_deref(),
+            Some(&[3, 4][..])
+        );
+        assert!(run_paths.iter().all(|path| !path.exists()));
+    }
+
+    fn build_config(repo: &Path, index: &Path) -> BuildConfig {
+        BuildConfig {
+            repo_path: repo.to_path_buf(),
+            storage_root: index.to_path_buf(),
+            tokenizer: TokenizerMode::SparseNgram,
+            corpus_mode: CorpusMode::NoIgnore,
+            include_hidden: true,
+            max_file_size: 1 << 20,
+            min_sparse_len: 3,
+            max_sparse_len: 8,
+        }
+    }
+
+    fn collect_base_input_files(build_config: &BuildConfig) -> Vec<BaseSnapshotInputFile> {
+        let files = scan_paths(
+            std::slice::from_ref(&build_config.repo_path),
+            Some(&build_config.storage_root),
+            ScanOptions {
+                respect_ignore: false,
+                include_hidden: build_config.include_hidden,
+                max_file_size: build_config.max_file_size,
+                max_depth: None,
+                ignore_files: Vec::new(),
+            },
+            None,
+        )
+        .expect("scan should succeed");
+        base_snapshot_input_files_from_repository_files(&files, &build_config.repo_path)
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn sharded_base_snapshot_reuses_unchanged_segment_files_via_hard_links() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("index");
+        std::fs::create_dir_all(&repo).expect("repo dir should succeed");
+
+        let mut shard_paths = std::collections::HashMap::<u32, std::path::PathBuf>::new();
+        for index in 0..256 {
+            let path = repo.join(format!("file-{index:03}.txt"));
+            std::fs::write(&path, format!("TOKEN_{index:03}\n")).expect("write should succeed");
+            let shard_id = super::base_snapshot_shard_id(&format!("file-{index:03}.txt"));
+            shard_paths.entry(shard_id).or_insert(path);
+            if shard_paths.len() >= 2 {
+                break;
+            }
+        }
+        assert!(
+            shard_paths.len() >= 2,
+            "expected at least two non-empty shards"
+        );
+
+        let build_config = build_config(&repo, &storage);
+        let repo_id = RepoId("repo".into());
+        WorkspaceBaseSnapshotIndex::build_with_options(
+            &build_config,
+            &repo_id,
+            BaseSnapshotBuildOptions::default(),
+        )
+        .expect("initial build should succeed");
+
+        let initial_metadata = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&build_config)
+            .expect("metadata read should succeed")
+            .expect("metadata should exist");
+        assert!(initial_metadata.shards.len() >= 2);
+
+        let changed_shard_id = *shard_paths.keys().min().expect("shard should exist");
+        let unchanged_shard_id = *shard_paths
+            .keys()
+            .filter(|shard_id| **shard_id != changed_shard_id)
+            .min()
+            .expect("second shard should exist");
+        let changed_path = shard_paths
+            .get(&changed_shard_id)
+            .expect("changed path should exist");
+        std::fs::write(changed_path, "CHANGED_TOKEN\n").expect("rewrite should succeed");
+
+        let previous_snapshot = reusable_base_snapshot_shards(&build_config)
+            .expect("reusable shards should load")
+            .expect("reusable shards should exist");
+        let staging_root = temp.path().join("staging");
+        let (doc_count, next_shards) = super::build_sharded_base_snapshot(
+            &staging_root,
+            &build_config,
+            &repo_id,
+            &repo,
+            collect_base_input_files(&build_config),
+            Some(&previous_snapshot),
+        )
+        .expect("staged build should succeed");
+        assert!(doc_count > 0);
+
+        let initial_unchanged = initial_metadata
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == unchanged_shard_id)
+            .expect("initial unchanged shard should exist");
+        let next_unchanged = next_shards
+            .iter()
+            .find(|shard| shard.shard_id == unchanged_shard_id)
+            .expect("next unchanged shard should exist");
+        assert_eq!(initial_unchanged.segment_id, next_unchanged.segment_id);
+
+        let initial_changed = initial_metadata
+            .shards
+            .iter()
+            .find(|shard| shard.shard_id == changed_shard_id)
+            .expect("initial changed shard should exist");
+        let next_changed = next_shards
+            .iter()
+            .find(|shard| shard.shard_id == changed_shard_id)
+            .expect("next changed shard should exist");
+        assert_ne!(initial_changed.fingerprint, next_changed.fingerprint);
+        assert_ne!(initial_changed.segment_id, next_changed.segment_id);
+
+        let source_meta = build_config
+            .storage_root
+            .join("base-snapshot/segments")
+            .join(&initial_unchanged.segment_id)
+            .join("SEGMENT_META.json");
+        let staged_meta = staging_root
+            .join("segments")
+            .join(&next_unchanged.segment_id)
+            .join("SEGMENT_META.json");
+        let source_links = std::fs::metadata(&source_meta)
+            .expect("source meta should exist")
+            .nlink();
+        let staged_links = std::fs::metadata(&staged_meta)
+            .expect("staged meta should exist")
+            .nlink();
+        assert!(
+            source_links >= 2,
+            "expected hard-linked source segment file"
+        );
+        assert!(
+            staged_links >= 2,
+            "expected hard-linked staged segment file"
         );
     }
 }

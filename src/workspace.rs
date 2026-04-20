@@ -897,7 +897,7 @@ mod tests {
     }
 
     #[test]
-    fn ensure_base_snapshot_publishes_one_compact_base_segment() {
+    fn ensure_base_snapshot_publishes_compact_base_manifest() {
         let repo = TestRepo::new();
         repo.write("src/a.rs", "const A: &str = \"AAAA\";\n");
         repo.write("src/b.rs", "const B: &str = \"BBBB\";\n");
@@ -915,7 +915,14 @@ mod tests {
             .expect("base snapshot should open")
             .open_committed()
             .expect("committed base snapshot should open");
-        assert_eq!(snapshot.manifest().active_segments.len(), 1);
+        let metadata = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&repo.build_config())
+            .expect("metadata should load")
+            .expect("metadata should exist");
+        assert!(!metadata.shards.is_empty());
+        assert_eq!(
+            snapshot.manifest().active_segments.len(),
+            metadata.shards.len()
+        );
 
         let manifest_count = fs::read_dir(
             WorkspaceBaseSnapshotIndex::index_root(&repo.build_config()).join("manifests"),

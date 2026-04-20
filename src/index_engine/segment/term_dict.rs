@@ -68,9 +68,17 @@ pub(crate) fn collect_document_posting_terms(
     bytes: &[u8],
     tokenizer: &PostingTokenizerConfig,
 ) -> Vec<u64> {
+    let text = String::from_utf8_lossy(bytes);
+    collect_document_posting_terms_from_text(&text, tokenizer)
+}
+
+pub(crate) fn collect_document_posting_terms_from_text(
+    text: &str,
+    tokenizer: &PostingTokenizerConfig,
+) -> Vec<u64> {
     match tokenizer.mode {
-        TokenizerMode::Trigram => collect_posting_grams(bytes),
-        TokenizerMode::SparseNgram => collect_sparse_posting_terms(bytes, tokenizer, true),
+        TokenizerMode::Trigram => collect_posting_grams(text.as_bytes()),
+        TokenizerMode::SparseNgram => collect_sparse_posting_terms_from_text(text, tokenizer, true),
     }
 }
 
@@ -254,13 +262,12 @@ pub(crate) fn collect_posting_grams(bytes: &[u8]) -> Vec<u64> {
     extract_trigram_terms_from_bytes(bytes)
 }
 
-fn collect_sparse_posting_terms(
-    bytes: &[u8],
+fn collect_sparse_posting_terms_from_text(
+    text: &str,
     tokenizer: &PostingTokenizerConfig,
     document_mode: bool,
 ) -> Vec<u64> {
-    let text = String::from_utf8_lossy(bytes);
-    let folded = fold_tokenizer_text(&text);
+    let folded = fold_tokenizer_text(text);
     let tokenizer = create(
         tokenizer.mode,
         TokenizerOptions {
@@ -278,7 +285,7 @@ fn collect_sparse_posting_terms(
 }
 
 fn collect_sparse_query_terms(literal: &str, tokenizer: &PostingTokenizerConfig) -> Vec<u64> {
-    collect_sparse_posting_terms(literal.as_bytes(), tokenizer, false)
+    collect_sparse_posting_terms_from_text(literal, tokenizer, false)
 }
 
 fn fold_tokenizer_text(text: &str) -> String {
