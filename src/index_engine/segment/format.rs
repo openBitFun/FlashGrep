@@ -6,6 +6,7 @@ use std::{
 };
 
 use serde::{Deserialize, Serialize};
+use zstd::bulk::{compress as zstd_compress, decompress as zstd_decompress};
 
 use crate::index_engine::{
     delete::DeleteRecord,
@@ -20,8 +21,14 @@ pub(crate) const STORED_FIELDS_FILE: &str = "stored_fields.bin";
 pub(crate) const PATH_MAP_FILE: &str = "path_map.bin";
 
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
-const STORED_FIELDS_MAGIC: &[u8; 8] = b"CGSTRD01";
+const STORED_FIELDS_MAGIC_V1: &[u8; 8] = b"CGSTRD01";
+const STORED_FIELDS_MAGIC_V2: &[u8; 8] = b"CGSTRD02";
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
+const STORED_SOURCE_ENCODING_RAW: u8 = 0;
+const STORED_SOURCE_ENCODING_ZSTD: u8 = 1;
+const STORED_SOURCE_ZSTD_LEVEL: i32 = 3;
+const STORED_SOURCE_COMPRESSION_ENABLED: bool = false;
+const STORED_SOURCE_MIN_COMPRESS_BYTES: usize = 4 * 1024;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentMeta {
@@ -74,7 +81,52 @@ pub(crate) struct StoredDocumentView<'a> {
     pub size: u64,
     pub modified_at: u64,
     pub content_hash: [u8; 32],
-    pub source_bytes: &'a [u8],
+    pub source_bytes: StoredSourceBytes<'a>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredFieldsLayout {
+    V1Raw,
+    V2Compressed,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum StoredSourceBytes<'a> {
+    Raw(&'a [u8]),
+    Zstd {
+        compressed: &'a [u8],
+        uncompressed_len: u32,
+    },
+}
+
+impl StoredSourceBytes<'_> {
+    pub(crate) fn len(self) -> usize {
+        match self {
+            Self::Raw(bytes) => bytes.len(),
+            Self::Zstd {
+                uncompressed_len, ..
+            } => uncompressed_len as usize,
+        }
+    }
+
+    pub(crate) fn decode(self) -> Result<Arc<[u8]>> {
+        match self {
+            Self::Raw(bytes) => Ok(Arc::<[u8]>::from(bytes)),
+            Self::Zstd {
+                compressed,
+                uncompressed_len,
+            } => {
+                let decoded = zstd_decompress(compressed, uncompressed_len as usize).map_err(
+                    |error| {
+                        AppError::InvalidIndex(format!(
+                            "stored source zstd decode failed: {error}"
+                        ))
+                    },
+                )?;
+                Ok(Arc::<[u8]>::from(decoded))
+            }
+        }
+    }
 }
 
 pub(crate) fn write_segment_meta(path: &Path, meta: &SegmentMeta) -> Result<()> {
@@ -99,7 +151,7 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
     write_u32(&mut path_map, documents.len() as u32)?;
 
     let mut stored_fields = Vec::new();
-    write_header(&mut stored_fields, STORED_FIELDS_MAGIC)?;
+    write_header(&mut stored_fields, STORED_FIELDS_MAGIC_V2)?;
     write_u32(&mut stored_fields, documents.len() as u32)?;
 
     let mut doc_records = Vec::with_capacity(documents.len());
@@ -149,7 +201,7 @@ pub(crate) fn read_segment_documents(dir: &Path) -> Result<Vec<IndexDocument>> {
 
     let stored_fields_bytes = fs::read(dir.join(STORED_FIELDS_FILE))?;
     let mut stored_cursor = Cursor::new(stored_fields_bytes.as_slice());
-    read_header(&mut stored_cursor, STORED_FIELDS_MAGIC)?;
+    let stored_fields_layout = read_stored_fields_header(&mut stored_cursor)?;
     let stored_doc_count = read_u32(&mut stored_cursor)? as usize;
 
     let addresses = read_segment_doc_addresses(dir)?;
@@ -171,7 +223,11 @@ pub(crate) fn read_segment_documents(dir: &Path) -> Result<Vec<IndexDocument>> {
         let slice = stored_fields_bytes
             .get(start..end)
             .ok_or_else(|| AppError::InvalidIndex("stored field slice out of range".into()))?;
-        documents.push(read_index_document_from_stored_slice(slice, &address.key)?);
+        documents.push(read_index_document_from_stored_slice(
+            slice,
+            &address.key,
+            stored_fields_layout,
+        )?);
     }
 
     Ok(documents)
@@ -214,8 +270,9 @@ pub(crate) fn read_segment_doc_addresses(dir: &Path) -> Result<Vec<SegmentDocAdd
 pub(crate) fn read_index_document_from_stored_slice(
     slice: &[u8],
     key: &DocKey,
+    stored_fields_layout: StoredFieldsLayout,
 ) -> Result<IndexDocument> {
-    let view = read_stored_document_view(slice)?;
+    let view = read_stored_document_view(slice, stored_fields_layout)?;
 
     Ok(IndexDocument {
         key: key.clone(),
@@ -226,11 +283,14 @@ pub(crate) fn read_index_document_from_stored_slice(
         size: view.size,
         modified_at: view.modified_at,
         content_hash: view.content_hash,
-        source_bytes: Arc::<[u8]>::from(view.source_bytes),
+        source_bytes: view.source_bytes.decode()?,
     })
 }
 
-pub(crate) fn read_stored_document_view(slice: &[u8]) -> Result<StoredDocumentView<'_>> {
+pub(crate) fn read_stored_document_view(
+    slice: &[u8],
+    stored_fields_layout: StoredFieldsLayout,
+) -> Result<StoredDocumentView<'_>> {
     let mut reader = StoredSliceReader::new(slice);
     let file_name = reader.read_string()?;
     let language = reader.read_optional_string()?;
@@ -239,8 +299,30 @@ pub(crate) fn read_stored_document_view(slice: &[u8]) -> Result<StoredDocumentVi
     let content_hash_bytes = reader.read_bytes(32)?;
     let mut content_hash = [0u8; 32];
     content_hash.copy_from_slice(content_hash_bytes);
-    let source_len = reader.read_u32()? as usize;
-    let source_bytes = reader.read_bytes(source_len)?;
+    let source_bytes = match stored_fields_layout {
+        StoredFieldsLayout::V1Raw => {
+            let source_len = reader.read_u32()? as usize;
+            StoredSourceBytes::Raw(reader.read_bytes(source_len)?)
+        }
+        StoredFieldsLayout::V2Compressed => {
+            let encoding = reader.read_bytes(1)?[0];
+            let source_len = reader.read_u32()?;
+            let payload_len = reader.read_u32()? as usize;
+            let payload = reader.read_bytes(payload_len)?;
+            match encoding {
+                STORED_SOURCE_ENCODING_RAW => StoredSourceBytes::Raw(payload),
+                STORED_SOURCE_ENCODING_ZSTD => StoredSourceBytes::Zstd {
+                    compressed: payload,
+                    uncompressed_len: source_len,
+                },
+                value => {
+                    return Err(AppError::InvalidIndex(format!(
+                        "invalid stored source encoding: {value}"
+                    )));
+                }
+            }
+        }
+    };
     Ok(StoredDocumentView {
         file_name,
         language,
@@ -249,6 +331,11 @@ pub(crate) fn read_stored_document_view(slice: &[u8]) -> Result<StoredDocumentVi
         content_hash,
         source_bytes,
     })
+}
+
+pub(crate) fn read_stored_fields_layout(bytes: &[u8]) -> Result<StoredFieldsLayout> {
+    let mut cursor = Cursor::new(bytes);
+    read_stored_fields_header(&mut cursor)
 }
 
 fn read_segment_paths(dir: &Path) -> Result<Vec<(String, String)>> {
@@ -286,6 +373,24 @@ fn read_header(cursor: &mut Cursor<&[u8]>, expected_magic: &[u8; 8]) -> Result<(
     Ok(())
 }
 
+fn read_stored_fields_header(cursor: &mut Cursor<&[u8]>) -> Result<StoredFieldsLayout> {
+    let mut magic = [0u8; 8];
+    cursor.read_exact(&mut magic)?;
+    let version = read_u32(cursor)?;
+    if version != 1 {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported stored fields version: {version}"
+        )));
+    }
+    match &magic {
+        magic if magic == STORED_FIELDS_MAGIC_V1 => Ok(StoredFieldsLayout::V1Raw),
+        magic if magic == STORED_FIELDS_MAGIC_V2 => Ok(StoredFieldsLayout::V2Compressed),
+        _ => Err(AppError::InvalidIndex(
+            "stored fields magic mismatch".into(),
+        )),
+    }
+}
+
 fn write_u32(writer: &mut impl Write, value: u32) -> Result<()> {
     writer.write_all(&value.to_le_bytes())?;
     Ok(())
@@ -319,9 +424,42 @@ fn write_optional_string(buffer: &mut Vec<u8>, value: Option<&str>) -> Result<()
 pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Result<()> {
     let len = u32::try_from(value.len())
         .map_err(|_| AppError::ValueOutOfRange("byte slice length exceeds u32 range".into()))?;
+    if let Some(compressed) = maybe_compress_source_bytes(value)? {
+        writer.write_all(&[STORED_SOURCE_ENCODING_ZSTD])?;
+        write_u32(writer, len)?;
+        write_u32(
+            writer,
+            u32::try_from(compressed.len()).map_err(|_| {
+                AppError::ValueOutOfRange(
+                    "compressed byte slice length exceeds u32 range".into(),
+                )
+            })?,
+        )?;
+        writer.write_all(&compressed)?;
+        return Ok(());
+    }
+
+    writer.write_all(&[STORED_SOURCE_ENCODING_RAW])?;
+    write_u32(writer, len)?;
     write_u32(writer, len)?;
     writer.write_all(value)?;
     Ok(())
+}
+
+fn maybe_compress_source_bytes(value: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !STORED_SOURCE_COMPRESSION_ENABLED {
+        return Ok(None);
+    }
+    if value.len() < STORED_SOURCE_MIN_COMPRESS_BYTES {
+        return Ok(None);
+    }
+
+    let compressed = zstd_compress(value, STORED_SOURCE_ZSTD_LEVEL)
+        .map_err(|error| AppError::Protocol(format!("stored source zstd encode failed: {error}")))?;
+    if compressed.len() + 16 >= value.len() {
+        return Ok(None);
+    }
+    Ok(Some(compressed))
 }
 
 fn read_u32(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
@@ -354,13 +492,6 @@ fn read_optional_string(cursor: &mut Cursor<&[u8]>) -> Result<Option<String>> {
             "invalid optional string tag: {value}"
         ))),
     }
-}
-
-fn read_source_bytes(cursor: &mut Cursor<&[u8]>) -> Result<Vec<u8>> {
-    let len = read_u32(cursor)? as usize;
-    let mut bytes = vec![0u8; len];
-    cursor.read_exact(&mut bytes)?;
-    Ok(bytes)
 }
 
 struct StoredSliceReader<'a> {

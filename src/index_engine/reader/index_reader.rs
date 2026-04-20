@@ -755,7 +755,7 @@ impl IndexSnapshotReader {
             results.bytes_searched += stored_doc.source_bytes.len() as u64;
             accumulate_search_bytes(
                 &stored_doc.key.logical_path,
-                stored_doc.source_bytes,
+                &stored_doc.source_bytes,
                 query,
                 regex,
                 &mut results,

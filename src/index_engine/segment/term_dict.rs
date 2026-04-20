@@ -10,7 +10,9 @@ use memmap2::Mmap;
 use crate::{
     config::TokenizerMode,
     index_engine::{
-        config::PostingTokenizerConfig, segment::advise_mmap_sequential, writer::IndexDocument,
+        config::PostingTokenizerConfig,
+        segment::{advise_mmap_sequential, encoded_posting_len},
+        writer::IndexDocument,
     },
     tokenizer::{create, TokenizerOptions},
     AppError, Result,
@@ -116,9 +118,7 @@ pub(crate) fn write_term_dict_file(
         write_u32(&mut buffer, postings_offset)?;
         let doc_ids = posting_lists.get(&key).expect("posting key must exist");
         let posting_bytes = 4usize
-            .checked_add(doc_ids.len().checked_mul(4).ok_or_else(|| {
-                AppError::ValueOutOfRange("posting size exceeds usize range".into())
-            })?)
+            .checked_add(encoded_posting_len(doc_ids)?)
             .ok_or_else(|| AppError::ValueOutOfRange("posting size exceeds usize range".into()))?;
         let posting_bytes = u32::try_from(posting_bytes)
             .map_err(|_| AppError::ValueOutOfRange("posting size exceeds u32 range".into()))?;
@@ -354,8 +354,8 @@ mod tests {
         let dict = TermDictionary::open(&path).expect("open term dict");
         assert_eq!(dict.len(), 3);
         assert_eq!(dict.postings_offset(11), Some(16));
-        assert_eq!(dict.postings_offset(22), Some(28));
-        assert_eq!(dict.postings_offset(33), Some(36));
+        assert_eq!(dict.postings_offset(22), Some(23));
+        assert_eq!(dict.postings_offset(33), Some(29));
         assert_eq!(dict.postings_offset(44), None);
     }
 }

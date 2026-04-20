@@ -12,7 +12,8 @@ use crate::{
         query::{QueryFilters, QueryPlan},
         segment::{
             advise_mmap_sequential, read_index_document_from_stored_slice,
-            read_stored_document_view, PostingLists, SegmentDocAddress,
+            read_stored_document_view, read_stored_fields_layout, PostingLists,
+            SegmentDocAddress, StoredFieldsLayout,
         },
         types::{DocKey, SegmentDocId},
         writer::IndexDocument,
@@ -38,7 +39,7 @@ pub type SegmentReaderHandle = Arc<dyn SegmentReader>;
 #[derive(Debug, Clone)]
 pub struct StoredDocRef<'a> {
     pub key: &'a DocKey,
-    pub source_bytes: &'a [u8],
+    pub source_bytes: Arc<[u8]>,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -148,7 +149,7 @@ impl SegmentReader for MemorySegmentReader {
         })?;
         Ok(StoredDocRef {
             key: &doc.key,
-            source_bytes: &doc.source_bytes,
+            source_bytes: Arc::clone(&doc.source_bytes),
         })
     }
 }
@@ -161,6 +162,7 @@ pub struct FileSegmentReader {
     path_doc_ids: BTreeMap<String, Vec<SegmentDocId>>,
     stored_fields_path: PathBuf,
     stored_fields_mmap: Mmap,
+    stored_fields_layout: StoredFieldsLayout,
     decoded_documents: Vec<OnceLock<IndexDocument>>,
     decoded_metadata: Vec<OnceLock<StoredDocMetadataValue>>,
 }
@@ -175,6 +177,7 @@ impl FileSegmentReader {
         let stored_fields_file = File::open(&stored_fields_path)?;
         let stored_fields_mmap = unsafe { Mmap::map(&stored_fields_file)? };
         advise_mmap_sequential(&stored_fields_mmap);
+        let stored_fields_layout = read_stored_fields_layout(stored_fields_mmap.as_ref())?;
         let decoded_documents = (0..doc_addresses.len())
             .map(|_| OnceLock::new())
             .collect::<Vec<_>>();
@@ -194,6 +197,7 @@ impl FileSegmentReader {
             path_doc_ids,
             stored_fields_path,
             stored_fields_mmap,
+            stored_fields_layout,
             decoded_documents,
             decoded_metadata,
         })
@@ -220,11 +224,16 @@ impl FileSegmentReader {
         let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
             AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
         })?;
-        read_index_document_from_stored_slice(self.stored_slice(doc_id)?, &address.key)
+        read_index_document_from_stored_slice(
+            self.stored_slice(doc_id)?,
+            &address.key,
+            self.stored_fields_layout,
+        )
     }
 
     fn load_metadata(&self, doc_id: usize) -> Result<StoredDocMetadataValue> {
-        let document = read_stored_document_view(self.stored_slice(doc_id)?)?;
+        let document =
+            read_stored_document_view(self.stored_slice(doc_id)?, self.stored_fields_layout)?;
         Ok(StoredDocMetadataValue {
             size: document.size,
             modified_at: document.modified_at,
@@ -349,10 +358,11 @@ impl SegmentReader for FileSegmentReader {
         let address = self.doc_addresses.get(doc_id).ok_or_else(|| {
             AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
         })?;
-        let document = read_stored_document_view(self.stored_slice(doc_id)?)?;
+        let document =
+            read_stored_document_view(self.stored_slice(doc_id)?, self.stored_fields_layout)?;
         Ok(StoredDocRef {
             key: &address.key,
-            source_bytes: document.source_bytes,
+            source_bytes: document.source_bytes.decode()?,
         })
     }
 }
