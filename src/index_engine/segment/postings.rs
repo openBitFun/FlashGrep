@@ -134,9 +134,11 @@ impl FileBackedPostingLists {
                     })?)
                     .ok_or_else(|| AppError::InvalidIndex("posting slice overflow".into()))?;
                 let doc_id_bytes =
-                    self.postings_mmap.get(body_start..body_end).ok_or_else(|| {
-                        AppError::InvalidIndex("posting doc ids are out of range".into())
-                    })?;
+                    self.postings_mmap
+                        .get(body_start..body_end)
+                        .ok_or_else(|| {
+                            AppError::InvalidIndex("posting doc ids are out of range".into())
+                        })?;
                 let mut doc_ids = Vec::with_capacity(doc_count);
                 for chunk in doc_id_bytes.chunks_exact(4) {
                     let mut raw_doc_id = [0u8; 4];
@@ -152,10 +154,9 @@ impl FileBackedPostingLists {
                 doc_count,
             ),
             POSTINGS_VERSION_V3 => {
-                let encoding = *self
-                    .postings_mmap
-                    .get(body_start)
-                    .ok_or_else(|| AppError::InvalidIndex("posting encoding is out of range".into()))?;
+                let encoding = *self.postings_mmap.get(body_start).ok_or_else(|| {
+                    AppError::InvalidIndex("posting encoding is out of range".into())
+                })?;
                 let payload = self.postings_mmap.get(body_start + 1..).ok_or_else(|| {
                     AppError::InvalidIndex("posting payload is out of range".into())
                 })?;
@@ -259,9 +260,12 @@ pub(crate) fn read_postings_file(path: &Path, entries: &[TermDictEntry]) -> Resu
                 let payload = cursor
                     .get_ref()
                     .get(cursor.position() as usize..)
-                    .ok_or_else(|| AppError::InvalidIndex("posting payload is out of range".into()))?;
+                    .ok_or_else(|| {
+                        AppError::InvalidIndex("posting payload is out of range".into())
+                    })?;
                 let doc_ids = decode_posting_payload(payload, doc_count, encoding[0])?;
-                let payload_len = encoded_posting_payload_len_for_encoding(doc_ids.as_slice(), encoding[0])?;
+                let payload_len =
+                    encoded_posting_payload_len_for_encoding(doc_ids.as_slice(), encoding[0])?;
                 cursor.set_position(
                     cursor
                         .position()
@@ -366,7 +370,11 @@ fn encoded_posting_payload_len_for_encoding(doc_ids: &[u32], encoding: u8) -> Re
                         "posting doc ids must be strictly increasing".into(),
                     ));
                 }
-                let delta = if index == 0 { doc_id } else { doc_id - previous };
+                let delta = if index == 0 {
+                    doc_id
+                } else {
+                    doc_id - previous
+                };
                 len = len.checked_add(varint_u32_len(delta)).ok_or_else(|| {
                     AppError::ValueOutOfRange("posting size exceeds usize range".into())
                 })?;
@@ -445,7 +453,11 @@ fn write_posting_deltas_impl(writer: &mut impl Write, doc_ids: &[u32]) -> Result
                 "posting doc ids must be strictly increasing".into(),
             ));
         }
-        let delta = if index == 0 { doc_id } else { doc_id - previous };
+        let delta = if index == 0 {
+            doc_id
+        } else {
+            doc_id - previous
+        };
         written += write_varint_u32(writer, delta)?;
         previous = doc_id;
     }
@@ -477,20 +489,19 @@ fn decode_posting_deltas_with_len(bytes: &[u8], doc_count: usize) -> Result<(Vec
     let mut offset = 0usize;
 
     for index in 0..doc_count {
-        let (delta, len) = read_varint_u32_from_slice(
-            bytes.get(offset..).ok_or_else(|| {
+        let (delta, len) =
+            read_varint_u32_from_slice(bytes.get(offset..).ok_or_else(|| {
                 AppError::InvalidIndex("posting payload is out of range".into())
-            })?,
-        )?;
+            })?)?;
         offset = offset
             .checked_add(len)
             .ok_or_else(|| AppError::InvalidIndex("posting payload overflow".into()))?;
         let doc_id = if index == 0 {
             delta
         } else {
-            previous.checked_add(delta).ok_or_else(|| {
-                AppError::InvalidIndex("posting doc id delta overflow".into())
-            })?
+            previous
+                .checked_add(delta)
+                .ok_or_else(|| AppError::InvalidIndex("posting doc id delta overflow".into()))?
         };
         doc_ids.push(doc_id);
         previous = doc_id;

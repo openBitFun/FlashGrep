@@ -69,16 +69,26 @@ impl SegmentStore for MemorySegmentStore {
 pub struct FileSegmentStore {
     segments_dir: PathBuf,
     tokenizer: PostingTokenizerConfig,
+    repo_root: Option<PathBuf>,
     cache: RwLock<HashMap<SegmentId, SegmentReaderHandle>>,
 }
 
 impl FileSegmentStore {
     pub fn open(index_root: &Path, tokenizer: PostingTokenizerConfig) -> Result<Self> {
+        Self::open_with_repo_root(index_root, tokenizer, None)
+    }
+
+    pub fn open_with_repo_root(
+        index_root: &Path,
+        tokenizer: PostingTokenizerConfig,
+        repo_root: Option<PathBuf>,
+    ) -> Result<Self> {
         let segments_dir = index_root.join("segments");
         fs::create_dir_all(&segments_dir)?;
         Ok(Self {
             segments_dir,
             tokenizer,
+            repo_root,
             cache: RwLock::new(HashMap::new()),
         })
     }
@@ -118,11 +128,13 @@ impl SegmentStore for FileSegmentStore {
         let doc_addresses = read_segment_doc_addresses(&segment_dir)?;
         let term_dict = TermDictionary::open(&segment_dir.join(TERM_DICT_FILE))?;
         let posting_lists = PostingLists::open_lazy(term_dict, &segment_dir.join(POSTINGS_FILE))?;
+        let stored_fields_path = segment_dir.join(STORED_FIELDS_FILE);
         let reader = std::sync::Arc::new(FileSegmentReader::new(
             meta,
             doc_addresses,
             posting_lists,
-            segment_dir.join(STORED_FIELDS_FILE),
+            stored_fields_path.exists().then_some(stored_fields_path),
+            self.repo_root.clone(),
         )?);
         let mut cache = self
             .cache
@@ -138,7 +150,6 @@ impl SegmentStore for FileSegmentStore {
             for required in [
                 SEGMENT_META_FILE,
                 DOCS_FILE,
-                STORED_FIELDS_FILE,
                 PATH_MAP_FILE,
                 TERM_DICT_FILE,
                 POSTINGS_FILE,

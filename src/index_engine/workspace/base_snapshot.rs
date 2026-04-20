@@ -25,9 +25,9 @@ use crate::{
         manifest::{FileManifestStore, Manifest, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
-            collect_document_posting_terms, write_segment_meta, write_source_bytes,
-            FileSegmentStore, PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE,
-            PATH_MAP_FILE, SEGMENT_META_FILE, STORED_FIELDS_FILE,
+            collect_document_posting_terms, write_segment_meta, FileSegmentStore,
+            PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE,
+            SEGMENT_META_FILE,
         },
         writer::IndexDocument,
         DocKey, GitRevision, ManifestId, RepoId, SegmentId, ShardId,
@@ -47,7 +47,7 @@ const BASE_SNAPSHOT_SEGMENT_ID: &str = "seg-0000000000000001-base";
 const BASE_SNAPSHOT_MANIFEST_ID: &str = "manifest-0000000000000001";
 const SEGMENT_SCHEMA_FINGERPRINT: &str = "segment-publish-v1";
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
-const STORED_FIELDS_MAGIC: &[u8; 8] = b"CGSTRD02";
+const DOCS_VERSION: u32 = 2;
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
 const SEGMENT_FILE_VERSION: u32 = 1;
 const COUNT_OFFSET: u64 = 12;
@@ -117,7 +117,6 @@ struct BulkBaseSegmentWriter {
     segment_id: SegmentId,
     tokenizer: PostingTokenizerConfig,
     path_map: BufWriter<File>,
-    stored_fields: BufWriter<File>,
     docs: BufWriter<File>,
     posting_buckets: PostingBuckets,
     doc_count: u32,
@@ -161,19 +160,16 @@ impl BulkBaseSegmentWriter {
         fs::create_dir_all(&segment_dir)?;
 
         let mut path_map = BufWriter::new(File::create(segment_dir.join(PATH_MAP_FILE))?);
-        let mut stored_fields = BufWriter::new(File::create(segment_dir.join(STORED_FIELDS_FILE))?);
         let mut docs = BufWriter::new(File::create(segment_dir.join(DOCS_FILE))?);
 
         write_segment_header(&mut path_map, PATH_MAP_MAGIC)?;
-        write_segment_header(&mut stored_fields, STORED_FIELDS_MAGIC)?;
-        write_segment_header(&mut docs, DOCS_MAGIC)?;
+        write_segment_header_with_version(&mut docs, DOCS_MAGIC, DOCS_VERSION)?;
 
         Ok(Self {
             segment_dir,
             segment_id,
             tokenizer,
             path_map,
-            stored_fields,
             docs,
             posting_buckets: PostingBuckets::new(index_root),
             doc_count: 0,
@@ -191,25 +187,12 @@ impl BulkBaseSegmentWriter {
         write_string_to(&mut self.path_map, &document.repo_id.0)?;
         write_string_to(&mut self.path_map, &document.logical_path)?;
 
-        let stored_offset = self.stored_fields.stream_position()?;
-        write_string_to(&mut self.stored_fields, &document.file_name)?;
-        write_optional_string_to(&mut self.stored_fields, document.language.as_deref())?;
-        write_u64_to(&mut self.stored_fields, document.size)?;
-        write_u64_to(&mut self.stored_fields, document.modified_at)?;
-        self.stored_fields.write_all(&document.content_hash)?;
-        write_source_bytes(&mut self.stored_fields, &document.source_bytes)?;
-        let stored_len = self
-            .stored_fields
-            .stream_position()?
-            .checked_sub(stored_offset)
-            .ok_or_else(|| AppError::InvalidIndex("stored fields length underflow".into()))?;
-        let stored_len = u32::try_from(stored_len).map_err(|_| {
-            AppError::ValueOutOfRange("stored fields length exceeds u32 range".into())
-        })?;
-
         write_u32_to(&mut self.docs, doc_id)?;
-        write_u64_to(&mut self.docs, stored_offset)?;
-        write_u32_to(&mut self.docs, stored_len)?;
+        write_u64_to(&mut self.docs, 0)?;
+        write_u32_to(&mut self.docs, 0)?;
+        write_u64_to(&mut self.docs, document.size)?;
+        write_u64_to(&mut self.docs, document.modified_at)?;
+        self.docs.write_all(&document.content_hash)?;
 
         self.posting_buckets.append_terms(doc_id, &posting_terms)?;
 
@@ -224,11 +207,9 @@ impl BulkBaseSegmentWriter {
 
     fn finish(mut self) -> Result<Option<SegmentRef>> {
         patch_segment_count(&mut self.path_map, self.doc_count)?;
-        patch_segment_count(&mut self.stored_fields, self.doc_count)?;
         patch_segment_count(&mut self.docs, self.doc_count)?;
 
         self.path_map.flush()?;
-        self.stored_fields.flush()?;
         self.docs.flush()?;
 
         if self.doc_count == 0 {
@@ -473,17 +454,18 @@ impl WorkspaceBaseSnapshotIndex {
         Self::metadata_path_for_root(&Self::index_root(build_config))
     }
 
-    pub(crate) fn open(build_config: &BuildConfig) -> Result<Self> {
+    pub fn open(build_config: &BuildConfig) -> Result<Self> {
         Self::open_read_only(build_config)
     }
 
-    pub(crate) fn open_read_only(build_config: &BuildConfig) -> Result<Self> {
+    pub fn open_read_only(build_config: &BuildConfig) -> Result<Self> {
         let config = Self::engine_config(build_config);
         let reader = Arc::new(IndexReaderFactory::new(
             Arc::new(FileManifestStore::open(&config.index_root)?),
-            Arc::new(FileSegmentStore::open(
+            Arc::new(FileSegmentStore::open_with_repo_root(
                 &config.index_root,
                 config.tokenizer.clone(),
+                Some(build_config.repo_path.clone()),
             )?),
             Arc::new(FileDeleteStore::open(&config.index_root)?),
             SharedSnapshotState::new(),
@@ -1285,8 +1267,16 @@ fn read_spilled_posting_record(reader: &mut impl Read) -> Result<Option<(u64, u3
 }
 
 fn write_segment_header(writer: &mut BufWriter<File>, magic: &[u8; 8]) -> Result<()> {
+    write_segment_header_with_version(writer, magic, SEGMENT_FILE_VERSION)
+}
+
+fn write_segment_header_with_version(
+    writer: &mut BufWriter<File>,
+    magic: &[u8; 8],
+    version: u32,
+) -> Result<()> {
     writer.write_all(magic)?;
-    write_u32_to(writer, SEGMENT_FILE_VERSION)?;
+    write_u32_to(writer, version)?;
     write_u32_to(writer, 0)?;
     Ok(())
 }
@@ -1315,17 +1305,6 @@ fn write_string_to(writer: &mut impl Write, value: &str) -> Result<()> {
         .map_err(|_| AppError::ValueOutOfRange("string length exceeds u32 range".into()))?;
     write_u32_to(writer, len)?;
     writer.write_all(bytes)?;
-    Ok(())
-}
-
-fn write_optional_string_to(writer: &mut impl Write, value: Option<&str>) -> Result<()> {
-    match value {
-        Some(value) => {
-            writer.write_all(&[1])?;
-            write_string_to(writer, value)?;
-        }
-        None => writer.write_all(&[0])?,
-    }
     Ok(())
 }
 

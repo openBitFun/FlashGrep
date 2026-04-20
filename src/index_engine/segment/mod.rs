@@ -11,17 +11,18 @@ mod writer;
 pub(crate) use format::{
     read_index_document_from_stored_slice, read_segment_doc_addresses, read_segment_meta,
     read_stored_document_view, read_stored_fields_layout, write_segment_documents,
-    write_segment_meta, write_source_bytes, SegmentDocAddress, StoredFieldsLayout, DOCS_FILE,
-    PATH_MAP_FILE, SEGMENT_META_FILE, STORED_FIELDS_FILE,
+    write_segment_meta, SegmentDocAddress, StoredFieldsLayout, DOCS_FILE, PATH_MAP_FILE,
+    SEGMENT_META_FILE, STORED_FIELDS_FILE,
 };
 pub use format::{DeleteSegmentBuildOutput, DeleteSegmentMeta, SegmentBuildOutput, SegmentMeta};
 pub(crate) use mmap::advise_mmap_sequential;
+pub(crate) use postings::encoded_posting_len;
 #[cfg(test)]
 pub(crate) use postings::read_postings_file;
 pub(crate) use postings::{write_postings_file, PostingLists, PostingsStreamWriter};
-pub(crate) use postings::encoded_posting_len;
 pub use reader::{
-    FileSegmentReader, MemorySegmentReader, SegmentReader, SegmentReaderHandle, StoredDocRef,
+    FileSegmentReader, MemorySegmentReader, SegmentReader, SegmentReaderHandle,
+    SegmentVerifySource, StoredDocRef,
 };
 #[cfg(test)]
 pub(crate) use term_dict::read_term_dict_file;

@@ -1,7 +1,7 @@
 use std::{env, path::PathBuf, time::Instant};
 
 use codgrep::{
-    index_engine::{query::QueryFilters, query::QueryRequest, EngineConfig, IndexEngine, ShardId},
+    index_engine::{query::QueryFilters, query::QueryRequest, WorkspaceBaseSnapshotIndex},
     BuildConfig, CorpusMode, SearchMode, TokenizerMode,
 };
 
@@ -17,6 +17,7 @@ fn run() -> codgrep::Result<()> {
     let mut storage_root: Option<PathBuf> = None;
     let mut pattern: Option<String> = None;
     let mut ignore_case = false;
+    let mut mode = SearchMode::CountOnly;
 
     let mut args = env::args().skip(1);
     while let Some(arg) = args.next() {
@@ -24,6 +25,24 @@ fn run() -> codgrep::Result<()> {
             "--repo" => repo_path = args.next().map(PathBuf::from),
             "--storage-root" => storage_root = args.next().map(PathBuf::from),
             "--pattern" => pattern = args.next(),
+            "--mode" => {
+                let value = args.next().ok_or_else(|| {
+                    codgrep::AppError::Protocol(
+                        "usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [--mode count|count-matches|first|materialize] [-i]".into(),
+                    )
+                })?;
+                mode = match value.as_str() {
+                    "count" => SearchMode::CountOnly,
+                    "count-matches" => SearchMode::CountMatches,
+                    "first" => SearchMode::FirstHitOnly,
+                    "materialize" => SearchMode::MaterializeMatches,
+                    other => {
+                        return Err(codgrep::AppError::Protocol(format!(
+                            "unknown mode: {other}"
+                        )))
+                    }
+                };
+            }
             "-i" | "--ignore-case" => ignore_case = true,
             other => {
                 return Err(codgrep::AppError::Protocol(format!(
@@ -38,7 +57,7 @@ fn run() -> codgrep::Result<()> {
     })?;
     let storage_root = storage_root.unwrap_or_else(|| repo_path.join(".codgrep-index-engine"));
     let pattern = pattern.ok_or_else(|| {
-        codgrep::AppError::Protocol("usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [-i]".into())
+        codgrep::AppError::Protocol("usage: direct_base_search --repo <repo> --pattern <pattern> [--storage-root <root>] [--mode count|count-matches|first|materialize] [-i]".into())
     })?;
 
     let build_config = BuildConfig {
@@ -51,20 +70,11 @@ fn run() -> codgrep::Result<()> {
         min_sparse_len: 3,
         max_sparse_len: 8,
     };
-    let engine = IndexEngine::open(EngineConfig {
-        shard_id: ShardId(format!(
-            "{}#base-snapshot",
-            build_config.repo_path.to_string_lossy()
-        )),
-        index_root: build_config.storage_root.join("base-snapshot"),
-        tokenizer: (&build_config).into(),
-        ..EngineConfig::default()
-    })?;
-    let snapshot = engine.reader().open_committed()?;
+    let snapshot = WorkspaceBaseSnapshotIndex::open_read_only(&build_config)?.open_committed()?;
     let started = Instant::now();
     let results = snapshot.search(&QueryRequest {
         pattern: pattern.clone(),
-        mode: SearchMode::CountOnly,
+        mode,
         case_insensitive: ignore_case,
         top_k: None,
         filters: QueryFilters::default(),
@@ -77,5 +87,6 @@ fn run() -> codgrep::Result<()> {
     println!("searches_with_match={}", results.searches_with_match);
     println!("matched_lines={}", results.matched_lines);
     println!("matched_occurrences={}", results.matched_occurrences);
+    println!("hits={}", results.hits.len());
     Ok(())
 }

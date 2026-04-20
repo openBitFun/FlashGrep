@@ -36,6 +36,50 @@ pub(crate) enum VerifyCandidateSource {
     Bytes(Arc<[u8]>),
 }
 
+#[derive(Debug, Clone)]
+pub(crate) struct VerifyPlan {
+    matcher: RegexMatcher,
+    line_prefilter: Option<LinePrefilter>,
+    multiline_verifier: bool,
+    mode: SearchMode,
+    max_count: Option<usize>,
+    before_context: usize,
+    after_context: usize,
+}
+
+impl VerifyPlan {
+    pub(crate) fn compile(
+        config: &QueryConfig,
+        multiline_verifier: bool,
+        line_prefilter: Option<LinePrefilter>,
+    ) -> Result<Self> {
+        Ok(Self {
+            matcher: build_matcher(config, multiline_verifier)?,
+            line_prefilter: (!multiline_verifier).then_some(line_prefilter).flatten(),
+            multiline_verifier,
+            mode: config.search_mode,
+            max_count: config.max_count,
+            before_context: config.before_context,
+            after_context: config.after_context,
+        })
+    }
+
+    pub(crate) fn create_runtime(&self) -> VerifyRuntime<'_> {
+        VerifyRuntime {
+            matcher: &self.matcher,
+            line_prefilter: self.line_prefilter.as_ref(),
+            verifier: build_verifier(
+                self.multiline_verifier,
+                self.mode,
+                self.max_count,
+                self.before_context,
+                self.after_context,
+            ),
+            mode: self.mode,
+        }
+    }
+}
+
 pub(crate) fn requires_multiline_verification(config: &QueryConfig) -> Result<bool> {
     if !config.multiline && !config.dot_matches_new_line {
         return Ok(false);
@@ -157,6 +201,28 @@ pub(crate) struct SearchTaskOutcome {
     pub(crate) ordinal: usize,
     pub(crate) doc_id: u32,
     pub(crate) outcome: VerifyOutcome,
+}
+
+pub(crate) struct VerifyRuntime<'a> {
+    matcher: &'a RegexMatcher,
+    line_prefilter: Option<&'a LinePrefilter>,
+    verifier: Searcher,
+    mode: SearchMode,
+}
+
+impl VerifyRuntime<'_> {
+    pub(crate) fn verify_source(
+        &mut self,
+        source: &VerifyCandidateSource,
+    ) -> Result<VerifyOutcome> {
+        verify_source(
+            source,
+            self.matcher,
+            self.line_prefilter,
+            &mut self.verifier,
+            self.mode,
+        )
+    }
 }
 
 fn build_verifier(

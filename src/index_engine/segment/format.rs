@@ -21,6 +21,8 @@ pub(crate) const STORED_FIELDS_FILE: &str = "stored_fields.bin";
 pub(crate) const PATH_MAP_FILE: &str = "path_map.bin";
 
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
+const DOCS_VERSION_V1: u32 = 1;
+const DOCS_VERSION_V2: u32 = 2;
 const STORED_FIELDS_MAGIC_V1: &[u8; 8] = b"CGSTRD01";
 const STORED_FIELDS_MAGIC_V2: &[u8; 8] = b"CGSTRD02";
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
@@ -65,6 +67,9 @@ struct DocRecord {
     path_index: u32,
     stored_offset: u64,
     stored_len: u32,
+    size: u64,
+    modified_at: u64,
+    content_hash: [u8; 32],
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -72,6 +77,10 @@ pub struct SegmentDocAddress {
     pub key: DocKey,
     pub stored_offset: u64,
     pub stored_len: u32,
+    pub size: u64,
+    pub modified_at: u64,
+    pub content_hash: [u8; 32],
+    pub metadata_embedded: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -116,13 +125,10 @@ impl StoredSourceBytes<'_> {
                 compressed,
                 uncompressed_len,
             } => {
-                let decoded = zstd_decompress(compressed, uncompressed_len as usize).map_err(
-                    |error| {
-                        AppError::InvalidIndex(format!(
-                            "stored source zstd decode failed: {error}"
-                        ))
-                    },
-                )?;
+                let decoded =
+                    zstd_decompress(compressed, uncompressed_len as usize).map_err(|error| {
+                        AppError::InvalidIndex(format!("stored source zstd decode failed: {error}"))
+                    })?;
                 Ok(Arc::<[u8]>::from(decoded))
             }
         }
@@ -178,16 +184,22 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
             path_index: path_index as u32,
             stored_offset,
             stored_len,
+            size: document.size,
+            modified_at: document.modified_at,
+            content_hash: document.content_hash,
         });
     }
 
     let mut docs = Vec::new();
-    write_header(&mut docs, DOCS_MAGIC)?;
+    write_header_with_version(&mut docs, DOCS_MAGIC, DOCS_VERSION_V2)?;
     write_u32(&mut docs, doc_records.len() as u32)?;
     for record in doc_records {
         write_u32(&mut docs, record.path_index)?;
         write_u64(&mut docs, record.stored_offset)?;
         write_u32(&mut docs, record.stored_len)?;
+        write_u64(&mut docs, record.size)?;
+        write_u64(&mut docs, record.modified_at)?;
+        docs.write_all(&record.content_hash)?;
     }
 
     fs::write(dir.join(PATH_MAP_FILE), path_map)?;
@@ -237,7 +249,7 @@ pub(crate) fn read_segment_doc_addresses(dir: &Path) -> Result<Vec<SegmentDocAdd
     let paths = read_segment_paths(dir)?;
     let docs_bytes = fs::read(dir.join(DOCS_FILE))?;
     let mut docs_cursor = Cursor::new(docs_bytes.as_slice());
-    read_header(&mut docs_cursor, DOCS_MAGIC)?;
+    let docs_version = read_docs_header(&mut docs_cursor)?;
     let doc_count = read_u32(&mut docs_cursor)? as usize;
     if doc_count != paths.len() {
         return Err(AppError::InvalidIndex(format!(
@@ -251,6 +263,16 @@ pub(crate) fn read_segment_doc_addresses(dir: &Path) -> Result<Vec<SegmentDocAdd
         let path_index = read_u32(&mut docs_cursor)? as usize;
         let stored_offset = read_u64(&mut docs_cursor)?;
         let stored_len = read_u32(&mut docs_cursor)?;
+        let (size, modified_at, content_hash, metadata_embedded) =
+            if docs_version >= DOCS_VERSION_V2 {
+                let size = read_u64(&mut docs_cursor)?;
+                let modified_at = read_u64(&mut docs_cursor)?;
+                let mut content_hash = [0u8; 32];
+                docs_cursor.read_exact(&mut content_hash)?;
+                (size, modified_at, content_hash, true)
+            } else {
+                (0, 0, [0u8; 32], false)
+            };
         let (repo_id, logical_path) = paths.get(path_index).cloned().ok_or_else(|| {
             AppError::InvalidIndex(format!("path index {path_index} is out of bounds"))
         })?;
@@ -262,6 +284,10 @@ pub(crate) fn read_segment_doc_addresses(dir: &Path) -> Result<Vec<SegmentDocAdd
             },
             stored_offset,
             stored_len,
+            size,
+            modified_at,
+            content_hash,
+            metadata_embedded,
         });
     }
     Ok(addresses)
@@ -353,8 +379,12 @@ fn read_segment_paths(dir: &Path) -> Result<Vec<(String, String)>> {
 }
 
 fn write_header(buffer: &mut Vec<u8>, magic: &[u8; 8]) -> Result<()> {
+    write_header_with_version(buffer, magic, 1)
+}
+
+fn write_header_with_version(buffer: &mut Vec<u8>, magic: &[u8; 8], version: u32) -> Result<()> {
     buffer.write_all(magic)?;
-    write_u32(buffer, 1)?;
+    write_u32(buffer, version)?;
     Ok(())
 }
 
@@ -389,6 +419,21 @@ fn read_stored_fields_header(cursor: &mut Cursor<&[u8]>) -> Result<StoredFieldsL
             "stored fields magic mismatch".into(),
         )),
     }
+}
+
+fn read_docs_header(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
+    let mut magic = [0u8; 8];
+    cursor.read_exact(&mut magic)?;
+    if &magic != DOCS_MAGIC {
+        return Err(AppError::InvalidIndex("segment file magic mismatch".into()));
+    }
+    let version = read_u32(cursor)?;
+    if !(DOCS_VERSION_V1..=DOCS_VERSION_V2).contains(&version) {
+        return Err(AppError::InvalidIndex(format!(
+            "unsupported docs file version: {version}"
+        )));
+    }
+    Ok(version)
 }
 
 fn write_u32(writer: &mut impl Write, value: u32) -> Result<()> {
@@ -430,9 +475,7 @@ pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Resul
         write_u32(
             writer,
             u32::try_from(compressed.len()).map_err(|_| {
-                AppError::ValueOutOfRange(
-                    "compressed byte slice length exceeds u32 range".into(),
-                )
+                AppError::ValueOutOfRange("compressed byte slice length exceeds u32 range".into())
             })?,
         )?;
         writer.write_all(&compressed)?;
@@ -454,8 +497,9 @@ fn maybe_compress_source_bytes(value: &[u8]) -> Result<Option<Vec<u8>>> {
         return Ok(None);
     }
 
-    let compressed = zstd_compress(value, STORED_SOURCE_ZSTD_LEVEL)
-        .map_err(|error| AppError::Protocol(format!("stored source zstd encode failed: {error}")))?;
+    let compressed = zstd_compress(value, STORED_SOURCE_ZSTD_LEVEL).map_err(|error| {
+        AppError::Protocol(format!("stored source zstd encode failed: {error}"))
+    })?;
     if compressed.len() + 16 >= value.len() {
         return Ok(None);
     }

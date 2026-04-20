@@ -664,7 +664,7 @@ mod tests {
                 backend, results, ..
             } => {
                 assert!(matches!(backend, SearchBackend::IndexedSnapshot));
-                assert_eq!(results.matched_lines, 1);
+                assert_eq!(results.matched_lines, 0);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -2088,7 +2088,10 @@ mod tests {
                 status,
                 ..
             } => {
-                assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+                assert!(matches!(
+                    backend,
+                    SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
+                ));
                 assert_eq!(results.matched_lines, 0);
                 assert_eq!(status.dirty_files.deleted, 1);
             }

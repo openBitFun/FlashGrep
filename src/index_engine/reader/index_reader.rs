@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use crate::{
+    config::QueryConfig,
     error::AppError,
     index_engine::{
         config::PostingTokenizerConfig,
@@ -8,9 +9,14 @@ use crate::{
         manifest::{Manifest, ManifestSnapshot, ManifestStore},
         query::{QueryPlan, QueryRequest},
         reader::state::{SharedSnapshotState, SnapshotData},
-        segment::{collect_document_posting_terms, SegmentStore},
+        segment::{collect_document_posting_terms, SegmentStore, SegmentVerifySource},
         types::DocKey,
         writer::IndexDocument,
+    },
+    planner::plan as build_regex_query_plan,
+    query_runtime::{
+        requires_multiline_verification, verify_candidate_sources_with_resolver, CountVerifyKind,
+        CountVerifyPlan, LinePrefilter, SearchVerifyPlan, VerifyCandidateSource,
     },
     search::{
         FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine, SearchResults,
@@ -18,6 +24,8 @@ use crate::{
     Result,
 };
 use regex::RegexBuilder;
+
+const SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD: usize = 15_000;
 
 #[derive(Debug, Clone, Default)]
 pub struct SearchProfile {
@@ -427,7 +435,7 @@ impl IndexSnapshotReader {
         let plan = QueryPlan::build(query.clone(), &self.tokenizer);
 
         if self.can_use_single_segment_candidate_fast_path() && query.filters.languages.is_empty() {
-            return self.search_single_segment_clean(query, &plan, &regex);
+            return self.search_single_segment_clean(query, &plan);
         }
 
         let mut results = empty_results();
@@ -733,7 +741,6 @@ impl IndexSnapshotReader {
         &self,
         query: &QueryRequest,
         plan: &QueryPlan,
-        regex: &regex::Regex,
     ) -> Result<SearchResults> {
         let segment_ref = self
             .snapshot
@@ -745,27 +752,177 @@ impl IndexSnapshotReader {
             })?;
         let reader = self.segment_store.open_segment(segment_ref.id.clone())?;
         let candidate_ids = reader.collect_candidates(plan, 0)?;
-        let mut results = empty_results();
+        let mut filtered_candidate_ids = Vec::with_capacity(candidate_ids.len());
+        let mut candidate_bytes = 0u64;
         for doc_id in candidate_ids {
-            let stored_doc = reader.stored_doc(doc_id)?;
-            if !matches_key_filters(stored_doc.key, query) {
+            let key = reader.doc_key(doc_id)?;
+            if !matches_key_filters(key, query) {
                 continue;
             }
-            results.candidate_docs += 1;
-            results.bytes_searched += stored_doc.source_bytes.len() as u64;
-            accumulate_search_bytes(
-                &stored_doc.key.logical_path,
-                &stored_doc.source_bytes,
-                query,
-                regex,
-                &mut results,
+            candidate_bytes += reader.doc_metadata(doc_id)?.size;
+            filtered_candidate_ids.push(doc_id);
+        }
+
+        if matches!(
+            query.mode,
+            crate::search::SearchMode::CountOnly | crate::search::SearchMode::CountMatches
+        ) {
+            let config = query_request_to_runtime_config(query);
+            let multiline_verifier = requires_multiline_verification(&config)?;
+            let query_plan = build_regex_query_plan(&config.regex_pattern)?;
+            let line_prefilter = (!multiline_verifier)
+                .then(|| LinePrefilter::compile(&config, &query_plan))
+                .flatten();
+            let verify_plan = CountVerifyPlan::compile(
+                &config,
+                multiline_verifier,
+                line_prefilter,
+                if matches!(query.mode, crate::search::SearchMode::CountOnly) {
+                    CountVerifyKind::Lines
+                } else {
+                    CountVerifyKind::Occurrences
+                },
             )?;
+            let counts = verify_plan.verify_candidate_counts_by_doc_with_sources(
+                &filtered_candidate_ids,
+                reader.doc_count(),
+                &|doc_id| {
+                    Ok(match reader.verify_source(doc_id)? {
+                        SegmentVerifySource::Path(path) => VerifyCandidateSource::Path(path),
+                        SegmentVerifySource::Bytes(bytes) => VerifyCandidateSource::Bytes(bytes),
+                    })
+                },
+            )?;
+            let searches_with_match = counts.len();
+            let matched_lines = counts.iter().map(|count| count.matched_lines).sum();
+            let matched_occurrences = counts.iter().map(|count| count.matched_occurrences).sum();
+            let (file_counts, file_match_counts) =
+                if matches!(query.mode, crate::search::SearchMode::CountOnly) {
+                    (
+                        counts
+                            .into_iter()
+                            .map(|count| {
+                                Ok(FileCount {
+                                    path: reader.doc_key(count.doc_id)?.logical_path.clone(),
+                                    matched_lines: count.matched_lines,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                        Vec::new(),
+                    )
+                } else {
+                    (
+                        Vec::new(),
+                        counts
+                            .into_iter()
+                            .map(|count| {
+                                Ok(FileMatchCount {
+                                    path: reader.doc_key(count.doc_id)?.logical_path.clone(),
+                                    matched_occurrences: count.matched_occurrences,
+                                })
+                            })
+                            .collect::<Result<Vec<_>>>()?,
+                    )
+                };
+            return Ok(SearchResults {
+                candidate_docs: filtered_candidate_ids.len(),
+                searches_with_match,
+                bytes_searched: candidate_bytes,
+                matched_lines,
+                matched_occurrences,
+                file_counts,
+                file_match_counts,
+                hits: Vec::new(),
+            });
+        }
+        let config = query_request_to_runtime_config(query);
+        let multiline_verifier = requires_multiline_verification(&config)?;
+        let query_plan = build_regex_query_plan(&config.regex_pattern)?;
+        let line_prefilter = (!multiline_verifier)
+            .then(|| LinePrefilter::compile(&config, &query_plan))
+            .flatten();
+        let line_prefilter_ref = line_prefilter.as_ref();
+        if query.top_k.is_none()
+            && filtered_candidate_ids.len() >= SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD
+        {
+            let matcher = crate::query_runtime::build_matcher(&config, multiline_verifier)?;
+            let outcomes = verify_candidate_sources_with_resolver(
+                &filtered_candidate_ids,
+                reader.doc_count(),
+                &|doc_id| {
+                    Ok(match reader.verify_source(doc_id)? {
+                        SegmentVerifySource::Path(path) => VerifyCandidateSource::Path(path),
+                        SegmentVerifySource::Bytes(bytes) => VerifyCandidateSource::Bytes(bytes),
+                    })
+                },
+                &matcher,
+                line_prefilter_ref,
+                multiline_verifier,
+                query.mode,
+                None,
+                None,
+                0,
+                0,
+            )?;
+            let mut results = empty_results();
+            results.candidate_docs = filtered_candidate_ids.len();
+            for task in outcomes {
+                results.bytes_searched += task.outcome.bytes_searched;
+                results.matched_lines += task.outcome.matched_lines;
+                results.matched_occurrences += task.outcome.matched_occurrences;
+                if !task.outcome.matches.is_empty() {
+                    results.searches_with_match += 1;
+                    let path = reader.doc_key(task.doc_id)?.logical_path.clone();
+                    results.hits.push(SearchHit {
+                        path,
+                        matches: task.outcome.matches,
+                        lines: task.outcome.lines,
+                    });
+                } else if task.outcome.matched_lines > 0 || task.outcome.matched_occurrences > 0 {
+                    results.searches_with_match += 1;
+                }
+            }
+            return Ok(results);
+        }
+
+        let verify_plan = SearchVerifyPlan::compile(&config, multiline_verifier, line_prefilter)?;
+        let mut runtime = verify_plan.create_runtime();
+        let mut results = empty_results();
+        for doc_id in filtered_candidate_ids {
+            results.candidate_docs += 1;
+            let outcome = runtime.verify_source(&match reader.verify_source(doc_id)? {
+                SegmentVerifySource::Path(path) => VerifyCandidateSource::Path(path),
+                SegmentVerifySource::Bytes(bytes) => VerifyCandidateSource::Bytes(bytes),
+            })?;
+            results.bytes_searched += outcome.bytes_searched;
+            results.matched_lines += outcome.matched_lines;
+            results.matched_occurrences += outcome.matched_occurrences;
+            if !outcome.matches.is_empty() {
+                results.searches_with_match += 1;
+                let path = reader.doc_key(doc_id)?.logical_path.clone();
+                results.hits.push(SearchHit {
+                    path,
+                    matches: outcome.matches,
+                    lines: outcome.lines,
+                });
+            } else if outcome.matched_lines > 0 || outcome.matched_occurrences > 0 {
+                results.searches_with_match += 1;
+            }
             if query.top_k.is_some_and(|limit| results.hits.len() >= limit) {
                 return Ok(results);
             }
         }
 
         Ok(results)
+    }
+}
+
+fn query_request_to_runtime_config(query: &QueryRequest) -> QueryConfig {
+    QueryConfig {
+        regex_pattern: query.pattern.clone(),
+        case_insensitive: query.case_insensitive,
+        search_mode: query.mode,
+        ..QueryConfig::default()
     }
 }
 

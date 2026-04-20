@@ -11,5 +11,5 @@ pub(crate) use count::{CountKind as CountVerifyKind, VerifyPlan as CountVerifyPl
 pub(crate) use query::LinePrefilter;
 pub(crate) use verify::{
     build_matcher, requires_multiline_verification, verify_candidate_sources_with_resolver,
-    VerifyCandidateSource,
+    VerifyCandidateSource, VerifyPlan as SearchVerifyPlan,
 };

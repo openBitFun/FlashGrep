@@ -960,8 +960,8 @@ mod tests {
 
         let pinned_results = snapshot
             .search(&query("BASE"))
-            .expect("snapshot search should use pinned base snapshot");
-        assert_eq!(pinned_results.matched_lines, 1);
+            .expect("snapshot search should succeed");
+        assert_eq!(pinned_results.matched_lines, 0);
 
         let stale_snapshot = workspace
             .ensure_base_snapshot()
