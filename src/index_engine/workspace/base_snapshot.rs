@@ -5,7 +5,7 @@ use std::{
     fs::{self, File},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
-    sync::{Arc, OnceLock},
+    sync::{mpsc, Arc, OnceLock},
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -44,6 +44,7 @@ const BASE_SNAPSHOT_BUILD_STALE_PREFIX: &str = "base-snapshot.stale-";
 const BASE_SNAPSHOT_PREPARE_CHUNK_DOCS: usize = 1024;
 const BASE_SNAPSHOT_PREPARE_PARALLEL_DOC_THRESHOLD: usize = 64;
 const BASE_SNAPSHOT_PREPARE_PARALLEL_BYTE_THRESHOLD: u64 = 8 * 1024 * 1024;
+const BASE_SNAPSHOT_PROGRESS_REPORT_DOCS: usize = 64;
 const BASE_SNAPSHOT_POSTING_BUCKET_COUNT: usize = 64;
 const BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES: usize = 128 * 1024 * 1024;
 const BASE_SNAPSHOT_SHARD_COUNT: usize = 16;
@@ -179,6 +180,18 @@ struct ShardBuildOutcome {
     doc_count: usize,
 }
 
+enum ShardBuildMessage {
+    Progress {
+        shard_id: u32,
+        processed_files: usize,
+    },
+    Finished {
+        shard_id: u32,
+        total_files: usize,
+        outcome: Result<ShardBuildOutcome>,
+    },
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 struct PostingRecord {
     term: u64,
@@ -273,8 +286,9 @@ impl BulkBaseSegmentWriter {
         let stored_len = stored_len
             .checked_sub(stored_offset)
             .ok_or_else(|| AppError::InvalidIndex("base source length underflow".into()))?;
-        let stored_len = u32::try_from(stored_len)
-            .map_err(|_| AppError::ValueOutOfRange("base source length exceeds u32 range".into()))?;
+        let stored_len = u32::try_from(stored_len).map_err(|_| {
+            AppError::ValueOutOfRange("base source length exceeds u32 range".into())
+        })?;
         self.base_sources_len = self
             .base_sources_len
             .checked_add(u64::from(stored_len))
@@ -676,6 +690,7 @@ impl WorkspaceBaseSnapshotIndex {
         repo_id: &RepoId,
         snapshot_key: &str,
         head_commit: Option<&str>,
+        on_progress: &mut impl FnMut(IndexProgress),
         should_cancel: &mut impl FnMut() -> bool,
     ) -> Result<Self> {
         cleanup_unpublished_base_snapshot_builds(build_config)?;
@@ -702,6 +717,7 @@ impl WorkspaceBaseSnapshotIndex {
                         &build_config.repo_path,
                     ),
                     previous_snapshot.as_ref(),
+                    on_progress,
                 )?
             } else {
                 let files = build_head_snapshot_input_files(
@@ -718,6 +734,7 @@ impl WorkspaceBaseSnapshotIndex {
                     &build_config.repo_path,
                     files,
                     previous_snapshot.as_ref(),
+                    on_progress,
                 )?
             }
         } else {
@@ -740,6 +757,7 @@ impl WorkspaceBaseSnapshotIndex {
                 &build_config.repo_path,
                 base_snapshot_input_files_from_repository_files(&files, &build_config.repo_path),
                 previous_snapshot.as_ref(),
+                on_progress,
             )?
         };
 
@@ -757,7 +775,21 @@ impl WorkspaceBaseSnapshotIndex {
                 shards,
             },
         )?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Writing,
+            "Publishing base snapshot",
+            2,
+            Some(3),
+        );
         publish_staged_base_snapshot(build_config, &staging_root)?;
+        report_progress(
+            on_progress,
+            IndexProgressPhase::Writing,
+            "Published base snapshot",
+            3,
+            Some(3),
+        );
         Self::open_read_only(build_config)
     }
 
@@ -906,6 +938,7 @@ impl WorkspaceBaseSnapshotIndex {
             repo_id,
             &resolved.snapshot_key,
             resolved.head_commit.as_deref(),
+            &mut on_progress,
             &mut should_cancel,
         )?;
         let metadata = Self::read_snapshot_metadata(&build_config)?
@@ -971,23 +1004,109 @@ fn build_sharded_base_snapshot(
     repo_root: &Path,
     files: Vec<BaseSnapshotInputFile>,
     previous_snapshot: Option<&ReusableBaseSnapshotShards>,
+    on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<(usize, Vec<WorkspaceBaseSnapshotShardMetadata>)> {
     fs::create_dir_all(index_root)?;
     let _ = FileDeleteStore::open(index_root)?;
     let shard_builds = partition_base_snapshot_shards(files);
-    let outcomes = shard_builds
-        .into_par_iter()
-        .map(|shard| {
-            build_or_reuse_base_snapshot_shard(
-                index_root,
-                build_config,
-                repo_id,
-                repo_root,
-                shard,
-                previous_snapshot,
+    let shard_total = shard_builds.len();
+    let total_files = shard_builds.iter().map(|shard| shard.files.len()).sum::<usize>();
+    let tokenizing_progress_total = total_files.max(1);
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Tokenizing,
+        if total_files == 0 {
+            "No base snapshot shards to build".into()
+        } else {
+            format!(
+                "Tokenizing {total_files} base snapshot file(s) across {shard_total} shard(s)"
             )
-        })
-        .collect::<Vec<_>>();
+        },
+        usize::from(total_files == 0),
+        Some(tokenizing_progress_total),
+    );
+    let mut outcomes = Vec::with_capacity(shard_total);
+    if shard_total > 0 {
+        let (tx, rx) = mpsc::channel();
+        let mut shard_processed = HashMap::<u32, usize>::new();
+        let mut completed_shards = 0usize;
+        std::thread::scope(|scope| {
+            for shard in shard_builds {
+                let shard_id = shard.shard_id;
+                let total_files = shard.files.len();
+                let tx = tx.clone();
+                scope.spawn(move || {
+                    let progress_tx = tx.clone();
+                    let report_shard_progress = move |processed_files| {
+                        let _ = progress_tx.send(ShardBuildMessage::Progress {
+                            shard_id,
+                            processed_files,
+                        });
+                    };
+                    let outcome = build_or_reuse_base_snapshot_shard(
+                        index_root,
+                        build_config,
+                        repo_id,
+                        repo_root,
+                        shard,
+                        previous_snapshot,
+                        &report_shard_progress,
+                    );
+                    let _ = tx.send(ShardBuildMessage::Finished {
+                        shard_id,
+                        total_files,
+                        outcome,
+                    });
+                });
+            }
+            drop(tx);
+
+            while completed_shards < shard_total {
+                match rx.recv().expect("base snapshot shard worker should send outcome") {
+                    ShardBuildMessage::Progress {
+                        shard_id,
+                        processed_files,
+                    } => {
+                        let current = shard_processed.entry(shard_id).or_default();
+                        if processed_files <= *current {
+                            continue;
+                        }
+                        *current = processed_files;
+                        let global_processed = shard_processed.values().sum::<usize>();
+                        report_progress(
+                            on_progress,
+                            IndexProgressPhase::Tokenizing,
+                            format!(
+                                "Tokenized {global_processed} of {total_files} base snapshot file(s) ({completed_shards} of {shard_total} shards complete)"
+                            ),
+                            global_processed,
+                            Some(tokenizing_progress_total),
+                        );
+                    }
+                    ShardBuildMessage::Finished {
+                        shard_id,
+                        total_files: shard_total_files,
+                        outcome,
+                    } => {
+                        completed_shards += 1;
+                        let current = shard_processed.entry(shard_id).or_default();
+                        *current = (*current).max(shard_total_files);
+                        let global_processed = shard_processed.values().sum::<usize>();
+                        outcomes.push(outcome);
+                        report_progress(
+                            on_progress,
+                            IndexProgressPhase::Tokenizing,
+                            format!(
+                                "Tokenized {global_processed} of {total_files} base snapshot file(s) ({completed_shards} of {shard_total} shards complete)"
+                            ),
+                            global_processed,
+                            Some(tokenizing_progress_total),
+                        );
+                    }
+                }
+            }
+        });
+    }
 
     let mut active_segments = Vec::new();
     let mut shard_metadata = Vec::new();
@@ -1004,6 +1123,16 @@ fn build_sharded_base_snapshot(
     }
 
     active_segments.sort_unstable_by(|left, right| left.id.0.cmp(&right.id.0));
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Writing,
+        format!(
+            "Writing base snapshot shard manifest for {} segment(s)",
+            active_segments.len()
+        ),
+        0,
+        Some(3),
+    );
     let committed_seq_no = if active_segments.is_empty() { 0 } else { 1 };
     let manifest_store = FileManifestStore::open(index_root)?;
     manifest_store.publish(&Manifest {
@@ -1017,6 +1146,13 @@ fn build_sharded_base_snapshot(
         active_segments,
         active_delete_segments: Vec::new(),
     })?;
+    report_progress(
+        on_progress,
+        IndexProgressPhase::Writing,
+        "Writing base snapshot metadata",
+        1,
+        Some(3),
+    );
 
     shard_metadata.sort_unstable_by_key(|shard| shard.shard_id);
     Ok((doc_count, shard_metadata))
@@ -1029,6 +1165,7 @@ fn build_or_reuse_base_snapshot_shard(
     repo_root: &Path,
     shard: BaseSnapshotShardBuild,
     previous_snapshot: Option<&ReusableBaseSnapshotShards>,
+    on_progress: &(impl Fn(usize) + Sync),
 ) -> Result<ShardBuildOutcome> {
     if let Some(reused) = maybe_link_reusable_base_snapshot_shard(
         index_root,
@@ -1036,6 +1173,7 @@ fn build_or_reuse_base_snapshot_shard(
         &shard.fingerprint,
         previous_snapshot,
     )? {
+        on_progress(shard.files.len());
         return Ok(ShardBuildOutcome {
             segment_ref: Some(reused.segment_ref.clone()),
             shard_metadata: Some(WorkspaceBaseSnapshotShardMetadata {
@@ -1057,6 +1195,7 @@ fn build_or_reuse_base_snapshot_shard(
         repo_root,
         &shard.files,
         segment_id,
+        on_progress,
     )?
     else {
         return Ok(ShardBuildOutcome {
@@ -1125,7 +1264,9 @@ fn maybe_link_reusable_base_snapshot_shard(
     }))
 }
 
-fn partition_base_snapshot_shards(files: Vec<BaseSnapshotInputFile>) -> Vec<BaseSnapshotShardBuild> {
+fn partition_base_snapshot_shards(
+    files: Vec<BaseSnapshotInputFile>,
+) -> Vec<BaseSnapshotShardBuild> {
     let mut shards = BTreeMap::<u32, Vec<BaseSnapshotInputFile>>::new();
     for file in files {
         shards
@@ -1221,23 +1362,51 @@ fn build_base_snapshot_segment(
     repo_root: &Path,
     files: &[BaseSnapshotInputFile],
     segment_id: SegmentId,
+    on_progress: &(impl Fn(usize) + Sync),
 ) -> Result<Option<SegmentRef>> {
     let mut builder = BulkBaseSegmentWriter::new(
         index_root,
         segment_id,
         PostingTokenizerConfig::from(build_config),
     )?;
+    let processed_files = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
     for chunk in files.chunks(BASE_SNAPSHOT_PREPARE_CHUNK_DOCS) {
         let prepared = if should_parallel_prepare_base_documents(chunk) {
+            let processed_files = Arc::clone(&processed_files);
             chunk
                 .par_iter()
-                .map(|file| prepare_base_document(repo_id, repo_root, file, &builder.tokenizer))
+                .map(|file| {
+                    let prepared =
+                        prepare_base_document(repo_id, repo_root, file, &builder.tokenizer);
+                    let processed = processed_files
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .saturating_add(1);
+                    if processed % BASE_SNAPSHOT_PROGRESS_REPORT_DOCS == 0
+                        || processed == files.len()
+                    {
+                        on_progress(processed);
+                    }
+                    prepared
+                })
                 .collect::<Vec<_>>()
         } else {
+            let processed_files = Arc::clone(&processed_files);
             chunk
                 .iter()
-                .map(|file| prepare_base_document(repo_id, repo_root, file, &builder.tokenizer))
+                .map(|file| {
+                    let prepared =
+                        prepare_base_document(repo_id, repo_root, file, &builder.tokenizer);
+                    let processed = processed_files
+                        .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                        .saturating_add(1);
+                    if processed % BASE_SNAPSHOT_PROGRESS_REPORT_DOCS == 0
+                        || processed == files.len()
+                    {
+                        on_progress(processed);
+                    }
+                    prepared
+                })
                 .collect::<Vec<_>>()
         };
 
@@ -1944,6 +2113,7 @@ mod tests {
         read_postings_file, read_term_dict_file, PostingsStreamWriter, TermDictStreamWriter,
     };
     use crate::index_engine::RepoId;
+    use crate::progress::{IndexProgress, IndexProgressPhase};
 
     #[test]
     fn posting_buckets_keep_postings_in_memory_below_threshold() {
@@ -2162,6 +2332,7 @@ mod tests {
             &repo,
             collect_base_input_files(&build_config),
             Some(&previous_snapshot),
+            &mut |_| {},
         )
         .expect("staged build should succeed");
         assert!(doc_count > 0);
@@ -2211,6 +2382,74 @@ mod tests {
         assert!(
             staged_links >= 2,
             "expected hard-linked staged segment file"
+        );
+    }
+
+    #[test]
+    fn sharded_base_snapshot_reports_incremental_tokenizing_progress() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = temp.path().join("repo");
+        let storage = temp.path().join("index");
+        std::fs::create_dir_all(&repo).expect("repo dir should succeed");
+
+        let target_shard_id = 0;
+        let mut file_count = 0usize;
+        for index in 0..10_000 {
+            let file_name = format!("file-{index:05}.txt");
+            if super::base_snapshot_shard_id(&file_name) != target_shard_id {
+                continue;
+            }
+            std::fs::write(
+                repo.join(&file_name),
+                format!("TOKEN_{index:05}\n"),
+            )
+            .expect("write should succeed");
+            file_count += 1;
+            if file_count >= super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS + 32 {
+                break;
+            }
+        }
+        assert!(
+            file_count > super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS,
+            "expected enough files in one shard to trigger incremental progress"
+        );
+
+        let build_config = build_config(&repo, &storage);
+        let repo_id = RepoId("repo".into());
+        let staging_root = temp.path().join("staging");
+        let mut events = Vec::<IndexProgress>::new();
+        let (_doc_count, shard_metadata) = super::build_sharded_base_snapshot(
+            &staging_root,
+            &build_config,
+            &repo_id,
+            &repo,
+            collect_base_input_files(&build_config),
+            None,
+            &mut |event| events.push(event),
+        )
+        .expect("staged build should succeed");
+
+        let tokenizing_events = events
+            .iter()
+            .filter(|event| event.phase == IndexProgressPhase::Tokenizing)
+            .cloned()
+            .collect::<Vec<_>>();
+        assert!(
+            !tokenizing_events.is_empty(),
+            "expected tokenizing progress events"
+        );
+        assert_eq!(shard_metadata.len(), 1);
+        assert!(tokenizing_events
+            .iter()
+            .all(|event| event.total == Some(file_count)));
+        assert_eq!(tokenizing_events.first().map(|event| event.processed), Some(0));
+        assert!(tokenizing_events.iter().any(|event| {
+            event.processed >= super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS
+                && event.processed < file_count
+        }));
+        assert_eq!(
+            tokenizing_events.last().map(|event| event.processed),
+            Some(file_count)
         );
     }
 }
