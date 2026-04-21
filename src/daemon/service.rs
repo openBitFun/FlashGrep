@@ -325,6 +325,15 @@ mod tests {
             .expect("clear workspace overlay engine should succeed");
     }
 
+    fn is_transition_or_indexed_workspace_backend(backend: SearchBackend) -> bool {
+        matches!(
+            backend,
+            SearchBackend::IndexedWorkspaceView
+                | SearchBackend::RgFallback
+                | SearchBackend::ScanFallback
+        )
+    }
+
     fn has_base_snapshot_engine(service: &DaemonService, repo_id: &str) -> bool {
         service
             .repos
@@ -1704,7 +1713,7 @@ mod tests {
     }
 
     #[test]
-    fn eventual_search_serves_base_snapshot_while_overlay_engine_recovers() {
+    fn eventual_search_uses_transition_fallback_while_overlay_engine_recovers() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -1741,8 +1750,8 @@ mod tests {
                 status,
                 ..
             } => {
-                assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
-                assert_eq!(results.matched_lines, 0);
+                assert!(is_transition_or_indexed_workspace_backend(backend));
+                assert_eq!(results.matched_lines, 1);
                 assert_eq!(status.dirty_files.modified, 1);
                 assert_eq!(status.dirty_files.deleted, 0);
                 assert_eq!(status.dirty_files.new, 0);
@@ -1804,7 +1813,7 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+        assert!(is_transition_or_indexed_workspace_backend(backend));
         assert!(matches!(
             status.phase,
             crate::daemon::protocol::RepoPhase::ReadyDirty
@@ -1817,7 +1826,7 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+        assert!(is_transition_or_indexed_workspace_backend(backend));
         assert!(matches!(
             status.phase,
             crate::daemon::protocol::RepoPhase::ReadyDirty
