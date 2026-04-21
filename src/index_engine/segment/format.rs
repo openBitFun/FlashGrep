@@ -614,9 +614,7 @@ pub(crate) fn read_stored_document_view(
     })
 }
 
-pub(crate) fn read_stored_source_bytes_view(
-    slice: &[u8],
-) -> Result<StoredSourceBytes<'_>> {
+pub(crate) fn read_stored_source_bytes_view(slice: &[u8]) -> Result<StoredSourceBytes<'_>> {
     let mut reader = StoredSliceReader::new(slice);
     let encoding = reader.read_bytes(1)?[0];
     let source_len = reader.read_u32()?;
@@ -760,7 +758,9 @@ pub(crate) fn encoded_source_bytes_len(value: &[u8]) -> Result<u64> {
         .checked_add(4)
         .and_then(|len| len.checked_add(4))
         .and_then(|len| len.checked_add(payload_len))
-        .ok_or_else(|| AppError::ValueOutOfRange("stored source length exceeds usize range".into()))?;
+        .ok_or_else(|| {
+            AppError::ValueOutOfRange("stored source length exceeds usize range".into())
+        })?;
     u64::try_from(total)
         .map_err(|_| AppError::ValueOutOfRange("stored source length exceeds u64 range".into()))
 }

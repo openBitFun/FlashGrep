@@ -55,6 +55,18 @@ impl WorkspaceOverlayWritePlan {
             kind: WorkspaceOverlayWritePlanKind::ApplyDelta { batch },
         }
     }
+
+    pub(super) fn dirty_path_count(&self) -> usize {
+        self.dirty_paths.modified.len()
+            + self.dirty_paths.deleted.len()
+            + self.dirty_paths.new.len()
+    }
+
+    pub(super) fn build_path_count(&self) -> usize {
+        self.build_paths.modified.len()
+            + self.build_paths.deleted.len()
+            + self.build_paths.new.len()
+    }
 }
 
 impl RepoRuntime {

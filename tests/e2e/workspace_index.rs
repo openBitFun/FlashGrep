@@ -79,7 +79,23 @@ fn build_base_snapshot_with_progress_emits_build_phases() {
         .any(|event| event.phase == IndexProgressPhase::Scanning));
     assert!(events
         .iter()
+        .any(|event| event.phase == IndexProgressPhase::Tokenizing));
+    assert!(events
+        .iter()
+        .any(|event| event.phase == IndexProgressPhase::Writing));
+    assert!(events
+        .iter()
         .any(|event| event.phase == IndexProgressPhase::Finalizing));
+    assert!(events.iter().all(|event| !event.message.trim().is_empty()));
+    assert!(events.iter().all(|event| {
+        event
+            .total
+            .map(|total| total > 0 && event.processed <= total)
+            .unwrap_or(true)
+    }));
+    assert!(events.iter().any(|event| {
+        event.phase == IndexProgressPhase::Writing && event.processed == 3 && event.total == Some(3)
+    }));
     assert_eq!(
         events.last().map(|event| event.phase),
         Some(IndexProgressPhase::Finalizing)

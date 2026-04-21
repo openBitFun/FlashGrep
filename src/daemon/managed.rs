@@ -253,11 +253,11 @@ impl ManagedDaemonClient {
         if state_file.exists() {
             fs::remove_file(state_file)?;
         }
-        let program = self
-            .daemon_program
-            .clone()
-            .or_else(|| std::env::var_os("CODGREP_DAEMON_BIN"))
-            .unwrap_or_else(|| OsString::from("cg"));
+        let program = select_daemon_program(
+            self.daemon_program.clone(),
+            std::env::var_os("CODGREP_DAEMON_BIN"),
+            std::env::current_exe().ok(),
+        );
 
         let mut command = Command::new(program);
         command
@@ -272,6 +272,17 @@ impl ManagedDaemonClient {
         command.spawn()?;
         Ok(())
     }
+}
+
+fn select_daemon_program(
+    explicit_program: Option<OsString>,
+    env_program: Option<OsString>,
+    current_exe: Option<PathBuf>,
+) -> OsString {
+    explicit_program
+        .or(env_program)
+        .or_else(|| current_exe.map(PathBuf::into_os_string))
+        .unwrap_or_else(|| OsString::from("cg"))
 }
 
 struct StartupLockGuard {
@@ -336,4 +347,38 @@ fn build_config_from_open_params(params: &OpenRepoParams) -> BuildConfig {
 fn daemon_state_file_path_from_build_config(build_config: BuildConfig) -> Result<PathBuf> {
     let build_config = build_config.normalized()?;
     Ok(build_config.storage_root.join(DEFAULT_DAEMON_STATE_FILE))
+}
+
+#[cfg(test)]
+mod tests {
+    use std::ffi::OsString;
+    use std::path::PathBuf;
+
+    use super::select_daemon_program;
+
+    #[test]
+    fn select_daemon_program_prefers_explicit_program() {
+        let selected = select_daemon_program(
+            Some(OsString::from("/tmp/explicit-cg")),
+            Some(OsString::from("/tmp/env-cg")),
+            Some(PathBuf::from("/tmp/current-cg")),
+        );
+        assert_eq!(selected, OsString::from("/tmp/explicit-cg"));
+    }
+
+    #[test]
+    fn select_daemon_program_falls_back_to_env_program() {
+        let selected = select_daemon_program(
+            None,
+            Some(OsString::from("/tmp/env-cg")),
+            Some(PathBuf::from("/tmp/current-cg")),
+        );
+        assert_eq!(selected, OsString::from("/tmp/env-cg"));
+    }
+
+    #[test]
+    fn select_daemon_program_falls_back_to_current_exe() {
+        let selected = select_daemon_program(None, None, Some(PathBuf::from("/tmp/current-cg")));
+        assert_eq!(selected, OsString::from("/tmp/current-cg"));
+    }
 }

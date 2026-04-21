@@ -33,6 +33,10 @@ impl RepoRuntime {
         SearchActivityGuard { runtime: self }
     }
 
+    pub(super) fn active_search_count(&self) -> u64 {
+        self.active_searches.load(Ordering::Relaxed)
+    }
+
     pub(super) fn refresh(&self, force: bool) -> Result<RepoStatus> {
         if force || self.workspace_probe_pending() {
             self.refresh_workspace_overlay()?;

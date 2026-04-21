@@ -741,7 +741,7 @@ mod tests {
                 backend, results, ..
             } => {
                 assert!(matches!(backend, SearchBackend::IndexedSnapshot));
-                assert_eq!(results.matched_lines, 0);
+                assert_eq!(results.matched_lines, 1);
             }
             other => panic!("unexpected response: {other:?}"),
         }
@@ -818,7 +818,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_delta_uses_overlay_snapshot_truth_when_published_overlay_paths_cache_is_empty() {
+    fn probe_delta_uses_overlay_snapshot_truth_when_published_overlay_paths_cache_is_empty() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -1662,7 +1662,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_marks_dirty_paths_for_eventual_workspace_search() {
+    fn probe_marks_dirty_paths_for_eventual_workspace_search() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -1770,7 +1770,7 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+        assert!(is_transition_or_indexed_workspace_backend(backend));
         assert_exact_dirty_stats(&status, 1, 0, 0);
     }
 
@@ -2150,7 +2150,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_reconciles_batched_tracked_file_updates() {
+    fn probe_reconciles_batched_tracked_file_updates() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2197,7 +2197,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_tracks_new_text_files() {
+    fn probe_tracks_new_text_files() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2230,7 +2230,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_tracks_new_text_files_inside_new_directory_without_probe() {
+    fn probe_tracks_new_text_files_inside_new_directory_without_extra_probe() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2278,7 +2278,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_tracks_deleted_files() {
+    fn probe_tracks_deleted_files() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2371,15 +2371,15 @@ mod tests {
             other => panic!("unexpected response: {other:?}"),
         };
 
-        let phrase = "VersionTuple watcher validation content gamma";
+        let phrase = "VersionTuple probe validation content gamma";
         fs::write(
             &cpp,
-            "/// VersionTuple baseline line.\n/// VersionTuple watcher edit baseline.\nconst char *Name = \"VersionTuple\";\n",
+            "/// VersionTuple baseline line.\n/// VersionTuple probe edit baseline.\nconst char *Name = \"VersionTuple\";\n",
         )
         .expect("write should succeed");
         fs::write(
             &header,
-            "class VersionTuple {\n  /// VersionTuple watcher validation content gamma.\n  /// VersionTuple baseline line.\n};\n",
+            "class VersionTuple {\n  /// VersionTuple probe validation content gamma.\n  /// VersionTuple baseline line.\n};\n",
         )
         .expect("write should succeed");
 
@@ -2431,7 +2431,7 @@ mod tests {
             .flat_map(|hit| hit.matches.iter())
             .any(|matched| matched
                 .snippet
-                .contains("VersionTuple watcher validation content gamma")));
+                .contains("VersionTuple probe validation content gamma")));
     }
 
     #[test]
@@ -2493,10 +2493,7 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        assert!(matches!(
-            backend,
-            SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
-        ));
+        assert!(is_transition_or_indexed_workspace_backend(backend));
     }
 
     #[test]
@@ -2613,10 +2610,7 @@ mod tests {
                 ConsistencyMode::WorkspaceEventual,
                 1,
             );
-            assert!(matches!(
-                backend,
-                SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
-            ));
+            assert!(is_transition_or_indexed_workspace_backend(backend));
         }
     }
 
@@ -2822,7 +2816,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_removes_overlay_only_new_file_without_refresh() {
+    fn probe_removes_overlay_only_new_file_without_refresh() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2842,15 +2836,15 @@ mod tests {
         let transient = nested.join("transient.rs");
         fs::write(
             &transient,
-            "const VALUE: &str = \"WATCHER_DELETE_TOKEN_20260410\";\n",
+            "const VALUE: &str = \"PROBE_DELETE_TOKEN_20260410\";\n",
         )
         .expect("transient write should succeed");
-        wait_for_workspace_overlay_match_count(&repo_path, "WATCHER_DELETE_TOKEN_20260410", 1);
+        wait_for_workspace_overlay_match_count(&repo_path, "PROBE_DELETE_TOKEN_20260410", 1);
 
         let (backend, status) = wait_for_search_count(
             &service,
             &repo_id,
-            "WATCHER_DELETE_TOKEN_20260410",
+            "PROBE_DELETE_TOKEN_20260410",
             ConsistencyMode::WorkspaceEventual,
             1,
         );
@@ -2862,12 +2856,12 @@ mod tests {
 
         fs::remove_file(&transient).expect("transient delete should succeed");
         fs::remove_dir(&nested).expect("nested dir delete should succeed");
-        wait_for_workspace_overlay_match_count(&repo_path, "WATCHER_DELETE_TOKEN_20260410", 0);
+        wait_for_workspace_overlay_match_count(&repo_path, "PROBE_DELETE_TOKEN_20260410", 0);
 
         let (backend, status) = wait_for_search_count(
             &service,
             &repo_id,
-            "WATCHER_DELETE_TOKEN_20260410",
+            "PROBE_DELETE_TOKEN_20260410",
             ConsistencyMode::WorkspaceEventual,
             0,
         );
@@ -2896,7 +2890,7 @@ mod tests {
             match search_repo(
                 &service,
                 &repo_id,
-                "WATCHER_DELETE_TOKEN_20260410",
+                "PROBE_DELETE_TOKEN_20260410",
                 ConsistencyMode::WorkspaceEventual,
             ) {
                 Response::SearchCompleted { results, .. } => {
@@ -2908,7 +2902,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_clears_restored_tracked_file_without_refresh() {
+    fn probe_clears_restored_tracked_file_without_refresh() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -2923,15 +2917,15 @@ mod tests {
 
         fs::write(
             &tracked,
-            "const VALUE: &str = \"WATCHER_RESTORE_TOKEN_20260416\";\n",
+            "const VALUE: &str = \"PROBE_RESTORE_TOKEN_20260416\";\n",
         )
         .expect("tracked rewrite should succeed");
-        wait_for_workspace_overlay_match_count(&repo_path, "WATCHER_RESTORE_TOKEN_20260416", 1);
+        wait_for_workspace_overlay_match_count(&repo_path, "PROBE_RESTORE_TOKEN_20260416", 1);
 
         let (backend, status) = wait_for_search_count(
             &service,
             &repo_id,
-            "WATCHER_RESTORE_TOKEN_20260416",
+            "PROBE_RESTORE_TOKEN_20260416",
             ConsistencyMode::WorkspaceEventual,
             1,
         );
@@ -2943,7 +2937,7 @@ mod tests {
 
         fs::write(&tracked, "const VALUE: &str = \"BASE\";\n")
             .expect("tracked restore should succeed");
-        wait_for_workspace_overlay_match_count(&repo_path, "WATCHER_RESTORE_TOKEN_20260416", 0);
+        wait_for_workspace_overlay_match_count(&repo_path, "PROBE_RESTORE_TOKEN_20260416", 0);
         let repo_status = get_status(&service, &repo_id);
         let build_config = crate::BuildConfig {
             repo_path: repo_path.clone(),
@@ -2981,7 +2975,7 @@ mod tests {
         let (backend, status) = wait_for_search_count(
             &service,
             &repo_id,
-            "WATCHER_RESTORE_TOKEN_20260416",
+            "PROBE_RESTORE_TOKEN_20260416",
             ConsistencyMode::WorkspaceEventual,
             0,
         );
@@ -3008,7 +3002,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_keeps_indexed_reads_while_directory_events_wait_for_reconcile() {
+    fn probe_keeps_indexed_reads_while_directory_events_wait_for_reconcile() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -3081,7 +3075,7 @@ mod tests {
     }
 
     #[test]
-    fn watcher_updates_invalidate_glob_cache() {
+    fn probe_updates_invalidate_glob_cache() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -3140,7 +3134,7 @@ mod tests {
 
     #[test]
     #[ignore = "known gap: tracked directory restore can temporarily lose stable query results without refresh"]
-    fn watcher_reconciles_tracked_directory_delete_and_restore_without_refresh() {
+    fn probe_reconciles_tracked_directory_delete_and_restore_without_refresh() {
         let _serial = daemon_test_serial();
         let service = DaemonService::new();
         let temp = tempdir().expect("temp dir should succeed");
@@ -3354,6 +3348,167 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             0,
         );
+    }
+
+    #[test]
+    fn background_base_rebuild_after_branch_switch_keeps_search_available() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        let tracked = repo_path.join("tracked.rs");
+        let old_dir = repo_path.join("old");
+        fs::create_dir_all(&old_dir).expect("old dir should succeed");
+        fs::write(&tracked, "const NAME: &str = \"MAIN_TOKEN\";\n")
+            .expect("tracked write should succeed");
+        fs::write(
+            old_dir.join("legacy.rs"),
+            "const NAME: &str = \"LEGACY_BRANCH_TOKEN\";\n",
+        )
+        .expect("legacy write should succeed");
+
+        init_git_repo(&repo_path);
+        git_commit_all(&repo_path, "base");
+
+        let storage_root = temp.path().join("storage");
+        let repo_id = match service
+            .handle_request_only(Request::OpenRepo {
+                params: OpenRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: Some(storage_root),
+                    config: RepoConfig::default(),
+                    refresh: crate::daemon::protocol::RefreshPolicyConfig {
+                        rebuild_dirty_threshold: 1,
+                        ..crate::daemon::protocol::RefreshPolicyConfig::default()
+                    },
+                },
+            })
+            .expect("open repo should succeed")
+        {
+            Response::RepoOpened { repo_id, .. } => repo_id,
+            other => panic!("unexpected response: {other:?}"),
+        };
+        build_repo(&service, &repo_id);
+        let built = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+                && status.last_rebuild_unix_secs.is_some()
+        });
+        let _initial_rebuild_at = built
+            .last_rebuild_unix_secs
+            .expect("initial rebuild timestamp should exist");
+
+        git_checkout_new_branch(&repo_path, "feature");
+        fs::remove_dir_all(&old_dir).expect("old dir delete should succeed");
+        fs::write(&tracked, "const NAME: &str = \"FEATURE_TOKEN\";\n")
+            .expect("tracked rewrite should succeed");
+        fs::create_dir_all(repo_path.join("feature")).expect("feature dir should succeed");
+        fs::write(
+            repo_path.join("feature/new.rs"),
+            "const NAME: &str = \"FEATURE_DIR_TOKEN\";\n",
+        )
+        .expect("feature file write should succeed");
+        git_commit_all(&repo_path, "feature");
+        git_checkout(&repo_path, "feature");
+
+        let refreshed = refresh_repo(&service, &repo_id, true);
+        assert!(matches!(
+            refreshed.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
+
+        let dirty = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+                && status.rebuild_recommended
+        });
+        assert!(dirty.probe_healthy);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(20);
+        let mut saw_background_rebuild = false;
+        let settled = loop {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "timed out waiting for background base rebuild"
+            );
+            let status = get_status(&service, &repo_id);
+            if status.active_task_id.is_some() {
+                saw_background_rebuild = true;
+                assert!(matches!(
+                    status.phase,
+                    crate::daemon::protocol::RepoPhase::ReadyDirty
+                        | crate::daemon::protocol::RepoPhase::ReadyClean
+                ));
+
+                match search_repo(
+                    &service,
+                    &repo_id,
+                    "MAIN_TOKEN",
+                    ConsistencyMode::SnapshotOnly,
+                ) {
+                    Response::SearchCompleted { backend, .. } => {
+                        assert!(matches!(backend, SearchBackend::IndexedSnapshot));
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
+                match search_repo(
+                    &service,
+                    &repo_id,
+                    "FEATURE_TOKEN",
+                    ConsistencyMode::SnapshotOnly,
+                ) {
+                    Response::SearchCompleted { backend, .. } => {
+                        assert!(matches!(backend, SearchBackend::IndexedSnapshot));
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
+                match search_repo(
+                    &service,
+                    &repo_id,
+                    "FEATURE_TOKEN",
+                    ConsistencyMode::WorkspaceEventual,
+                ) {
+                    Response::SearchCompleted { results, .. } => {
+                        assert_eq!(results.matched_lines, 1);
+                    }
+                    other => panic!("unexpected response: {other:?}"),
+                }
+            }
+
+            if status.active_task_id.is_none()
+                && matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+                && !status.rebuild_recommended
+                && status.dirty_files.modified == 0
+                && status.dirty_files.deleted == 0
+                && status.dirty_files.new == 0
+            {
+                break status;
+            }
+            thread::sleep(Duration::from_millis(50));
+        };
+
+        assert!(
+            saw_background_rebuild,
+            "expected auto background rebuild task"
+        );
+        assert!(settled.probe_healthy);
+        assert!(!settled.rebuild_recommended);
+        assert_exact_dirty_stats(&settled, 0, 0, 0);
+
+        let (backend, _) = assert_search_count_now(
+            &service,
+            &repo_id,
+            "FEATURE_TOKEN",
+            ConsistencyMode::SnapshotOnly,
+            1,
+        );
+        assert!(matches!(backend, SearchBackend::IndexedSnapshot));
+        let (backend, _) = assert_search_count_now(
+            &service,
+            &repo_id,
+            "MAIN_TOKEN",
+            ConsistencyMode::SnapshotOnly,
+            0,
+        );
+        assert!(matches!(backend, SearchBackend::IndexedSnapshot));
     }
 
     #[test]

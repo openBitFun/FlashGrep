@@ -15,9 +15,8 @@ use crate::{
         query::{QueryFilters, QueryPlan},
         segment::{
             advise_mmap_sequential, read_index_document_from_stored_slice,
-            read_stored_document_view, read_stored_fields_layout,
-            read_stored_source_bytes_view, FileSegmentDocTable, PostingLists, SegmentDocRecord,
-            StoredFieldsLayout,
+            read_stored_document_view, read_stored_fields_layout, read_stored_source_bytes_view,
+            FileSegmentDocTable, PostingLists, SegmentDocRecord, StoredFieldsLayout,
         },
         types::{DocKey, SegmentDocId},
         writer::IndexDocument,

@@ -184,7 +184,11 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         apply_workspace_dirty_status(&mut state, self.rebuild_dirty_threshold, dirty_stats);
+        let rebuild_recommended = state.rebuild_recommended;
         drop(state);
+        if rebuild_recommended {
+            self.schedule_background_base_rebuild();
+        }
         self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
     }

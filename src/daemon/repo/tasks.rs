@@ -127,6 +127,23 @@ impl RepoRuntime {
         task_id: String,
         kind: RepoTaskKind,
     ) -> Result<RepoTaskStatus> {
+        self.start_task_with_repo_phase(task_id, kind, true)
+    }
+
+    pub(super) fn start_background_task(
+        self: &Arc<Self>,
+        task_id: String,
+        kind: RepoTaskKind,
+    ) -> Result<RepoTaskStatus> {
+        self.start_task_with_repo_phase(task_id, kind, false)
+    }
+
+    fn start_task_with_repo_phase(
+        self: &Arc<Self>,
+        task_id: String,
+        kind: RepoTaskKind,
+        update_repo_phase: bool,
+    ) -> Result<RepoTaskStatus> {
         self.cleanup_finished_task_handle();
         self.ensure_no_active_task()?;
 
@@ -142,7 +159,7 @@ impl RepoRuntime {
             };
             tasks.insert(task_id.clone(), Arc::clone(&task));
         }
-        self.mark_task_started(kind, Some(task_id.clone()));
+        self.mark_task_started(kind, Some(task_id.clone()), update_repo_phase);
 
         let runtime = Arc::clone(self);
         let thread_task = Arc::clone(&task);
@@ -158,6 +175,19 @@ impl RepoRuntime {
         }
 
         Ok(task.snapshot())
+    }
+
+    pub(super) fn allocate_background_task_id(&self, kind: RepoTaskKind) -> String {
+        let seq = self
+            .next_background_task_id
+            .fetch_add(1, Ordering::Relaxed)
+            .saturating_add(1);
+        let kind = match kind {
+            RepoTaskKind::BuildBaseSnapshot => "build",
+            RepoTaskKind::RebuildBaseSnapshot => "rebuild",
+            RepoTaskKind::RefreshWorkspace => "refresh",
+        };
+        format!("auto:{kind}:{}:{seq}", self.repo_id)
     }
 
     pub(super) fn task_status(&self, task_id: &str) -> Option<RepoTaskStatus> {
@@ -250,10 +280,14 @@ impl RepoRuntime {
                     .with_cancel(&mut should_cancel),
             )
             .map(|result| result.indexed_docs),
-            RepoTaskKind::RefreshWorkspace => self.refresh_workspace_overlay().map(|_| 0),
+            RepoTaskKind::RefreshWorkspace => self
+                .refresh_workspace_overlay_with_progress(&mut progress)
+                .map(|_| 0),
         };
 
-        match result.and_then(|indexed_docs| self.finish_task_success(task.kind, indexed_docs)) {
+        match result.and_then(|indexed_docs| {
+            self.finish_task_success(task.kind, indexed_docs, &mut progress)
+        }) {
             Ok(message) => {
                 task.finish_completed(message);
                 self.finish_task_execution(&task, None);
@@ -270,10 +304,15 @@ impl RepoRuntime {
         }
     }
 
-    fn finish_task_success(&self, kind: RepoTaskKind, indexed_docs: usize) -> Result<String> {
+    fn finish_task_success(
+        &self,
+        kind: RepoTaskKind,
+        indexed_docs: usize,
+        on_progress: &mut dyn FnMut(IndexProgress),
+    ) -> Result<String> {
         if !matches!(kind, RepoTaskKind::RefreshWorkspace) {
             self.bootstrap_from_existing_snapshot()?;
-            self.refresh_workspace_overlay()?;
+            self.refresh_workspace_overlay_with_progress(on_progress)?;
         }
         {
             let mut state = match self.state.lock() {
@@ -354,18 +393,25 @@ impl RepoRuntime {
         }
     }
 
-    pub(super) fn mark_task_started(&self, kind: RepoTaskKind, active_task_id: Option<String>) {
+    pub(super) fn mark_task_started(
+        &self,
+        kind: RepoTaskKind,
+        active_task_id: Option<String>,
+        update_repo_phase: bool,
+    ) {
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         state.active_task_id = active_task_id;
         state.last_error = None;
-        state.phase = match kind {
-            RepoTaskKind::BuildBaseSnapshot => RepoPhase::BuildingBaseSnapshot,
-            RepoTaskKind::RebuildBaseSnapshot => RepoPhase::RebuildingBaseSnapshot,
-            RepoTaskKind::RefreshWorkspace => RepoPhase::Opening,
-        };
+        if update_repo_phase {
+            state.phase = match kind {
+                RepoTaskKind::BuildBaseSnapshot => RepoPhase::BuildingBaseSnapshot,
+                RepoTaskKind::RebuildBaseSnapshot => RepoPhase::RebuildingBaseSnapshot,
+                RepoTaskKind::RefreshWorkspace => RepoPhase::Opening,
+            };
+        }
         drop(state);
         self.emit_workspace_status_changed();
     }

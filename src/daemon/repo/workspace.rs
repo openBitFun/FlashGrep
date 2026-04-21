@@ -2,6 +2,7 @@ use std::{collections::HashMap, path::PathBuf, sync::atomic::Ordering, time::Sys
 
 use crate::{
     error::{AppError, Result},
+    progress::{IndexProgress, IndexProgressPhase},
     search_engine::SearchDocument,
     worktree_diff::DirtyPathKind,
 };
@@ -76,22 +77,67 @@ impl DirtyPathSet {
 
 impl RepoRuntime {
     pub(super) fn refresh_workspace_overlay(&self) -> Result<()> {
+        let mut noop_progress = |_event: IndexProgress| {};
+        self.refresh_workspace_overlay_with_progress(&mut noop_progress)
+    }
+
+    pub(super) fn refresh_workspace_overlay_with_progress(
+        &self,
+        on_progress: &mut dyn FnMut(IndexProgress),
+    ) -> Result<()> {
         match self.current_base_snapshot_key() {
             Ok(Some(snapshot_key)) => {
+                on_progress(IndexProgress::new(
+                    IndexProgressPhase::RefreshingOverlay,
+                    "Planning workspace overlay refresh",
+                    0,
+                    Some(2),
+                ));
                 let plan = self.plan_overlay_full_rebuild_from_worktree()?;
+                let refreshed_paths = plan.dirty_path_count().max(plan.build_path_count());
+                on_progress(IndexProgress::new(
+                    IndexProgressPhase::RefreshingOverlay,
+                    format!("Applying workspace overlay refresh for {refreshed_paths} path(s)"),
+                    1,
+                    Some(2),
+                ));
                 self.apply_refreshed_overlay(snapshot_key, plan);
+                on_progress(IndexProgress::new(
+                    IndexProgressPhase::RefreshingOverlay,
+                    format!("Published workspace overlay refresh for {refreshed_paths} path(s)"),
+                    2,
+                    Some(2),
+                ));
                 Ok(())
             }
             Ok(None) => {
                 self.apply_missing_base_overlay_state(None);
+                on_progress(IndexProgress::new(
+                    IndexProgressPhase::RefreshingOverlay,
+                    "Skipped workspace overlay refresh because the base snapshot is missing",
+                    1,
+                    Some(1),
+                ));
                 Ok(())
             }
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 self.apply_missing_base_overlay_state(None);
+                on_progress(IndexProgress::new(
+                    IndexProgressPhase::RefreshingOverlay,
+                    "Skipped workspace overlay refresh because the base snapshot is missing",
+                    1,
+                    Some(1),
+                ));
                 Ok(())
             }
             Err(AppError::InvalidIndex(error)) => {
                 self.apply_missing_base_overlay_state(Some(error));
+                on_progress(IndexProgress::new(
+                    IndexProgressPhase::RefreshingOverlay,
+                    "Skipped workspace overlay refresh because the base snapshot is invalid",
+                    1,
+                    Some(1),
+                ));
                 Ok(())
             }
             Err(error) => {

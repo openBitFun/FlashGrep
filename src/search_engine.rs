@@ -47,7 +47,7 @@ pub struct SearchResponse {
 ///
 /// Prefer this type when you want direct search execution with automatic
 /// workspace overlay materialization but without a long-lived daemon/runtime.
-/// For richer workspace lifecycle, status, and watcher-driven maintenance,
+/// For richer workspace lifecycle, status, and probe-driven maintenance,
 /// prefer `WorkspaceIndex` or the daemon API.
 #[derive(Debug, Clone)]
 pub struct SearchEngine {
@@ -362,7 +362,7 @@ mod tests {
 
     #[test]
     fn search_documents_matches_fixed_string_phrase_with_spaces_in_loaded_bytes() {
-        let pattern = "VersionTuple watcher validation content gamma";
+        let pattern = "VersionTuple probe validation content gamma";
         let documents = vec![SearchDocument::from_loaded_bytes(
             "doc.txt".into(),
             pattern.len() as u64,

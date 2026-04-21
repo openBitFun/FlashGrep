@@ -504,12 +504,14 @@ mod tests {
         let build_config = build_config(repo, index);
         let snapshot_key = "base-repo-test-snapshot".to_string();
         let repo_id = RepoId(repo.to_string_lossy().into_owned());
+        let mut on_progress = |_event| {};
         let mut should_cancel = || false;
         WorkspaceBaseSnapshotIndex::rebuild_for_snapshot_identity(
             &build_config,
             &repo_id,
             &snapshot_key,
             None,
+            &mut on_progress,
             &mut should_cancel,
         )
         .expect("write base shard marker");

@@ -179,8 +179,9 @@ mod tests {
     use super::*;
     use crate::daemon::{
         protocol::{
-            ClientCapabilities, InitializeParams, Notification, OpenRepoParams, RepoConfig,
-            Request, RequestEnvelope, Response, ResponseEnvelope, ServerMessage,
+            ClientCapabilities, InitializeParams, Notification, OpenRepoParams,
+            ProgressNotificationParams, RepoConfig, Request, RequestEnvelope, Response,
+            ResponseEnvelope, ServerMessage, TaskPhase, TaskState, TaskStatus,
         },
         DaemonClient,
     };
@@ -228,7 +229,7 @@ mod tests {
         let state_file = temp.path().join("daemon-state.json");
         let repo_path = temp.path().join("repo");
         fs::create_dir_all(&repo_path).expect("repo dir should succeed");
-        for index in 0..8 {
+        for index in 0..256 {
             fs::write(
                 repo_path.join(format!("file-{index}.rs")),
                 format!("pub const NAME_{index}: &str = \"HELLO_{index}\";\n"),
@@ -324,9 +325,10 @@ mod tests {
             .to_string_lossy()
             .into_owned();
         let mut saw_status_changed = false;
-        let mut saw_progress = false;
         let mut saw_task_finished = false;
         let mut task_id = None;
+        let mut progress_events = Vec::<ProgressNotificationParams>::new();
+        let mut finished_task = None::<TaskStatus>;
 
         send_request(
             &mut writer,
@@ -356,7 +358,19 @@ mod tests {
                 ServerMessage::Notification(notification) => match notification.notification {
                     Notification::Progress { params } => {
                         if params.workspace_id == repo_id {
-                            saw_progress = true;
+                            if let Some(expected) = task_id.as_ref() {
+                                assert_eq!(&params.task_id, expected);
+                            }
+                            assert!(matches!(
+                                params.kind,
+                                crate::daemon::protocol::TaskKind::BuildBaseSnapshot
+                            ));
+                            assert!(!params.message.trim().is_empty());
+                            if let Some(total) = params.total {
+                                assert!(total > 0);
+                                assert!(params.processed <= total);
+                            }
+                            progress_events.push(params);
                         }
                     }
                     Notification::WorkspaceStatusChanged { params } => {
@@ -370,22 +384,61 @@ mod tests {
                             if let Some(expected) = task_id.as_ref() {
                                 assert_eq!(&params.task.task_id, expected);
                             }
+                            finished_task = Some(params.task);
                         }
                     }
                 },
             }
-            if task_id.is_some() && saw_progress && saw_status_changed && saw_task_finished {
+            if task_id.is_some()
+                && !progress_events.is_empty()
+                && saw_status_changed
+                && saw_task_finished
+            {
                 break;
             }
         }
 
         assert!(task_id.is_some(), "expected task_started response");
-        assert!(saw_progress, "expected progress notification");
+        assert!(
+            !progress_events.is_empty(),
+            "expected progress notification"
+        );
         assert!(
             saw_status_changed,
             "expected workspace/statusChanged notification"
         );
         assert!(saw_task_finished, "expected task/finished notification");
+        let expected_task_id = task_id.as_ref().expect("task id should be present");
+        assert!(progress_events
+            .iter()
+            .all(|event| &event.task_id == expected_task_id));
+
+        let phases = progress_events
+            .iter()
+            .filter_map(|event| event.phase)
+            .collect::<Vec<_>>();
+        assert!(phases.contains(&TaskPhase::Scanning));
+        assert!(phases.contains(&TaskPhase::Tokenizing));
+        assert!(phases.contains(&TaskPhase::Writing));
+        assert!(phases.contains(&TaskPhase::Finalizing));
+        assert!(phases.contains(&TaskPhase::RefreshingOverlay));
+        assert!(progress_events.iter().any(|event| {
+            event.phase == Some(TaskPhase::Tokenizing)
+                && event.total.is_some_and(|total| total > 1 && event.processed > 0)
+                && event.total.is_some_and(|total| event.processed < total)
+        }));
+
+        let last_progress = progress_events
+            .last()
+            .expect("progress events should be present");
+        assert_eq!(last_progress.phase, Some(TaskPhase::RefreshingOverlay));
+        assert_eq!(last_progress.processed, 2);
+        assert_eq!(last_progress.total, Some(2));
+
+        let finished_task = finished_task.expect("finished task should be captured");
+        assert!(matches!(finished_task.state, TaskState::Completed));
+        assert_eq!(finished_task.phase, Some(TaskPhase::RefreshingOverlay));
+        assert!(finished_task.message.contains("built base snapshot"));
 
         let client = DaemonClient::new(state.addr);
         client
