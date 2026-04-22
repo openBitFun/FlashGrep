@@ -20,7 +20,6 @@ use super::{
 };
 const TERM_DICT_FILE: &str = "term_dict.bin";
 const POSTINGS_FILE: &str = "postings.bin";
-const BASE_SOURCES_FILE: &str = "base_sources.bin";
 
 pub trait SegmentStore: Send + Sync {
     fn write_segment(&self, build: SegmentBuildOutput) -> Result<SegmentMeta>;
@@ -72,18 +71,20 @@ pub struct FileSegmentStore {
     segments_dir: PathBuf,
     tokenizer: PostingTokenizerConfig,
     repo_root: Option<PathBuf>,
+    base_head_commit: Option<String>,
     cache: RwLock<HashMap<SegmentId, SegmentReaderHandle>>,
 }
 
 impl FileSegmentStore {
     pub fn open(index_root: &Path, tokenizer: PostingTokenizerConfig) -> Result<Self> {
-        Self::open_with_repo_root(index_root, tokenizer, None)
+        Self::open_with_repo_root(index_root, tokenizer, None, None)
     }
 
     pub fn open_with_repo_root(
         index_root: &Path,
         tokenizer: PostingTokenizerConfig,
         repo_root: Option<PathBuf>,
+        base_head_commit: Option<String>,
     ) -> Result<Self> {
         let segments_dir = index_root.join("segments");
         fs::create_dir_all(&segments_dir)?;
@@ -91,6 +92,7 @@ impl FileSegmentStore {
             segments_dir,
             tokenizer,
             repo_root,
+            base_head_commit,
             cache: RwLock::new(HashMap::new()),
         })
     }
@@ -138,15 +140,14 @@ impl SegmentStore for FileSegmentStore {
         let posting_lists = PostingLists::open_lazy(term_dict, &segment_dir.join(POSTINGS_FILE))?;
         let postings_elapsed = postings_started.elapsed();
         let stored_fields_path = segment_dir.join(STORED_FIELDS_FILE);
-        let base_sources_path = segment_dir.join(BASE_SOURCES_FILE);
         let reader_started = Instant::now();
         let reader = std::sync::Arc::new(FileSegmentReader::new(
             meta,
             doc_table,
             posting_lists,
             stored_fields_path.exists().then_some(stored_fields_path),
-            base_sources_path.exists().then_some(base_sources_path),
             self.repo_root.clone(),
+            self.base_head_commit.clone(),
         )?);
         let reader_elapsed = reader_started.elapsed();
         if profile_open {

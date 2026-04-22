@@ -9,11 +9,10 @@ mod term_dict;
 mod writer;
 
 pub(crate) use format::{
-    encoded_source_bytes_len, read_index_document_from_stored_slice, read_segment_meta,
-    read_stored_document_view, read_stored_fields_layout, read_stored_source_bytes_view,
-    write_path_offsets_file, write_segment_documents, write_segment_meta, write_source_bytes,
-    FileSegmentDocTable, SegmentDocRecord, StoredFieldsLayout, DOCS_FILE, PATH_MAP_FILE,
-    PATH_OFFSETS_FILE, SEGMENT_META_FILE, STORED_FIELDS_FILE,
+    read_index_document_from_stored_slice, read_segment_meta, read_stored_document_view,
+    read_stored_fields_layout, write_path_offsets_file, write_segment_documents,
+    write_segment_meta, FileSegmentDocTable, SegmentDocRecord, StoredFieldsLayout, DOCS_FILE,
+    PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE, STORED_FIELDS_FILE,
 };
 pub use format::{DeleteSegmentBuildOutput, DeleteSegmentMeta, SegmentBuildOutput, SegmentMeta};
 pub(crate) use mmap::{advise_mmap_random, advise_mmap_sequential};

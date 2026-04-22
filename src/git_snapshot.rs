@@ -1,9 +1,10 @@
 use std::{
     collections::HashSet,
     fs,
-    io::Read,
+    io::{BufRead, BufReader, BufWriter, Read, Write},
     path::Path,
-    process::{Command, Output, Stdio},
+    process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio},
+    sync::Mutex,
     thread,
     time::{Duration, UNIX_EPOCH},
 };
@@ -18,6 +19,25 @@ use crate::{
 
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_INDEX_FINGERPRINT_VERSION: &str = "index-engine-postings-v2";
+
+pub(crate) struct GitBlobReader {
+    repo_root: std::path::PathBuf,
+    state: Mutex<GitBlobReaderState>,
+}
+
+struct GitBlobReaderState {
+    child: Child,
+    stdin: BufWriter<ChildStdin>,
+    stdout: BufReader<ChildStdout>,
+}
+
+impl std::fmt::Debug for GitBlobReader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitBlobReader")
+            .field("repo_root", &self.repo_root)
+            .finish_non_exhaustive()
+    }
+}
 
 pub(crate) fn resolve_git_head(
     repo_root: &Path,
@@ -183,6 +203,75 @@ pub(crate) fn read_git_blob(
     Ok(output.stdout)
 }
 
+impl GitBlobReader {
+    pub(crate) fn new(repo_root: &Path) -> Result<Self> {
+        Ok(Self {
+            repo_root: repo_root.to_path_buf(),
+            state: Mutex::new(spawn_git_blob_reader_state(repo_root)?),
+        })
+    }
+
+    pub(crate) fn read_blob(&self, head_commit: &str, logical_path: &str) -> Result<Vec<u8>> {
+        let spec = format!("{head_commit}:{logical_path}");
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        state.stdin.write_all(spec.as_bytes())?;
+        state.stdin.write_all(b"\n")?;
+        state.stdin.flush()?;
+
+        let mut header = String::new();
+        let bytes_read = state.stdout.read_line(&mut header)?;
+        if bytes_read == 0 {
+            return Err(AppError::InvalidIndex(format!(
+                "git cat-file batch closed unexpectedly for {}",
+                self.repo_root.display()
+            )));
+        }
+        let header = header.trim_end_matches('\n');
+        if header.ends_with(" missing") {
+            return Ok(Vec::new());
+        }
+        let mut fields = header.split_whitespace();
+        let _object_id = fields.next();
+        let object_type = fields.next();
+        let size = fields.next();
+        if object_type != Some("blob") {
+            return Err(AppError::InvalidIndex(format!(
+                "unexpected git cat-file response for {spec}: {header}"
+            )));
+        }
+        let size = size
+            .and_then(|value| value.parse::<usize>().ok())
+            .ok_or_else(|| {
+                AppError::InvalidIndex(format!(
+                    "failed to parse git cat-file size for {spec}: {header}"
+                ))
+            })?;
+        let mut bytes = vec![0u8; size];
+        state.stdout.read_exact(&mut bytes)?;
+        let mut trailing = [0u8; 1];
+        state.stdout.read_exact(&mut trailing)?;
+        if trailing[0] != b'\n' {
+            return Err(AppError::InvalidIndex(format!(
+                "git cat-file batch framing error for {spec}"
+            )));
+        }
+        Ok(bytes)
+    }
+}
+
+impl Drop for GitBlobReader {
+    fn drop(&mut self) {
+        if let Ok(mut state) = self.state.lock() {
+            let _ = state.stdin.flush();
+            let _ = state.child.kill();
+            let _ = state.child.wait();
+        }
+    }
+}
+
 pub(crate) fn build_config_fingerprint(config: &BuildConfig) -> String {
     let mut hasher = Hasher::new();
     hasher.update(SEARCH_INDEX_FINGERPRINT_VERSION.as_bytes());
@@ -281,6 +370,31 @@ fn run_git_command<const N: usize>(
     let mut command = Command::new("git");
     command.arg("-C").arg(repo_root).args(args);
     run_command_with_cancellation(&mut command, should_cancel)
+}
+
+fn spawn_git_blob_reader_state(repo_root: &Path) -> Result<GitBlobReaderState> {
+    let mut command = Command::new("git");
+    command
+        .arg("-C")
+        .arg(repo_root)
+        .args(["cat-file", "--batch"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command.spawn()?;
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| AppError::InvalidIndex("failed to capture git blob reader stdin".into()))?;
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| AppError::InvalidIndex("failed to capture git blob reader stdout".into()))?;
+    Ok(GitBlobReaderState {
+        child,
+        stdin: BufWriter::new(stdin),
+        stdout: BufReader::new(stdout),
+    })
 }
 
 fn run_command_with_cancellation(

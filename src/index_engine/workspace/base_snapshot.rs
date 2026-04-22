@@ -27,10 +27,9 @@ use crate::{
         manifest::{FileManifestStore, Manifest, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
-            collect_document_posting_terms_from_text, encoded_source_bytes_len,
-            write_path_offsets_file, write_segment_meta, write_source_bytes, FileSegmentStore,
-            PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE,
-            PATH_OFFSETS_FILE, SEGMENT_META_FILE,
+            collect_document_posting_terms_from_text, write_path_offsets_file, write_segment_meta,
+            FileSegmentStore, PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE,
+            PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
         },
         writer::IndexDocument,
         DocKey, GitRevision, ManifestId, RepoId, SegmentId, ShardId,
@@ -56,7 +55,6 @@ const DOCS_VERSION: u32 = 2;
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
 const SEGMENT_FILE_VERSION: u32 = 1;
 const COUNT_OFFSET: u64 = 12;
-const BASE_SOURCES_FILE: &str = "base_sources.bin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBaseSnapshotMetadata {
@@ -162,8 +160,6 @@ struct BulkBaseSegmentWriter {
     path_entry_offsets: Vec<u64>,
     path_map_len: u64,
     docs: BufWriter<File>,
-    base_sources: BufWriter<File>,
-    base_sources_len: u64,
     posting_buckets: PostingBuckets,
     doc_count: u32,
     total_source_bytes: u64,
@@ -237,7 +233,6 @@ impl BulkBaseSegmentWriter {
 
         let mut path_map = BufWriter::new(File::create(segment_dir.join(PATH_MAP_FILE))?);
         let mut docs = BufWriter::new(File::create(segment_dir.join(DOCS_FILE))?);
-        let base_sources = BufWriter::new(File::create(segment_dir.join(BASE_SOURCES_FILE))?);
         let posting_buckets = PostingBuckets::new(&segment_dir);
 
         write_segment_header(&mut path_map, PATH_MAP_MAGIC)?;
@@ -251,8 +246,6 @@ impl BulkBaseSegmentWriter {
             path_entry_offsets: Vec::new(),
             path_map_len: COUNT_OFFSET + 4,
             docs,
-            base_sources,
-            base_sources_len: 0,
             posting_buckets,
             doc_count: 0,
             total_source_bytes: 0,
@@ -277,26 +270,9 @@ impl BulkBaseSegmentWriter {
             .and_then(|len| len.checked_add(logical_path_len))
             .ok_or_else(|| AppError::ValueOutOfRange("path map offset overflow".into()))?;
 
-        let stored_offset = self.base_sources_len;
-        write_source_bytes(&mut self.base_sources, &document.source_bytes)?;
-        let stored_len = self
-            .base_sources_len
-            .checked_add(encoded_source_bytes_len(&document.source_bytes)?)
-            .ok_or_else(|| AppError::ValueOutOfRange("base source offset overflow".into()))?;
-        let stored_len = stored_len
-            .checked_sub(stored_offset)
-            .ok_or_else(|| AppError::InvalidIndex("base source length underflow".into()))?;
-        let stored_len = u32::try_from(stored_len).map_err(|_| {
-            AppError::ValueOutOfRange("base source length exceeds u32 range".into())
-        })?;
-        self.base_sources_len = self
-            .base_sources_len
-            .checked_add(u64::from(stored_len))
-            .ok_or_else(|| AppError::ValueOutOfRange("base source offset overflow".into()))?;
-
         write_u32_to(&mut self.docs, doc_id)?;
-        write_u64_to(&mut self.docs, stored_offset)?;
-        write_u32_to(&mut self.docs, stored_len)?;
+        write_u64_to(&mut self.docs, 0)?;
+        write_u32_to(&mut self.docs, 0)?;
         write_u64_to(&mut self.docs, document.size)?;
         write_u64_to(&mut self.docs, document.modified_at)?;
         self.docs.write_all(&document.content_hash)?;
@@ -318,7 +294,6 @@ impl BulkBaseSegmentWriter {
 
         self.path_map.flush()?;
         self.docs.flush()?;
-        self.base_sources.flush()?;
 
         if self.doc_count == 0 {
             fs::remove_dir_all(&self.segment_dir)?;
@@ -568,12 +543,15 @@ impl WorkspaceBaseSnapshotIndex {
 
     pub fn open_read_only(build_config: &BuildConfig) -> Result<Self> {
         let config = Self::engine_config(build_config);
+        let base_head_commit =
+            Self::read_metadata_file(build_config)?.and_then(|metadata| metadata.head_commit);
         let reader = Arc::new(IndexReaderFactory::new(
             Arc::new(FileManifestStore::open(&config.index_root)?),
             Arc::new(FileSegmentStore::open_with_repo_root(
                 &config.index_root,
                 config.tokenizer.clone(),
                 Some(build_config.repo_path.clone()),
+                base_head_commit,
             )?),
             Arc::new(FileDeleteStore::open(&config.index_root)?),
             SharedSnapshotState::new(),
@@ -1010,7 +988,10 @@ fn build_sharded_base_snapshot(
     let _ = FileDeleteStore::open(index_root)?;
     let shard_builds = partition_base_snapshot_shards(files);
     let shard_total = shard_builds.len();
-    let total_files = shard_builds.iter().map(|shard| shard.files.len()).sum::<usize>();
+    let total_files = shard_builds
+        .iter()
+        .map(|shard| shard.files.len())
+        .sum::<usize>();
     let tokenizing_progress_total = total_files.max(1);
     report_progress(
         on_progress,
@@ -1018,9 +999,7 @@ fn build_sharded_base_snapshot(
         if total_files == 0 {
             "No base snapshot shards to build".into()
         } else {
-            format!(
-                "Tokenizing {total_files} base snapshot file(s) across {shard_total} shard(s)"
-            )
+            format!("Tokenizing {total_files} base snapshot file(s) across {shard_total} shard(s)")
         },
         usize::from(total_files == 0),
         Some(tokenizing_progress_total),
@@ -1062,7 +1041,10 @@ fn build_sharded_base_snapshot(
             drop(tx);
 
             while completed_shards < shard_total {
-                match rx.recv().expect("base snapshot shard worker should send outcome") {
+                match rx
+                    .recv()
+                    .expect("base snapshot shard worker should send outcome")
+                {
                     ShardBuildMessage::Progress {
                         shard_id,
                         processed_files,
@@ -2399,11 +2381,8 @@ mod tests {
             if super::base_snapshot_shard_id(&file_name) != target_shard_id {
                 continue;
             }
-            std::fs::write(
-                repo.join(&file_name),
-                format!("TOKEN_{index:05}\n"),
-            )
-            .expect("write should succeed");
+            std::fs::write(repo.join(&file_name), format!("TOKEN_{index:05}\n"))
+                .expect("write should succeed");
             file_count += 1;
             if file_count >= super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS + 32 {
                 break;
@@ -2442,7 +2421,10 @@ mod tests {
         assert!(tokenizing_events
             .iter()
             .all(|event| event.total == Some(file_count)));
-        assert_eq!(tokenizing_events.first().map(|event| event.processed), Some(0));
+        assert_eq!(
+            tokenizing_events.first().map(|event| event.processed),
+            Some(0)
+        );
         assert!(tokenizing_events.iter().any(|event| {
             event.processed >= super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS
                 && event.processed < file_count
