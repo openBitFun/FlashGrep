@@ -35,7 +35,7 @@ impl ManifestStore for MemoryManifestStore {
         let guard = self
             .current
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         Ok(guard.clone())
     }
 
@@ -58,7 +58,7 @@ impl ManifestStore for MemoryManifestStore {
         let mut guard = self
             .current
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = manifest.clone();
         Ok(())
     }
@@ -71,7 +71,7 @@ impl ManifestStore for MemoryManifestStore {
         let mut guard = self
             .current
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         if guard.manifest_id != *expected_manifest_id {
             return Ok(false);
         }
@@ -177,7 +177,7 @@ impl ManifestStore for FileManifestStore {
         let _guard = self
             .publish_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.publish_locked(manifest)
     }
 
@@ -189,7 +189,7 @@ impl ManifestStore for FileManifestStore {
         let _guard = self
             .publish_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = self.load_current_from_disk()?;
         if current.manifest_id != *expected_manifest_id {
             return Ok(false);
@@ -225,7 +225,7 @@ impl ManifestStore for FileManifestStore {
         let _guard = self
             .publish_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let current = self.load_current_from_disk()?;
         if current.manifest_id == *manifest_id {
             return Err(AppError::InvalidIndex(format!(

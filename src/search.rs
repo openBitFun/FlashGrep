@@ -35,10 +35,9 @@ impl SearchResults {
 
     pub fn result_units(&self, mode: SearchMode) -> usize {
         match mode {
-            SearchMode::CountOnly => self.matched_lines,
             SearchMode::CountMatches => self.matched_occurrences,
             SearchMode::FirstHitOnly => self.searches_with_match,
-            SearchMode::MaterializeMatches => self.matched_lines,
+            SearchMode::CountOnly | SearchMode::MaterializeMatches => self.matched_lines,
         }
     }
 }

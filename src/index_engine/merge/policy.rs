@@ -6,17 +6,9 @@ pub trait MergePolicy: Send + Sync {
     fn pick_merges(&self, manifest: &Manifest, stats: &MergeStats) -> Vec<MergeTask>;
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct TieredMergePolicy {
     config: MergePolicyConfig,
-}
-
-impl Default for TieredMergePolicy {
-    fn default() -> Self {
-        Self {
-            config: MergePolicyConfig::default(),
-        }
-    }
 }
 
 impl TieredMergePolicy {
@@ -63,7 +55,7 @@ impl MergePolicy for TieredMergePolicy {
             return Vec::new();
         }
 
-        let mut candidates = manifest.active_segments.iter().cloned().collect::<Vec<_>>();
+        let mut candidates = manifest.active_segments.to_vec();
         candidates.sort_by(|left, right| {
             left.max_seq_no
                 .cmp(&right.max_seq_no)

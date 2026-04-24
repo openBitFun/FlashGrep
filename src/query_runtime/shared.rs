@@ -1,7 +1,10 @@
+use std::{fs::File, path::Path};
+
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
 #[cfg(not(target_os = "macos"))]
 use grep_searcher::MmapChoice;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
+use memmap2::Mmap;
 
 use crate::{
     config::QueryConfig,
@@ -71,6 +74,31 @@ pub(super) fn line_index_for_offset(offset: usize, line_starts: &[usize]) -> usi
 pub(super) fn trim_line_terminator_bytes(line: &[u8]) -> &[u8] {
     let line = line.strip_suffix(b"\n").unwrap_or(line);
     line.strip_suffix(b"\r").unwrap_or(line)
+}
+
+pub(super) fn with_verify_path_bytes<T, F>(path: &Path, op: F) -> Result<T>
+where
+    F: FnOnce(&[u8]) -> Result<T>,
+{
+    let file = match File::open(path) {
+        Ok(file) => file,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+            ) =>
+        {
+            return op(&[]);
+        }
+        Err(error) => return Err(error.into()),
+    };
+
+    if file.metadata()?.len() == 0 {
+        return op(&[]);
+    }
+
+    let mmap = unsafe { Mmap::map(&file)? };
+    op(mmap.as_ref())
 }
 
 pub(super) fn validate_doc_ids(doc_count: usize, doc_ids: &[u32]) -> Result<()> {

@@ -112,9 +112,9 @@ impl WorkspaceOverlayIngestBatch {
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum WorkspaceOverlayPublishPolicy {
     #[default]
-    RefreshOnly,
-    RefreshAndCheckpoint,
-    RefreshWithAutoCheckpoint {
+    Refresh,
+    Checkpoint,
+    AutoCheckpoint {
         max_uncommitted_ops: u64,
     },
 }
@@ -182,7 +182,7 @@ impl WorkspaceOverlayIndex {
     pub(crate) fn open(build_config: &BuildConfig) -> Result<Self> {
         Self::open_with_policy(
             build_config,
-            WorkspaceOverlayPublishPolicy::RefreshWithAutoCheckpoint {
+            WorkspaceOverlayPublishPolicy::AutoCheckpoint {
                 max_uncommitted_ops: DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
             },
         )
@@ -353,14 +353,14 @@ impl WorkspaceOverlayIndex {
 
     fn publish_after_write(&self, writer: &Arc<IndexWriter>) -> Result<()> {
         match self.publish_policy {
-            WorkspaceOverlayPublishPolicy::RefreshOnly => {
+            WorkspaceOverlayPublishPolicy::Refresh => {
                 writer.refresh()?;
             }
-            WorkspaceOverlayPublishPolicy::RefreshAndCheckpoint => {
+            WorkspaceOverlayPublishPolicy::Checkpoint => {
                 let _ = writer.commit()?;
                 self.request_background_merge();
             }
-            WorkspaceOverlayPublishPolicy::RefreshWithAutoCheckpoint {
+            WorkspaceOverlayPublishPolicy::AutoCheckpoint {
                 max_uncommitted_ops,
             } => {
                 let stats = writer.stats();
@@ -621,6 +621,7 @@ mod tests {
             case_insensitive: false,
             top_k: None,
             filters: QueryFilters::default(),
+            prefer_worktree_for_git_head_blob: false,
         }
     }
 
@@ -802,7 +803,7 @@ mod tests {
                 ..EngineConfig::default()
             })
             .expect("open engine"),
-            WorkspaceOverlayPublishPolicy::RefreshAndCheckpoint,
+            WorkspaceOverlayPublishPolicy::Checkpoint,
         );
 
         let tracked_path = repo.join("tracked.rs");
@@ -849,7 +850,7 @@ mod tests {
                 ..EngineConfig::default()
             })
             .expect("open engine"),
-            WorkspaceOverlayPublishPolicy::RefreshWithAutoCheckpoint {
+            WorkspaceOverlayPublishPolicy::AutoCheckpoint {
                 max_uncommitted_ops: 2,
             },
         );
@@ -933,7 +934,7 @@ mod tests {
 
         assert_eq!(
             overlay.publish_policy,
-            WorkspaceOverlayPublishPolicy::RefreshWithAutoCheckpoint {
+            WorkspaceOverlayPublishPolicy::AutoCheckpoint {
                 max_uncommitted_ops: DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
             }
         );
@@ -959,7 +960,7 @@ mod tests {
                 ..EngineConfig::default()
             })
             .expect("open legacy overlay engine"),
-            WorkspaceOverlayPublishPolicy::RefreshAndCheckpoint,
+            WorkspaceOverlayPublishPolicy::Checkpoint,
         );
         let mut documents = HashMap::new();
         documents.insert(
@@ -1011,7 +1012,7 @@ mod tests {
                 ..EngineConfig::default()
             })
             .expect("open engine"),
-            WorkspaceOverlayPublishPolicy::RefreshAndCheckpoint,
+            WorkspaceOverlayPublishPolicy::Checkpoint,
         );
 
         let tracked_path = repo.join("tracked.rs");
@@ -1076,7 +1077,7 @@ mod tests {
                 ..EngineConfig::default()
             })
             .expect("open engine"),
-            WorkspaceOverlayPublishPolicy::RefreshAndCheckpoint,
+            WorkspaceOverlayPublishPolicy::Checkpoint,
         );
 
         let a_path = repo.join("a.rs");

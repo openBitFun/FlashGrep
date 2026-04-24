@@ -73,14 +73,13 @@ pub(crate) fn search_documents(
                     (
                         counts
                             .into_iter()
-                            .map(|count| crate::search::FileCount {
-                                path: docs[usize::try_from(count.doc_id)
-                                    .expect("doc id should fit usize")]
-                                .path
-                                .clone(),
-                                matched_lines: count.matched_lines,
+                            .map(|count| {
+                                Ok(crate::search::FileCount {
+                                    path: scan_doc_meta(docs.as_slice(), count.doc_id)?.path.clone(),
+                                    matched_lines: count.matched_lines,
+                                })
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                         Vec::new(),
                     )
                 } else {
@@ -88,14 +87,13 @@ pub(crate) fn search_documents(
                         Vec::new(),
                         counts
                             .into_iter()
-                            .map(|count| crate::search::FileMatchCount {
-                                path: docs[usize::try_from(count.doc_id)
-                                    .expect("doc id should fit usize")]
-                                .path
-                                .clone(),
-                                matched_occurrences: count.matched_occurrences,
+                            .map(|count| {
+                                Ok(crate::search::FileMatchCount {
+                                    path: scan_doc_meta(docs.as_slice(), count.doc_id)?.path.clone(),
+                                    matched_occurrences: count.matched_occurrences,
+                                })
                             })
-                            .collect(),
+                            .collect::<Result<Vec<_>>>()?,
                     )
                 };
             Ok(SearchResults {
@@ -258,8 +256,8 @@ fn search_documents_multi_literal_fast(
         }
         let consumed_results = match config.search_mode {
             crate::search::SearchMode::FirstHitOnly => searches_with_match,
-            crate::search::SearchMode::MaterializeMatches => matched_lines,
-            crate::search::SearchMode::CountOnly => matched_lines,
+            crate::search::SearchMode::CountOnly
+            | crate::search::SearchMode::MaterializeMatches => matched_lines,
             crate::search::SearchMode::CountMatches => matched_occurrences,
         };
         if global_limit.is_some_and(|limit| consumed_results >= limit) {
@@ -479,4 +477,12 @@ fn scan_doc_source(documents: &[SearchDocument], doc_id: u32) -> Result<VerifyCa
         .ok_or_else(|| {
             AppError::InvalidIndex(format!("doc id {doc_id} is missing from scan documents"))
         })
+}
+
+fn scan_doc_meta(documents: &[ScannedDocMeta], doc_id: u32) -> Result<&ScannedDocMeta> {
+    let index = usize::try_from(doc_id)
+        .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
+    documents
+        .get(index)
+        .ok_or_else(|| AppError::InvalidIndex(format!("doc id {doc_id} is missing from scan metadata")))
 }

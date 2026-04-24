@@ -1,6 +1,6 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, RwLock},
+    sync::{Arc, Mutex, OnceLock, RwLock},
 };
 
 use crate::index_engine::{
@@ -16,10 +16,19 @@ pub(crate) struct VersionedDocument {
 }
 
 #[derive(Debug, Clone, Default)]
+pub(crate) struct SnapshotVisibilityState {
+    pub(crate) latest_live_segment_seq: BTreeMap<DocKey, SeqNo>,
+    pub(crate) latest_delete_seq: BTreeMap<DocKey, SeqNo>,
+    pub(crate) live_keys: BTreeSet<DocKey>,
+    pub(crate) deleted_keys: BTreeSet<DocKey>,
+}
+
+#[derive(Debug, Clone, Default)]
 pub(crate) struct SnapshotData {
     pub(crate) manifest: Manifest,
     pub(crate) docs: BTreeMap<DocKey, VersionedDocument>,
     pub(crate) deleted_keys: BTreeSet<DocKey>,
+    pub(crate) visibility_cache: Arc<OnceLock<Arc<SnapshotVisibilityState>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -37,14 +46,14 @@ impl SharedSnapshotState {
     pub(crate) fn load_refreshed(&self) -> SnapshotData {
         self.refreshed
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
     pub(crate) fn load_committed(&self) -> SnapshotData {
         self.committed
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone()
     }
 
@@ -52,7 +61,7 @@ impl SharedSnapshotState {
         let mut guard = self
             .refreshed
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = snapshot;
     }
 
@@ -60,7 +69,7 @@ impl SharedSnapshotState {
         let mut guard = self
             .committed
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         *guard = snapshot;
     }
 
@@ -84,7 +93,7 @@ impl SnapshotLeaseRegistry {
             let mut guard = self
                 .inner
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             *guard.entry(manifest_id.clone()).or_default() += 1;
         }
         SnapshotLease {
@@ -98,7 +107,7 @@ impl SnapshotLeaseRegistry {
     fn pinned_manifest_ids(&self) -> BTreeSet<ManifestId> {
         self.inner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
             .cloned()
             .collect()
@@ -108,7 +117,7 @@ impl SnapshotLeaseRegistry {
         let mut guard = self
             .inner
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let remove = match guard.get_mut(manifest_id) {
             Some(count) if *count > 1 => {
                 *count -= 1;

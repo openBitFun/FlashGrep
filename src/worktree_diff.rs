@@ -101,7 +101,8 @@ fn current_snapshot_file_states(
 
 fn current_file_content_hash(path: &std::path::Path) -> Result<Option<[u8; 32]>> {
     let bytes = fs::read(path)?;
-    if bytes.contains(&0) || std::str::from_utf8(&bytes).is_err() {
+    let probe_len = bytes.len().min(8 * 1024);
+    if bytes[..probe_len].contains(&0) {
         return Ok(None);
     }
     let mut content_hash = [0u8; 32];

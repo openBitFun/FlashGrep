@@ -8,6 +8,7 @@ use std::{
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
 use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch};
+use memmap2::Mmap;
 use rayon::prelude::*;
 use regex_syntax::{
     hir::{Class, Hir, HirKind},
@@ -25,7 +26,7 @@ use super::query::LinePrefilter;
 pub(crate) use super::shared::build_regex_matcher as build_matcher;
 use super::shared::{
     build_line_starts, configure_verifier_searcher, line_index_for_offset,
-    trim_line_terminator_bytes, validate_doc_id, validate_doc_ids,
+    trim_line_terminator_bytes, validate_doc_id, validate_doc_ids, with_verify_path_bytes,
 };
 
 const MAX_LOOK_AHEAD: usize = 128;
@@ -37,6 +38,7 @@ const VERIFY_PARALLEL_THRESHOLD: usize = 128;
 pub(crate) enum VerifyCandidateSource {
     Path(PathBuf),
     Bytes(Arc<[u8]>),
+    Mmap(Arc<Mmap>),
 }
 
 #[derive(Debug, Clone)]
@@ -196,10 +198,9 @@ where
 
 fn outcome_result_units(mode: SearchMode, outcome: &VerifyOutcome) -> usize {
     match mode {
-        SearchMode::CountOnly => outcome.matched_lines,
         SearchMode::CountMatches => outcome.matched_occurrences,
         SearchMode::FirstHitOnly => usize::from(!outcome.matches.is_empty()),
-        SearchMode::MaterializeMatches => outcome.matched_lines,
+        SearchMode::CountOnly | SearchMode::MaterializeMatches => outcome.matched_lines,
     }
 }
 
@@ -274,14 +275,9 @@ fn verify_path(
     verifier: &mut Searcher,
     mode: SearchMode,
 ) -> Result<VerifyOutcome> {
-    let mut sink = VerifySink::new(matcher, mode);
-    if let Some(prefilter) = line_prefilter {
-        let wrapped = LinePrefilterMatcher::new(matcher, prefilter);
-        verifier.search_path(&wrapped, path, &mut sink)?;
-    } else {
-        verifier.search_path(matcher, path, &mut sink)?;
-    }
-    Ok(sink.finish())
+    with_verify_path_bytes(path, |bytes| {
+        verify_slice(bytes, matcher, line_prefilter, verifier, mode)
+    })
 }
 
 fn verify_slice(
@@ -309,8 +305,16 @@ fn verify_source(
     verifier: &mut Searcher,
     mode: SearchMode,
 ) -> Result<VerifyOutcome> {
-    if let (Some(matcher), VerifyCandidateSource::Bytes(bytes)) = (literal_matcher, source) {
-        return Ok(verify_literal_bytes(bytes, matcher, mode));
+    if let Some(matcher) = literal_matcher {
+        match source {
+            VerifyCandidateSource::Bytes(bytes) => {
+                return Ok(verify_literal_bytes(bytes, matcher, mode));
+            }
+            VerifyCandidateSource::Mmap(mmap) => {
+                return Ok(verify_literal_bytes(mmap.as_ref(), matcher, mode));
+            }
+            VerifyCandidateSource::Path(_) => {}
+        }
     }
     match source {
         VerifyCandidateSource::Path(path) => {
@@ -318,6 +322,9 @@ fn verify_source(
         }
         VerifyCandidateSource::Bytes(bytes) => {
             verify_slice(bytes, matcher, line_prefilter, verifier, mode)
+        }
+        VerifyCandidateSource::Mmap(mmap) => {
+            verify_slice(mmap.as_ref(), matcher, line_prefilter, verifier, mode)
         }
     }
 }
@@ -614,9 +621,9 @@ impl<'m> VerifySink<'m> {
         }
     }
 
-    fn record_context(&mut self, context: &SinkContext<'_>) -> io::Result<bool> {
+    fn record_context(&mut self, context: &SinkContext<'_>) -> bool {
         if !self.mode.materializes_matches() {
-            return Ok(true);
+            return true;
         }
         let line_number = context
             .line_number()
@@ -627,7 +634,7 @@ impl<'m> VerifySink<'m> {
             snippet: String::from_utf8_lossy(trim_line_terminator_bytes(context.bytes()))
                 .into_owned(),
         }));
-        Ok(true)
+        true
     }
 }
 
@@ -647,7 +654,7 @@ impl Sink for VerifySink<'_> {
         _searcher: &Searcher,
         context: &SinkContext<'_>,
     ) -> std::result::Result<bool, Self::Error> {
-        self.record_context(context)
+        Ok(self.record_context(context))
     }
 
     fn context_break(&mut self, _searcher: &Searcher) -> std::result::Result<bool, Self::Error> {

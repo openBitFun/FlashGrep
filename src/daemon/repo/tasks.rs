@@ -225,7 +225,7 @@ impl RepoRuntime {
             state.last_rebuild_at = Some(SystemTime::now());
             state.last_error = None;
         }
-        Ok((indexed_docs, self.status_snapshot()?))
+        Ok((indexed_docs, self.status_snapshot()))
     }
 
     pub(super) fn rebuild_base_snapshot(&self) -> Result<(usize, super::RepoStatus)> {
@@ -247,7 +247,7 @@ impl RepoRuntime {
             state.last_rebuild_at = Some(SystemTime::now());
             state.last_error = None;
         }
-        Ok((indexed_docs, self.status_snapshot()?))
+        Ok((indexed_docs, self.status_snapshot()))
     }
 
     fn run_task(&self, task: Arc<RepoTaskRecord>) {
@@ -420,7 +420,7 @@ impl RepoRuntime {
         self.shutting_down.store(true, Ordering::Relaxed);
         {
             let (lock, condvar) = &*self.maintenance_worker;
-            let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
             state.shutdown = true;
             condvar.notify_all();
         }

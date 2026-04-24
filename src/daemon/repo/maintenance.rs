@@ -48,7 +48,9 @@ impl RepoRuntime {
         loop {
             let reasons = {
                 let (lock, condvar) = &*worker_state;
-                let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                let mut state = lock
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
                 loop {
                     if state.shutdown {
                         break None;
@@ -59,13 +61,13 @@ impl RepoRuntime {
                     let Some(deadline) = next_maintenance_deadline(&state) else {
                         state = condvar
                             .wait(state)
-                            .unwrap_or_else(|poisoned| poisoned.into_inner());
+                            .unwrap_or_else(std::sync::PoisonError::into_inner);
                         continue;
                     };
                     let timeout = deadline.saturating_duration_since(Instant::now());
                     let (next_state, _) = condvar
                         .wait_timeout(state, timeout)
-                        .unwrap_or_else(|poisoned| poisoned.into_inner());
+                        .unwrap_or_else(std::sync::PoisonError::into_inner);
                     state = next_state;
                 }
             };
@@ -143,16 +145,7 @@ impl RepoRuntime {
             return;
         }
 
-        let status = match self.status_snapshot() {
-            Ok(status) => status,
-            Err(error) => {
-                self.set_last_error(Some(format!(
-                    "background base rebuild status snapshot failed: {error}"
-                )));
-                self.schedule_background_base_rebuild_after(AUTO_BASE_REBUILD_RETRY_DELAY);
-                return;
-            }
-        };
+        let status = self.status_snapshot();
 
         let eligible = matches!(status.phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
             && status.snapshot_key.is_some()
@@ -169,7 +162,7 @@ impl RepoRuntime {
             return;
         }
 
-        let Some(runtime) = self.self_handle.get().and_then(|handle| handle.upgrade()) else {
+        let Some(runtime) = self.self_handle.get().and_then(Weak::upgrade) else {
             self.schedule_background_base_rebuild_after(AUTO_BASE_REBUILD_RETRY_DELAY);
             return;
         };
@@ -184,7 +177,9 @@ impl RepoRuntime {
 
     pub(super) fn schedule_maintenance(&self, reasons: u32) {
         let (lock, condvar) = &*self.maintenance_worker;
-        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.requested_reasons |= reasons;
         if reasons & MAINTENANCE_REASON_OVERLAY_MERGE != 0 {
             let due_at = Instant::now() + self.overlay_merge_min_delay;
@@ -199,7 +194,9 @@ impl RepoRuntime {
 
     pub(super) fn schedule_workspace_probe(&self, delay: Duration) {
         let (lock, condvar) = &*self.maintenance_worker;
-        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.requested_reasons |= MAINTENANCE_REASON_WORKSPACE_POLL;
         let due_at = Instant::now() + delay;
         state.workspace_probe_due_at = Some(
@@ -216,7 +213,9 @@ impl RepoRuntime {
 
     fn schedule_background_base_rebuild_after(&self, delay: Duration) {
         let (lock, condvar) = &*self.maintenance_worker;
-        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.requested_reasons |= MAINTENANCE_REASON_BASE_REBUILD;
         let due_at = Instant::now() + delay;
         state.base_rebuild_due_at = Some(
@@ -237,7 +236,9 @@ impl RepoRuntime {
 
     fn schedule_overlay_merge_retry(&self) {
         let (lock, condvar) = &*self.maintenance_worker;
-        let mut state = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.requested_reasons |= MAINTENANCE_REASON_OVERLAY_MERGE;
         state.overlay_merge_due_at = Some(Instant::now() + self.overlay_merge_retry_delay);
         condvar.notify_one();

@@ -10,7 +10,7 @@ use crate::{
     config::CorpusMode,
     error::Result,
     files::{
-        is_indexable_text_file, is_text_file, is_workspace_internal_path, repo_relative_path,
+        is_corpus_text_file, is_text_file, is_workspace_internal_path, repo_relative_path,
         resolve_repo_path, scan_paths, ScanOptions,
     },
     git_snapshot::resolve_git_head,
@@ -202,17 +202,13 @@ impl RepoRuntime {
         for file in scanned {
             let logical_path = repo_relative_path(&file.path, &self.build_config.repo_path);
             match catalog.get(&logical_path) {
-                Some(_) => {
-                    let entry = catalog
-                        .get(&logical_path)
-                        .expect("catalog entry should exist for tracked path");
-                    if entry.size == file.size {
-                        if entry.modified_at == file.mtime_nanos
-                            || current_file_content_hash(&file.path)? == entry.content_hash
-                        {
-                            seen.insert(logical_path);
-                            continue;
-                        }
+                Some(entry) => {
+                    if entry.size == file.size
+                        && (entry.modified_at == file.mtime_nanos
+                            || current_file_content_hash(&file.path)? == entry.content_hash)
+                    {
+                        seen.insert(logical_path);
+                        continue;
                     }
                     if !is_text_file(&file.path)? {
                         continue;
@@ -445,7 +441,7 @@ impl RepoRuntime {
             Err(error) => return Err(error.into()),
         };
         let probe_len = bytes.len().min(8 * 1024);
-        if bytes[..probe_len].contains(&0) || std::str::from_utf8(&bytes).is_err() {
+        if bytes[..probe_len].contains(&0) {
             return Ok(None);
         }
 
@@ -505,7 +501,7 @@ impl RepoRuntime {
             }
         }
 
-        is_indexable_text_file(path)
+        is_corpus_text_file(path)
     }
 
     fn logical_repo_path(&self, path: &Path) -> Option<String> {

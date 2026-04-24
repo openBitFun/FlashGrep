@@ -424,7 +424,9 @@ mod tests {
         assert!(phases.contains(&TaskPhase::RefreshingOverlay));
         assert!(progress_events.iter().any(|event| {
             event.phase == Some(TaskPhase::Tokenizing)
-                && event.total.is_some_and(|total| total > 1 && event.processed > 0)
+                && event
+                    .total
+                    .is_some_and(|total| total > 1 && event.processed > 0)
                 && event.total.is_some_and(|total| event.processed < total)
         }));
 

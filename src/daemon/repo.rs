@@ -155,7 +155,7 @@ pub struct RepoTaskStatus {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoRefreshPolicy {
     pub rebuild_dirty_threshold: usize,
     pub overlay_auto_checkpoint_max_uncommitted_ops: u64,
@@ -235,15 +235,30 @@ impl RepoManager {
     pub fn open_repo(&self, request: OpenRepoRequest) -> Result<RepoStatus> {
         let build_config = request.build_config.normalized()?;
         let repo_id = build_config.repo_path.to_string_lossy().into_owned();
+        let stale_runtime = {
+            let mut repos = match self.repos.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            match repos.get(&repo_id) {
+                Some(existing)
+                    if existing.matches_open_request(&build_config, &request.refresh_policy) =>
+                {
+                    return Ok(existing.status_snapshot());
+                }
+                Some(_) => repos.remove(&repo_id),
+                None => None,
+            }
+        };
+        if let Some(runtime) = stale_runtime {
+            runtime.shutdown();
+        }
 
         let runtime = {
             let mut repos = match self.repos.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
             };
-            if let Some(existing) = repos.get(&repo_id) {
-                return existing.status_snapshot();
-            }
             let runtime = Arc::new(RepoRuntime::new(
                 repo_id.clone(),
                 build_config,
@@ -257,7 +272,7 @@ impl RepoManager {
         };
 
         runtime.bootstrap_from_existing_snapshot()?;
-        if runtime.status_snapshot()?.snapshot_key.is_some() {
+        if runtime.status_snapshot().snapshot_key.is_some() {
             if let Err(error) = runtime.refresh_workspace_overlay() {
                 runtime.mark_workspace_probe_pending_with_error(format!(
                     "initial workspace refresh failed: {error}"
@@ -265,11 +280,11 @@ impl RepoManager {
             }
         }
         runtime.schedule_workspace_probe(runtime.workspace_probe_interval());
-        runtime.status_snapshot()
+        Ok(runtime.status_snapshot())
     }
 
     pub fn get_status(&self, repo_id: &str) -> Result<RepoStatus> {
-        self.repo(repo_id)?.status_snapshot()
+        Ok(self.repo(repo_id)?.status_snapshot())
     }
 
     pub fn refresh_repo(&self, repo_id: &str, force: bool) -> Result<RepoStatus> {
@@ -499,6 +514,21 @@ struct GlobCacheState {
 }
 
 impl RepoRuntime {
+    fn matches_open_request(
+        &self,
+        build_config: &BuildConfig,
+        refresh_policy: &RepoRefreshPolicy,
+    ) -> bool {
+        self.build_config == *build_config
+            && self.rebuild_dirty_threshold == refresh_policy.rebuild_dirty_threshold
+            && self.overlay_auto_checkpoint_max_uncommitted_ops
+                == refresh_policy.overlay_auto_checkpoint_max_uncommitted_ops
+            && self.overlay_merge_min_delay
+                == std::time::Duration::from_millis(refresh_policy.overlay_merge_min_delay_ms)
+            && self.overlay_merge_retry_delay
+                == std::time::Duration::from_millis(refresh_policy.overlay_merge_retry_delay_ms)
+    }
+
     fn new(
         repo_id: String,
         build_config: BuildConfig,

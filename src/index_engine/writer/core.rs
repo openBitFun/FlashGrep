@@ -114,7 +114,7 @@ impl IndexWriter {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         apply_add(&mut state, seq_no, doc);
         Ok(OpStamp { seq_no })
     }
@@ -124,7 +124,7 @@ impl IndexWriter {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         apply_delete(&mut state, seq_no, key);
         Ok(OpStamp { seq_no })
     }
@@ -144,7 +144,7 @@ impl IndexWriter {
             let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.generation += 1;
             build_snapshot(
                 &state,
@@ -164,7 +164,7 @@ impl IndexWriter {
             let state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             build_flush_plan(&state)
         };
         let Some(plan) = plan else {
@@ -186,7 +186,7 @@ impl IndexWriter {
             let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             apply_completed_flush(&mut state, &plan)
         };
         self.snapshots.publish_refreshed(refreshed.snapshot);
@@ -202,7 +202,7 @@ impl IndexWriter {
             let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.committed_seq_no = state.last_seq_no;
             promote_pending_segments(&mut state);
             state.generation += 1;
@@ -232,7 +232,7 @@ impl IndexWriter {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         WriterStats {
             committed_seq_no: state.committed_seq_no,
             last_seq_no: state.last_seq_no,
@@ -246,7 +246,7 @@ impl IndexWriter {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.generation = manifest.generation;
         state.committed_seq_no = manifest.committed_seq_no;
         state.last_flushed_seq_no = manifest.committed_seq_no;
@@ -272,6 +272,7 @@ impl IndexWriter {
             manifest: manifest.clone(),
             docs: BTreeMap::new(),
             deleted_keys: BTreeSet::new(),
+            ..SnapshotData::default()
         };
         self.snapshots.publish_committed(committed.clone());
         self.snapshots.publish_refreshed(committed);
@@ -282,7 +283,7 @@ impl IndexWriter {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let next = state.last_seq_no + 1;
         state.last_seq_no = next;
         next
@@ -292,7 +293,7 @@ impl IndexWriter {
         let state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         !state.pending_docs.is_empty() || !state.pending_delete_seq_by_key.is_empty()
     }
 
@@ -660,6 +661,7 @@ impl IndexAdmin {
             manifest,
             docs: BTreeMap::new(),
             deleted_keys: BTreeSet::new(),
+            ..SnapshotData::default()
         };
         self.snapshots.publish_committed(snapshot.clone());
         self.snapshots.publish_refreshed(snapshot);
@@ -686,7 +688,7 @@ impl IndexAdmin {
             let state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.generation + 1
         };
         let merged_manifest = Manifest {
@@ -718,7 +720,7 @@ impl IndexAdmin {
             let mut state = self
                 .state
                 .lock()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.generation = next_generation;
             state.committed_seq_no = manifest.committed_seq_no;
             state.last_flushed_seq_no = manifest.committed_seq_no;
@@ -730,6 +732,7 @@ impl IndexAdmin {
             manifest: merged_manifest,
             docs: BTreeMap::new(),
             deleted_keys: BTreeSet::new(),
+            ..SnapshotData::default()
         };
         self.snapshots.publish_committed(snapshot.clone());
         self.snapshots.publish_refreshed(snapshot);
@@ -853,12 +856,13 @@ pub(super) fn build_snapshot(
             committed_seq_no,
             refreshed_seq_no,
             writer_epoch: 0,
-            schema_fingerprint: "segment-publish-v1".into(),
+            schema_fingerprint: "segment-publish-v2".into(),
             active_segments: visible_segment_refs(state, snapshot_kind),
             active_delete_segments: visible_delete_segment_refs(state, snapshot_kind),
         },
         docs,
         deleted_keys,
+        ..SnapshotData::default()
     }
 }
 
@@ -1027,6 +1031,7 @@ mod tests {
             case_insensitive: false,
             top_k: None,
             filters: QueryFilters::default(),
+            prefer_worktree_for_git_head_blob: false,
         }
     }
 
@@ -1132,6 +1137,7 @@ mod tests {
             .join(&flush.segment_ids[0].0);
         assert!(segment_dir.join("SEGMENT_META.json").exists());
         assert!(segment_dir.join("docs.bin").exists());
+        assert!(!segment_dir.join("stored_fields.bin").exists());
 
         writer.commit().expect("commit should succeed");
         let manifest = admin.manifest().expect("manifest should load");

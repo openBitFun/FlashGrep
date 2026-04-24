@@ -46,6 +46,15 @@ impl TestRepo {
         path
     }
 
+    pub fn write_bytes(&self, relative: impl AsRef<Path>, contents: &[u8]) -> PathBuf {
+        let path = self.path(relative);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("test should succeed");
+        }
+        fs::write(&path, contents).expect("test should succeed");
+        path
+    }
+
     pub fn trigram_build_config(&self) -> BuildConfig {
         BuildConfig {
             repo_path: self.repo.clone(),

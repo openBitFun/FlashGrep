@@ -8,7 +8,7 @@ use std::{
 use crate::{
     config::BuildConfig,
     error::Result,
-    files::{is_indexable_text_file, is_text_file, scan_paths, scan_repository, ScanOptions},
+    files::{is_corpus_text_file, is_text_file, scan_paths, scan_repository, ScanOptions},
     index_engine::{reader::SnapshotPathCatalog, workspace::WorkspaceOverlaySnapshotState, RepoId},
     path_filter::PathFilter,
     search::SearchResults,
@@ -177,7 +177,7 @@ where
         if filter.is_some_and(|active| !active.matches_file(&path)) {
             continue;
         }
-        if !path.exists() || !is_indexable_text_file(&path)? {
+        if !path.exists() || !is_corpus_text_file(&path)? {
             continue;
         }
         documents.push(search_document_from_path(logical_path, path)?);

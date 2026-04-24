@@ -216,7 +216,7 @@ impl GitBlobReader {
         let mut state = self
             .state
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         state.stdin.write_all(spec.as_bytes())?;
         state.stdin.write_all(b"\n")?;
         state.stdin.flush()?;

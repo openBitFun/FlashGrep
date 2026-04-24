@@ -19,6 +19,7 @@ pub struct QueryRequest {
     pub case_insensitive: bool,
     pub top_k: Option<usize>,
     pub filters: QueryFilters,
+    pub prefer_worktree_for_git_head_blob: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +112,7 @@ mod tests {
             case_insensitive: false,
             top_k: None,
             filters: QueryFilters::default(),
+            prefer_worktree_for_git_head_blob: false,
         }
     }
 

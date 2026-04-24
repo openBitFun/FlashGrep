@@ -42,6 +42,24 @@ impl RepoRuntime {
             };
             *slot = opened_base_snapshot;
         }
+        if base_snapshot_ready {
+            let prewarm_result = {
+                let guard = match self.base_snapshot_engine.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                guard
+                    .as_ref()
+                    .map(|index| index.open_committed().map(|_| ()))
+                    .transpose()
+            };
+            if let Err(error) = prewarm_result {
+                eprintln!(
+                    "codgrep: failed to prewarm base snapshot search state for {} during bootstrap: {error}",
+                    self.build_config.repo_path.display()
+                );
+            }
+        }
         self.clear_base_snapshot_catalog();
         if base_snapshot_ready {
             if let Err(error) = self.preload_base_snapshot_catalog() {
@@ -57,7 +75,7 @@ impl RepoRuntime {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        state.snapshot_key = base_snapshot_ready.then(|| snapshot_key).flatten();
+        state.snapshot_key = base_snapshot_ready.then_some(snapshot_key).flatten();
         state.last_probe_at = Some(now);
         state.last_error = None;
         apply_workspace_dirty_status(

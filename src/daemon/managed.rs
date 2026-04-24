@@ -15,7 +15,9 @@ use crate::{
 use super::{
     client::DaemonClient,
     convert::build_config_from_open,
-    protocol::{EnsureRepoParams, GlobParams, OpenRepoParams, RepoStatus, Response, SearchParams},
+    protocol::{
+        EnsureRepoParams, GlobParams, OpenRepoParams, RepoStatus, Request, Response, SearchParams,
+    },
     server::read_state_file,
 };
 
@@ -89,7 +91,7 @@ impl ManagedDaemonClient {
             }
 
             if let Some(_guard) =
-                self.try_acquire_startup_lock(&lock_file, MIN_STALE_STARTUP_LOCK_AGE)?
+                Self::try_acquire_startup_lock(&lock_file, MIN_STALE_STARTUP_LOCK_AGE)?
             {
                 if let Ok(repo) = self.try_ensure_repo(&state_file, &params) {
                     return Ok(repo);
@@ -132,7 +134,7 @@ impl ManagedDaemonClient {
             }
 
             if let Some(_guard) =
-                self.try_acquire_startup_lock(&lock_file, MIN_STALE_STARTUP_LOCK_AGE)?
+                Self::try_acquire_startup_lock(&lock_file, MIN_STALE_STARTUP_LOCK_AGE)?
             {
                 if let Ok(repo) = self.try_open_repo(&state_file, &params) {
                     return Ok(repo);
@@ -177,6 +179,7 @@ impl ManagedDaemonClient {
 
     fn try_ensure_repo(&self, state_file: &Path, params: &EnsureRepoParams) -> Result<EnsuredRepo> {
         let state = read_state_file(state_file)?;
+        self.ensure_daemon_healthy(&state.addr)?;
         let client = DaemonClient::new(state.addr.clone());
         match client.ensure_repo(params.clone())? {
             Response::RepoEnsured {
@@ -197,6 +200,7 @@ impl ManagedDaemonClient {
 
     fn try_open_repo(&self, state_file: &Path, params: &OpenRepoParams) -> Result<OpenedRepo> {
         let state = read_state_file(state_file)?;
+        self.ensure_daemon_healthy(&state.addr)?;
         let client = DaemonClient::new(state.addr.clone());
         match client.open_repo(params.clone())? {
             Response::RepoOpened { repo_id, status } => Ok(OpenedRepo {
@@ -211,7 +215,6 @@ impl ManagedDaemonClient {
     }
 
     fn try_acquire_startup_lock(
-        &self,
         lock_file: &Path,
         stale_after: Duration,
     ) -> Result<Option<StartupLockGuard>> {
@@ -233,7 +236,7 @@ impl ManagedDaemonClient {
             Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
                 if startup_lock_is_stale(lock_file, stale_after) {
                     match fs::remove_file(lock_file) {
-                        Ok(()) => self.try_acquire_startup_lock(lock_file, stale_after),
+                        Ok(()) => Self::try_acquire_startup_lock(lock_file, stale_after),
                         Err(remove_error)
                             if remove_error.kind() == std::io::ErrorKind::NotFound =>
                         {
@@ -272,6 +275,18 @@ impl ManagedDaemonClient {
         command.spawn()?;
         Ok(())
     }
+
+    fn ensure_daemon_healthy(&self, addr: &str) -> Result<()> {
+        match DaemonClient::new(addr.to_string())
+            .with_io_timeout(self.retry_interval.max(Duration::from_secs(1)))
+            .send(Request::Ping)?
+        {
+            Response::Pong { .. } => Ok(()),
+            other => Err(AppError::Protocol(format!(
+                "unexpected ping response from daemon: {other:?}"
+            ))),
+        }
+    }
 }
 
 fn select_daemon_program(
@@ -306,8 +321,10 @@ pub fn daemon_state_file_path_from_open(params: &OpenRepoParams) -> Result<PathB
 fn daemon_start_lock_file_path(state_file: &Path) -> PathBuf {
     state_file
         .parent()
-        .map(|parent| parent.join(DEFAULT_DAEMON_START_LOCK_FILE))
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_DAEMON_START_LOCK_FILE))
+        .map_or_else(
+            || PathBuf::from(DEFAULT_DAEMON_START_LOCK_FILE),
+            |parent| parent.join(DEFAULT_DAEMON_START_LOCK_FILE),
+        )
 }
 
 fn startup_lock_is_stale(path: &Path, stale_after: Duration) -> bool {

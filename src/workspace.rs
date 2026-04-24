@@ -306,6 +306,7 @@ impl WorkspaceIndex {
             filter,
             workspace_snapshot.shadowed_base_paths(),
             workspace_snapshot.base_snapshot(),
+            true,
         )?;
         let base_elapsed = base_started.elapsed();
 
@@ -550,7 +551,7 @@ fn search_workspace_view(
 ) -> Result<SearchResults> {
     let workspace_snapshot = search_view
         .open_workspace_query_snapshot(Some(base_snapshot.clone()), overlay_snapshot.cloned())?;
-    workspace_snapshot.search(search_view, query, &QueryFilters::default(), filter)
+    workspace_snapshot.search(search_view, query, &QueryFilters::default(), filter, true)
 }
 
 fn workspace_visible_paths(
@@ -560,7 +561,7 @@ fn workspace_visible_paths(
     filter: Option<&PathFilter>,
 ) -> Result<Vec<String>> {
     let shadowed_base_paths = overlay_snapshot
-        .map(|snapshot| snapshot.visible_keys())
+        .map(IndexSnapshotReader::visible_keys)
         .transpose()?
         .map(|keys| {
             keys.live
@@ -596,7 +597,7 @@ fn workspace_candidate_paths(
     filter: Option<&PathFilter>,
 ) -> Result<Vec<String>> {
     let shadowed_base_paths = overlay_snapshot
-        .map(|snapshot| snapshot.visible_keys())
+        .map(IndexSnapshotReader::visible_keys)
         .transpose()?
         .map(|keys| {
             keys.live
@@ -631,6 +632,7 @@ pub(crate) fn workspace_query_request(query: &crate::QueryConfig) -> QueryReques
         case_insensitive: query.case_insensitive,
         top_k: query.global_max_results,
         filters: QueryFilters::default(),
+        prefer_worktree_for_git_head_blob: false,
     }
 }
 

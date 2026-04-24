@@ -40,8 +40,11 @@ impl DaemonService {
 
     #[allow(dead_code)]
     pub fn handle(&self, envelope: RequestEnvelope) -> ResponseEnvelope {
-        self.handle_for_connection(None, envelope)
-            .expect("direct service handle should always have a response")
+        let id = envelope.id;
+        match self.handle_envelope(envelope) {
+            Ok((result, _, _)) => ResponseEnvelope::success(id, result),
+            Err(error) => ResponseEnvelope::error(id, protocol_error(error)),
+        }
     }
 
     pub fn register_connection(&self, sender: mpsc::Sender<ServerMessage>) -> u64 {
@@ -576,6 +579,7 @@ mod tests {
             case_insensitive: false,
             top_k: None,
             filters: QueryFilters::default(),
+            prefer_worktree_for_git_head_blob: false,
         })?;
         Ok(results.matched_lines)
     }
@@ -596,6 +600,7 @@ mod tests {
             case_insensitive: false,
             top_k: None,
             filters: QueryFilters::default(),
+            prefer_worktree_for_git_head_blob: false,
         })?;
         Ok(results.matched_lines)
     }
@@ -3202,6 +3207,98 @@ mod tests {
             ConsistencyMode::WorkspaceEventual,
             1,
         );
+    }
+
+    #[test]
+    fn ensure_repo_replaces_runtime_when_storage_root_changes() {
+        let _serial = daemon_test_serial();
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        fs::write(
+            repo_path.join("tracked.rs"),
+            "const NAME: &str = \"STORAGE_SWITCH_TOKEN\";\n",
+        )
+        .expect("tracked write should succeed");
+
+        let storage_a = temp.path().join("storage-a");
+        let storage_b = temp.path().join("storage-b");
+
+        let (repo_id, first_status) = match service
+            .handle_request_only(Request::EnsureRepo {
+                params: EnsureRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: Some(storage_a.clone()),
+                    config: RepoConfig::default(),
+                    refresh: Default::default(),
+                },
+            })
+            .expect("first ensure should succeed")
+        {
+            Response::RepoEnsured {
+                repo_id,
+                status,
+                indexed_docs,
+            } => {
+                assert!(indexed_docs.is_some(), "first ensure should build a snapshot");
+                (repo_id, status)
+            }
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert_eq!(PathBuf::from(&first_status.storage_root), storage_a);
+        let _ = wait_for_search_count(
+            &service,
+            &repo_id,
+            "STORAGE_SWITCH_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+
+        fs::remove_dir_all(&storage_a).expect("old storage root delete should succeed");
+
+        match service
+            .handle_request_only(Request::EnsureRepo {
+                params: EnsureRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: Some(storage_b.clone()),
+                    config: RepoConfig::default(),
+                    refresh: Default::default(),
+                },
+            })
+            .expect("second ensure should succeed")
+        {
+            Response::RepoEnsured {
+                repo_id: second_repo_id,
+                status,
+                indexed_docs,
+            } => {
+                assert_eq!(second_repo_id, repo_id);
+                assert_eq!(PathBuf::from(&status.storage_root), storage_b);
+                assert!(
+                    indexed_docs.is_some(),
+                    "second ensure should rebuild into the new storage root"
+                );
+            }
+            other => panic!("unexpected response: {other:?}"),
+        }
+
+        let settled = wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+                && PathBuf::from(&status.storage_root) == storage_b
+        });
+        assert!(settled.probe_healthy);
+        assert_eq!(settled.last_error, None);
+
+        let (backend, status) = wait_for_search_count(
+            &service,
+            &repo_id,
+            "STORAGE_SWITCH_TOKEN",
+            ConsistencyMode::WorkspaceEventual,
+            1,
+        );
+        assert!(matches!(backend, SearchBackend::IndexedClean));
+        assert_eq!(PathBuf::from(&status.storage_root), storage_b);
     }
 
     #[test]

@@ -81,6 +81,35 @@ fn build_can_disable_ignore_rules() {
 }
 
 #[test]
+fn indexed_search_includes_non_utf8_text_files() {
+    let repo = TestRepo::new();
+    let utf8 = repo.write("utf8.txt", "Content-Security-Policy\n");
+    let latin1 = repo.write_bytes("latin1.txt", b"Content-Security-Policy\xff\n");
+
+    let engine = codgrep::SearchEngine::new(repo.sparse_build_config());
+    engine.build_base_snapshot().expect("test should succeed");
+
+    let query = count_query("Content-Security-Policy");
+    let results = engine
+        .search(&query, codgrep::SearchPolicy::IndexOnly)
+        .expect("test should succeed")
+        .results;
+    assert_eq!(results.candidate_docs, 2);
+    assert_eq!(results.matched_lines, 2);
+
+    let candidates = engine
+        .candidate_paths(&query, None)
+        .expect("test should succeed");
+    assert_eq!(
+        candidates,
+        vec![
+            latin1.to_string_lossy().to_string(),
+            utf8.to_string_lossy().to_string()
+        ]
+    );
+}
+
+#[test]
 fn build_skips_hidden_files_by_default() {
     let repo = TestRepo::new();
     repo.write(".secret.rs", "const NAME: &str = \"PM_RESUME\";\n");

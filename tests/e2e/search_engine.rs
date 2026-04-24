@@ -49,6 +49,36 @@ fn search_engine_uses_workspace_snapshot_view_when_worktree_is_dirty() {
 }
 
 #[test]
+fn search_engine_workspace_view_keeps_non_utf8_dirty_text_files() {
+    let repo = TestRepo::new();
+    let tracked = repo.write("tracked.rs", "const NAME: &str = \"PM_RESUME\";\n");
+
+    let engine = SearchEngine::new(repo.sparse_build_config());
+    engine.build_base_snapshot().expect("test should succeed");
+    let new_file = repo.write_bytes("latin1.txt", b"const NAME: &str = \"PM_RESUME\";\xff\n");
+    let outcome = engine
+        .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
+        .expect("test should succeed");
+
+    assert_eq!(outcome.backend, SearchBackend::Index);
+    assert_eq!(outcome.results.hits.len(), 2);
+    let mut paths = outcome
+        .results
+        .hits
+        .iter()
+        .map(|hit| hit.path.clone())
+        .collect::<Vec<_>>();
+    paths.sort();
+    assert_eq!(
+        paths,
+        vec![
+            new_file.to_string_lossy().into_owned(),
+            tracked.to_string_lossy().into_owned()
+        ]
+    );
+}
+
+#[test]
 fn search_engine_scans_when_index_is_missing() {
     let repo = TestRepo::new();
     let source = repo.write("service.rs", "const NAME: &str = \"PM_RESUME\";\n");

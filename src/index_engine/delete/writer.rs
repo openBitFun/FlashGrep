@@ -42,7 +42,7 @@ impl DeleteStore for MemoryDeleteStore {
         let mut guard = self
             .delete_segments
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(build.meta.delete_segment_id.clone(), build.meta.clone());
         Ok(build.meta)
     }
@@ -60,7 +60,7 @@ impl DeleteStore for MemoryDeleteStore {
         let mut guard = self
             .delete_segments
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(&id);
         Ok(())
     }
