@@ -49,7 +49,7 @@ repo 默认把索引数据落在 `.codgrep-index-engine/`：
 ## 快速开始
 
 ```bash
-cargo run -- serve
+cargo run --bin cg -- serve
 ```
 
 推荐把 `codgrep` 当成一个独立常驻进程来使用，形态更接近本地搜索 server，而不是 ripgrep 风格的一次性搜索 CLI。
@@ -64,36 +64,87 @@ cargo run -- serve
 
 ```bash
 # 前台拉起 server
-cargo run -- serve --bind 127.0.0.1:4597
+cargo run --bin cg -- serve --bind 127.0.0.1:4597
 
 # 注册或打开一个 repo
-cargo run -- daemon open --repo /path/to/repo
+cargo run --bin cg -- daemon open --repo /path/to/repo
 
 # 对 repo 建索引
-cargo run -- daemon build --repo-id /path/to/repo
+cargo run --bin cg -- daemon build --repo-id /path/to/repo
 
 # 通过 daemon 发搜索请求
-cargo run -- daemon search --repo-id /path/to/repo 'foo.*bar'
+cargo run --bin cg -- daemon search --repo-id /path/to/repo 'foo.*bar'
 
 # 通过 daemon 做路径 glob / scope 解析
-cargo run -- daemon glob --repo-id /path/to/repo -g '*.rs' src
+cargo run --bin cg -- daemon glob --repo-id /path/to/repo -g '*.rs' src
 
 # 查询 repo 状态
-cargo run -- daemon status --repo-id /path/to/repo
+cargo run --bin cg -- daemon status --repo-id /path/to/repo
 
 # 关闭 repo，或关闭整个 server
-cargo run -- daemon close --repo-id /path/to/repo
-cargo run -- daemon shutdown
+cargo run --bin cg -- daemon close --repo-id /path/to/repo
+cargo run --bin cg -- daemon shutdown
 ```
+
+## MCP 集成
+
+如果你想把 `codgrep` 作为 MCP server 暴露给别的项目，而不改宿主源码，可以直接启动：
+
+```bash
+# Node MCP server，固定 repo
+node src/mcp/server.js --repo /path/to/repo
+
+# 也可以显式指定索引目录或 codgrep daemon 二进制
+node src/mcp/server.js --repo /path/to/repo --storage-root /tmp/codgrep-index
+node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/cg
+```
+
+这个 MCP server 当前暴露 5 个 tools：
+
+- `search_code`
+  对 repo 执行 codgrep 搜索；不会隐式建索引。如果 repo 还没有 base snapshot，会直接报错，要求先调用 `build_index`，或者显式允许 `allow_scan_fallback`。
+- `glob_files`
+  按 ignore/glob/type 规则返回当前可见文件。
+- `repo_status`
+  返回 daemon 里的 repo 状态。
+- `refresh_repo`
+  触发 workspace refresh。
+- `build_index`
+  显式确保 repo 已完成基础索引构建。
+
+典型 MCP 配置示例：
+
+```json
+{
+  "mcpServers": {
+    "codgrep": {
+      "command": "node",
+      "args": [
+        "/absolute/path/to/codgrep/src/mcp/server.js",
+        "--repo",
+        "/path/to/repo"
+      ]
+    }
+  }
+}
+```
+
+说明：
+
+- 如果启动时已经传了 `--repo`，tool 调用里可以省略 `repo_path`。
+- 如果没有传 `--repo`，每次 tool 调用都需要带 `repo_path`。
+- MCP transport 走 stdio，framing 使用 `Content-Length`。
+- MCP server 自身是 Node 进程；它会在本次 MCP session 内拉起并持有一个 `cg serve --stdio` 后端子进程。
+- 如果没显式传 `--daemon-bin`，server 会优先尝试 `target/release/cg`、`target/debug/cg`，最后回退到环境里的 `cg`。
 
 如果只是离线准备索引或做 bench，也保留这两个入口：
 
 ```bash
 # 通过 managed daemon 自动拉起/连接 server，并确保 repo 已可搜索
-cargo run -- build --repo /path/to/repo
+cargo run --bin cg -- build --repo /path/to/repo
 
 # benchmark 仍是本地运维工具入口
-cargo run -- bench --suite-dir bench_data
+cargo run --bin cg -- bench --suite-dir bench_data
 ```
 
 当前 CLI 语义：
@@ -216,6 +267,7 @@ daemon 运行时维护两类 workspace 状态：
 ## Benchmark
 
 当前项目已集成一版兼容 ripgrep `benchsuite` 命名方式的 benchmark runner。
+benchmark 的 `codgrep` 结果只统计上层 daemon/service 查询路径；不再提供底层 direct benchmark 口径。
 
 语料目录默认按下面布局准备：
 
@@ -226,30 +278,19 @@ daemon 运行时维护两类 workspace 状态：
 运行示例：
 
 ```bash
-cargo run -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter linux_literal --rebuild
+cargo run --bin cg -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter linux_literal --rebuild
 ```
 
 如果希望顺带对比 `rg`：
 
 ```bash
-cargo run -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
-```
-
-如果希望额外测库层 facade 和 dirty worktree 路径：
-
-```bash
-cargo run -- bench \
-  --suite-dir /Users/user/workspace/codgrep/bench_data \
-  --filter linux_literal \
-  --compare-worktree \
-  --compare-workspace \
-  --rebuild
+cargo run --bin cg -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
 ```
 
 如果希望 dirty worktree 更贴近“只改了几份文件”的 agent 场景，可以给 worktree fixture 加一个文件数上限。这个模式会从完整语料里抽一个保留真实目录结构的小型子仓库，并保证包含当前 benchmark 需要命中的文件：
 
 ```bash
-cargo run -- bench \
+cargo run --bin cg -- bench \
   --suite-dir /Users/user/workspace/codgrep/bench_data \
   --filter linux_literal \
   --compare-worktree \
@@ -260,7 +301,7 @@ cargo run -- bench \
 如果希望比较 cold query，可以切到 `cold` cache mode。这个模式会在每个 sample 前主动驱逐本次 benchmark 会访问到的 index / corpus 文件页缓存；如果你还想连系统级 page cache 一起清掉，可以额外提供一个 hook：
 
 ```bash
-cargo run -- bench \
+cargo run --bin cg -- bench \
   --suite-dir /Users/user/workspace/codgrep/bench_data \
   --filter linux_literal \
   --compare-rg \
@@ -272,11 +313,10 @@ cargo run -- bench \
 说明：
 
 - `codgrep` 的 benchmark 会单独统计索引构建时间和查询时间。
-- `--compare-worktree` 会额外跑 dirty worktree 查询路径；当前实现直接走“base snapshot + query-time dirty repair”，不再依赖持久化 overlay cache。历史 runner 名称里的 `dirty_first_query` / `dirty_cached_query` 仅为兼容已有 benchmark 输出。
+- `--compare-worktree` 会额外跑 dirty worktree 查询路径；当前实现直接走“base snapshot + query-time dirty repair”，不再依赖持久化 overlay cache。
 - `--worktree-sample-files <N>` 只影响 `--compare-worktree` 的 fixture 构造：不再复制完整目录，而是抽一个最多 `N` 个文本文件的小型真实子仓库。这个模式更适合测“少量 dirty 文件”的真实查询成本；不传时仍然保留完整仓库 worst-case。
-- `--compare-workspace` 会额外跑 clean workspace facade 路径；每个 sample 都会重新走一次 `snapshot().search()`，用于把工作区读视图构造成本也计入结果，而不是只测固定 snapshot 上的纯查询。
 - `rg` 对比项只统计直接搜索耗时，不包含任何建索引步骤。
-- `--raw-output <path>` 会把每个 sample 以 CSV 形式落盘；除了 `runner` 原始 id 之外，还会额外写出 `runner_family` 和 `runner_mode`，方便脚本稳定地区分 `daemon_steady_state` / `workspace_snapshot` / `dirty_first_query` / `dirty_cached_query` 等路径。当前这两条 dirty runner 都走 query-time repair，只是为了兼容旧 benchmark 标签而保留了名称。
+- `--raw-output <path>` 会把每个 sample 以 CSV 形式落盘；除了 `runner` 原始 id 之外，还会额外写出 `runner_family` 和 `runner_mode`，方便脚本稳定地区分 `daemon_steady_state` / `dirty_first_query` / `dirty_cached_query` 等路径。
 - bench 默认是 `warm` cache mode；`warmup_iter=1`、`bench_iter=3` 的默认值测出来的不是 cold query。
 - bench 默认是 `trace` query mode：如果 ad-hoc benchmark 传了多个 `--pattern`，会把它们当成一条 query trace 顺序执行，而不是把同一个 query 热重复很多次；需要旧的 steady-state 语义时可显式传 `--query-mode same`。
 - `cold` cache mode 默认使用 `posix_fadvise(..., DONTNEED)` 驱逐本次 benchmark 文件集的 page cache；额外的 `--cold-hook` 适合在 Linux 上配合 `drop_caches` 做更严格的系统级 cold run。

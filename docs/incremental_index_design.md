@@ -27,7 +27,7 @@
 
 ### 2. Dirty Detection Is Separate From Query Visibility
 
-watcher、定时 reconcile、手动 refresh 都只负责：
+后台 workspace probe、定时 reconcile、手动 refresh 都只负责：
 
 - 发现 dirty path
 - 记录 observed file version
@@ -111,7 +111,7 @@ Filesystem / Git changes
 
 变化来源可以是：
 
-- filesystem watcher
+- background workspace probe
 - Git diff / repo reconcile
 - 启动时全量 rescan
 - 显式 refresh

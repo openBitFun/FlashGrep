@@ -26,7 +26,7 @@ v1 采用 `JSON-RPC 2.0` 风格消息：
 
 - 不暴露底层索引文件格式
 - 不承诺 Rust crate root 导出的 API 稳定
-- 不暴露 watcher 的原始文件系统事件流
+- 不暴露内部 workspace probe / rescan 的原始事件流
 - 不在 v1 中提供通用订阅 DSL
 
 ## 传输
@@ -128,7 +128,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
   },
   "rebuild_recommended": false,
   "active_task_id": null,
-  "watcher_healthy": true,
+  "probe_healthy": true,
   "last_error": null
 }
 ```
@@ -136,11 +136,11 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 `phase` 枚举：
 
 - `opening`
-- `missing_index`
-- `indexing`
+- `missing_base_snapshot`
+- `building_base_snapshot`
 - `ready_clean`
 - `ready_dirty`
-- `rebuilding`
+- `rebuilding_base_snapshot`
 - `degraded`
 
 说明：
@@ -379,7 +379,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 用途：
 
 - 注册 repo runtime
-- 启动 watcher
+- 启动后台 maintenance / workspace probe 循环
 - 不自动构建 base snapshot
 
 补充约定：
@@ -467,7 +467,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 用途：
 
 - 主动从 worktree 重算 dirty 集
-- 当 watcher 失步或客户端怀疑状态过期时使用
+- 当后台 probe 尚未收敛或客户端怀疑状态过期时使用
 
 请求：
 
@@ -492,7 +492,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 用途：
 
 - 关闭 repo runtime
-- 停止 watcher
+- 停止后台 maintenance / workspace probe 循环
 
 请求：
 
@@ -681,7 +681,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 - `scope.roots` 必须为空，或解析后仍位于 `repo_id` 对应 repo 根目录之内
 - `glob` 语义是 repo 内路径枚举，不允许把 daemon 当作任意目录扫描器使用
-- daemon 可以在单个 repo runtime 内缓存 `glob(scope)` 结果，但 watcher 或 refresh 只要改变当前可见文件集，这份缓存就必须失效
+- daemon 可以在单个 repo runtime 内缓存 `glob(scope)` 结果，但 background probe 或 refresh 只要改变当前可见文件集，这份缓存就必须失效
 
 ## 任务方法
 
