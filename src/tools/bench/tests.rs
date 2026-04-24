@@ -4,7 +4,8 @@ use tempfile::tempdir;
 
 use super::{
     bench_build_config, benchmark_scope_roots, copy_tree, ensure_bench_base_snapshot,
-    parse_rg_count_output, prepare_rg_search_scope, run, BenchCacheMode, BenchConfig,
+    parse_rg_count_output, prepare_rg_search_scope, run, start_bench_daemon, BenchCacheMode,
+    BenchConfig,
 };
 use super::{fixtures::prepare_dirty_worktree_fixture, DirtyPattern};
 use crate::config::{CorpusMode, TokenizerMode};
@@ -348,6 +349,54 @@ fn bench_runner_supports_custom_repo_patterns() {
         .runners
         .iter()
         .any(|runner| runner.runner == "codgrep"));
+}
+
+#[test]
+fn bench_daemon_shutdown_removes_state_file() {
+    let temp = tempdir().expect("test should succeed");
+    let suite_dir = temp.path().join("suite");
+    let repo_dir = temp.path().join("repo");
+    let storage_root = suite_dir
+        .join(".codgrep-bench")
+        .join("custom-runtime")
+        .join("repo-repro-ignore-sparse-ngram");
+
+    fs::create_dir_all(&suite_dir).expect("test should succeed");
+    fs::create_dir_all(&repo_dir).expect("test should succeed");
+    fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+
+    let config = BenchConfig {
+        suite_dir,
+        filter: None,
+        custom_repo: Some(repo_dir.clone()),
+        custom_patterns: vec!["BitFun".into()],
+        custom_name: Some("repro".into()),
+        custom_case_insensitive: false,
+        tokenizer: TokenizerMode::SparseNgram,
+        corpus_mode: CorpusMode::RespectIgnore,
+        cache_mode: BenchCacheMode::Warm,
+        query_mode: super::BenchQueryMode::Same,
+        warmup_iter: 0,
+        bench_iter: 1,
+        top_k_tokens: 4,
+        compare_rg: false,
+        compare_worktree: false,
+        worktree_sample_files: None,
+        worktree_dirty_files: 1,
+        rebuild: true,
+        raw_output: None,
+        cold_hook: None,
+    };
+    ensure_bench_base_snapshot(&bench_build_config(&repo_dir, &storage_root, &config), true)
+        .expect("test should succeed");
+
+    let daemon =
+        start_bench_daemon(&repo_dir, &storage_root, &config).expect("test should succeed");
+    let state_file = daemon.state_file.clone();
+    assert!(state_file.exists());
+
+    daemon.shutdown().expect("shutdown should succeed");
+    assert!(!state_file.exists());
 }
 
 #[test]

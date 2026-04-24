@@ -9,6 +9,7 @@ use crate::error::{AppError, Result};
 use super::{
     cache::prepare_sample,
     configure_rg_command,
+    finish_daemon_run,
     report::{build_summary, RawSample, RawWriter},
     run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchmarkCase,
     BitfunOutcome, CacheRunner, RgSearchScope, RunnerSummary,
@@ -24,41 +25,44 @@ pub(super) fn run_codgrep_benchmark(
 ) -> Result<RunnerSummary> {
     let target = benchmark.corpus.search_target(suite_dir);
     let daemon = start_bench_daemon(&benchmark.corpus.repo_path(suite_dir), storage_root, config)?;
-    let mut durations = Vec::with_capacity(config.bench_iter);
-    let mut match_count = 0;
+    let result = (|| {
+        let mut durations = Vec::with_capacity(config.bench_iter);
+        let mut match_count = 0;
 
-    for _ in 0..config.warmup_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
-    }
-
-    for iter in 0..config.bench_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let started = Instant::now();
-        let matches = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
-        let duration_secs = started.elapsed().as_secs_f64();
-        match_count = matches.match_count;
-        durations.push(duration_secs);
-
-        if let Some(writer) = raw_writer.as_deref_mut() {
-            writer.write_sample(RawSample {
-                benchmark: benchmark.name,
-                corpus: benchmark.corpus.label(),
-                runner: "codgrep",
-                iteration: iter,
-                duration_secs,
-                candidate_docs: Some(matches.candidate_docs),
-                match_count,
-            })?;
+        for _ in 0..config.warmup_iter {
+            prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
+            let _ = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
         }
-    }
 
-    Ok(build_summary(
-        "codgrep".into(),
-        durations,
-        None,
-        match_count,
-    ))
+        for iter in 0..config.bench_iter {
+            prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
+            let started = Instant::now();
+            let matches = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
+            let duration_secs = started.elapsed().as_secs_f64();
+            match_count = matches.match_count;
+            durations.push(duration_secs);
+
+            if let Some(writer) = raw_writer.as_deref_mut() {
+                writer.write_sample(RawSample {
+                    benchmark: benchmark.name,
+                    corpus: benchmark.corpus.label(),
+                    runner: "codgrep",
+                    iteration: iter,
+                    duration_secs,
+                    candidate_docs: Some(matches.candidate_docs),
+                    match_count,
+                })?;
+            }
+        }
+
+        Ok(build_summary(
+            "codgrep".into(),
+            durations,
+            None,
+            match_count,
+        ))
+    })();
+    finish_daemon_run(daemon, result)
 }
 
 pub(super) fn run_rg_benchmark(
@@ -109,68 +113,74 @@ pub(super) fn run_worktree_benchmark(
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<RunnerSummary> {
-    let mut durations = Vec::with_capacity(config.bench_iter);
-    let mut candidate_docs = None;
-    let mut match_count = 0;
     let daemon = (!build_overlay_each_sample)
         .then(|| start_bench_daemon(repo_path, storage_root, config))
         .transpose()?;
+    let result = (|| {
+        let mut durations = Vec::with_capacity(config.bench_iter);
+        let mut candidate_docs = None;
+        let mut match_count = 0;
 
-    for _ in 0..config.warmup_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let _ = run_worktree_once(
-            daemon.as_ref(),
-            repo_path,
-            storage_root,
-            benchmark,
-            build_overlay_each_sample,
-            config,
-        )?;
-    }
-
-    for iter in 0..config.bench_iter {
-        prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-        let started = Instant::now();
-        let outcome = run_worktree_once(
-            daemon.as_ref(),
-            repo_path,
-            storage_root,
-            benchmark,
-            build_overlay_each_sample,
-            config,
-        )?;
-        let duration_secs = started.elapsed().as_secs_f64();
-        candidate_docs = Some(outcome.candidate_docs);
-        match_count = outcome.match_count;
-        durations.push(duration_secs);
-
-        if let Some(writer) = raw_writer.as_deref_mut() {
-            writer.write_sample(RawSample {
-                benchmark: benchmark.name,
-                corpus: benchmark.corpus.label(),
-                runner: if build_overlay_each_sample {
-                    "codgrep_worktree_build"
-                } else {
-                    "codgrep_worktree"
-                },
-                iteration: iter,
-                duration_secs,
-                candidate_docs,
-                match_count,
-            })?;
+        for _ in 0..config.warmup_iter {
+            prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
+            let _ = run_worktree_once(
+                daemon.as_ref(),
+                repo_path,
+                storage_root,
+                benchmark,
+                build_overlay_each_sample,
+                config,
+            )?;
         }
-    }
 
-    Ok(build_summary(
-        if build_overlay_each_sample {
-            "codgrep_worktree_build".into()
-        } else {
-            "codgrep_worktree".into()
-        },
-        durations,
-        candidate_docs,
-        match_count,
-    ))
+        for iter in 0..config.bench_iter {
+            prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
+            let started = Instant::now();
+            let outcome = run_worktree_once(
+                daemon.as_ref(),
+                repo_path,
+                storage_root,
+                benchmark,
+                build_overlay_each_sample,
+                config,
+            )?;
+            let duration_secs = started.elapsed().as_secs_f64();
+            candidate_docs = Some(outcome.candidate_docs);
+            match_count = outcome.match_count;
+            durations.push(duration_secs);
+
+            if let Some(writer) = raw_writer.as_deref_mut() {
+                writer.write_sample(RawSample {
+                    benchmark: benchmark.name,
+                    corpus: benchmark.corpus.label(),
+                    runner: if build_overlay_each_sample {
+                        "codgrep_worktree_build"
+                    } else {
+                        "codgrep_worktree"
+                    },
+                    iteration: iter,
+                    duration_secs,
+                    candidate_docs,
+                    match_count,
+                })?;
+            }
+        }
+
+        Ok(build_summary(
+            if build_overlay_each_sample {
+                "codgrep_worktree_build".into()
+            } else {
+                "codgrep_worktree".into()
+            },
+            durations,
+            candidate_docs,
+            match_count,
+        ))
+    })();
+    match daemon {
+        Some(daemon) => finish_daemon_run(daemon, result),
+        None => result,
+    }
 }
 
 fn run_rg_once(
@@ -272,7 +282,8 @@ fn run_worktree_once(
 ) -> Result<BitfunOutcome> {
     if build_overlay_each_sample {
         let daemon = start_bench_daemon(repo_path, storage_root, config)?;
-        run_worktree_query(&daemon, benchmark, repo_path, config)
+        let result = run_worktree_query(&daemon, benchmark, repo_path, config);
+        finish_daemon_run(daemon, result)
     } else {
         let daemon = daemon.ok_or_else(|| {
             AppError::Protocol("missing cached daemon for dirty worktree benchmark".into())

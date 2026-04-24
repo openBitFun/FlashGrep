@@ -9,19 +9,24 @@ mod tests;
 use std::{
     collections::{BTreeMap, HashSet},
     env, fs,
+    io::{BufRead, BufReader, BufWriter, Write},
+    net::TcpStream,
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, Command, ExitStatus, Stdio},
+    thread,
+    time::{Duration, Instant},
 };
 
 use crate::{
     base_snapshot_build::{BaseSnapshotBuildMode, BaseSnapshotBuildOptions},
     config::{BuildConfig, CorpusMode, TokenizerMode},
     daemon::{
+        daemon_state_file_path,
         protocol::{
-            ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, SearchModeConfig,
-            SearchParams,
+            ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request,
+            RequestEnvelope, Response, ResponseEnvelope, SearchModeConfig, SearchParams,
         },
-        DaemonClient, ManagedDaemonClient,
+        DaemonClient,
     },
     error::{AppError, Result},
     files::{repo_relative_path, scan_repository},
@@ -246,9 +251,12 @@ pub(super) struct BitfunOutcome {
 }
 
 pub(super) struct BenchDaemon {
+    child: Option<Child>,
     client: DaemonClient,
     addr: String,
     repo_id: String,
+    state_file: PathBuf,
+    shutdown_sent: bool,
 }
 
 const BENCHMARKS: &[BenchmarkCase] = &[
@@ -475,8 +483,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             );
             let patterns = dirty_patterns_by_corpus
                 .get(&corpus)
-                .map(Vec::as_slice)
-                .unwrap_or(&[]);
+                .map_or_else(|| &[][..], Vec::as_slice);
             dirty_worktree_fixtures.insert(
                 corpus,
                 prepare_dirty_worktree_fixture(
@@ -696,6 +703,11 @@ fn prepare_rg_ignore_file(
     storage_root: &Path,
     config: &BenchConfig,
 ) -> Result<Option<PathBuf>> {
+    let ignore_path = storage_root.join("bench-rg-exclude.ignore");
+    if ignore_path.exists() {
+        return Ok(Some(ignore_path));
+    }
+
     let repo_root = fs::canonicalize(repo_path).unwrap_or_else(|_| repo_path.to_path_buf());
     let visible_paths = bench_visible_paths(repo_path, storage_root, config)?;
     let excluded = scan_repository(&bench_build_config(repo_path, storage_root, config))?
@@ -710,7 +722,6 @@ fn prepare_rg_ignore_file(
     }
 
     fs::create_dir_all(storage_root)?;
-    let ignore_path = storage_root.join("bench-rg-exclude.ignore");
     let mut contents = String::new();
     for path in excluded {
         contents.push('/');
@@ -773,13 +784,11 @@ fn codgrep_executable() -> Result<PathBuf> {
     let candidates = [
         current
             .parent()
-            .map(|parent| parent.join("cg"))
-            .unwrap_or_else(|| PathBuf::from("cg")),
+            .map_or_else(|| PathBuf::from("cg"), |parent| parent.join("cg")),
         current
             .parent()
             .and_then(Path::parent)
-            .map(|parent| parent.join("cg"))
-            .unwrap_or_else(|| PathBuf::from("cg")),
+            .map_or_else(|| PathBuf::from("cg"), |parent| parent.join("cg")),
     ];
     for candidate in candidates {
         if candidate.exists() {
@@ -795,8 +804,7 @@ pub(super) fn start_bench_daemon(
     storage_root: &Path,
     config: &BenchConfig,
 ) -> Result<BenchDaemon> {
-    let managed = ManagedDaemonClient::new().with_daemon_program(codgrep_executable()?);
-    let ensured = managed.ensure_repo(EnsureRepoParams {
+    let ensure_params = EnsureRepoParams {
         repo_path: repo_path.to_path_buf(),
         storage_root: Some(storage_root.to_path_buf()),
         config: RepoConfig {
@@ -818,12 +826,27 @@ pub(super) fn start_bench_daemon(
             max_sparse_len: 8,
         },
         refresh: Default::default(),
-    })?;
+    };
+    let state_file = daemon_state_file_path(&ensure_params)?;
+    let daemon_program = codgrep_executable()?;
+    let mut child = spawn_bench_daemon_process(&daemon_program, &state_file)?;
+    let (addr, repo_id) = wait_for_bench_daemon_ready(&mut child, &state_file, &ensure_params)?;
     Ok(BenchDaemon {
-        client: DaemonClient::new(ensured.addr.clone()),
-        addr: ensured.addr,
-        repo_id: ensured.repo_id,
+        child: Some(child),
+        client: DaemonClient::new(addr.clone()),
+        addr,
+        repo_id,
+        state_file,
+        shutdown_sent: false,
     })
+}
+
+pub(super) fn finish_daemon_run<T>(daemon: BenchDaemon, result: Result<T>) -> Result<T> {
+    let shutdown_result = daemon.shutdown();
+    match (result, shutdown_result) {
+        (Ok(value), Ok(())) => Ok(value),
+        (Err(error), Ok(()) | Err(_)) | (Ok(_), Err(error)) => Err(error),
+    }
 }
 
 pub(super) fn run_daemon_search_count(
@@ -934,8 +957,226 @@ fn normalize_scope_root(
 
 impl Drop for BenchDaemon {
     fn drop(&mut self) {
-        let _ = self.client.send(crate::daemon::protocol::Request::Shutdown);
-        let _ = &self.addr;
+        let _ = self.request_shutdown();
+        let _ = self.wait_for_exit();
+    }
+}
+
+impl BenchDaemon {
+    fn request_shutdown(&mut self) -> Result<()> {
+        if self.shutdown_sent {
+            return Ok(());
+        }
+        send_shutdown_request(&self.addr)?;
+        self.shutdown_sent = true;
+        Ok(())
+    }
+
+    fn shutdown(mut self) -> Result<()> {
+        self.request_shutdown()?;
+        self.wait_for_exit()
+    }
+
+    fn wait_for_exit(&mut self) -> Result<()> {
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if let Some(status) = self.try_wait_child()? {
+                self.finish_child_cleanup(status);
+                return Ok(());
+            }
+
+            if !self.state_file.exists() {
+                let status = self.wait_child_blocking()?;
+                self.finish_child_cleanup(status);
+                return Ok(());
+            }
+
+            if Instant::now() >= deadline {
+                self.force_kill_child();
+                return Ok(());
+            }
+
+            thread::sleep(Duration::from_millis(50));
+        }
+    }
+
+    fn try_wait_child(&mut self) -> Result<Option<ExitStatus>> {
+        match self.child.as_mut() {
+            Some(child) => child.try_wait().map_err(Into::into),
+            None => Ok(Some(success_exit_status())),
+        }
+    }
+
+    fn wait_child_blocking(&mut self) -> Result<ExitStatus> {
+        match self.child.as_mut() {
+            Some(child) => child.wait().map_err(Into::into),
+            None => Ok(success_exit_status()),
+        }
+    }
+
+    fn finish_child_cleanup(&mut self, _status: ExitStatus) {
+        self.child.take();
+        let _ = fs::remove_file(&self.state_file);
+    }
+
+    fn force_kill_child(&mut self) {
+        let Some(mut child) = self.child.take() else {
+            let _ = fs::remove_file(&self.state_file);
+            return;
+        };
+        let _ = child.kill();
+        let _ = child.wait();
+        let _ = fs::remove_file(&self.state_file);
+    }
+}
+
+fn spawn_bench_daemon_process(daemon_program: &Path, state_file: &Path) -> Result<Child> {
+    if let Some(parent) = state_file.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if state_file.exists() {
+        fs::remove_file(state_file)?;
+    }
+
+    let mut command = Command::new(daemon_program);
+    command
+        .arg("serve")
+        .arg("--bind")
+        .arg("127.0.0.1:0")
+        .arg("--state-file")
+        .arg(state_file)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    command.spawn().map_err(Into::into)
+}
+
+fn wait_for_bench_daemon_ready(
+    child: &mut Child,
+    state_file: &Path,
+    ensure_params: &EnsureRepoParams,
+) -> Result<(String, String)> {
+    let deadline = Instant::now() + Duration::from_secs(10);
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Err(AppError::Protocol(format!(
+                "bench daemon exited before becoming ready: {status}"
+            )));
+        }
+
+        if let Some(addr) = read_bench_daemon_addr(state_file)? {
+            let client = DaemonClient::new(addr.clone()).with_io_timeout(Duration::from_secs(1));
+            match client.ensure_repo(ensure_params.clone()) {
+                Ok(Response::RepoEnsured { repo_id, .. }) => return Ok((addr, repo_id)),
+                Ok(other) => {
+                    return Err(AppError::Protocol(format!(
+                        "unexpected ensure_repo response while starting bench daemon: {other:?}"
+                    )));
+                }
+                Err(_) => {}
+            }
+        }
+
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            let _ = fs::remove_file(state_file);
+            return Err(AppError::Protocol(format!(
+                "timed out waiting for bench daemon state file at {}",
+                state_file.display()
+            )));
+        }
+
+        thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn read_bench_daemon_addr(state_file: &Path) -> Result<Option<String>> {
+    let contents = match fs::read_to_string(state_file) {
+        Ok(contents) => contents,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.into()),
+    };
+    let value: serde_json::Value = serde_json::from_str(&contents)
+        .map_err(|error| AppError::Protocol(format!("invalid bench daemon state file: {error}")))?;
+    Ok(value
+        .get("addr")
+        .and_then(|addr| addr.as_str())
+        .map(std::string::ToString::to_string))
+}
+
+fn success_exit_status() -> ExitStatus {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::ExitStatusExt;
+        ExitStatus::from_raw(0)
+    }
+}
+
+fn send_shutdown_request(addr: &str) -> Result<()> {
+    let stream = match TcpStream::connect(addr) {
+        Ok(stream) => stream,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::ConnectionRefused
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error.into()),
+    };
+    stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+    stream.set_write_timeout(Some(Duration::from_secs(2)))?;
+    let request = RequestEnvelope {
+        jsonrpc: "2.0".into(),
+        id: Some(1),
+        request: Request::Shutdown,
+    };
+    let mut writer = BufWriter::new(stream.try_clone()?);
+    serde_json::to_writer(&mut writer, &request)
+        .map_err(|error| AppError::Protocol(format!("failed to encode shutdown request: {error}")))?;
+    writer.write_all(b"\n")?;
+    writer.flush()?;
+
+    let mut reader = BufReader::new(stream);
+    let mut line = String::new();
+    match reader.read_line(&mut line) {
+        Ok(0) => Ok(()),
+        Ok(_) => {
+            let response: ResponseEnvelope = serde_json::from_str(&line).map_err(|error| {
+                AppError::Protocol(format!("failed to decode shutdown response: {error}"))
+            })?;
+            match response.result {
+                Some(Response::ShutdownAck) | None => Ok(()),
+                Some(other) => Err(AppError::Protocol(format!(
+                    "unexpected shutdown response: {other:?}"
+                ))),
+            }
+        }
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::TimedOut
+                    | std::io::ErrorKind::WouldBlock
+                    | std::io::ErrorKind::UnexpectedEof
+                    | std::io::ErrorKind::ConnectionAborted
+                    | std::io::ErrorKind::ConnectionReset
+                    | std::io::ErrorKind::BrokenPipe
+                    | std::io::ErrorKind::NotConnected
+            ) =>
+        {
+            Ok(())
+        }
+        Err(error) => Err(error.into()),
     }
 }
 
