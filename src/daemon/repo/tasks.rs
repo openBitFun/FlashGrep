@@ -420,7 +420,9 @@ impl RepoRuntime {
         self.shutting_down.store(true, Ordering::Relaxed);
         {
             let (lock, condvar) = &*self.maintenance_worker;
-            let mut state = lock.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+            let mut state = lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.shutdown = true;
             condvar.notify_all();
         }
@@ -435,6 +437,12 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner().take(),
         } {
             let _ = active.handle.join();
+        }
+        if let Some(handle) = match self.watcher_handle.lock() {
+            Ok(mut guard) => guard.take(),
+            Err(poisoned) => poisoned.into_inner().take(),
+        } {
+            let _ = handle.join();
         }
         if let Some(handle) = match self.maintenance_handle.lock() {
             Ok(mut guard) => guard.take(),

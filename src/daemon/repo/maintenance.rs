@@ -24,8 +24,11 @@ const MAINTENANCE_REASON_OVERLAY_REBUILD: u32 = 1 << 2;
 const MAINTENANCE_REASON_BASE_REBUILD: u32 = 1 << 3;
 #[allow(dead_code)]
 const MAINTENANCE_REASON_BASE_PROMOTE: u32 = 1 << 4;
-const GIT_WORKSPACE_PROBE_INTERVAL: Duration = Duration::from_millis(100);
-const NON_GIT_WORKSPACE_PROBE_INTERVAL: Duration = Duration::from_secs(2);
+const GIT_WORKSPACE_EVENT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+const NON_GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
+const GIT_WORKSPACE_POLL_FALLBACK_INTERVAL: Duration = Duration::from_millis(100);
+const NON_GIT_WORKSPACE_POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 const AUTO_BASE_REBUILD_MIN_DELAY: Duration = Duration::from_secs(2);
 const AUTO_BASE_REBUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -126,12 +129,28 @@ impl RepoRuntime {
         let ready_for_probe = matches!(state.phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
             && state.snapshot_key.is_some();
 
-        if !ready_for_probe || self.has_active_task() {
+        if !ready_for_probe {
             self.schedule_workspace_probe(probe_interval);
             return;
         }
 
-        if let Err(error) = self.probe_workspace_overlay() {
+        if self.has_active_task() {
+            let retry_delay = if self.has_pending_workspace_events() {
+                GIT_WORKSPACE_EVENT_RETRY_DELAY
+            } else {
+                probe_interval
+            };
+            self.schedule_workspace_probe(retry_delay);
+            return;
+        }
+
+        let probe_result = if self.has_pending_workspace_events() {
+            self.probe_workspace_overlay_from_events()
+        } else {
+            self.probe_workspace_overlay()
+        };
+
+        if let Err(error) = probe_result {
             self.set_probe_healthy(false);
             self.set_last_error(Some(format!("background workspace poll failed: {error}")));
         } else {
@@ -228,9 +247,17 @@ impl RepoRuntime {
 
     pub(super) fn workspace_probe_interval(&self) -> Duration {
         if self.build_config.repo_path.join(".git").exists() {
-            GIT_WORKSPACE_PROBE_INTERVAL
+            if self.workspace_watcher_active() {
+                GIT_WORKSPACE_RECONCILE_INTERVAL
+            } else {
+                GIT_WORKSPACE_POLL_FALLBACK_INTERVAL
+            }
         } else {
-            NON_GIT_WORKSPACE_PROBE_INTERVAL
+            if self.workspace_watcher_active() {
+                NON_GIT_WORKSPACE_RECONCILE_INTERVAL
+            } else {
+                NON_GIT_WORKSPACE_POLL_FALLBACK_INTERVAL
+            }
         }
     }
 

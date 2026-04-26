@@ -75,7 +75,9 @@ pub(crate) fn search_documents(
                             .into_iter()
                             .map(|count| {
                                 Ok(crate::search::FileCount {
-                                    path: scan_doc_meta(docs.as_slice(), count.doc_id)?.path.clone(),
+                                    path: scan_doc_meta(docs.as_slice(), count.doc_id)?
+                                        .path
+                                        .clone(),
                                     matched_lines: count.matched_lines,
                                 })
                             })
@@ -89,7 +91,9 @@ pub(crate) fn search_documents(
                             .into_iter()
                             .map(|count| {
                                 Ok(crate::search::FileMatchCount {
-                                    path: scan_doc_meta(docs.as_slice(), count.doc_id)?.path.clone(),
+                                    path: scan_doc_meta(docs.as_slice(), count.doc_id)?
+                                        .path
+                                        .clone(),
                                     matched_occurrences: count.matched_occurrences,
                                 })
                             })
@@ -482,7 +486,7 @@ fn scan_doc_source(documents: &[SearchDocument], doc_id: u32) -> Result<VerifyCa
 fn scan_doc_meta(documents: &[ScannedDocMeta], doc_id: u32) -> Result<&ScannedDocMeta> {
     let index = usize::try_from(doc_id)
         .map_err(|_| AppError::ValueOutOfRange(format!("doc id {doc_id} exceeds usize range")))?;
-    documents
-        .get(index)
-        .ok_or_else(|| AppError::InvalidIndex(format!("doc id {doc_id} is missing from scan metadata")))
+    documents.get(index).ok_or_else(|| {
+        AppError::InvalidIndex(format!("doc id {doc_id} is missing from scan metadata"))
+    })
 }

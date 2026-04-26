@@ -303,10 +303,7 @@ fn extract_trigram_terms_from_text(text: &str) -> Vec<u64> {
 }
 
 fn extract_trigram_terms_from_bytes(bytes: &[u8]) -> Vec<u64> {
-    let folded = bytes
-        .iter()
-        .map(u8::to_ascii_lowercase)
-        .collect::<Vec<_>>();
+    let folded = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
     if folded.len() < POSTING_GRAM_LEN {
         return Vec::new();
     }

@@ -1142,8 +1142,9 @@ fn send_shutdown_request(addr: &str) -> Result<()> {
         request: Request::Shutdown,
     };
     let mut writer = BufWriter::new(stream.try_clone()?);
-    serde_json::to_writer(&mut writer, &request)
-        .map_err(|error| AppError::Protocol(format!("failed to encode shutdown request: {error}")))?;
+    serde_json::to_writer(&mut writer, &request).map_err(|error| {
+        AppError::Protocol(format!("failed to encode shutdown request: {error}"))
+    })?;
     writer.write_all(b"\n")?;
     writer.flush()?;
 

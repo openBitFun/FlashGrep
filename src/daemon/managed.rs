@@ -319,12 +319,10 @@ pub fn daemon_state_file_path_from_open(params: &OpenRepoParams) -> Result<PathB
 }
 
 fn daemon_start_lock_file_path(state_file: &Path) -> PathBuf {
-    state_file
-        .parent()
-        .map_or_else(
-            || PathBuf::from(DEFAULT_DAEMON_START_LOCK_FILE),
-            |parent| parent.join(DEFAULT_DAEMON_START_LOCK_FILE),
-        )
+    state_file.parent().map_or_else(
+        || PathBuf::from(DEFAULT_DAEMON_START_LOCK_FILE),
+        |parent| parent.join(DEFAULT_DAEMON_START_LOCK_FILE),
+    )
 }
 
 fn startup_lock_is_stale(path: &Path, stale_after: Duration) -> bool {

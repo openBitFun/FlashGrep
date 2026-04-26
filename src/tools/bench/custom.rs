@@ -202,12 +202,10 @@ pub(super) fn run_custom(
     })
 }
 fn custom_storage_root(repo_path: &Path, target_label: &str, config: &BenchConfig) -> PathBuf {
-    let repo_label = repo_path
-        .file_name()
-        .map_or_else(
-            || "custom".into(),
-            |name| sanitize_benchmark_name(&name.to_string_lossy()),
-        );
+    let repo_label = repo_path.file_name().map_or_else(
+        || "custom".into(),
+        |name| sanitize_benchmark_name(&name.to_string_lossy()),
+    );
     let suffix = format!(
         "{}-{}-{}-{}",
         repo_label,

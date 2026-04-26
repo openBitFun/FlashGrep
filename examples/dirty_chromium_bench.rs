@@ -22,8 +22,15 @@ use codgrep::{
 
 const DEFAULT_QUERY: &str = "ScopedAllowBlockingForTesting";
 const DEFAULT_BENCH_ITERS: usize = 5;
-const DEFAULT_SEARCH_DELAYS_MS: [u64; 5] = [0, 200, 500, 1000, 3000];
-const SIZES: [usize; 3] = [10, 100, 300];
+const DEFAULT_SCENARIO_SAMPLES: usize = 3;
+const DEFAULT_SIZES: [usize; 5] = [1, 10, 30, 100, 300];
+const STRICT_READY_POLL_MS: u64 = 200;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum BenchMode {
+    Search,
+    Detect,
+}
 
 #[derive(Clone, Debug)]
 struct Scenario {
@@ -36,18 +43,51 @@ struct Scenario {
 #[derive(Debug)]
 struct ScenarioResult {
     scenario: String,
-    search_delay_ms: u64,
-    modify_count: usize,
-    add_count: usize,
-    delete_count: usize,
+    edited_files: usize,
+    samples: usize,
+    rg_matched_lines_mean: f64,
+    codgrep_matched_lines_mean: f64,
+    missing_lines_mean: f64,
+    recall_ratio_mean: f64,
+    settle_backend: String,
+    detection_ms_mean: f64,
+    detection_ms_stddev: f64,
+    settle_ms_mean: f64,
+    settle_ms_stddev: f64,
+    codgrep_query_ms_mean: f64,
+    codgrep_query_ms_stddev: f64,
+    rg_median_ms_mean: f64,
+    rg_median_ms_stddev: f64,
+    status_dirty_paths_mean: f64,
+}
+
+#[derive(Debug)]
+struct ScenarioSampleResult {
+    scenario: String,
+    sample_index: usize,
+    edited_files: usize,
     rg_matched_lines: usize,
     codgrep_matched_lines: usize,
     missing_lines: usize,
     recall_ratio: f64,
-    backend: String,
-    codgrep_search_ms: f64,
+    settle_backend: String,
+    detection_ms: f64,
+    settle_ms: f64,
+    codgrep_query_ms: f64,
     rg_median_ms: f64,
     status_dirty_paths: usize,
+}
+
+#[derive(Debug)]
+struct DetectionResult {
+    scenario: String,
+    sample_index: usize,
+    modify_count: usize,
+    add_count: usize,
+    delete_count: usize,
+    expected_dirty_paths: usize,
+    detected_dirty_paths: usize,
+    detection_ms: f64,
 }
 
 #[derive(Debug)]
@@ -55,6 +95,13 @@ struct SearchMeasurement {
     matched_lines: usize,
     backend: String,
     elapsed_ms: f64,
+}
+
+#[derive(Clone, Debug)]
+struct CandidateProfile {
+    relative_path: PathBuf,
+    matched_lines: usize,
+    byte_len: usize,
 }
 
 #[derive(Clone, Debug)]
@@ -168,28 +215,6 @@ impl BenchWorkspace {
         })
     }
 
-    fn reset_clean(
-        &self,
-        previous: Option<&Scenario>,
-        baseline_files: &[BaselineFile],
-    ) -> Result<()> {
-        let Some(previous) = previous else {
-            return Ok(());
-        };
-        let restore_count = previous.modify_count + previous.delete_count;
-        restore_baseline_files(&baseline_files[..restore_count])?;
-        if previous.add_count > 0 {
-            let added = self
-                .worktree_path
-                .join("codgrep_bench_added")
-                .join(&previous.name);
-            if added.exists() {
-                fs::remove_dir_all(added)?;
-            }
-        }
-        Ok(())
-    }
-
     fn reset_start_clean(&self, baseline_files: &[BaselineFile]) -> Result<()> {
         if let Some(source_repo) = self.source_repo.as_ref() {
             if *source_repo != self.worktree_path {
@@ -244,8 +269,11 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| DEFAULT_QUERY.to_string());
     let source_repo = fs::canonicalize(source_repo)?;
     let in_place = env::var("CODGREP_BENCH_IN_PLACE").ok().as_deref() == Some("1");
+    let bench_mode = bench_mode();
     let bench_iters = bench_iters();
-    let search_delays_ms = search_delays_ms();
+    let scenario_samples = scenario_samples();
+    let sizes = scenario_sizes();
+    let max_size = sizes.iter().copied().max().unwrap_or_default();
     let worktree = BenchWorkspace::new(&source_repo, in_place)?;
     let storage_root = worktree.storage_root.clone();
 
@@ -253,10 +281,11 @@ fn main() -> Result<()> {
     println!("worktree={}", worktree.worktree_path.display());
     println!("storage_root={}", storage_root.display());
     println!("in_place={in_place}");
+    println!("bench_mode={bench_mode:?}");
     println!("query={query}");
-    println!("sizes={:?}", SIZES);
+    println!("sizes={sizes:?}");
     println!("bench_iters={bench_iters}");
-    println!("search_delays_ms={search_delays_ms:?}");
+    println!("scenario_samples={scenario_samples}");
 
     let build_started = Instant::now();
     let build_config = BuildConfig {
@@ -290,125 +319,160 @@ fn main() -> Result<()> {
     let build_elapsed_ms = elapsed_ms(build_started.elapsed().as_secs_f64());
 
     let candidate_relative_paths = git_grep_files(&source_repo, &query)?;
-    let candidate_files = candidate_relative_paths
+    if candidate_relative_paths.len() < max_size {
+        return Err(codgrep::AppError::InvalidIndex(format!(
+            "expected at least {max_size} tracked files for query {query}, found {}",
+            candidate_relative_paths.len()
+        )));
+    }
+    let selected_relative_paths =
+        select_controlled_candidate_paths(&source_repo, &candidate_relative_paths, &query)?;
+    let candidate_files = selected_relative_paths
         .iter()
         .map(|relative| worktree.worktree_path.join(relative))
         .collect::<Vec<_>>();
-    if candidate_files.len() < 600 {
-        return Err(codgrep::AppError::InvalidIndex(format!(
-            "expected at least 600 tracked files for query {query}, found {}",
-            candidate_files.len()
-        )));
-    }
-    println!("candidate_files={}", candidate_files.len());
+    println!("candidate_files_total={}", candidate_relative_paths.len());
+    println!("candidate_files_selected={}", candidate_files.len());
     println!("index_prepare_mode={prepare_mode}");
     println!("index_prepare_ms={build_elapsed_ms:.2}");
     println!();
     let baseline_files = load_baseline_files(
         &source_repo,
         &worktree.worktree_path,
-        &candidate_relative_paths,
+        &selected_relative_paths,
     )?;
     worktree.reset_start_clean(&baseline_files)?;
 
     let scenario_filter = env::var("CODGREP_BENCH_SCENARIOS").ok();
-    let scenarios = filter_scenarios(build_scenarios(), scenario_filter.as_deref());
+    let scenarios = filter_scenarios(build_scenarios(&sizes), scenario_filter.as_deref());
     let cg_path = codgrep_executable()?;
+    let mut sample_results = Vec::new();
     let mut results = Vec::with_capacity(scenarios.len());
-    let mut previous_scenario: Option<Scenario> = None;
+    let mut detection_results = Vec::with_capacity(scenarios.len());
 
     for scenario in scenarios {
-        eprintln!("running scenario {}", scenario.name);
-        let scenario_state = scenario.clone();
-        worktree.reset_clean(previous_scenario.as_ref(), &baseline_files)?;
-        let repo = open_codgrep_repo(&cg_path, &worktree.worktree_path, &storage_root)?;
-        wait_for_dirty_paths(&repo, 0, Duration::from_secs(180))?;
-        apply_scenario(&worktree.worktree_path, &scenario, &candidate_files, &query)?;
-        let apply_completed_at = Instant::now();
+        let mut scenario_samples_results = Vec::with_capacity(scenario_samples);
+        for sample_index in 0..scenario_samples {
+            eprintln!(
+                "running scenario {} sample {}/{}",
+                scenario.name,
+                sample_index + 1,
+                scenario_samples
+            );
+            worktree.reset_start_clean(&baseline_files)?;
+            let scenario_candidates = select_scenario_candidates(
+                &candidate_files,
+                scenario.modify_count + scenario.delete_count,
+                sample_index,
+                scenario_samples,
+            )?;
+            let repo = open_codgrep_repo(&cg_path, &worktree.worktree_path, &storage_root)?;
+            wait_for_dirty_paths(&repo, 0, Duration::from_secs(180))?;
+            apply_scenario(
+                &worktree.worktree_path,
+                &scenario,
+                &scenario_candidates,
+                &query,
+            )?;
+            let expected_dirty_paths =
+                scenario.modify_count + scenario.add_count + scenario.delete_count;
 
-        let mut rg_times = Vec::with_capacity(bench_iters);
-        let mut rg_count = None;
-        for _ in 0..bench_iters {
-            let (count, elapsed_ms) = run_rg_query(&worktree.worktree_path, &query)?;
-            rg_times.push(elapsed_ms);
-            rg_count.get_or_insert(count);
-        }
+            if bench_mode == BenchMode::Detect {
+                let detection_ms =
+                    wait_for_dirty_paths(&repo, expected_dirty_paths, Duration::from_secs(180))?;
+                let detected_dirty_paths = repo_dirty_paths(&repo)?;
+                detection_results.push(DetectionResult {
+                    scenario: scenario.name.clone(),
+                    sample_index,
+                    modify_count: scenario.modify_count,
+                    add_count: scenario.add_count,
+                    delete_count: scenario.delete_count,
+                    expected_dirty_paths,
+                    detected_dirty_paths,
+                    detection_ms,
+                });
+                shutdown_daemon(&repo)?;
+                continue;
+            }
 
-        let rg_count = rg_count.expect("rg should run at least once");
-        let rg_median = median_ms(rg_times);
+            let mut rg_times = Vec::with_capacity(bench_iters);
+            let mut rg_count = None;
+            for _ in 0..bench_iters {
+                let (count, elapsed_ms) = run_rg_query(&worktree.worktree_path, &query)?;
+                rg_times.push(elapsed_ms);
+                rg_count.get_or_insert(count);
+            }
 
-        for search_delay_ms in &search_delays_ms {
-            sleep_until(apply_completed_at, Duration::from_millis(*search_delay_ms));
-            let codgrep = run_codgrep_query(&repo, &query)?;
+            let rg_count = rg_count.expect("rg should run at least once");
+            let rg_median = median_ms(rg_times);
+            let detection_ms =
+                wait_for_dirty_paths(&repo, expected_dirty_paths, Duration::from_secs(180))?;
+            let (settle_ms, settle_measurement) = wait_for_workspace_strict_ready(
+                &repo,
+                &query,
+                expected_dirty_paths,
+                Duration::from_secs(180),
+            )?;
+            let query_measurement = run_codgrep_query_with_consistency(
+                &repo,
+                &query,
+                ConsistencyMode::WorkspaceEventual,
+            )?;
             let status_dirty_paths = repo_dirty_paths(&repo)?;
-            let missing_lines = rg_count.saturating_sub(codgrep.matched_lines);
+            let missing_lines = rg_count.saturating_sub(query_measurement.matched_lines);
             let recall_ratio = if rg_count == 0 {
                 1.0
             } else {
-                codgrep.matched_lines as f64 / rg_count as f64
+                query_measurement.matched_lines as f64 / rg_count as f64
             };
 
-            results.push(ScenarioResult {
+            let sample_result = ScenarioSampleResult {
                 scenario: scenario.name.clone(),
-                search_delay_ms: *search_delay_ms,
-                modify_count: scenario.modify_count,
-                add_count: scenario.add_count,
-                delete_count: scenario.delete_count,
+                sample_index,
+                edited_files: expected_dirty_paths,
                 rg_matched_lines: rg_count,
-                codgrep_matched_lines: codgrep.matched_lines,
+                codgrep_matched_lines: query_measurement.matched_lines,
                 missing_lines,
                 recall_ratio,
-                backend: codgrep.backend,
-                codgrep_search_ms: codgrep.elapsed_ms,
+                settle_backend: settle_measurement.backend,
+                detection_ms,
+                settle_ms,
+                codgrep_query_ms: query_measurement.elapsed_ms,
                 rg_median_ms: rg_median,
                 status_dirty_paths,
-            });
+            };
+            scenario_samples_results.push(sample_result);
+            shutdown_daemon(&repo)?;
         }
-        shutdown_daemon(&repo)?;
-        previous_scenario = Some(scenario_state);
+        if bench_mode == BenchMode::Search {
+            sample_results.extend(scenario_samples_results.iter().map(clone_sample_result));
+            results.push(aggregate_scenario_results(
+                &scenario.name,
+                scenario.modify_count + scenario.add_count + scenario.delete_count,
+                &scenario_samples_results,
+            ));
+        }
     }
 
-    worktree.reset_clean(previous_scenario.as_ref(), &baseline_files)?;
-    print_results(build_elapsed_ms, &results);
+    worktree.reset_start_clean(&baseline_files)?;
+    match bench_mode {
+        BenchMode::Search => print_results(build_elapsed_ms, &sample_results, &results),
+        BenchMode::Detect => print_detection_results(build_elapsed_ms, &detection_results),
+    }
     Ok(())
 }
 
-fn build_scenarios() -> Vec<Scenario> {
-    let mut scenarios = vec![Scenario {
-        name: "clean".into(),
-        modify_count: 0,
-        add_count: 0,
-        delete_count: 0,
-    }];
-
-    for size in SIZES {
-        scenarios.push(Scenario {
+fn build_scenarios(sizes: &[usize]) -> Vec<Scenario> {
+    sizes
+        .iter()
+        .copied()
+        .map(|size| Scenario {
             name: format!("modify-{size}"),
             modify_count: size,
             add_count: 0,
             delete_count: 0,
-        });
-        scenarios.push(Scenario {
-            name: format!("add-{size}"),
-            modify_count: 0,
-            add_count: size,
-            delete_count: 0,
-        });
-        scenarios.push(Scenario {
-            name: format!("delete-{size}"),
-            modify_count: 0,
-            add_count: 0,
-            delete_count: size,
-        });
-        scenarios.push(Scenario {
-            name: format!("mixed-{size}"),
-            modify_count: size / 3,
-            add_count: size / 3,
-            delete_count: size - 2 * (size / 3),
-        });
-    }
-
-    scenarios
+        })
+        .collect()
 }
 
 fn filter_scenarios(scenarios: Vec<Scenario>, filter: Option<&str>) -> Vec<Scenario> {
@@ -464,6 +528,122 @@ fn apply_scenario(
     Ok(())
 }
 
+fn clone_sample_result(result: &ScenarioSampleResult) -> ScenarioSampleResult {
+    ScenarioSampleResult {
+        scenario: result.scenario.clone(),
+        sample_index: result.sample_index,
+        edited_files: result.edited_files,
+        rg_matched_lines: result.rg_matched_lines,
+        codgrep_matched_lines: result.codgrep_matched_lines,
+        missing_lines: result.missing_lines,
+        recall_ratio: result.recall_ratio,
+        settle_backend: result.settle_backend.clone(),
+        detection_ms: result.detection_ms,
+        settle_ms: result.settle_ms,
+        codgrep_query_ms: result.codgrep_query_ms,
+        rg_median_ms: result.rg_median_ms,
+        status_dirty_paths: result.status_dirty_paths,
+    }
+}
+
+fn aggregate_scenario_results(
+    scenario: &str,
+    edited_files: usize,
+    samples: &[ScenarioSampleResult],
+) -> ScenarioResult {
+    let settle_backend = samples
+        .iter()
+        .map(|sample| sample.settle_backend.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .into_iter()
+        .collect::<Vec<_>>()
+        .join("|");
+    ScenarioResult {
+        scenario: scenario.to_string(),
+        edited_files,
+        samples: samples.len(),
+        rg_matched_lines_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.rg_matched_lines as f64)
+                .collect::<Vec<_>>(),
+        ),
+        codgrep_matched_lines_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.codgrep_matched_lines as f64)
+                .collect::<Vec<_>>(),
+        ),
+        missing_lines_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.missing_lines as f64)
+                .collect::<Vec<_>>(),
+        ),
+        recall_ratio_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.recall_ratio)
+                .collect::<Vec<_>>(),
+        ),
+        settle_backend,
+        detection_ms_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.detection_ms)
+                .collect::<Vec<_>>(),
+        ),
+        detection_ms_stddev: stddev(
+            &samples
+                .iter()
+                .map(|sample| sample.detection_ms)
+                .collect::<Vec<_>>(),
+        ),
+        settle_ms_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.settle_ms)
+                .collect::<Vec<_>>(),
+        ),
+        settle_ms_stddev: stddev(
+            &samples
+                .iter()
+                .map(|sample| sample.settle_ms)
+                .collect::<Vec<_>>(),
+        ),
+        codgrep_query_ms_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.codgrep_query_ms)
+                .collect::<Vec<_>>(),
+        ),
+        codgrep_query_ms_stddev: stddev(
+            &samples
+                .iter()
+                .map(|sample| sample.codgrep_query_ms)
+                .collect::<Vec<_>>(),
+        ),
+        rg_median_ms_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.rg_median_ms)
+                .collect::<Vec<_>>(),
+        ),
+        rg_median_ms_stddev: stddev(
+            &samples
+                .iter()
+                .map(|sample| sample.rg_median_ms)
+                .collect::<Vec<_>>(),
+        ),
+        status_dirty_paths_mean: mean(
+            &samples
+                .iter()
+                .map(|sample| sample.status_dirty_paths as f64)
+                .collect::<Vec<_>>(),
+        ),
+    }
+}
+
 fn open_codgrep_repo(cg_path: &Path, repo_path: &Path, storage_root: &Path) -> Result<DaemonRepo> {
     let client = ManagedDaemonClient::new()
         .with_daemon_program(OsString::from(cg_path))
@@ -480,14 +660,18 @@ fn open_codgrep_repo(cg_path: &Path, repo_path: &Path, storage_root: &Path) -> R
     })
 }
 
-fn run_codgrep_query(repo: &DaemonRepo, query: &str) -> Result<SearchMeasurement> {
+fn run_codgrep_query_with_consistency(
+    repo: &DaemonRepo,
+    query: &str,
+    consistency: ConsistencyMode,
+) -> Result<SearchMeasurement> {
     let started = Instant::now();
     let outcome = repo.client.send(Request::Search {
         params: SearchParams {
             repo_id: repo.repo_id.clone(),
             query: count_only_query(query),
             scope: PathScope::default(),
-            consistency: ConsistencyMode::WorkspaceEventual,
+            consistency,
             allow_scan_fallback: false,
         },
     })?;
@@ -504,6 +688,40 @@ fn run_codgrep_query(repo: &DaemonRepo, query: &str) -> Result<SearchMeasurement
         other => Err(codgrep::AppError::Protocol(format!(
             "unexpected search response: {other:?}"
         ))),
+    }
+}
+
+fn wait_for_workspace_strict_ready(
+    repo: &DaemonRepo,
+    query: &str,
+    expected_dirty_paths: usize,
+    timeout: Duration,
+) -> Result<(f64, SearchMeasurement)> {
+    let started = Instant::now();
+    let poll_interval = Duration::from_millis(STRICT_READY_POLL_MS);
+    let mut observed_dirty = false;
+    loop {
+        let dirty_paths = repo_dirty_paths(repo)?;
+        if dirty_paths >= expected_dirty_paths {
+            observed_dirty = true;
+        }
+        if observed_dirty {
+            match run_codgrep_query_with_consistency(repo, query, ConsistencyMode::WorkspaceStrict)
+            {
+                Ok(measurement) => {
+                    return Ok((elapsed_ms(started.elapsed().as_secs_f64()), measurement));
+                }
+                Err(codgrep::AppError::Protocol(message))
+                    if message.contains("strict search requires") => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if started.elapsed() >= timeout {
+            return Err(codgrep::AppError::Protocol(format!(
+                "timed out waiting for strict workspace readiness after observing {expected_dirty_paths} dirty paths"
+            )));
+        }
+        thread::sleep(poll_interval);
     }
 }
 
@@ -656,6 +874,96 @@ fn git_grep_files(repo_path: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
     Ok(paths)
 }
 
+fn select_controlled_candidate_paths(
+    repo_path: &Path,
+    relative_paths: &[PathBuf],
+    query: &str,
+) -> Result<Vec<PathBuf>> {
+    let mut profiles = relative_paths
+        .iter()
+        .map(|relative_path| {
+            let contents = fs::read(repo_path.join(relative_path))?;
+            let matched_lines = String::from_utf8_lossy(&contents)
+                .lines()
+                .filter(|line| line.contains(query))
+                .count();
+            Ok(CandidateProfile {
+                relative_path: relative_path.clone(),
+                matched_lines,
+                byte_len: contents.len(),
+            })
+        })
+        .collect::<Result<Vec<_>>>()?;
+    profiles.retain(|profile| profile.matched_lines > 0);
+
+    let min_matched_lines = profiles
+        .iter()
+        .map(|profile| profile.matched_lines)
+        .min()
+        .unwrap_or(0);
+    let preferred_count = profiles
+        .iter()
+        .filter(|profile| profile.matched_lines == min_matched_lines)
+        .count();
+    let median_size = candidate_median_size(
+        profiles
+            .iter()
+            .filter(|profile| profile.matched_lines == min_matched_lines)
+            .map(|profile| profile.byte_len)
+            .collect::<Vec<_>>()
+            .as_slice(),
+    );
+    profiles.sort_by(|left, right| {
+        (
+            left.matched_lines,
+            left.byte_len.abs_diff(median_size),
+            &left.relative_path,
+        )
+            .cmp(&(
+                right.matched_lines,
+                right.byte_len.abs_diff(median_size),
+                &right.relative_path,
+            ))
+    });
+    let selected = profiles
+        .into_iter()
+        .map(|profile| profile.relative_path)
+        .collect::<Vec<_>>();
+    eprintln!(
+        "controlled candidate selection: min_matched_lines={min_matched_lines}, preferred_count={preferred_count}, selected={}",
+        selected.len()
+    );
+    Ok(selected)
+}
+
+fn select_scenario_candidates(
+    candidates: &[PathBuf],
+    needed: usize,
+    sample_index: usize,
+    sample_count: usize,
+) -> Result<Vec<PathBuf>> {
+    if needed == 0 {
+        return Ok(Vec::new());
+    }
+    if candidates.len() < needed {
+        return Err(codgrep::AppError::InvalidIndex(format!(
+            "expected at least {needed} candidate files, found {}",
+            candidates.len()
+        )));
+    }
+    let stride = (candidates.len() / sample_count.max(1)).max(1);
+    let start = (sample_index * stride) % candidates.len();
+    Ok((0..needed)
+        .map(|offset| candidates[(start + offset) % candidates.len()].clone())
+        .collect())
+}
+
+fn candidate_median_size(sizes: &[usize]) -> usize {
+    let mut sizes = sizes.to_vec();
+    sizes.sort_unstable();
+    sizes.get(sizes.len() / 2).copied().unwrap_or_default()
+}
+
 fn run_git<const N: usize>(repo_path: &Path, args: [&str; N]) -> Result<()> {
     let output = Command::new("git")
         .arg("-C")
@@ -737,15 +1045,31 @@ fn median_ms(mut values: Vec<f64>) -> f64 {
     }
 }
 
-fn elapsed_ms(seconds: f64) -> f64 {
-    seconds * 1000.0
+fn mean(values: &[f64]) -> f64 {
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.iter().sum::<f64>() / values.len() as f64
 }
 
-fn sleep_until(started_at: Instant, target_elapsed: Duration) {
-    let elapsed = started_at.elapsed();
-    if target_elapsed > elapsed {
-        thread::sleep(target_elapsed - elapsed);
+fn stddev(values: &[f64]) -> f64 {
+    if values.len() <= 1 {
+        return 0.0;
     }
+    let mean = mean(values);
+    let variance = values
+        .iter()
+        .map(|value| {
+            let delta = value - mean;
+            delta * delta
+        })
+        .sum::<f64>()
+        / values.len() as f64;
+    variance.sqrt()
+}
+
+fn elapsed_ms(seconds: f64) -> f64 {
+    seconds * 1000.0
 }
 
 fn bench_iters() -> usize {
@@ -754,6 +1078,25 @@ fn bench_iters() -> usize {
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
         .unwrap_or(DEFAULT_BENCH_ITERS)
+}
+
+fn scenario_samples() -> usize {
+    env::var("CODGREP_BENCH_SAMPLES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(DEFAULT_SCENARIO_SAMPLES)
+}
+
+fn bench_mode() -> BenchMode {
+    match env::var("CODGREP_BENCH_MODE")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+    {
+        Some("detect") => BenchMode::Detect,
+        _ => BenchMode::Search,
+    }
 }
 
 fn configured_path(name: &str) -> Result<Option<PathBuf>> {
@@ -767,46 +1110,98 @@ fn configured_path(name: &str) -> Result<Option<PathBuf>> {
     Ok(Some(path))
 }
 
-fn search_delays_ms() -> Vec<u64> {
-    let Some(value) = env::var("CODGREP_BENCH_SEARCH_DELAYS_MS").ok() else {
-        return DEFAULT_SEARCH_DELAYS_MS.to_vec();
+fn scenario_sizes() -> Vec<usize> {
+    let Some(value) = env::var("CODGREP_BENCH_SIZES").ok() else {
+        return DEFAULT_SIZES.to_vec();
     };
 
     let parsed = value
         .split(',')
         .map(str::trim)
         .filter(|item| !item.is_empty())
-        .filter_map(|item| item.parse::<u64>().ok())
+        .filter_map(|item| item.parse::<usize>().ok())
+        .filter(|value| *value > 0)
         .collect::<Vec<_>>();
     if parsed.is_empty() {
-        DEFAULT_SEARCH_DELAYS_MS.to_vec()
+        DEFAULT_SIZES.to_vec()
     } else {
         parsed
     }
 }
 
-fn print_results(base_snapshot_build_ms: f64, results: &[ScenarioResult]) {
+fn print_results(
+    base_snapshot_build_ms: f64,
+    sample_results: &[ScenarioSampleResult],
+    results: &[ScenarioResult],
+) {
     println!("RESULTS");
     println!("base_snapshot_build_ms={base_snapshot_build_ms:.2}");
     println!(
-        "scenario,search_delay_ms,modify,add,delete,rg_matched_lines,codgrep_matched_lines,missing_lines,recall_ratio,backend,codgrep_search_ms,rg_median_ms,status_dirty_paths"
+        "sample,scenario,edited_files,rg_matched_lines,codgrep_matched_lines,missing_lines,recall_ratio,settle_backend,detection_ms,settle_ms,codgrep_query_ms,rg_median_ms,status_dirty_paths"
     );
-    for result in results {
+    for result in sample_results {
         println!(
-            "{},{},{},{},{},{},{},{},{:.4},{},{:.2},{:.2},{}",
+            "{},{},{},{},{},{},{:.4},{},{:.2},{:.2},{:.2},{:.2},{}",
+            result.sample_index + 1,
             result.scenario,
-            result.search_delay_ms,
-            result.modify_count,
-            result.add_count,
-            result.delete_count,
+            result.edited_files,
             result.rg_matched_lines,
             result.codgrep_matched_lines,
             result.missing_lines,
             result.recall_ratio,
-            result.backend,
-            result.codgrep_search_ms,
+            result.settle_backend,
+            result.detection_ms,
+            result.settle_ms,
+            result.codgrep_query_ms,
             result.rg_median_ms,
             result.status_dirty_paths
+        );
+    }
+    println!("SUMMARY");
+    println!(
+        "scenario,edited_files,samples,rg_matched_lines_mean,codgrep_matched_lines_mean,missing_lines_mean,recall_ratio_mean,settle_backend,detection_ms_mean,detection_ms_stddev,settle_ms_mean,settle_ms_stddev,codgrep_query_ms_mean,codgrep_query_ms_stddev,rg_median_ms_mean,rg_median_ms_stddev,status_dirty_paths_mean"
+    );
+    for result in results {
+        println!(
+            "{},{},{},{:.2},{:.2},{:.2},{:.4},{},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2},{:.2}",
+            result.scenario,
+            result.edited_files,
+            result.samples,
+            result.rg_matched_lines_mean,
+            result.codgrep_matched_lines_mean,
+            result.missing_lines_mean,
+            result.recall_ratio_mean,
+            result.settle_backend,
+            result.detection_ms_mean,
+            result.detection_ms_stddev,
+            result.settle_ms_mean,
+            result.settle_ms_stddev,
+            result.codgrep_query_ms_mean,
+            result.codgrep_query_ms_stddev,
+            result.rg_median_ms_mean,
+            result.rg_median_ms_stddev,
+            result.status_dirty_paths_mean
+        );
+    }
+}
+
+fn print_detection_results(base_snapshot_build_ms: f64, results: &[DetectionResult]) {
+    println!("RESULTS");
+    println!("base_snapshot_build_ms={base_snapshot_build_ms:.2}");
+    println!(
+        "scenario,sample,modify,add,delete,expected_dirty_paths,detected_dirty_paths,detection_ms"
+    );
+    for result in results {
+        println!(
+            "{},{},{},{},{},{},{},{:.2}",
+            result.scenario,
+            result.sample_index + 1,
+            result.modify_count,
+            result.add_count,
+            result.delete_count,
+            result.expected_dirty_paths,
+            result.detected_dirty_paths,
+            result.detection_ms
         );
     }
 }

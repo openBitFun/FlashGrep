@@ -393,12 +393,10 @@ impl FileSegmentReader {
     }
 
     fn segment_source_label(&self) -> String {
-        self.repo_root
-            .as_ref()
-            .map_or_else(
-                || self.meta.segment_id.0.clone(),
-                |path| path.display().to_string(),
-            )
+        self.repo_root.as_ref().map_or_else(
+            || self.meta.segment_id.0.clone(),
+            |path| path.display().to_string(),
+        )
     }
 
     fn load_worktree_verify_mmap(&self, doc_id: usize) -> Result<Option<Arc<Mmap>>> {

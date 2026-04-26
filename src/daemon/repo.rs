@@ -47,6 +47,8 @@ mod query;
 mod status;
 #[path = "repo/tasks.rs"]
 mod tasks;
+#[path = "repo/watch.rs"]
+mod watch;
 #[path = "repo/workspace.rs"]
 mod workspace;
 
@@ -267,6 +269,7 @@ impl RepoManager {
             )?);
             runtime.install_self_handle(Arc::downgrade(&runtime));
             RepoRuntime::start_maintenance_worker(&runtime);
+            RepoRuntime::start_workspace_watcher(&runtime);
             repos.insert(repo_id, Arc::clone(&runtime));
             runtime
         };
@@ -459,8 +462,11 @@ struct RepoRuntime {
     self_handle: OnceLock<Weak<RepoRuntime>>,
     maintenance_worker: Arc<(Mutex<MaintenanceWorkerState>, Condvar)>,
     maintenance_handle: Mutex<Option<JoinHandle<()>>>,
+    watcher_handle: Mutex<Option<JoinHandle<()>>>,
     state: Mutex<RepoState>,
     published_overlay_paths_cache: Mutex<DirtyPathSet>,
+    workspace_event_buffer: Mutex<watch::WorkspaceEventBuffer>,
+    workspace_watcher_active: AtomicBool,
     glob_cache: Mutex<GlobCacheState>,
     glob_cache_epoch: AtomicU64,
     active_searches: AtomicU64,
@@ -565,8 +571,11 @@ impl RepoRuntime {
                 Condvar::new(),
             )),
             maintenance_handle: Mutex::new(None),
+            watcher_handle: Mutex::new(None),
             state: Mutex::new(RepoState::default()),
             published_overlay_paths_cache: Mutex::new(DirtyPathSet::default()),
+            workspace_event_buffer: Mutex::new(watch::WorkspaceEventBuffer::default()),
+            workspace_watcher_active: AtomicBool::new(false),
             glob_cache: Mutex::new(GlobCacheState::default()),
             glob_cache_epoch: AtomicU64::new(0),
             active_searches: AtomicU64::new(0),

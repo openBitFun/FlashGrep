@@ -8,8 +8,7 @@ use crate::error::{AppError, Result};
 
 use super::{
     cache::prepare_sample,
-    configure_rg_command,
-    finish_daemon_run,
+    configure_rg_command, finish_daemon_run,
     report::{build_summary, RawSample, RawWriter},
     run_daemon_search_count, start_bench_daemon, BenchCachePaths, BenchConfig, BenchmarkCase,
     BitfunOutcome, CacheRunner, RgSearchScope, RunnerSummary,
