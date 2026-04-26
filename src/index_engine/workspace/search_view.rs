@@ -61,6 +61,7 @@ impl WorkspaceQuerySnapshot {
         query: &QueryConfig,
         query_filters: &QueryFilters,
         filter: Option<&PathFilter>,
+        prefer_worktree_for_git_head_blob: bool,
     ) -> Result<SearchResults> {
         let base_results = view.search_base_snapshot(
             query,
@@ -68,6 +69,7 @@ impl WorkspaceQuerySnapshot {
             filter,
             Some(&self.shadowed_base_paths),
             self.base_snapshot(),
+            prefer_worktree_for_git_head_blob,
         )?;
         let Some(overlay_query) = query_with_remaining_global_limit(query, &base_results) else {
             return Ok(base_results);
@@ -148,7 +150,7 @@ impl WorkspaceSearchView {
                 .transpose()?
                 .unwrap_or_default(),
         }
-        .search(self, query, query_filters, filter)
+        .search(self, query, query_filters, filter, true)
     }
 
     pub(crate) fn open_workspace_query_snapshot(
@@ -183,7 +185,7 @@ impl WorkspaceSearchView {
                 snapshot.snapshot.snapshot_key, current.snapshot.snapshot_key
             )));
         }
-        self.search_base_snapshot(query, query_filters, filter, None, base_snapshot)
+        self.search_base_snapshot(query, query_filters, filter, None, base_snapshot, false)
     }
 
     pub(crate) fn search_overlay_snapshot(
@@ -200,6 +202,7 @@ impl WorkspaceSearchView {
                 case_insensitive: query.case_insensitive,
                 top_k: query.global_max_results,
                 filters: query_filters.clone(),
+                prefer_worktree_for_git_head_blob: false,
             })?
         } else {
             return Ok(empty_search_results());
@@ -219,6 +222,7 @@ impl WorkspaceSearchView {
         filter: Option<&PathFilter>,
         excluded_paths: Option<&HashSet<String>>,
         base_snapshot: Option<&IndexSnapshotReader>,
+        prefer_worktree_for_git_head_blob: bool,
     ) -> Result<SearchResults> {
         let snapshot = base_snapshot
             .ok_or_else(|| AppError::InvalidIndex("base snapshot reader is unavailable".into()))?;
@@ -228,6 +232,7 @@ impl WorkspaceSearchView {
             case_insensitive: query.case_insensitive,
             top_k: query.global_max_results,
             filters: query_filters.clone(),
+            prefer_worktree_for_git_head_blob,
         })?;
         absolutize_search_results(&mut results, &self.build_config.repo_path);
         if let Some(excluded_paths) = excluded_paths {

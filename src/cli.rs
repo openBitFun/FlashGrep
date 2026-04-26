@@ -119,7 +119,7 @@ struct BuildArgs {
     no_ignore: bool,
     #[arg(short = '.', long, default_value_t = false)]
     hidden: bool,
-    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
     max_file_size: u64,
     #[arg(long, default_value_t = 3)]
     min_sparse_len: usize,
@@ -237,7 +237,7 @@ struct DaemonOpenArgs {
     corpus_mode: CorpusArg,
     #[arg(short = '.', long, default_value_t = false)]
     hidden: bool,
-    #[arg(long, default_value_t = 2 * 1024 * 1024)]
+    #[arg(long, default_value_t = 8 * 1024 * 1024)]
     max_file_size: u64,
     #[arg(long, default_value_t = 3)]
     min_sparse_len: usize,
@@ -486,6 +486,7 @@ fn run_engine(args: EngineArgs) -> Result<bool> {
                 case_insensitive: args.ignore_case,
                 top_k: None,
                 filters: crate::index_engine::query::QueryFilters::default(),
+                prefer_worktree_for_git_head_blob: false,
             };
             let reader = if args.committed {
                 engine.reader().open_committed()?
@@ -918,16 +919,14 @@ fn format_repo_status_human(status: &crate::daemon::protocol::RepoStatus) -> Str
         "last_probe_unix_secs: {}",
         status
             .last_probe_unix_secs
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".into())
+            .map_or_else(|| "-".into(), |value| value.to_string())
     );
     let _ = writeln!(
         output,
         "last_rebuild_unix_secs: {}",
         status
             .last_rebuild_unix_secs
-            .map(|value| value.to_string())
-            .unwrap_or_else(|| "-".into())
+            .map_or_else(|| "-".into(), |value| value.to_string())
     );
     let _ = writeln!(
         output,

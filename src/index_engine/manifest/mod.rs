@@ -1,7 +1,7 @@
-mod manifest;
+mod model;
 mod snapshot;
 mod store;
 
-pub use manifest::{DeleteSegmentRef, Manifest, ManifestMeta, SegmentRef};
+pub use model::{DeleteSegmentRef, Manifest, ManifestMeta, SegmentRef};
 pub use snapshot::ManifestSnapshot;
 pub use store::{FileManifestStore, ManifestStore, MemoryManifestStore};

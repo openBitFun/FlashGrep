@@ -29,9 +29,9 @@ pub(super) fn should_send_notification(
     }
 }
 
-pub(super) fn notification_for_event(event: ServiceNotificationEvent) -> Option<Notification> {
+pub(super) fn notification_for_event(event: ServiceNotificationEvent) -> Notification {
     match event {
-        ServiceNotificationEvent::TaskProgress(task) => Some(Notification::Progress {
+        ServiceNotificationEvent::TaskProgress(task) => Notification::Progress {
             params: ProgressNotificationParams {
                 task_id: task.task_id,
                 workspace_id: task.repo_id,
@@ -41,20 +41,18 @@ pub(super) fn notification_for_event(event: ServiceNotificationEvent) -> Option<
                 processed: task.processed,
                 total: task.total,
             },
-        }),
-        ServiceNotificationEvent::WorkspaceStatus(status) => {
-            Some(Notification::WorkspaceStatusChanged {
-                params: WorkspaceStatusChangedParams {
-                    workspace_id: status.repo_id.clone(),
-                    status,
-                },
-            })
-        }
-        ServiceNotificationEvent::TaskFinished(task) => Some(Notification::TaskFinished {
+        },
+        ServiceNotificationEvent::WorkspaceStatus(status) => Notification::WorkspaceStatusChanged {
+            params: WorkspaceStatusChangedParams {
+                workspace_id: status.repo_id.clone(),
+                status,
+            },
+        },
+        ServiceNotificationEvent::TaskFinished(task) => Notification::TaskFinished {
             params: TaskFinishedParams {
                 task: convert_task_status(task),
             },
-        }),
+        },
     }
 }
 

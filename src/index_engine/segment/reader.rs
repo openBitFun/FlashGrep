@@ -2,7 +2,7 @@ use std::{
     collections::{BTreeMap, BTreeSet},
     env,
     fs::{self, File},
-    path::{Path, PathBuf},
+    path::PathBuf,
     sync::{Arc, OnceLock},
     time::Instant,
 };
@@ -11,12 +11,13 @@ use memmap2::Mmap;
 
 use crate::{
     files::resolve_repo_path,
+    git_snapshot::GitBlobReader,
     index_engine::{
         query::{QueryFilters, QueryPlan},
         segment::{
-            advise_mmap_sequential, read_index_document_from_stored_slice,
-            read_stored_document_view, read_stored_fields_layout, read_stored_source_bytes_view,
-            FileSegmentDocTable, PostingLists, SegmentDocRecord, StoredFieldsLayout,
+            file_name_from_logical_path, language_from_logical_path,
+            read_encoded_source_bytes_view, read_index_document_from_inline_slice,
+            FileSegmentDocTable, PostingLists, SegmentDocRecord, SegmentDocSourceKind,
         },
         types::{DocKey, SegmentDocId},
         writer::IndexDocument,
@@ -35,27 +36,29 @@ pub trait SegmentReader: Send + Sync {
     fn collect_candidates(&self, _plan: &QueryPlan, _field: u16) -> Result<Vec<SegmentDocId>>;
     fn document(&self, doc_id: SegmentDocId) -> Result<&IndexDocument>;
     fn doc_key(&self, _doc_id: SegmentDocId) -> Result<&DocKey>;
-    fn doc_metadata(&self, _doc_id: SegmentDocId) -> Result<StoredDocMetadata<'_>>;
-    fn stored_doc(&self, _doc_id: SegmentDocId) -> Result<StoredDocRef<'_>>;
+    fn doc_metadata(&self, _doc_id: SegmentDocId) -> Result<SegmentDocMetadata<'_>>;
+    fn doc_source_kind(&self, _doc_id: SegmentDocId) -> Result<SegmentDocSourceKind>;
     fn verify_source(&self, _doc_id: SegmentDocId) -> Result<SegmentVerifySource>;
+    fn verify_source_for_query(
+        &self,
+        doc_id: SegmentDocId,
+        _prefer_worktree_for_git_head_blob: bool,
+    ) -> Result<SegmentVerifySource> {
+        self.verify_source(doc_id)
+    }
 }
 
 pub type SegmentReaderHandle = Arc<dyn SegmentReader>;
 
 #[derive(Debug, Clone)]
-pub struct StoredDocRef<'a> {
-    pub key: &'a DocKey,
-    pub source_bytes: Arc<[u8]>,
-}
-
-#[derive(Debug, Clone)]
 pub enum SegmentVerifySource {
-    Path(PathBuf),
     Bytes(Arc<[u8]>),
+    Mmap(Arc<Mmap>),
+    Path(PathBuf),
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct StoredDocMetadata<'a> {
+pub struct SegmentDocMetadata<'a> {
     pub key: &'a DocKey,
     pub size: u64,
     pub modified_at: u64,
@@ -63,7 +66,7 @@ pub struct StoredDocMetadata<'a> {
 }
 
 #[derive(Debug, Clone, Copy)]
-struct StoredDocMetadataValue {
+struct SegmentDocMetadataValue {
     size: u64,
     modified_at: u64,
     content_hash: [u8; 32],
@@ -143,11 +146,11 @@ impl SegmentReader for MemorySegmentReader {
             .ok_or_else(|| AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds")))
     }
 
-    fn doc_metadata(&self, doc_id: SegmentDocId) -> Result<StoredDocMetadata<'_>> {
+    fn doc_metadata(&self, doc_id: SegmentDocId) -> Result<SegmentDocMetadata<'_>> {
         let doc = self.documents.get(doc_id as usize).ok_or_else(|| {
             AppError::InvalidIndex(format!("segment doc {doc_id} is out of bounds"))
         })?;
-        Ok(StoredDocMetadata {
+        Ok(SegmentDocMetadata {
             key: &doc.key,
             size: doc.size,
             modified_at: doc.modified_at,
@@ -155,14 +158,8 @@ impl SegmentReader for MemorySegmentReader {
         })
     }
 
-    fn stored_doc(&self, _doc_id: SegmentDocId) -> Result<StoredDocRef<'_>> {
-        let doc = self.documents.get(_doc_id as usize).ok_or_else(|| {
-            AppError::InvalidIndex(format!("segment doc {_doc_id} is out of bounds"))
-        })?;
-        Ok(StoredDocRef {
-            key: &doc.key,
-            source_bytes: Arc::clone(&doc.source_bytes),
-        })
+    fn doc_source_kind(&self, _doc_id: SegmentDocId) -> Result<SegmentDocSourceKind> {
+        Ok(SegmentDocSourceKind::Inline)
     }
 
     fn verify_source(&self, doc_id: SegmentDocId) -> Result<SegmentVerifySource> {
@@ -179,16 +176,14 @@ pub struct FileSegmentReader {
     doc_table: FileSegmentDocTable,
     posting_lists: PostingLists,
     path_doc_ids: OnceLock<BTreeMap<String, Vec<SegmentDocId>>>,
-    stored_fields_path: Option<PathBuf>,
-    stored_fields_mmap: Option<Mmap>,
-    stored_fields_layout: Option<StoredFieldsLayout>,
-    base_sources_path: Option<PathBuf>,
-    base_sources_mmap: Option<Mmap>,
     repo_root: Option<PathBuf>,
+    base_head_commit: Option<String>,
+    git_blob_reader: Option<GitBlobReader>,
     decoded_keys: LazyDocCache<DocKey>,
     decoded_source_bytes: LazyDocCache<Arc<[u8]>>,
+    decoded_worktree_verify_mmaps: LazyDocCache<Arc<Mmap>>,
     decoded_documents: LazyDocCache<IndexDocument>,
-    decoded_metadata: LazyDocCache<StoredDocMetadataValue>,
+    decoded_metadata: LazyDocCache<SegmentDocMetadataValue>,
 }
 
 #[derive(Debug)]
@@ -203,41 +198,25 @@ impl FileSegmentReader {
         meta: SegmentMeta,
         doc_table: FileSegmentDocTable,
         posting_lists: PostingLists,
-        stored_fields_path: Option<PathBuf>,
-        base_sources_path: Option<PathBuf>,
         repo_root: Option<PathBuf>,
+        base_head_commit: Option<String>,
     ) -> Result<Self> {
         let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
-        let stored_fields_started = Instant::now();
-        let (stored_fields_mmap, stored_fields_layout) = if let Some(path) = &stored_fields_path {
-            let stored_fields_file = File::open(path)?;
-            let stored_fields_mmap = unsafe { Mmap::map(&stored_fields_file)? };
-            advise_mmap_sequential(&stored_fields_mmap);
-            let stored_fields_layout = read_stored_fields_layout(stored_fields_mmap.as_ref())?;
-            (Some(stored_fields_mmap), Some(stored_fields_layout))
-        } else {
-            (None, None)
+        let reader_init_started = Instant::now();
+        let git_blob_reader = match (base_head_commit.as_ref(), repo_root.as_deref()) {
+            (Some(_), Some(repo_root)) => Some(GitBlobReader::new(repo_root)?),
+            _ => None,
         };
-        let base_sources_mmap = if let Some(path) = &base_sources_path {
-            let base_sources_file = File::open(path)?;
-            let base_sources_mmap = unsafe { Mmap::map(&base_sources_file)? };
-            advise_mmap_sequential(&base_sources_mmap);
-            Some(base_sources_mmap)
-        } else {
-            None
-        };
-        let stored_fields_elapsed = stored_fields_started.elapsed();
-        let path_doc_ids_started = Instant::now();
         let decoded_keys = LazyDocCache::new(doc_table.len());
         let decoded_source_bytes = LazyDocCache::new(doc_table.len());
+        let decoded_worktree_verify_mmaps = LazyDocCache::new(doc_table.len());
         let decoded_documents = LazyDocCache::new(doc_table.len());
         let decoded_metadata = LazyDocCache::new(doc_table.len());
         if profile_open {
             eprintln!(
-                "segment_reader_new id={} stored_fields_ms={:.3} cache_init_ms={:.3} doc_count={}",
+                "segment_reader_new id={} init_ms={:.3} doc_count={}",
                 meta.segment_id.0,
-                stored_fields_elapsed.as_secs_f64() * 1000.0,
-                path_doc_ids_started.elapsed().as_secs_f64() * 1000.0,
+                reader_init_started.elapsed().as_secs_f64() * 1000.0,
                 doc_table.len(),
             );
         }
@@ -246,14 +225,12 @@ impl FileSegmentReader {
             doc_table,
             posting_lists,
             path_doc_ids: OnceLock::new(),
-            stored_fields_path,
-            stored_fields_mmap,
-            stored_fields_layout,
-            base_sources_path,
-            base_sources_mmap,
             repo_root,
+            base_head_commit,
+            git_blob_reader,
             decoded_keys,
             decoded_source_bytes,
+            decoded_worktree_verify_mmaps,
             decoded_documents,
             decoded_metadata,
         })
@@ -289,27 +266,6 @@ impl FileSegmentReader {
         Ok(path_doc_ids)
     }
 
-    fn stored_slice(&self, doc_id: usize) -> Result<&[u8]> {
-        let stored_fields_mmap = self.stored_fields_mmap.as_ref().ok_or_else(|| {
-            AppError::InvalidIndex(format!(
-                "segment {} does not have stored fields",
-                self.meta.segment_id.0
-            ))
-        })?;
-        let record = self.doc_record(doc_id)?;
-        let start = usize::try_from(record.stored_offset)
-            .map_err(|_| AppError::ValueOutOfRange("stored offset exceeds usize range".into()))?;
-        let end = start
-            .checked_add(record.stored_len as usize)
-            .ok_or_else(|| AppError::InvalidIndex("stored field slice overflow".into()))?;
-        stored_fields_mmap.get(start..end).ok_or_else(|| {
-            AppError::InvalidIndex(format!(
-                "stored field slice out of range for {}",
-                self.segment_source_label()
-            ))
-        })
-    }
-
     fn doc_record(&self, doc_id: usize) -> Result<SegmentDocRecord> {
         self.doc_table.record(doc_id)
     }
@@ -317,14 +273,12 @@ impl FileSegmentReader {
     fn load_document(&self, doc_id: usize) -> Result<IndexDocument> {
         let record = self.doc_record(doc_id)?;
         let key = self.doc_key(doc_id as SegmentDocId)?;
-        if record.stored_len > 0 {
-            if let Some(stored_fields_layout) = self.stored_fields_layout {
-                return read_index_document_from_stored_slice(
-                    self.stored_slice(doc_id)?,
-                    key,
-                    stored_fields_layout,
-                );
-            }
+        if matches!(record.source_kind, SegmentDocSourceKind::Inline) {
+            return read_index_document_from_inline_slice(
+                self.doc_table.source_slice(doc_id)?,
+                key,
+                record,
+            );
         }
 
         Ok(IndexDocument {
@@ -340,30 +294,16 @@ impl FileSegmentReader {
         })
     }
 
-    fn load_metadata(&self, doc_id: usize) -> Result<StoredDocMetadataValue> {
+    fn load_metadata(&self, doc_id: usize) -> Result<SegmentDocMetadataValue> {
         let record = self.doc_record(doc_id)?;
-        if record.metadata_embedded {
-            return Ok(StoredDocMetadataValue {
-                size: record.size,
-                modified_at: record.modified_at,
-                content_hash: record.content_hash,
-            });
-        }
-        let stored_fields_layout = self.stored_fields_layout.ok_or_else(|| {
-            AppError::InvalidIndex(format!(
-                "segment {} is missing stored metadata",
-                self.meta.segment_id.0
-            ))
-        })?;
-        let document = read_stored_document_view(self.stored_slice(doc_id)?, stored_fields_layout)?;
-        Ok(StoredDocMetadataValue {
-            size: document.size,
-            modified_at: document.modified_at,
-            content_hash: document.content_hash,
+        Ok(SegmentDocMetadataValue {
+            size: record.size,
+            modified_at: record.modified_at,
+            content_hash: record.content_hash,
         })
     }
 
-    fn read_source_bytes_from_repo(&self, key: &DocKey) -> Result<Arc<[u8]>> {
+    fn read_source_bytes_from_worktree(&self, key: &DocKey) -> Result<Arc<[u8]>> {
         let path = self.repo_path_for_key(key)?;
         match fs::read(&path) {
             Ok(bytes) => Ok(Arc::<[u8]>::from(bytes)),
@@ -379,50 +319,42 @@ impl FileSegmentReader {
         }
     }
 
-    fn read_source_bytes_from_store(&self, doc_id: usize) -> Result<Arc<[u8]>> {
-        let stored_fields_layout = self.stored_fields_layout.ok_or_else(|| {
+    fn read_source_bytes_from_git_blob(
+        &self,
+        key: &DocKey,
+        head_commit: &str,
+    ) -> Result<Arc<[u8]>> {
+        let reader = self.git_blob_reader.as_ref().ok_or_else(|| {
             AppError::InvalidIndex(format!(
-                "segment {} does not have stored fields",
-                self.meta.segment_id.0
+                "segment {} cannot read {} from git blob storage",
+                self.meta.segment_id.0, key.logical_path
             ))
         })?;
-        let document = read_stored_document_view(self.stored_slice(doc_id)?, stored_fields_layout)?;
-        document.source_bytes.decode()
+        Ok(Arc::<[u8]>::from(
+            reader.read_blob(head_commit, &key.logical_path)?,
+        ))
     }
 
-    fn read_source_bytes_from_base_store(&self, doc_id: usize) -> Result<Arc<[u8]>> {
-        let base_sources_mmap = self.base_sources_mmap.as_ref().ok_or_else(|| {
-            AppError::InvalidIndex(format!(
-                "segment {} does not have base source storage",
-                self.meta.segment_id.0
-            ))
-        })?;
-        let record = self.doc_record(doc_id)?;
-        let start = usize::try_from(record.stored_offset)
-            .map_err(|_| AppError::ValueOutOfRange("stored offset exceeds usize range".into()))?;
-        let end = start
-            .checked_add(record.stored_len as usize)
-            .ok_or_else(|| AppError::InvalidIndex("base source slice overflow".into()))?;
-        let slice = base_sources_mmap.get(start..end).ok_or_else(|| {
-            AppError::InvalidIndex(format!(
-                "base source slice out of range for {}",
-                self.segment_source_label()
-            ))
-        })?;
-        read_stored_source_bytes_view(slice)?.decode()
+    fn read_source_bytes_from_inline_segment(&self, doc_id: usize) -> Result<Arc<[u8]>> {
+        read_encoded_source_bytes_view(self.doc_table.source_slice(doc_id)?)?.decode()
     }
 
     fn load_source_bytes(&self, doc_id: usize) -> Result<Arc<[u8]>> {
-        if let Some(_stored_fields_layout) = self.stored_fields_layout {
-            if self.doc_record(doc_id)?.stored_len > 0 {
-                return self.read_source_bytes_from_store(doc_id);
+        let record = self.doc_record(doc_id)?;
+        let key = self.doc_key(doc_id as SegmentDocId)?;
+        match record.source_kind {
+            SegmentDocSourceKind::Inline => self.read_source_bytes_from_inline_segment(doc_id),
+            SegmentDocSourceKind::Worktree => self.read_source_bytes_from_worktree(key),
+            SegmentDocSourceKind::GitHeadBlob => {
+                let head_commit = self.base_head_commit.as_deref().ok_or_else(|| {
+                    AppError::InvalidIndex(format!(
+                        "segment {} is missing base head commit for git-backed doc source",
+                        self.meta.segment_id.0
+                    ))
+                })?;
+                self.read_source_bytes_from_git_blob(key, head_commit)
             }
         }
-        if self.base_sources_mmap.is_some() && self.doc_record(doc_id)?.stored_len > 0 {
-            return self.read_source_bytes_from_base_store(doc_id);
-        }
-        let key = self.doc_key(doc_id as SegmentDocId)?;
-        self.read_source_bytes_from_repo(key)
     }
 
     fn source_bytes(&self, doc_id: SegmentDocId) -> Result<Arc<[u8]>> {
@@ -461,20 +393,62 @@ impl FileSegmentReader {
     }
 
     fn segment_source_label(&self) -> String {
-        self.stored_fields_path
-            .as_ref()
-            .map(|path| path.display().to_string())
-            .or_else(|| {
-                self.base_sources_path
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-            })
-            .or_else(|| {
-                self.repo_root
-                    .as_ref()
-                    .map(|path| path.display().to_string())
-            })
-            .unwrap_or_else(|| self.meta.segment_id.0.clone())
+        self.repo_root.as_ref().map_or_else(
+            || self.meta.segment_id.0.clone(),
+            |path| path.display().to_string(),
+        )
+    }
+
+    fn load_worktree_verify_mmap(&self, doc_id: usize) -> Result<Option<Arc<Mmap>>> {
+        let key = self.doc_key(doc_id as SegmentDocId)?;
+        let path = self.repo_path_for_key(key)?;
+        let file = match File::open(&path) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
+                ) =>
+            {
+                return Ok(None);
+            }
+            Err(error) => return Err(error.into()),
+        };
+        if file.metadata()?.len() == 0 {
+            return Ok(None);
+        }
+        Ok(Some(Arc::new(unsafe { Mmap::map(&file)? })))
+    }
+
+    fn worktree_verify_source(&self, doc_id: SegmentDocId) -> Result<SegmentVerifySource> {
+        let doc_id = doc_id as usize;
+        let cache = self.decoded_worktree_verify_mmaps.get(doc_id)?;
+        if let Some(mmap) = cache.get() {
+            return Ok(SegmentVerifySource::Mmap(Arc::clone(mmap)));
+        }
+
+        let Some(mmap) = self.load_worktree_verify_mmap(doc_id)? else {
+            return Ok(SegmentVerifySource::Bytes(Arc::<[u8]>::from(
+                Vec::<u8>::new(),
+            )));
+        };
+
+        if cache.set(Arc::clone(&mmap)).is_err() {
+            let mmap = cache.get().ok_or_else(|| {
+                AppError::Protocol(format!(
+                    "failed to initialize cached segment worktree mmap {doc_id} from {}",
+                    self.segment_source_label()
+                ))
+            })?;
+            return Ok(SegmentVerifySource::Mmap(Arc::clone(mmap)));
+        }
+        let mmap = cache.get().ok_or_else(|| {
+            AppError::Protocol(format!(
+                "failed to read cached segment worktree mmap {doc_id} from {}",
+                self.segment_source_label()
+            ))
+        })?;
+        Ok(SegmentVerifySource::Mmap(Arc::clone(mmap)))
     }
 }
 
@@ -562,12 +536,12 @@ impl SegmentReader for FileSegmentReader {
         })
     }
 
-    fn doc_metadata(&self, doc_id: SegmentDocId) -> Result<StoredDocMetadata<'_>> {
+    fn doc_metadata(&self, doc_id: SegmentDocId) -> Result<SegmentDocMetadata<'_>> {
         let doc_id = doc_id as usize;
         let key = self.doc_key(doc_id as SegmentDocId)?;
         let cache = self.decoded_metadata.get(doc_id)?;
         if let Some(metadata) = cache.get() {
-            return Ok(StoredDocMetadata {
+            return Ok(SegmentDocMetadata {
                 key,
                 size: metadata.size,
                 modified_at: metadata.modified_at,
@@ -582,7 +556,7 @@ impl SegmentReader for FileSegmentReader {
                     self.segment_source_label()
                 ))
             })?;
-            return Ok(StoredDocMetadata {
+            return Ok(SegmentDocMetadata {
                 key,
                 size: metadata.size,
                 modified_at: metadata.modified_at,
@@ -595,7 +569,7 @@ impl SegmentReader for FileSegmentReader {
                 self.segment_source_label()
             ))
         })?;
-        Ok(StoredDocMetadata {
+        Ok(SegmentDocMetadata {
             key,
             size: metadata.size,
             modified_at: metadata.modified_at,
@@ -603,14 +577,40 @@ impl SegmentReader for FileSegmentReader {
         })
     }
 
-    fn stored_doc(&self, doc_id: SegmentDocId) -> Result<StoredDocRef<'_>> {
-        let key = self.doc_key(doc_id)?;
-        let source_bytes = self.source_bytes(doc_id)?;
-        Ok(StoredDocRef { key, source_bytes })
+    fn doc_source_kind(&self, doc_id: SegmentDocId) -> Result<SegmentDocSourceKind> {
+        Ok(self.doc_record(doc_id as usize)?.source_kind)
     }
 
     fn verify_source(&self, doc_id: SegmentDocId) -> Result<SegmentVerifySource> {
-        Ok(SegmentVerifySource::Bytes(self.source_bytes(doc_id)?))
+        match self.doc_record(doc_id as usize)?.source_kind {
+            SegmentDocSourceKind::Worktree => self.worktree_verify_source(doc_id),
+            SegmentDocSourceKind::Inline | SegmentDocSourceKind::GitHeadBlob => {
+                Ok(SegmentVerifySource::Bytes(self.source_bytes(doc_id)?))
+            }
+        }
+    }
+
+    fn verify_source_for_query(
+        &self,
+        doc_id: SegmentDocId,
+        prefer_worktree_for_git_head_blob: bool,
+    ) -> Result<SegmentVerifySource> {
+        if !prefer_worktree_for_git_head_blob {
+            return self.verify_source(doc_id);
+        }
+
+        let cache = self.decoded_source_bytes.get(doc_id as usize)?;
+        if let Some(bytes) = cache.get() {
+            return Ok(SegmentVerifySource::Bytes(Arc::clone(bytes)));
+        }
+
+        let record = self.doc_record(doc_id as usize)?;
+        if matches!(record.source_kind, SegmentDocSourceKind::GitHeadBlob) {
+            let key = self.doc_key(doc_id)?;
+            return Ok(SegmentVerifySource::Path(self.repo_path_for_key(key)?));
+        }
+
+        self.verify_source(doc_id)
     }
 }
 
@@ -658,20 +658,6 @@ impl<T> LazyDocCache<T> {
         let chunk_start = chunk_index * self.chunk_size;
         self.len.saturating_sub(chunk_start).min(self.chunk_size)
     }
-}
-
-fn file_name_from_logical_path(logical_path: &str) -> String {
-    Path::new(logical_path)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(logical_path)
-        .to_string()
-}
-
-fn language_from_logical_path(logical_path: &str) -> Option<String> {
-    Path::new(logical_path)
-        .extension()
-        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
 }
 
 fn build_path_doc_ids<'a, I>(entries: I) -> BTreeMap<String, Vec<SegmentDocId>>

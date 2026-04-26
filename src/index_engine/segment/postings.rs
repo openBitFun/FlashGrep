@@ -39,7 +39,6 @@ pub(crate) const POSTINGS_VERSION_V3: u32 = 3;
 const POSTING_COUNT_OFFSET: u64 = 12;
 const POSTING_ENCODING_RAW: u8 = 0;
 const POSTING_ENCODING_DELTA_VARINT: u8 = 1;
-const RAW_POSTING_DOC_COUNT_THRESHOLD: usize = usize::MAX;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PostingBlock {
@@ -95,7 +94,7 @@ impl FileBackedPostingLists {
             let cache = self
                 .cache
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(doc_ids) = cache.get(key) {
                 return Ok(Some(doc_ids.clone()));
             }
@@ -109,7 +108,7 @@ impl FileBackedPostingLists {
         let mut cache = self
             .cache
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let entry = cache.entry(*key).or_insert_with(|| doc_ids.clone());
         Ok(Some(entry.clone()))
     }
@@ -179,7 +178,9 @@ pub(crate) fn write_postings_file(
     write_u32(&mut buffer, posting_lists.len() as u32)?;
 
     for key in ordered_posting_keys(posting_lists) {
-        let doc_ids = posting_lists.get(&key).expect("posting key must exist");
+        let doc_ids = posting_lists
+            .get(&key)
+            .ok_or_else(|| AppError::InvalidIndex("posting key missing during write".into()))?;
         write_u32(&mut buffer, doc_ids.len() as u32)?;
         write_posting_payload(&mut buffer, doc_ids)?;
     }
@@ -347,12 +348,8 @@ pub(crate) fn encoded_posting_len(doc_ids: &[u32]) -> Result<usize> {
         .ok_or_else(|| AppError::ValueOutOfRange("posting size exceeds usize range".into()))
 }
 
-fn posting_encoding(doc_ids: &[u32]) -> u8 {
-    if doc_ids.len() >= RAW_POSTING_DOC_COUNT_THRESHOLD {
-        POSTING_ENCODING_RAW
-    } else {
-        POSTING_ENCODING_DELTA_VARINT
-    }
+fn posting_encoding(_doc_ids: &[u32]) -> u8 {
+    POSTING_ENCODING_DELTA_VARINT
 }
 
 fn encoded_posting_payload_len_for_encoding(doc_ids: &[u32], encoding: u8) -> Result<usize> {

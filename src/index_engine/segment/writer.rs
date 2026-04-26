@@ -6,7 +6,9 @@ use std::{
     time::Instant,
 };
 
-use crate::index_engine::segment::reader::FileSegmentReader;
+use crate::index_engine::segment::reader::{
+    FileSegmentReader, MemorySegmentReader, SegmentReaderHandle,
+};
 use crate::{
     index_engine::{config::PostingTokenizerConfig, types::SegmentId},
     AppError, Result,
@@ -14,13 +16,11 @@ use crate::{
 
 use super::{
     build_posting_lists, read_segment_meta, write_postings_file, write_segment_documents,
-    write_segment_meta, write_term_dict_file, FileSegmentDocTable, MemorySegmentReader,
-    PostingLists, SegmentBuildOutput, SegmentMeta, SegmentReaderHandle, TermDictionary, DOCS_FILE,
-    PATH_MAP_FILE, SEGMENT_META_FILE, STORED_FIELDS_FILE,
+    write_segment_meta, write_term_dict_file, FileSegmentDocTable, PostingLists,
+    SegmentBuildOutput, SegmentMeta, TermDictionary, DOCS_FILE, PATH_MAP_FILE, SEGMENT_META_FILE,
 };
 const TERM_DICT_FILE: &str = "term_dict.bin";
 const POSTINGS_FILE: &str = "postings.bin";
-const BASE_SOURCES_FILE: &str = "base_sources.bin";
 
 pub trait SegmentStore: Send + Sync {
     fn write_segment(&self, build: SegmentBuildOutput) -> Result<SegmentMeta>;
@@ -38,7 +38,7 @@ impl SegmentStore for MemorySegmentStore {
         let mut guard = self
             .segments
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.insert(build.meta.segment_id.clone(), build.meta.clone());
         Ok(build.meta)
     }
@@ -47,7 +47,7 @@ impl SegmentStore for MemorySegmentStore {
         let guard = self
             .segments
             .read()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let meta = guard.get(&id).cloned().ok_or_else(|| {
             crate::AppError::Protocol(format!("unknown in-memory segment: {}", id.0))
         })?;
@@ -62,7 +62,7 @@ impl SegmentStore for MemorySegmentStore {
         let mut guard = self
             .segments
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         guard.remove(&id);
         Ok(())
     }
@@ -72,18 +72,20 @@ pub struct FileSegmentStore {
     segments_dir: PathBuf,
     tokenizer: PostingTokenizerConfig,
     repo_root: Option<PathBuf>,
+    base_head_commit: Option<String>,
     cache: RwLock<HashMap<SegmentId, SegmentReaderHandle>>,
 }
 
 impl FileSegmentStore {
     pub fn open(index_root: &Path, tokenizer: PostingTokenizerConfig) -> Result<Self> {
-        Self::open_with_repo_root(index_root, tokenizer, None)
+        Self::open_with_repo_root(index_root, tokenizer, None, None)
     }
 
     pub fn open_with_repo_root(
         index_root: &Path,
         tokenizer: PostingTokenizerConfig,
         repo_root: Option<PathBuf>,
+        base_head_commit: Option<String>,
     ) -> Result<Self> {
         let segments_dir = index_root.join("segments");
         fs::create_dir_all(&segments_dir)?;
@@ -91,6 +93,7 @@ impl FileSegmentStore {
             segments_dir,
             tokenizer,
             repo_root,
+            base_head_commit,
             cache: RwLock::new(HashMap::new()),
         })
     }
@@ -119,7 +122,7 @@ impl SegmentStore for FileSegmentStore {
             let cache = self
                 .cache
                 .read()
-                .unwrap_or_else(|poisoned| poisoned.into_inner());
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
             if let Some(reader) = cache.get(&id) {
                 return Ok(reader.clone());
             }
@@ -137,16 +140,13 @@ impl SegmentStore for FileSegmentStore {
         let postings_started = Instant::now();
         let posting_lists = PostingLists::open_lazy(term_dict, &segment_dir.join(POSTINGS_FILE))?;
         let postings_elapsed = postings_started.elapsed();
-        let stored_fields_path = segment_dir.join(STORED_FIELDS_FILE);
-        let base_sources_path = segment_dir.join(BASE_SOURCES_FILE);
         let reader_started = Instant::now();
         let reader = std::sync::Arc::new(FileSegmentReader::new(
             meta,
             doc_table,
             posting_lists,
-            stored_fields_path.exists().then_some(stored_fields_path),
-            base_sources_path.exists().then_some(base_sources_path),
             self.repo_root.clone(),
+            self.base_head_commit.clone(),
         )?);
         let reader_elapsed = reader_started.elapsed();
         if profile_open {
@@ -162,7 +162,7 @@ impl SegmentStore for FileSegmentStore {
         let mut cache = self
             .cache
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.insert(id, reader.clone());
         Ok(reader)
     }
@@ -190,7 +190,7 @@ impl SegmentStore for FileSegmentStore {
         let mut cache = self
             .cache
             .write()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.remove(&id);
         Ok(())
     }

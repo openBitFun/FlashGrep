@@ -37,7 +37,6 @@ src/index_engine/
     reader.rs
     postings.rs
     term_dict.rs
-    stored_fields.rs
     path_map.rs
     live_docs.rs
 
@@ -211,7 +210,7 @@ merge 是后台维护行为，不改变“只有 published manifest 可见”这
 - `tasks.rs`
   build/rebuild/refresh 任务生命周期
 - `workspace.rs`
-  watcher / reconcile / refresh 编排
+  workspace probe / reconcile / refresh 编排
 
 ## Core Data Structures
 

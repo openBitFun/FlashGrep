@@ -21,25 +21,20 @@ use crate::{AppError, Result};
 
 pub(crate) const SEGMENT_META_FILE: &str = "SEGMENT_META.json";
 pub(crate) const DOCS_FILE: &str = "docs.bin";
-pub(crate) const STORED_FIELDS_FILE: &str = "stored_fields.bin";
 pub(crate) const PATH_MAP_FILE: &str = "path_map.bin";
 pub(crate) const PATH_OFFSETS_FILE: &str = "path_offsets.bin";
 
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
-const DOCS_VERSION_V1: u32 = 1;
-const DOCS_VERSION_V2: u32 = 2;
-const STORED_FIELDS_MAGIC_V1: &[u8; 8] = b"CGSTRD01";
-const STORED_FIELDS_MAGIC_V2: &[u8; 8] = b"CGSTRD02";
+const DOCS_VERSION: u32 = 4;
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
-const STORED_SOURCE_ENCODING_RAW: u8 = 0;
-const STORED_SOURCE_ENCODING_ZSTD: u8 = 1;
-const STORED_SOURCE_ZSTD_LEVEL: i32 = 3;
-const STORED_SOURCE_COMPRESSION_ENABLED: bool = false;
-const STORED_SOURCE_MIN_COMPRESS_BYTES: usize = 4 * 1024;
+const SOURCE_ENCODING_RAW: u8 = 0;
+const SOURCE_ENCODING_ZSTD: u8 = 1;
+const SOURCE_ZSTD_LEVEL: i32 = 3;
+const SOURCE_COMPRESSION_ENABLED: bool = false;
+const SOURCE_MIN_COMPRESS_BYTES: usize = 4 * 1024;
 const PATH_MAP_HEADER_LEN: usize = 16;
 const DOCS_HEADER_LEN: usize = 16;
-const DOC_RECORD_LEN_V1: usize = 16;
-const DOC_RECORD_LEN_V2: usize = 64;
+const DOC_RECORD_LEN: usize = 72;
 const PATH_OFFSETS_MAGIC: &[u8; 8] = b"CGPTOF01";
 const PATH_OFFSETS_VERSION: u32 = 1;
 
@@ -76,22 +71,31 @@ pub struct DeleteSegmentBuildOutput {
 #[derive(Debug, Clone, Copy)]
 struct DocRecord {
     path_index: u32,
-    stored_offset: u64,
-    stored_len: u32,
+    source_offset: u64,
+    source_len: u32,
     size: u64,
     modified_at: u64,
     content_hash: [u8; 32],
+    source_kind: SegmentDocSourceKind,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u8)]
+pub enum SegmentDocSourceKind {
+    Inline = 0,
+    Worktree = 1,
+    GitHeadBlob = 2,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SegmentDocRecord {
     pub path_index: u32,
-    pub stored_offset: u64,
-    pub stored_len: u32,
+    pub source_offset: u64,
+    pub source_len: u32,
     pub size: u64,
     pub modified_at: u64,
     pub content_hash: [u8; 32],
-    pub metadata_embedded: bool,
+    pub source_kind: SegmentDocSourceKind,
 }
 
 #[derive(Debug)]
@@ -99,28 +103,11 @@ pub struct FileSegmentDocTable {
     path_map_mmap: Mmap,
     docs_mmap: Mmap,
     doc_count: usize,
-    docs_version: u32,
     path_entry_offsets: Vec<usize>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct StoredDocumentView<'a> {
-    pub file_name: &'a str,
-    pub language: Option<&'a str>,
-    pub size: u64,
-    pub modified_at: u64,
-    pub content_hash: [u8; 32],
-    pub source_bytes: StoredSourceBytes<'a>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StoredFieldsLayout {
-    V1Raw,
-    V2Compressed,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) enum StoredSourceBytes<'a> {
+pub(crate) enum EncodedSourceBytes<'a> {
     Raw(&'a [u8]),
     Zstd {
         compressed: &'a [u8],
@@ -128,7 +115,7 @@ pub(crate) enum StoredSourceBytes<'a> {
     },
 }
 
-impl StoredSourceBytes<'_> {
+impl EncodedSourceBytes<'_> {
     pub(crate) fn len(self) -> usize {
         match self {
             Self::Raw(bytes) => bytes.len(),
@@ -147,7 +134,7 @@ impl StoredSourceBytes<'_> {
             } => {
                 let decoded =
                     zstd_decompress(compressed, uncompressed_len as usize).map_err(|error| {
-                        AppError::InvalidIndex(format!("stored source zstd decode failed: {error}"))
+                        AppError::InvalidIndex(format!("inline source zstd decode failed: {error}"))
                     })?;
                 Ok(Arc::<[u8]>::from(decoded))
             }
@@ -176,10 +163,16 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
     write_header(&mut path_map, PATH_MAP_MAGIC)?;
     write_u32(&mut path_map, documents.len() as u32)?;
     let mut path_entry_offsets = Vec::with_capacity(documents.len());
-
-    let mut stored_fields = Vec::new();
-    write_header(&mut stored_fields, STORED_FIELDS_MAGIC_V2)?;
-    write_u32(&mut stored_fields, documents.len() as u32)?;
+    let source_data_start = DOCS_HEADER_LEN
+        .checked_add(documents.len().checked_mul(DOC_RECORD_LEN).ok_or_else(|| {
+            AppError::ValueOutOfRange("docs record region exceeds usize range".into())
+        })?)
+        .ok_or_else(|| {
+            AppError::ValueOutOfRange("docs record region exceeds usize range".into())
+        })?;
+    let mut next_source_offset = u64::try_from(source_data_start)
+        .map_err(|_| AppError::ValueOutOfRange("docs source offset exceeds u64 range".into()))?;
+    let mut encoded_sources = Vec::new();
 
     let mut doc_records = Vec::with_capacity(documents.len());
 
@@ -188,83 +181,41 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
         write_string(&mut path_map, &document.repo_id.0)?;
         write_string(&mut path_map, &document.logical_path)?;
 
-        let stored_offset = stored_fields.len() as u64;
-        write_string(&mut stored_fields, &document.file_name)?;
-        write_optional_string(&mut stored_fields, document.language.as_deref())?;
-        write_u64(&mut stored_fields, document.size)?;
-        write_u64(&mut stored_fields, document.modified_at)?;
-        stored_fields.write_all(&document.content_hash)?;
-        write_source_bytes(&mut stored_fields, &document.source_bytes)?;
-        let stored_len = (stored_fields.len() as u64)
-            .checked_sub(stored_offset)
-            .ok_or_else(|| AppError::InvalidIndex("stored fields length underflow".into()))?;
-        let stored_len = u32::try_from(stored_len).map_err(|_| {
-            AppError::ValueOutOfRange("stored fields length exceeds u32 range".into())
+        let source_len = encoded_source_bytes_len(&document.source_bytes)?;
+        let source_len = u32::try_from(source_len).map_err(|_| {
+            AppError::ValueOutOfRange("inline source length exceeds u32 range".into())
         })?;
+        write_source_bytes(&mut encoded_sources, &document.source_bytes)?;
 
         doc_records.push(DocRecord {
             path_index: path_index as u32,
-            stored_offset,
-            stored_len,
+            source_offset: next_source_offset,
+            source_len,
             size: document.size,
             modified_at: document.modified_at,
             content_hash: document.content_hash,
+            source_kind: SegmentDocSourceKind::Inline,
         });
+
+        next_source_offset = next_source_offset
+            .checked_add(u64::from(source_len))
+            .ok_or_else(|| {
+                AppError::ValueOutOfRange("docs source offset exceeds u64 range".into())
+            })?;
     }
 
     let mut docs = Vec::new();
-    write_header_with_version(&mut docs, DOCS_MAGIC, DOCS_VERSION_V2)?;
+    write_header_with_version(&mut docs, DOCS_MAGIC, DOCS_VERSION)?;
     write_u32(&mut docs, doc_records.len() as u32)?;
     for record in doc_records {
-        write_u32(&mut docs, record.path_index)?;
-        write_u64(&mut docs, record.stored_offset)?;
-        write_u32(&mut docs, record.stored_len)?;
-        write_u64(&mut docs, record.size)?;
-        write_u64(&mut docs, record.modified_at)?;
-        docs.write_all(&record.content_hash)?;
+        write_doc_record(&mut docs, &record)?;
     }
+    docs.write_all(&encoded_sources)?;
 
     fs::write(dir.join(PATH_MAP_FILE), path_map)?;
     write_path_offsets_file(&dir.join(PATH_OFFSETS_FILE), &path_entry_offsets)?;
-    fs::write(dir.join(STORED_FIELDS_FILE), stored_fields)?;
     fs::write(dir.join(DOCS_FILE), docs)?;
     Ok(())
-}
-
-pub(crate) fn read_segment_documents(dir: &Path) -> Result<Vec<IndexDocument>> {
-    let stored_fields_bytes = fs::read(dir.join(STORED_FIELDS_FILE))?;
-    let mut stored_cursor = Cursor::new(stored_fields_bytes.as_slice());
-    let stored_fields_layout = read_stored_fields_header(&mut stored_cursor)?;
-    let stored_doc_count = read_u32(&mut stored_cursor)? as usize;
-
-    let table = FileSegmentDocTable::open(dir)?;
-    let doc_count = table.len();
-    if doc_count != stored_doc_count {
-        return Err(AppError::InvalidIndex(format!(
-            "segment file count mismatch: docs={doc_count}, stored={stored_doc_count}",
-        )));
-    }
-
-    let mut documents = Vec::with_capacity(doc_count);
-    for doc_id in 0..doc_count {
-        let record = table.record(doc_id)?;
-        let key = table.doc_key(doc_id)?;
-        let start = usize::try_from(record.stored_offset)
-            .map_err(|_| AppError::ValueOutOfRange("stored offset exceeds usize range".into()))?;
-        let end = start
-            .checked_add(record.stored_len as usize)
-            .ok_or_else(|| AppError::InvalidIndex("stored field slice overflow".into()))?;
-        let slice = stored_fields_bytes
-            .get(start..end)
-            .ok_or_else(|| AppError::InvalidIndex("stored field slice out of range".into()))?;
-        documents.push(read_index_document_from_stored_slice(
-            slice,
-            &key,
-            stored_fields_layout,
-        )?);
-    }
-
-    Ok(documents)
 }
 
 fn load_or_create_path_offsets(
@@ -429,7 +380,7 @@ impl FileSegmentDocTable {
             )));
         }
         let mut docs_cursor = Cursor::new(docs_mmap.as_ref());
-        let docs_version = read_docs_header(&mut docs_cursor)?;
+        read_docs_header(&mut docs_cursor)?;
         let doc_count = read_u32(&mut docs_cursor)? as usize;
         let docs_header_elapsed = docs_started.elapsed();
         if doc_count != path_count {
@@ -438,9 +389,8 @@ impl FileSegmentDocTable {
             )));
         }
 
-        let record_len = doc_record_len_for_version(docs_version)?;
         let expected_docs_len = DOCS_HEADER_LEN
-            .checked_add(doc_count.checked_mul(record_len).ok_or_else(|| {
+            .checked_add(doc_count.checked_mul(DOC_RECORD_LEN).ok_or_else(|| {
                 AppError::ValueOutOfRange("docs file size exceeds usize range".into())
             })?)
             .ok_or_else(|| {
@@ -468,7 +418,6 @@ impl FileSegmentDocTable {
             path_map_mmap,
             docs_mmap,
             doc_count,
-            docs_version,
             path_entry_offsets,
         })
     }
@@ -483,46 +432,46 @@ impl FileSegmentDocTable {
                 "segment doc {doc_id} is out of bounds"
             )));
         }
-        let record_len = doc_record_len_for_version(self.docs_version)?;
         let start = DOCS_HEADER_LEN
-            .checked_add(doc_id.checked_mul(record_len).ok_or_else(|| {
+            .checked_add(doc_id.checked_mul(DOC_RECORD_LEN).ok_or_else(|| {
                 AppError::ValueOutOfRange("docs offset exceeds usize range".into())
             })?)
             .ok_or_else(|| AppError::ValueOutOfRange("docs offset exceeds usize range".into()))?;
         let end = start
-            .checked_add(record_len)
+            .checked_add(DOC_RECORD_LEN)
             .ok_or_else(|| AppError::InvalidIndex("docs record slice overflow".into()))?;
         let bytes = self.docs_mmap.get(start..end).ok_or_else(|| {
             AppError::InvalidIndex(format!("segment doc {doc_id} is out of range"))
         })?;
 
         let path_index = read_u32_from_slice(bytes, 0)?;
-        let stored_offset = read_u64_from_slice(bytes, 4)?;
-        let stored_len = read_u32_from_slice(bytes, 12)?;
-        if self.docs_version >= DOCS_VERSION_V2 {
-            let size = read_u64_from_slice(bytes, 16)?;
-            let modified_at = read_u64_from_slice(bytes, 24)?;
-            let content_hash = read_fixed_32_from_slice(bytes, 32)?;
-            Ok(SegmentDocRecord {
-                path_index,
-                stored_offset,
-                stored_len,
-                size,
-                modified_at,
-                content_hash,
-                metadata_embedded: true,
-            })
-        } else {
-            Ok(SegmentDocRecord {
-                path_index,
-                stored_offset,
-                stored_len,
-                size: 0,
-                modified_at: 0,
-                content_hash: [0u8; 32],
-                metadata_embedded: false,
-            })
-        }
+        let source_offset = read_u64_from_slice(bytes, 4)?;
+        let source_len = read_u32_from_slice(bytes, 12)?;
+        let size = read_u64_from_slice(bytes, 16)?;
+        let modified_at = read_u64_from_slice(bytes, 24)?;
+        let content_hash = read_fixed_32_from_slice(bytes, 32)?;
+        let source_kind = read_source_kind_from_slice(bytes, 64)?;
+        Ok(SegmentDocRecord {
+            path_index,
+            source_offset,
+            source_len,
+            size,
+            modified_at,
+            content_hash,
+            source_kind,
+        })
+    }
+
+    pub fn source_slice(&self, doc_id: usize) -> Result<&[u8]> {
+        let record = self.record(doc_id)?;
+        let start = usize::try_from(record.source_offset)
+            .map_err(|_| AppError::ValueOutOfRange("source offset exceeds usize range".into()))?;
+        let end = start
+            .checked_add(record.source_len as usize)
+            .ok_or_else(|| AppError::InvalidIndex("source slice overflow".into()))?;
+        self.docs_mmap.get(start..end).ok_or_else(|| {
+            AppError::InvalidIndex(format!("segment doc {doc_id} source is out of range"))
+        })
     }
 
     pub fn doc_key(&self, doc_id: usize) -> Result<DocKey> {
@@ -548,93 +497,42 @@ impl FileSegmentDocTable {
     }
 }
 
-pub(crate) fn read_index_document_from_stored_slice(
+pub(crate) fn read_index_document_from_inline_slice(
     slice: &[u8],
     key: &DocKey,
-    stored_fields_layout: StoredFieldsLayout,
+    record: SegmentDocRecord,
 ) -> Result<IndexDocument> {
-    let view = read_stored_document_view(slice, stored_fields_layout)?;
+    let source_bytes = read_encoded_source_bytes_view(slice)?.decode()?;
 
     Ok(IndexDocument {
         key: key.clone(),
         repo_id: key.repo_id.clone(),
         logical_path: key.logical_path.clone(),
-        file_name: view.file_name.to_string(),
-        language: view.language.map(str::to_string),
-        size: view.size,
-        modified_at: view.modified_at,
-        content_hash: view.content_hash,
-        source_bytes: view.source_bytes.decode()?,
-    })
-}
-
-pub(crate) fn read_stored_document_view(
-    slice: &[u8],
-    stored_fields_layout: StoredFieldsLayout,
-) -> Result<StoredDocumentView<'_>> {
-    let mut reader = StoredSliceReader::new(slice);
-    let file_name = reader.read_string()?;
-    let language = reader.read_optional_string()?;
-    let size = reader.read_u64()?;
-    let modified_at = reader.read_u64()?;
-    let content_hash_bytes = reader.read_bytes(32)?;
-    let mut content_hash = [0u8; 32];
-    content_hash.copy_from_slice(content_hash_bytes);
-    let source_bytes = match stored_fields_layout {
-        StoredFieldsLayout::V1Raw => {
-            let source_len = reader.read_u32()? as usize;
-            StoredSourceBytes::Raw(reader.read_bytes(source_len)?)
-        }
-        StoredFieldsLayout::V2Compressed => {
-            let encoding = reader.read_bytes(1)?[0];
-            let source_len = reader.read_u32()?;
-            let payload_len = reader.read_u32()? as usize;
-            let payload = reader.read_bytes(payload_len)?;
-            match encoding {
-                STORED_SOURCE_ENCODING_RAW => StoredSourceBytes::Raw(payload),
-                STORED_SOURCE_ENCODING_ZSTD => StoredSourceBytes::Zstd {
-                    compressed: payload,
-                    uncompressed_len: source_len,
-                },
-                value => {
-                    return Err(AppError::InvalidIndex(format!(
-                        "invalid stored source encoding: {value}"
-                    )));
-                }
-            }
-        }
-    };
-    Ok(StoredDocumentView {
-        file_name,
-        language,
-        size,
-        modified_at,
-        content_hash,
+        file_name: file_name_from_logical_path(&key.logical_path),
+        language: language_from_logical_path(&key.logical_path),
+        size: record.size,
+        modified_at: record.modified_at,
+        content_hash: record.content_hash,
         source_bytes,
     })
 }
 
-pub(crate) fn read_stored_source_bytes_view(slice: &[u8]) -> Result<StoredSourceBytes<'_>> {
+pub(crate) fn read_encoded_source_bytes_view(slice: &[u8]) -> Result<EncodedSourceBytes<'_>> {
     let mut reader = StoredSliceReader::new(slice);
     let encoding = reader.read_bytes(1)?[0];
     let source_len = reader.read_u32()?;
     let payload_len = reader.read_u32()? as usize;
     let payload = reader.read_bytes(payload_len)?;
     match encoding {
-        STORED_SOURCE_ENCODING_RAW => Ok(StoredSourceBytes::Raw(payload)),
-        STORED_SOURCE_ENCODING_ZSTD => Ok(StoredSourceBytes::Zstd {
+        SOURCE_ENCODING_RAW => Ok(EncodedSourceBytes::Raw(payload)),
+        SOURCE_ENCODING_ZSTD => Ok(EncodedSourceBytes::Zstd {
             compressed: payload,
             uncompressed_len: source_len,
         }),
         value => Err(AppError::InvalidIndex(format!(
-            "invalid stored source encoding: {value}"
+            "invalid inline source encoding: {value}"
         ))),
     }
-}
-
-pub(crate) fn read_stored_fields_layout(bytes: &[u8]) -> Result<StoredFieldsLayout> {
-    let mut cursor = Cursor::new(bytes);
-    read_stored_fields_header(&mut cursor)
 }
 
 fn write_header(buffer: &mut Vec<u8>, magic: &[u8; 8]) -> Result<()> {
@@ -662,24 +560,6 @@ fn read_header(cursor: &mut Cursor<&[u8]>, expected_magic: &[u8; 8]) -> Result<(
     Ok(())
 }
 
-fn read_stored_fields_header(cursor: &mut Cursor<&[u8]>) -> Result<StoredFieldsLayout> {
-    let mut magic = [0u8; 8];
-    cursor.read_exact(&mut magic)?;
-    let version = read_u32(cursor)?;
-    if version != 1 {
-        return Err(AppError::InvalidIndex(format!(
-            "unsupported stored fields version: {version}"
-        )));
-    }
-    match &magic {
-        magic if magic == STORED_FIELDS_MAGIC_V1 => Ok(StoredFieldsLayout::V1Raw),
-        magic if magic == STORED_FIELDS_MAGIC_V2 => Ok(StoredFieldsLayout::V2Compressed),
-        _ => Err(AppError::InvalidIndex(
-            "stored fields magic mismatch".into(),
-        )),
-    }
-}
-
 fn read_docs_header(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
     let mut magic = [0u8; 8];
     cursor.read_exact(&mut magic)?;
@@ -687,7 +567,7 @@ fn read_docs_header(cursor: &mut Cursor<&[u8]>) -> Result<u32> {
         return Err(AppError::InvalidIndex("segment file magic mismatch".into()));
     }
     let version = read_u32(cursor)?;
-    if !(DOCS_VERSION_V1..=DOCS_VERSION_V2).contains(&version) {
+    if version != DOCS_VERSION {
         return Err(AppError::InvalidIndex(format!(
             "unsupported docs file version: {version}"
         )));
@@ -729,7 +609,7 @@ pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Resul
     let len = u32::try_from(value.len())
         .map_err(|_| AppError::ValueOutOfRange("byte slice length exceeds u32 range".into()))?;
     if let Some(compressed) = maybe_compress_source_bytes(value)? {
-        writer.write_all(&[STORED_SOURCE_ENCODING_ZSTD])?;
+        writer.write_all(&[SOURCE_ENCODING_ZSTD])?;
         write_u32(writer, len)?;
         write_u32(
             writer,
@@ -741,7 +621,7 @@ pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Resul
         return Ok(());
     }
 
-    writer.write_all(&[STORED_SOURCE_ENCODING_RAW])?;
+    writer.write_all(&[SOURCE_ENCODING_RAW])?;
     write_u32(writer, len)?;
     write_u32(writer, len)?;
     writer.write_all(value)?;
@@ -766,15 +646,15 @@ pub(crate) fn encoded_source_bytes_len(value: &[u8]) -> Result<u64> {
 }
 
 fn maybe_compress_source_bytes(value: &[u8]) -> Result<Option<Vec<u8>>> {
-    if !STORED_SOURCE_COMPRESSION_ENABLED {
+    if !SOURCE_COMPRESSION_ENABLED {
         return Ok(None);
     }
-    if value.len() < STORED_SOURCE_MIN_COMPRESS_BYTES {
+    if value.len() < SOURCE_MIN_COMPRESS_BYTES {
         return Ok(None);
     }
 
-    let compressed = zstd_compress(value, STORED_SOURCE_ZSTD_LEVEL).map_err(|error| {
-        AppError::Protocol(format!("stored source zstd encode failed: {error}"))
+    let compressed = zstd_compress(value, SOURCE_ZSTD_LEVEL).map_err(|error| {
+        AppError::Protocol(format!("inline source zstd encode failed: {error}"))
     })?;
     if compressed.len() + 16 >= value.len() {
         return Ok(None);
@@ -782,13 +662,35 @@ fn maybe_compress_source_bytes(value: &[u8]) -> Result<Option<Vec<u8>>> {
     Ok(Some(compressed))
 }
 
-fn doc_record_len_for_version(version: u32) -> Result<usize> {
-    match version {
-        DOCS_VERSION_V1 => Ok(DOC_RECORD_LEN_V1),
-        DOCS_VERSION_V2 => Ok(DOC_RECORD_LEN_V2),
-        other => Err(AppError::InvalidIndex(format!(
-            "unsupported docs file version: {other}"
-        ))),
+fn write_doc_record(writer: &mut impl Write, record: &DocRecord) -> Result<()> {
+    write_u32(writer, record.path_index)?;
+    write_u64(writer, record.source_offset)?;
+    write_u32(writer, record.source_len)?;
+    write_u64(writer, record.size)?;
+    write_u64(writer, record.modified_at)?;
+    writer.write_all(&record.content_hash)?;
+    writer.write_all(&[record.source_kind as u8])?;
+    writer.write_all(&[0u8; 7])?;
+    Ok(())
+}
+
+fn read_source_kind_from_slice(slice: &[u8], offset: usize) -> Result<SegmentDocSourceKind> {
+    let raw = *slice
+        .get(offset)
+        .ok_or_else(|| AppError::InvalidIndex("source kind is out of range".into()))?;
+    SegmentDocSourceKind::from_u8(raw)
+}
+
+impl SegmentDocSourceKind {
+    fn from_u8(value: u8) -> Result<Self> {
+        match value {
+            0 => Ok(Self::Inline),
+            1 => Ok(Self::Worktree),
+            2 => Ok(Self::GitHeadBlob),
+            other => Err(AppError::InvalidIndex(format!(
+                "invalid segment doc source kind: {other}"
+            ))),
+        }
     }
 }
 
@@ -844,6 +746,20 @@ fn read_u64(cursor: &mut Cursor<&[u8]>) -> Result<u64> {
     let mut bytes = [0u8; 8];
     cursor.read_exact(&mut bytes)?;
     Ok(u64::from_le_bytes(bytes))
+}
+
+pub(crate) fn file_name_from_logical_path(logical_path: &str) -> String {
+    Path::new(logical_path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(logical_path)
+        .to_string()
+}
+
+pub(crate) fn language_from_logical_path(logical_path: &str) -> Option<String> {
+    Path::new(logical_path)
+        .extension()
+        .map(|ext| ext.to_string_lossy().to_ascii_lowercase())
 }
 
 fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {

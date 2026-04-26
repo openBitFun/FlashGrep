@@ -23,7 +23,7 @@ impl DirtyPathSet {
         self.modified.is_empty() && self.deleted.is_empty() && self.new.is_empty()
     }
 
-    fn upsert(&mut self, path: String, kind: DirtyPathKind) -> bool {
+    pub(super) fn upsert(&mut self, path: String, kind: DirtyPathKind) -> bool {
         let changed = self.remove(&path);
         match kind {
             DirtyPathKind::Modified => changed || self.modified.insert(path),
@@ -178,6 +178,42 @@ impl RepoRuntime {
         }
     }
 
+    pub(super) fn probe_workspace_overlay_from_events(&self) -> Result<bool> {
+        let observed = self.take_workspace_events();
+        if observed.force_full_rescan {
+            return self.probe_workspace_overlay();
+        }
+        match self.current_base_snapshot_key() {
+            Ok(Some(snapshot_key)) => {
+                if let Some(plan) = self.plan_overlay_update_from_observed_paths(
+                    &observed.paths.into_iter().collect::<Vec<_>>(),
+                )? {
+                    self.apply_refreshed_overlay(snapshot_key, plan);
+                } else {
+                    self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
+                }
+                Ok(true)
+            }
+            Ok(None) => {
+                self.apply_missing_base_overlay_state(None);
+                Ok(true)
+            }
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.apply_missing_base_overlay_state(None);
+                Ok(true)
+            }
+            Err(AppError::InvalidIndex(error)) => {
+                self.apply_missing_base_overlay_state(Some(error));
+                Ok(true)
+            }
+            Err(error) => {
+                self.set_probe_healthy(false);
+                self.set_phase(RepoPhase::Degraded, Some(error.to_string()));
+                Err(error)
+            }
+        }
+    }
+
     fn apply_refreshed_overlay(
         &self,
         snapshot_key: String,
@@ -194,6 +230,23 @@ impl RepoRuntime {
         state.last_error = None;
         drop(state);
         self.apply_overlay_write_plan(plan);
+    }
+
+    fn finish_workspace_probe_without_overlay_change(&self, snapshot_key: Option<String>) {
+        self.workspace_probe_pending.store(false, Ordering::Relaxed);
+        self.set_probe_healthy(true);
+        let dirty_stats = self.dirty_catalog_stats();
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.snapshot_key = snapshot_key;
+        state.last_probe_at = Some(SystemTime::now());
+        state.last_error = None;
+        apply_workspace_dirty_status(&mut state, self.rebuild_dirty_threshold, dirty_stats);
+        drop(state);
+        self.invalidate_glob_cache();
+        self.emit_workspace_status_changed();
     }
 
     fn apply_missing_base_overlay_state(&self, last_error: Option<String>) {

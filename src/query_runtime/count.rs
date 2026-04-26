@@ -16,7 +16,7 @@ use super::{
     query::LinePrefilter,
     shared::{
         build_line_starts, build_regex_matcher, configure_verifier_searcher, line_index_for_offset,
-        validate_doc_id, validate_doc_ids,
+        validate_doc_id, validate_doc_ids, with_verify_path_bytes,
     },
     verify::VerifyCandidateSource,
 };
@@ -162,15 +162,7 @@ struct VerifyRuntime<'a> {
 
 impl VerifyRuntime<'_> {
     fn verify_path(&mut self, path: &Path) -> Result<DocCountStats> {
-        let mut sink = CountSink::new(&self.plan.matcher, self.plan.count_kind);
-        if let Some(prefilter) = self.plan.line_prefilter.as_ref() {
-            let matcher = LinePrefilterMatcher::new(&self.plan.matcher, prefilter);
-            self.searcher.search_path(&matcher, path, &mut sink)?;
-        } else {
-            self.searcher
-                .search_path(&self.plan.matcher, path, &mut sink)?;
-        }
-        Ok(sink.stats)
+        with_verify_path_bytes(path, |bytes| self.verify_slice(bytes))
     }
 
     fn verify_slice(&mut self, bytes: &[u8]) -> Result<DocCountStats> {
@@ -187,21 +179,28 @@ impl VerifyRuntime<'_> {
 
     fn verify_source(&mut self, source: &VerifyCandidateSource) -> Result<DocCountStats> {
         if let Some(matcher) = self.plan.literal_matcher.as_ref() {
-            let VerifyCandidateSource::Bytes(bytes) = source else {
-                return self.verify_path(match source {
-                    VerifyCandidateSource::Path(path) => path,
-                    VerifyCandidateSource::Bytes(_) => unreachable!(),
-                });
-            };
-            let stats = matcher.count(bytes);
-            return Ok(DocCountStats {
-                matched_lines: stats.matched_lines,
-                matched_occurrences: stats.matched_occurrences,
-            });
+            match source {
+                VerifyCandidateSource::Bytes(bytes) => {
+                    let stats = matcher.count(bytes);
+                    return Ok(DocCountStats {
+                        matched_lines: stats.matched_lines,
+                        matched_occurrences: stats.matched_occurrences,
+                    });
+                }
+                VerifyCandidateSource::Mmap(mmap) => {
+                    let stats = matcher.count(mmap.as_ref());
+                    return Ok(DocCountStats {
+                        matched_lines: stats.matched_lines,
+                        matched_occurrences: stats.matched_occurrences,
+                    });
+                }
+                VerifyCandidateSource::Path(path) => return self.verify_path(path),
+            }
         }
         match source {
             VerifyCandidateSource::Path(path) => self.verify_path(path),
             VerifyCandidateSource::Bytes(bytes) => self.verify_slice(bytes),
+            VerifyCandidateSource::Mmap(mmap) => self.verify_slice(mmap.as_ref()),
         }
     }
 }

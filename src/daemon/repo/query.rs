@@ -41,7 +41,7 @@ impl RepoRuntime {
         if force || self.workspace_probe_pending() {
             self.refresh_workspace_overlay()?;
         }
-        self.status_snapshot()
+        Ok(self.status_snapshot())
     }
 
     pub(super) fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
@@ -52,7 +52,7 @@ impl RepoRuntime {
         let query_filters = build_query_filters(&self.build_config.repo_path, &scope);
         match request.consistency {
             SearchConsistency::SnapshotOnly => {
-                let status = self.status_snapshot()?;
+                let status = self.status_snapshot();
                 let can_search_opening_snapshot =
                     matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
                 if matches!(
@@ -115,7 +115,7 @@ impl RepoRuntime {
             SearchConsistency::WorkspaceEventual | SearchConsistency::WorkspaceStrict => {
                 self.schedule_workspace_probe(Duration::from_millis(0));
 
-                let status = self.status_snapshot()?;
+                let status = self.status_snapshot();
                 if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
                     self.ensure_workspace_strict_ready(&status)?;
                 }
@@ -220,9 +220,10 @@ impl RepoRuntime {
                             &request.query,
                             &query_filters,
                             filter.as_ref(),
+                            true,
                         ) {
                             Ok(results) => results,
-                            Err(AppError::InvalidIndex(_))
+                            Err(AppError::InvalidIndex(_error))
                                 if matches!(
                                     request.consistency,
                                     SearchConsistency::WorkspaceEventual
@@ -237,7 +238,7 @@ impl RepoRuntime {
                                     None,
                                 ) {
                                     Ok(results) => results,
-                                    Err(AppError::InvalidIndex(_)) => {
+                                    Err(AppError::InvalidIndex(_error)) => {
                                         return self.search_during_transition(
                                             &request,
                                             &scope,
@@ -324,7 +325,7 @@ impl RepoRuntime {
         if let Some(paths) = self.lookup_glob_cache(cache_epoch, &cache_key) {
             return Ok(super::GlobResponse {
                 repo_id: self.repo_id.clone(),
-                status: self.status_snapshot()?,
+                status: self.status_snapshot(),
                 paths,
             });
         }
@@ -359,7 +360,7 @@ impl RepoRuntime {
         }
         Ok(super::GlobResponse {
             repo_id: self.repo_id.clone(),
-            status: self.status_snapshot()?,
+            status: self.status_snapshot(),
             paths,
         })
     }
@@ -398,8 +399,7 @@ impl RepoRuntime {
 
         let base_ready = match self.open_base_snapshot_reader() {
             Ok(Some(_)) => true,
-            Ok(None) => false,
-            Err(AppError::InvalidIndex(_)) => false,
+            Ok(None) | Err(AppError::InvalidIndex(_)) => false,
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
             Err(error) => return Err(error),
         };
@@ -532,14 +532,14 @@ impl RepoRuntime {
                 repo_id: self.repo_id.clone(),
                 backend: QueryBackend::RgFallback,
                 consistency_applied: request.consistency,
-                status: self.status_snapshot()?,
+                status: self.status_snapshot(),
                 results,
             }),
             Err(_) => Ok(SearchResponse {
                 repo_id: self.repo_id.clone(),
                 backend: QueryBackend::ScanFallback,
                 consistency_applied: request.consistency,
-                status: self.status_snapshot()?,
+                status: self.status_snapshot(),
                 results: self.scan_search_fallback(&request.query, filter)?,
             }),
         }
@@ -566,7 +566,7 @@ fn repo_phase_label(phase: RepoPhase) -> &'static str {
     }
 }
 
-fn build_path_filter(repo_root: &PathBuf, args: &PathFilterArgs) -> Result<Option<PathFilter>> {
+fn build_path_filter(repo_root: &Path, args: &PathFilterArgs) -> Result<Option<PathFilter>> {
     let has_scope = !args.roots.is_empty()
         || !args.globs.is_empty()
         || !args.iglobs.is_empty()

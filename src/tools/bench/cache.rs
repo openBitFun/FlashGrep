@@ -79,7 +79,7 @@ fn runtime_index_files(root: &Path) -> Vec<PathBuf> {
         .into_iter()
         .filter_map(std::result::Result::ok)
         .filter(|entry| entry.file_type().is_file())
-        .map(|entry| entry.into_path())
+        .map(walkdir::DirEntry::into_path)
         .collect()
 }
 

@@ -484,8 +484,7 @@ fn rg_file_match(snippet: &str, line_number: usize, submatch: &Value) -> Option<
         .unwrap_or_default();
     let column = snippet
         .get(..start)
-        .map(|prefix| prefix.chars().count() + 1)
-        .unwrap_or(1);
+        .map_or(1, |prefix| prefix.chars().count() + 1);
     Some(FileMatch {
         location: MatchLocation {
             line: line_number,

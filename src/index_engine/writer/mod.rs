@@ -1,3 +1,3 @@
-mod writer;
+mod core;
 
-pub use writer::{IndexAdmin, IndexDocument, IndexEngine, IndexWriter, WriterStats};
+pub use core::{IndexAdmin, IndexDocument, IndexEngine, IndexWriter, WriterStats};

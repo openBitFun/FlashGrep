@@ -81,7 +81,7 @@ impl RepoRuntime {
         let _write_guard = self
             .overlay_write_lock
             .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         let planned_dirty = plan.dirty_paths.clone();
         let build_paths = plan.build_paths.clone();
         if let Err(error) = self.mark_dirty_catalog_building(&build_paths) {
@@ -180,7 +180,11 @@ impl RepoRuntime {
             let rebuild = self.build_overlay_rebuild_plan(dirty.clone())?;
             return self.try_apply_overlay_write_plan(rebuild);
         }
-        let overlay_index = overlay_index.expect("workspace overlay engine should be initialized");
+        let Some(overlay_index) = overlay_index else {
+            return Err(AppError::Protocol(
+                "workspace overlay engine missing during overlay delta publish".into(),
+            ));
+        };
         overlay_index.ingest_batch(&batch)?;
         Ok(())
     }
@@ -214,7 +218,7 @@ impl RepoRuntime {
     }
 
     fn workspace_overlay_publish_policy(&self) -> WorkspaceOverlayPublishPolicy {
-        WorkspaceOverlayPublishPolicy::RefreshWithAutoCheckpoint {
+        WorkspaceOverlayPublishPolicy::AutoCheckpoint {
             max_uncommitted_ops: self.overlay_auto_checkpoint_max_uncommitted_ops,
         }
     }

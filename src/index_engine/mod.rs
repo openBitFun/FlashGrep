@@ -15,8 +15,8 @@ pub mod writer;
 
 pub use config::{EngineConfig, MergePolicyConfig, PostingTokenizerConfig};
 pub use reader::{
-    DryRunQueryProfile, DryRunSegmentProfile, IndexReaderFactory, IndexSnapshotReader,
-    SearchProfile,
+    CandidateBuildProfile, DetailedSearchProfile, DryRunQueryProfile, DryRunSegmentProfile,
+    IndexReaderFactory, IndexSnapshotReader, SearchPhaseProfile, SearchProfile,
 };
 pub use types::{
     CommitStamp, DeleteSegmentId, DocKey, DocSeqNo, FieldId, FlushResult, GitRevision, ManifestId,

@@ -3,6 +3,7 @@ use std::{
     net::TcpStream,
     sync::atomic::{AtomicU64, Ordering},
     sync::Mutex,
+    time::Duration,
 };
 
 use crate::error::{AppError, Result};
@@ -15,6 +16,7 @@ use super::protocol::{
 #[derive(Debug)]
 pub struct DaemonClient {
     addr: String,
+    io_timeout: Option<Duration>,
     next_id: AtomicU64,
     connection: Mutex<Option<DaemonConnection>>,
 }
@@ -29,9 +31,15 @@ impl DaemonClient {
     pub fn new(addr: impl Into<String>) -> Self {
         Self {
             addr: addr.into(),
+            io_timeout: None,
             next_id: AtomicU64::new(1),
             connection: Mutex::new(None),
         }
+    }
+
+    pub fn with_io_timeout(mut self, timeout: Duration) -> Self {
+        self.io_timeout = Some(timeout);
+        self
     }
 
     pub fn send(&self, request: Request) -> Result<Response> {
@@ -91,9 +99,9 @@ impl DaemonClient {
             Some(connection) => connection,
             None => {
                 *connection = Some(self.connect()?);
-                connection
-                    .as_mut()
-                    .expect("connection must exist after successful connect")
+                connection.as_mut().ok_or_else(|| {
+                    AppError::Protocol("daemon connection missing after successful connect".into())
+                })?
             }
         };
 
@@ -115,6 +123,10 @@ impl DaemonClient {
 
     fn connect(&self) -> Result<DaemonConnection> {
         let stream = TcpStream::connect(&self.addr)?;
+        if let Some(timeout) = self.io_timeout {
+            stream.set_read_timeout(Some(timeout))?;
+            stream.set_write_timeout(Some(timeout))?;
+        }
         let reader = BufReader::new(stream.try_clone()?);
         let writer = BufWriter::new(stream);
         Ok(DaemonConnection { reader, writer })

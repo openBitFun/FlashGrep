@@ -1,4 +1,5 @@
 use std::{
+    borrow::Cow,
     cmp::Reverse,
     collections::BinaryHeap,
     collections::{BTreeMap, HashMap},
@@ -27,10 +28,9 @@ use crate::{
         manifest::{FileManifestStore, Manifest, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
-            collect_document_posting_terms_from_text, encoded_source_bytes_len,
-            write_path_offsets_file, write_segment_meta, write_source_bytes, FileSegmentStore,
-            PostingsStreamWriter, SegmentMeta, TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE,
-            PATH_OFFSETS_FILE, SEGMENT_META_FILE,
+            collect_document_posting_terms_from_text, write_path_offsets_file, write_segment_meta,
+            FileSegmentStore, PostingsStreamWriter, SegmentDocSourceKind, SegmentMeta,
+            TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
         },
         writer::IndexDocument,
         DocKey, GitRevision, ManifestId, RepoId, SegmentId, ShardId,
@@ -50,13 +50,12 @@ const BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES: usize = 128 * 1024 * 1024
 const BASE_SNAPSHOT_SHARD_COUNT: usize = 16;
 const BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN: usize = 512 * 1024;
 const BASE_SNAPSHOT_MANIFEST_ID: &str = "manifest-0000000000000001";
-const SEGMENT_SCHEMA_FINGERPRINT: &str = "segment-publish-v1";
+const SEGMENT_SCHEMA_FINGERPRINT: &str = "segment-publish-v3";
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
-const DOCS_VERSION: u32 = 2;
+const DOCS_VERSION: u32 = 4;
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
 const SEGMENT_FILE_VERSION: u32 = 1;
 const COUNT_OFFSET: u64 = 12;
-const BASE_SOURCES_FILE: &str = "base_sources.bin";
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBaseSnapshotMetadata {
@@ -162,8 +161,6 @@ struct BulkBaseSegmentWriter {
     path_entry_offsets: Vec<u64>,
     path_map_len: u64,
     docs: BufWriter<File>,
-    base_sources: BufWriter<File>,
-    base_sources_len: u64,
     posting_buckets: PostingBuckets,
     doc_count: u32,
     total_source_bytes: u64,
@@ -172,6 +169,7 @@ struct BulkBaseSegmentWriter {
 struct PreparedBaseDocument {
     document: IndexDocument,
     posting_terms: Vec<u64>,
+    source_kind: SegmentDocSourceKind,
 }
 
 struct ShardBuildOutcome {
@@ -237,7 +235,6 @@ impl BulkBaseSegmentWriter {
 
         let mut path_map = BufWriter::new(File::create(segment_dir.join(PATH_MAP_FILE))?);
         let mut docs = BufWriter::new(File::create(segment_dir.join(DOCS_FILE))?);
-        let base_sources = BufWriter::new(File::create(segment_dir.join(BASE_SOURCES_FILE))?);
         let posting_buckets = PostingBuckets::new(&segment_dir);
 
         write_segment_header(&mut path_map, PATH_MAP_MAGIC)?;
@@ -251,8 +248,6 @@ impl BulkBaseSegmentWriter {
             path_entry_offsets: Vec::new(),
             path_map_len: COUNT_OFFSET + 4,
             docs,
-            base_sources,
-            base_sources_len: 0,
             posting_buckets,
             doc_count: 0,
             total_source_bytes: 0,
@@ -264,6 +259,7 @@ impl BulkBaseSegmentWriter {
         let PreparedBaseDocument {
             document,
             posting_terms,
+            source_kind,
         } = prepared;
 
         self.path_entry_offsets.push(self.path_map_len);
@@ -277,29 +273,14 @@ impl BulkBaseSegmentWriter {
             .and_then(|len| len.checked_add(logical_path_len))
             .ok_or_else(|| AppError::ValueOutOfRange("path map offset overflow".into()))?;
 
-        let stored_offset = self.base_sources_len;
-        write_source_bytes(&mut self.base_sources, &document.source_bytes)?;
-        let stored_len = self
-            .base_sources_len
-            .checked_add(encoded_source_bytes_len(&document.source_bytes)?)
-            .ok_or_else(|| AppError::ValueOutOfRange("base source offset overflow".into()))?;
-        let stored_len = stored_len
-            .checked_sub(stored_offset)
-            .ok_or_else(|| AppError::InvalidIndex("base source length underflow".into()))?;
-        let stored_len = u32::try_from(stored_len).map_err(|_| {
-            AppError::ValueOutOfRange("base source length exceeds u32 range".into())
-        })?;
-        self.base_sources_len = self
-            .base_sources_len
-            .checked_add(u64::from(stored_len))
-            .ok_or_else(|| AppError::ValueOutOfRange("base source offset overflow".into()))?;
-
         write_u32_to(&mut self.docs, doc_id)?;
-        write_u64_to(&mut self.docs, stored_offset)?;
-        write_u32_to(&mut self.docs, stored_len)?;
+        write_u64_to(&mut self.docs, 0)?;
+        write_u32_to(&mut self.docs, 0)?;
         write_u64_to(&mut self.docs, document.size)?;
         write_u64_to(&mut self.docs, document.modified_at)?;
         self.docs.write_all(&document.content_hash)?;
+        self.docs.write_all(&[source_kind as u8])?;
+        self.docs.write_all(&[0u8; 7])?;
 
         self.posting_buckets.append_terms(doc_id, &posting_terms)?;
 
@@ -318,7 +299,6 @@ impl BulkBaseSegmentWriter {
 
         self.path_map.flush()?;
         self.docs.flush()?;
-        self.base_sources.flush()?;
 
         if self.doc_count == 0 {
             fs::remove_dir_all(&self.segment_dir)?;
@@ -418,10 +398,7 @@ impl InMemoryPostingBuckets {
     fn append_terms(&mut self, doc_id: u32, posting_terms: &[u64]) {
         for term in posting_terms {
             let bucket_id = posting_bucket_id(*term);
-            let bucket = self
-                .buckets
-                .get_mut(bucket_id)
-                .expect("posting bucket must exist");
+            let bucket = &mut self.buckets[bucket_id];
             let entry = bucket.entry(*term).or_insert_with(|| {
                 self.approximate_bytes = self
                     .approximate_bytes
@@ -456,11 +433,10 @@ impl InMemoryPostingBuckets {
         let mut postings_writer = PostingsStreamWriter::create(postings_path)?;
 
         for bucket in self.buckets {
-            let mut keys = bucket.keys().cloned().collect::<Vec<_>>();
-            keys.sort_unstable();
-            for key in keys {
-                let doc_ids = bucket.get(&key).expect("posting key must exist");
-                let postings_offset = postings_writer.push_doc_ids(doc_ids)?;
+            let mut entries = bucket.into_iter().collect::<Vec<_>>();
+            entries.sort_unstable_by_key(|(key, _)| *key);
+            for (key, doc_ids) in entries {
+                let postings_offset = postings_writer.push_doc_ids(&doc_ids)?;
                 term_dict_writer.push_entry(key, postings_offset)?;
             }
         }
@@ -568,12 +544,15 @@ impl WorkspaceBaseSnapshotIndex {
 
     pub fn open_read_only(build_config: &BuildConfig) -> Result<Self> {
         let config = Self::engine_config(build_config);
+        let base_head_commit =
+            Self::read_metadata_file(build_config)?.and_then(|metadata| metadata.head_commit);
         let reader = Arc::new(IndexReaderFactory::new(
             Arc::new(FileManifestStore::open(&config.index_root)?),
             Arc::new(FileSegmentStore::open_with_repo_root(
                 &config.index_root,
                 config.tokenizer.clone(),
                 Some(build_config.repo_path.clone()),
+                base_head_commit,
             )?),
             Arc::new(FileDeleteStore::open(&config.index_root)?),
             SharedSnapshotState::new(),
@@ -665,8 +644,8 @@ impl WorkspaceBaseSnapshotIndex {
             build_config,
             repo_id,
             options.build_mode,
-            |event| on_progress(event),
-            || should_cancel(),
+            on_progress,
+            should_cancel,
         )
     }
 
@@ -770,7 +749,7 @@ impl WorkspaceBaseSnapshotIndex {
                 tokenizer: Some(build_config.tokenizer),
                 doc_count: Some(doc_count),
                 head_commit: head_commit.map(str::to_string),
-                config_fingerprint: Some(build_config_fingerprint(build_config)),
+                config_fingerprint: Some(base_snapshot_config_fingerprint(build_config)),
                 repo_root: Some(canonical_repo_root(&build_config.repo_path)),
                 shards,
             },
@@ -799,6 +778,7 @@ impl WorkspaceBaseSnapshotIndex {
         }
 
         let reader = self.reader.open_persisted_current()?;
+        reader.prewarm_search_state()?;
         if self.committed_reader.set(reader.clone()).is_err() {
             let cached = self.committed_reader.get().ok_or_else(|| {
                 AppError::Protocol(
@@ -972,7 +952,8 @@ fn reusable_base_snapshot_shards(
     };
     if metadata.shards.is_empty()
         || metadata.tokenizer != Some(build_config.tokenizer)
-        || metadata.config_fingerprint.as_deref() != Some(&build_config_fingerprint(build_config))
+        || metadata.config_fingerprint.as_deref()
+            != Some(&base_snapshot_config_fingerprint(build_config))
         || metadata.repo_root.as_deref() != Some(&canonical_repo_root(&build_config.repo_path))
     {
         return Ok(None);
@@ -1010,7 +991,10 @@ fn build_sharded_base_snapshot(
     let _ = FileDeleteStore::open(index_root)?;
     let shard_builds = partition_base_snapshot_shards(files);
     let shard_total = shard_builds.len();
-    let total_files = shard_builds.iter().map(|shard| shard.files.len()).sum::<usize>();
+    let total_files = shard_builds
+        .iter()
+        .map(|shard| shard.files.len())
+        .sum::<usize>();
     let tokenizing_progress_total = total_files.max(1);
     report_progress(
         on_progress,
@@ -1018,9 +1002,7 @@ fn build_sharded_base_snapshot(
         if total_files == 0 {
             "No base snapshot shards to build".into()
         } else {
-            format!(
-                "Tokenizing {total_files} base snapshot file(s) across {shard_total} shard(s)"
-            )
+            format!("Tokenizing {total_files} base snapshot file(s) across {shard_total} shard(s)")
         },
         usize::from(total_files == 0),
         Some(tokenizing_progress_total),
@@ -1030,7 +1012,7 @@ fn build_sharded_base_snapshot(
         let (tx, rx) = mpsc::channel();
         let mut shard_processed = HashMap::<u32, usize>::new();
         let mut completed_shards = 0usize;
-        std::thread::scope(|scope| {
+        std::thread::scope(|scope| -> Result<()> {
             for shard in shard_builds {
                 let shard_id = shard.shard_id;
                 let total_files = shard.files.len();
@@ -1062,7 +1044,11 @@ fn build_sharded_base_snapshot(
             drop(tx);
 
             while completed_shards < shard_total {
-                match rx.recv().expect("base snapshot shard worker should send outcome") {
+                match rx.recv().map_err(|_| {
+                    AppError::Protocol(
+                        "base snapshot shard worker exited before sending outcome".into(),
+                    )
+                })? {
                     ShardBuildMessage::Progress {
                         shard_id,
                         processed_files,
@@ -1105,7 +1091,8 @@ fn build_sharded_base_snapshot(
                     }
                 }
             }
-        });
+            Ok(())
+        })?;
     }
 
     let mut active_segments = Vec::new();
@@ -1133,7 +1120,7 @@ fn build_sharded_base_snapshot(
         0,
         Some(3),
     );
-    let committed_seq_no = if active_segments.is_empty() { 0 } else { 1 };
+    let committed_seq_no = u64::from(!active_segments.is_empty());
     let manifest_store = FileManifestStore::open(index_root)?;
     manifest_store.publish(&Manifest {
         manifest_id: ManifestId(BASE_SNAPSHOT_MANIFEST_ID.into()),
@@ -1292,7 +1279,7 @@ fn partition_base_snapshot_shards(
 fn base_snapshot_shard_id(logical_path: &str) -> u32 {
     let mut hasher = crc32fast::Hasher::new();
     hasher.update(logical_path.as_bytes());
-    (hasher.finalize() % BASE_SNAPSHOT_SHARD_COUNT as u32) as u32
+    hasher.finalize() % BASE_SNAPSHOT_SHARD_COUNT as u32
 }
 
 fn base_snapshot_shard_fingerprint(files: &[BaseSnapshotInputFile]) -> String {
@@ -1549,7 +1536,7 @@ fn resolve_base_snapshot_build(
     build_config: &BuildConfig,
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<ResolvedBaseSnapshotBuild> {
-    let config_fingerprint = build_config_fingerprint(build_config);
+    let config_fingerprint = base_snapshot_config_fingerprint(build_config);
     match resolve_git_head(&build_config.repo_path, should_cancel)? {
         Some(head_commit) => {
             let snapshot_key = format!("base-git-{head_commit}-{config_fingerprint}");
@@ -1572,6 +1559,14 @@ fn resolve_base_snapshot_build(
             })
         }
     }
+}
+
+fn base_snapshot_config_fingerprint(build_config: &BuildConfig) -> String {
+    format!(
+        "{}-{}",
+        build_config_fingerprint(build_config),
+        SEGMENT_SCHEMA_FINGERPRINT
+    )
 }
 
 fn reusable_snapshot_metadata(
@@ -1814,13 +1809,21 @@ fn prepare_base_document(
     let Some(text) = indexable_source_text(&document.source_bytes) else {
         return Ok(None);
     };
-    let mut posting_terms = collect_document_posting_terms_from_text(text, tokenizer);
+    let mut posting_terms = collect_document_posting_terms_from_text(text.as_ref(), tokenizer);
     posting_terms.sort_unstable();
     posting_terms.dedup();
     Ok(Some(PreparedBaseDocument {
         document,
         posting_terms,
+        source_kind: segment_doc_source_kind(&file.source),
     }))
+}
+
+fn segment_doc_source_kind(source: &BaseSnapshotFileSource) -> SegmentDocSourceKind {
+    match source {
+        BaseSnapshotFileSource::Worktree => SegmentDocSourceKind::Worktree,
+        BaseSnapshotFileSource::GitHeadBlob { .. } => SegmentDocSourceKind::GitHeadBlob,
+    }
 }
 
 fn should_parallel_prepare_base_documents(files: &[BaseSnapshotInputFile]) -> bool {
@@ -1838,10 +1841,8 @@ fn has_binary_source_bytes(bytes: &[u8]) -> bool {
     bytes[..probe_len].contains(&0)
 }
 
-fn indexable_source_text(bytes: &[u8]) -> Option<&str> {
-    (!has_binary_source_bytes(bytes))
-        .then(|| std::str::from_utf8(bytes).ok())
-        .flatten()
+fn indexable_source_text(bytes: &[u8]) -> Option<Cow<'_, str>> {
+    (!has_binary_source_bytes(bytes)).then(|| String::from_utf8_lossy(bytes))
 }
 
 fn posting_bucket_id(term: u64) -> usize {
@@ -2093,363 +2094,4 @@ fn now_unix_nanos() -> u128 {
 }
 
 #[cfg(test)]
-mod tests {
-    #[cfg(unix)]
-    use std::os::unix::fs::MetadataExt;
-    use std::path::Path;
-
-    use tempfile::TempDir;
-
-    use super::{
-        base_snapshot_input_files_from_repository_files, estimated_term_entry_bytes,
-        merge_sorted_posting_runs, reusable_base_snapshot_shards, write_sorted_posting_runs,
-        write_spilled_posting_record, BaseSnapshotInputFile, PostingBuckets, PostingBucketsState,
-        PostingRecord, WorkspaceBaseSnapshotIndex,
-    };
-    use crate::base_snapshot_build::BaseSnapshotBuildOptions;
-    use crate::config::{BuildConfig, CorpusMode, TokenizerMode};
-    use crate::files::{scan_paths, ScanOptions};
-    use crate::index_engine::segment::{
-        read_postings_file, read_term_dict_file, PostingsStreamWriter, TermDictStreamWriter,
-    };
-    use crate::index_engine::RepoId;
-    use crate::progress::{IndexProgress, IndexProgressPhase};
-
-    #[test]
-    fn posting_buckets_keep_postings_in_memory_below_threshold() {
-        let temp = TempDir::new().expect("temp dir");
-        let mut buckets = PostingBuckets::with_memory_threshold(
-            temp.path(),
-            estimated_term_entry_bytes(&0x00636261) + std::mem::size_of::<u32>() + 64,
-        );
-        let terms = vec![0x00636261];
-
-        buckets.append_terms(0, &terms).expect("append");
-
-        assert!(matches!(buckets.state, PostingBucketsState::InMemory(_)));
-    }
-
-    #[test]
-    fn posting_buckets_spill_and_finish_preserves_postings() {
-        let temp = TempDir::new().expect("temp dir");
-        let mut buckets = PostingBuckets::with_memory_threshold(temp.path(), 1);
-        let terms_a = vec![0x00636261, 0x00666564];
-        let terms_b = vec![0x00636261];
-
-        buckets.append_terms(0, &terms_a).expect("append");
-        buckets.append_terms(1, &terms_b).expect("append");
-        assert!(matches!(buckets.state, PostingBucketsState::Spilled(_)));
-
-        let term_dict_path = temp.path().join("term_dict.bin");
-        let postings_path = temp.path().join("postings.bin");
-        buckets
-            .finish(&term_dict_path, &postings_path)
-            .expect("finish");
-
-        let keys = read_term_dict_file(&term_dict_path).expect("read term dict");
-        let postings = read_postings_file(&postings_path, &keys).expect("read postings");
-        assert_eq!(keys.len(), 2);
-        assert_eq!(
-            postings
-                .get(&0x00636261)
-                .expect("posting lookup")
-                .as_deref(),
-            Some(&[0, 1][..])
-        );
-        assert_eq!(
-            postings
-                .get(&0x00666564)
-                .expect("posting lookup")
-                .as_deref(),
-            Some(&[0][..])
-        );
-        assert!(!temp.path().join("posting-buckets").exists());
-    }
-
-    #[test]
-    fn spilled_posting_runs_merge_preserves_postings_across_multiple_runs() {
-        let temp = TempDir::new().expect("temp dir");
-        let bucket_path = temp.path().join("bucket-000.bin");
-        let mut bucket_writer = std::io::BufWriter::new(
-            std::fs::File::create(&bucket_path).expect("bucket create should succeed"),
-        );
-        for record in [
-            PostingRecord {
-                term: 0x00666564,
-                doc_id: 3,
-            },
-            PostingRecord {
-                term: 0x00636261,
-                doc_id: 0,
-            },
-            PostingRecord {
-                term: 0x00666564,
-                doc_id: 4,
-            },
-            PostingRecord {
-                term: 0x00636261,
-                doc_id: 1,
-            },
-            PostingRecord {
-                term: 0x00636261,
-                doc_id: 2,
-            },
-        ] {
-            write_spilled_posting_record(&mut bucket_writer, record)
-                .expect("write spilled record should succeed");
-        }
-        use std::io::Write as _;
-        bucket_writer.flush().expect("bucket flush should succeed");
-
-        let run_root = temp.path().join("runs");
-        std::fs::create_dir_all(&run_root).expect("run root should succeed");
-        let run_paths = write_sorted_posting_runs(&bucket_path, &run_root, 0, 2)
-            .expect("run split should succeed");
-        assert!(run_paths.len() > 1);
-        std::fs::remove_file(&bucket_path).expect("bucket remove should succeed");
-
-        let term_dict_path = temp.path().join("term_dict.bin");
-        let postings_path = temp.path().join("postings.bin");
-        let mut term_dict_writer =
-            TermDictStreamWriter::create(&term_dict_path).expect("term dict create should succeed");
-        let mut postings_writer =
-            PostingsStreamWriter::create(&postings_path).expect("postings create should succeed");
-        merge_sorted_posting_runs(&run_paths, &mut term_dict_writer, &mut postings_writer)
-            .expect("run merge should succeed");
-        term_dict_writer
-            .finish()
-            .expect("term dict finish should succeed");
-        postings_writer
-            .finish()
-            .expect("postings finish should succeed");
-
-        let keys = read_term_dict_file(&term_dict_path).expect("read term dict");
-        let postings = read_postings_file(&postings_path, &keys).expect("read postings");
-        assert_eq!(keys.len(), 2);
-        assert_eq!(
-            postings
-                .get(&0x00636261)
-                .expect("posting lookup")
-                .as_deref(),
-            Some(&[0, 1, 2][..])
-        );
-        assert_eq!(
-            postings
-                .get(&0x00666564)
-                .expect("posting lookup")
-                .as_deref(),
-            Some(&[3, 4][..])
-        );
-        assert!(run_paths.iter().all(|path| !path.exists()));
-    }
-
-    fn build_config(repo: &Path, index: &Path) -> BuildConfig {
-        BuildConfig {
-            repo_path: repo.to_path_buf(),
-            storage_root: index.to_path_buf(),
-            tokenizer: TokenizerMode::SparseNgram,
-            corpus_mode: CorpusMode::NoIgnore,
-            include_hidden: true,
-            max_file_size: 1 << 20,
-            min_sparse_len: 3,
-            max_sparse_len: 8,
-        }
-    }
-
-    fn collect_base_input_files(build_config: &BuildConfig) -> Vec<BaseSnapshotInputFile> {
-        let files = scan_paths(
-            std::slice::from_ref(&build_config.repo_path),
-            Some(&build_config.storage_root),
-            ScanOptions {
-                respect_ignore: false,
-                include_hidden: build_config.include_hidden,
-                max_file_size: build_config.max_file_size,
-                max_depth: None,
-                ignore_files: Vec::new(),
-            },
-            None,
-        )
-        .expect("scan should succeed");
-        base_snapshot_input_files_from_repository_files(&files, &build_config.repo_path)
-    }
-
-    #[test]
-    #[cfg(unix)]
-    fn sharded_base_snapshot_reuses_unchanged_segment_files_via_hard_links() {
-        let temp = TempDir::new().expect("temp dir");
-        let repo = temp.path().join("repo");
-        let storage = temp.path().join("index");
-        std::fs::create_dir_all(&repo).expect("repo dir should succeed");
-
-        let mut shard_paths = std::collections::HashMap::<u32, std::path::PathBuf>::new();
-        for index in 0..256 {
-            let path = repo.join(format!("file-{index:03}.txt"));
-            std::fs::write(&path, format!("TOKEN_{index:03}\n")).expect("write should succeed");
-            let shard_id = super::base_snapshot_shard_id(&format!("file-{index:03}.txt"));
-            shard_paths.entry(shard_id).or_insert(path);
-            if shard_paths.len() >= 2 {
-                break;
-            }
-        }
-        assert!(
-            shard_paths.len() >= 2,
-            "expected at least two non-empty shards"
-        );
-
-        let build_config = build_config(&repo, &storage);
-        let repo_id = RepoId("repo".into());
-        WorkspaceBaseSnapshotIndex::build_with_options(
-            &build_config,
-            &repo_id,
-            BaseSnapshotBuildOptions::default(),
-        )
-        .expect("initial build should succeed");
-
-        let initial_metadata = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&build_config)
-            .expect("metadata read should succeed")
-            .expect("metadata should exist");
-        assert!(initial_metadata.shards.len() >= 2);
-
-        let changed_shard_id = *shard_paths.keys().min().expect("shard should exist");
-        let unchanged_shard_id = *shard_paths
-            .keys()
-            .filter(|shard_id| **shard_id != changed_shard_id)
-            .min()
-            .expect("second shard should exist");
-        let changed_path = shard_paths
-            .get(&changed_shard_id)
-            .expect("changed path should exist");
-        std::fs::write(changed_path, "CHANGED_TOKEN\n").expect("rewrite should succeed");
-
-        let previous_snapshot = reusable_base_snapshot_shards(&build_config)
-            .expect("reusable shards should load")
-            .expect("reusable shards should exist");
-        let staging_root = temp.path().join("staging");
-        let (doc_count, next_shards) = super::build_sharded_base_snapshot(
-            &staging_root,
-            &build_config,
-            &repo_id,
-            &repo,
-            collect_base_input_files(&build_config),
-            Some(&previous_snapshot),
-            &mut |_| {},
-        )
-        .expect("staged build should succeed");
-        assert!(doc_count > 0);
-
-        let initial_unchanged = initial_metadata
-            .shards
-            .iter()
-            .find(|shard| shard.shard_id == unchanged_shard_id)
-            .expect("initial unchanged shard should exist");
-        let next_unchanged = next_shards
-            .iter()
-            .find(|shard| shard.shard_id == unchanged_shard_id)
-            .expect("next unchanged shard should exist");
-        assert_eq!(initial_unchanged.segment_id, next_unchanged.segment_id);
-
-        let initial_changed = initial_metadata
-            .shards
-            .iter()
-            .find(|shard| shard.shard_id == changed_shard_id)
-            .expect("initial changed shard should exist");
-        let next_changed = next_shards
-            .iter()
-            .find(|shard| shard.shard_id == changed_shard_id)
-            .expect("next changed shard should exist");
-        assert_ne!(initial_changed.fingerprint, next_changed.fingerprint);
-        assert_ne!(initial_changed.segment_id, next_changed.segment_id);
-
-        let source_meta = build_config
-            .storage_root
-            .join("base-snapshot/segments")
-            .join(&initial_unchanged.segment_id)
-            .join("SEGMENT_META.json");
-        let staged_meta = staging_root
-            .join("segments")
-            .join(&next_unchanged.segment_id)
-            .join("SEGMENT_META.json");
-        let source_links = std::fs::metadata(&source_meta)
-            .expect("source meta should exist")
-            .nlink();
-        let staged_links = std::fs::metadata(&staged_meta)
-            .expect("staged meta should exist")
-            .nlink();
-        assert!(
-            source_links >= 2,
-            "expected hard-linked source segment file"
-        );
-        assert!(
-            staged_links >= 2,
-            "expected hard-linked staged segment file"
-        );
-    }
-
-    #[test]
-    fn sharded_base_snapshot_reports_incremental_tokenizing_progress() {
-        let temp = TempDir::new().expect("temp dir");
-        let repo = temp.path().join("repo");
-        let storage = temp.path().join("index");
-        std::fs::create_dir_all(&repo).expect("repo dir should succeed");
-
-        let target_shard_id = 0;
-        let mut file_count = 0usize;
-        for index in 0..10_000 {
-            let file_name = format!("file-{index:05}.txt");
-            if super::base_snapshot_shard_id(&file_name) != target_shard_id {
-                continue;
-            }
-            std::fs::write(
-                repo.join(&file_name),
-                format!("TOKEN_{index:05}\n"),
-            )
-            .expect("write should succeed");
-            file_count += 1;
-            if file_count >= super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS + 32 {
-                break;
-            }
-        }
-        assert!(
-            file_count > super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS,
-            "expected enough files in one shard to trigger incremental progress"
-        );
-
-        let build_config = build_config(&repo, &storage);
-        let repo_id = RepoId("repo".into());
-        let staging_root = temp.path().join("staging");
-        let mut events = Vec::<IndexProgress>::new();
-        let (_doc_count, shard_metadata) = super::build_sharded_base_snapshot(
-            &staging_root,
-            &build_config,
-            &repo_id,
-            &repo,
-            collect_base_input_files(&build_config),
-            None,
-            &mut |event| events.push(event),
-        )
-        .expect("staged build should succeed");
-
-        let tokenizing_events = events
-            .iter()
-            .filter(|event| event.phase == IndexProgressPhase::Tokenizing)
-            .cloned()
-            .collect::<Vec<_>>();
-        assert!(
-            !tokenizing_events.is_empty(),
-            "expected tokenizing progress events"
-        );
-        assert_eq!(shard_metadata.len(), 1);
-        assert!(tokenizing_events
-            .iter()
-            .all(|event| event.total == Some(file_count)));
-        assert_eq!(tokenizing_events.first().map(|event| event.processed), Some(0));
-        assert!(tokenizing_events.iter().any(|event| {
-            event.processed >= super::BASE_SNAPSHOT_PROGRESS_REPORT_DOCS
-                && event.processed < file_count
-        }));
-        assert_eq!(
-            tokenizing_events.last().map(|event| event.processed),
-            Some(file_count)
-        );
-    }
-}
+mod tests;

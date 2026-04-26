@@ -14,6 +14,8 @@ mod progress;
 mod query_runtime;
 mod search;
 mod search_engine;
+#[cfg(test)]
+mod test_support;
 mod tokenizer;
 mod tools;
 mod workspace;

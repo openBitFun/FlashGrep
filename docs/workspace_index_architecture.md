@@ -16,7 +16,7 @@ daemon runtime 仍然还维护一份 `dirty catalog`，
 这套架构的目标是把“工作区变化发现”和“查询可见性”彻底分离：
 
 - 搜索读取 `base + overlay` 两层 snapshot。
-- watcher / reconcile / refresh 只负责更新 dirty catalog，并驱动后台 overlay build。
+- background probe / reconcile / refresh 只负责更新 dirty catalog，并驱动后台 overlay build。
 - 只有 published overlay 才参与查询。
 
 ## External Contract
@@ -41,7 +41,7 @@ base snapshot 由 `WorkspaceBaseSnapshotIndex` 负责：
 
 dirty catalog 由 daemon runtime 负责维护：
 
-- watcher / reconcile 从当前 worktree 归纳 modified / deleted / new paths。
+- background probe / reconcile 从当前 worktree 归纳 modified / deleted / new paths。
 - 对每个 path 记录 `dirty / building / ready / failed` 和 observed file version。
 - catalog 只负责表达“哪些路径需要重建或已经发布”，不直接参与查询合并，也不是查询真相源。
 
@@ -90,7 +90,8 @@ EffectiveCandidates =
 src/index_engine/workspace/base_snapshot.rs
 src/index_engine/workspace/search_view.rs
 src/daemon/repo/catalog.rs
-src/daemon/repo/watcher.rs
+src/daemon/repo/maintenance.rs
+src/daemon/repo/workspace.rs
 src/workspace.rs
 src/workspace/runtime.rs
 src/search_engine.rs
@@ -108,8 +109,10 @@ src/worktree_diff.rs
   计算 base 相对当前工作区的 dirty 集，并构造 rebuild / delta publish 计划。
 - `daemon/repo/dirty_catalog.rs`
   维护持久化 dirty catalog 和最小状态机。
-- `daemon/repo/watcher.rs`
-  把 watcher / reconcile 结果写入 overlay runtime。
+- `daemon/repo/maintenance.rs`
+  驱动后台 workspace probe、overlay merge 与 base rebuild maintenance。
+- `daemon/repo/workspace.rs`
+  执行 workspace probe / refresh，并把结果发布到 overlay runtime。
 - `workspace.rs`
   对外暴露 workspace facade、snapshot view、freshness/status API。
 - `workspace/runtime.rs`

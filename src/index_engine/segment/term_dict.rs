@@ -124,7 +124,9 @@ pub(crate) fn write_term_dict_file(
     for key in ordered_posting_keys(posting_lists) {
         write_u64(&mut buffer, key)?;
         write_u32(&mut buffer, postings_offset)?;
-        let doc_ids = posting_lists.get(&key).expect("posting key must exist");
+        let doc_ids = posting_lists
+            .get(&key)
+            .ok_or_else(|| AppError::InvalidIndex("posting key missing during write".into()))?;
         let posting_bytes = 4usize
             .checked_add(encoded_posting_len(doc_ids)?)
             .ok_or_else(|| AppError::ValueOutOfRange("posting size exceeds usize range".into()))?;
@@ -301,10 +303,7 @@ fn extract_trigram_terms_from_text(text: &str) -> Vec<u64> {
 }
 
 fn extract_trigram_terms_from_bytes(bytes: &[u8]) -> Vec<u64> {
-    let folded = bytes
-        .iter()
-        .map(|byte| byte.to_ascii_lowercase())
-        .collect::<Vec<_>>();
+    let folded = bytes.iter().map(u8::to_ascii_lowercase).collect::<Vec<_>>();
     if folded.len() < POSTING_GRAM_LEN {
         return Vec::new();
     }

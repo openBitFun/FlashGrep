@@ -27,7 +27,7 @@ impl Default for RepoState {
 }
 
 impl RepoRuntime {
-    pub(super) fn status_snapshot(&self) -> Result<RepoStatus> {
+    pub(super) fn status_snapshot(&self) -> RepoStatus {
         let state = match self.state.lock() {
             Ok(guard) => guard.clone(),
             Err(poisoned) => poisoned.into_inner().clone(),
@@ -61,15 +61,13 @@ impl RepoRuntime {
                 self.dirty_catalog_stats(),
             );
         }
-        Ok(status)
+        status
     }
 
     pub(super) fn emit_workspace_status_changed(&self) {
-        if let Ok(status) = self.status_snapshot() {
-            (self.notifier)(super::ServiceNotificationEvent::WorkspaceStatus(
-                convert::convert_repo_status(status),
-            ));
-        }
+        (self.notifier)(super::ServiceNotificationEvent::WorkspaceStatus(
+            convert::convert_repo_status(self.status_snapshot()),
+        ));
     }
 
     pub(super) fn emit_task_progress(&self, task: RepoTaskStatus) {

@@ -72,10 +72,7 @@ impl ConnectionRegistry {
     }
 
     pub(super) fn broadcast(&self, event: ServiceNotificationEvent) {
-        let notification = match notification_for_event(event) {
-            Some(notification) => notification,
-            None => return,
-        };
+        let notification = notification_for_event(event);
         let recipients = {
             let connections = match self.connections.lock() {
                 Ok(guard) => guard,

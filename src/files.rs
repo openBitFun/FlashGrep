@@ -73,12 +73,9 @@ pub fn read_text_file(path: &std::path::Path) -> Result<Option<String>> {
     }
 }
 
-pub fn is_indexable_text_file(path: &Path) -> Result<bool> {
+pub fn is_corpus_text_file(path: &Path) -> Result<bool> {
     let bytes = fs::read(path)?;
-    if looks_binary(&bytes) {
-        return Ok(false);
-    }
-    Ok(std::str::from_utf8(&bytes).is_ok())
+    Ok(!looks_binary(&bytes))
 }
 
 pub fn is_text_file(path: &Path) -> Result<bool> {
@@ -235,7 +232,7 @@ mod tests {
     use tempfile::TempDir;
 
     use super::{
-        is_indexable_text_file, is_workspace_internal_path, looks_like_text_prefix, scan_paths,
+        is_corpus_text_file, is_workspace_internal_path, looks_like_text_prefix, scan_paths,
         ScanOptions,
     };
 
@@ -262,14 +259,14 @@ mod tests {
     }
 
     #[test]
-    fn indexable_text_file_rejects_invalid_utf8_after_text_prefix() {
+    fn corpus_text_file_accepts_invalid_utf8_after_text_prefix() {
         let temp = TempDir::new().expect("temp dir should succeed");
         let path = temp.path().join("encoded.txt");
         let mut bytes = vec![b'a'; 8 * 1024];
         bytes.push(0xFF);
         fs::write(&path, bytes).expect("encoded file should be written");
 
-        assert!(!is_indexable_text_file(&path).expect("probe should succeed"));
+        assert!(is_corpus_text_file(&path).expect("probe should succeed"));
     }
 
     #[test]

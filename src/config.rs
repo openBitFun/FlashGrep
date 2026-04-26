@@ -64,7 +64,7 @@ impl CorpusMode {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildConfig {
     pub repo_path: PathBuf,
     pub storage_root: PathBuf,
@@ -84,7 +84,7 @@ impl Default for BuildConfig {
             tokenizer: TokenizerMode::SparseNgram,
             corpus_mode: CorpusMode::RespectIgnore,
             include_hidden: false,
-            max_file_size: 2 * 1024 * 1024,
+            max_file_size: 8 * 1024 * 1024,
             min_sparse_len: 3,
             max_sparse_len: 8,
         }
