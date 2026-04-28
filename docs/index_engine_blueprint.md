@@ -283,7 +283,7 @@ pub struct WorkspaceOverlayStatus {
 workspace repo 的完整布局：
 
 ```text
-.codgrep-index-engine/
+.flashgrep-index-engine/
   base-snapshot/
     <snapshot-key>/
       ...

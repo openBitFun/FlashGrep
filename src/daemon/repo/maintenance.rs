@@ -109,7 +109,7 @@ impl RepoRuntime {
                 overlay.retry_failed_merge();
                 self.schedule_overlay_merge_retry();
                 eprintln!(
-                    "codgrep: failed to run workspace overlay maintenance for {}: {error}",
+                    "flashgrep: failed to run workspace overlay maintenance for {}: {error}",
                     self.build_config.repo_path.display()
                 );
             }

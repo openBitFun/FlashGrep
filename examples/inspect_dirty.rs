@@ -1,7 +1,7 @@
 use std::env;
 use std::path::PathBuf;
 
-use codgrep::{BuildConfig, CorpusMode, TokenizerMode, WorkspaceIndex, WorkspaceIndexOptions};
+use flashgrep::{BuildConfig, CorpusMode, TokenizerMode, WorkspaceIndex, WorkspaceIndexOptions};
 
 fn print_section(title: &str, paths: &[String]) {
     println!("{title}: {}", paths.len());

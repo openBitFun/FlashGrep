@@ -151,13 +151,13 @@ fn bench_report_labels_worktree_runner_modes() {
 
     let rendered = render_report(&report);
     let base = rendered
-        .find("codgrep [daemon-steady-state]")
+        .find("flashgrep [daemon-steady-state]")
         .expect("test should succeed");
     let worktree_build = rendered
-        .find("codgrep_worktree_build [dirty-first-query]")
+        .find("flashgrep_worktree_build [dirty-first-query]")
         .expect("test should succeed");
     let worktree_cached = rendered
-        .find("codgrep_worktree [dirty-cached-query]")
+        .find("flashgrep_worktree [dirty-cached-query]")
         .expect("test should succeed");
 
     assert!(base < worktree_build);
@@ -203,11 +203,11 @@ fn bench_raw_output_includes_runner_family_and_mode() {
     );
     assert!(lines
         .iter()
-        .any(|line| line.contains(",codgrep,codgrep,daemon_steady_state,")));
+        .any(|line| line.contains(",flashgrep,flashgrep,daemon_steady_state,")));
     assert!(lines
         .iter()
-        .any(|line| line.contains(",codgrep_worktree_build,codgrep,dirty_first_query,")));
+        .any(|line| line.contains(",flashgrep_worktree_build,flashgrep,dirty_first_query,")));
     assert!(lines
         .iter()
-        .any(|line| line.contains(",codgrep_worktree,codgrep,dirty_cached_query,")));
+        .any(|line| line.contains(",flashgrep_worktree,flashgrep,dirty_cached_query,")));
 }

@@ -129,7 +129,7 @@ impl SegmentStore for FileSegmentStore {
         }
 
         let segment_dir = self.segment_dir(&id);
-        let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
+        let profile_open = env::var_os("FLASHGREP_PROFILE_OPEN_SEGMENT").is_some();
         let meta = read_segment_meta(&segment_dir.join(SEGMENT_META_FILE))?;
         let doc_addresses_started = Instant::now();
         let doc_table = FileSegmentDocTable::open(&segment_dir)?;

@@ -5,7 +5,7 @@ const path = require("node:path");
 const { spawn } = require("node:child_process");
 
 const JSONRPC_VERSION = "2.0";
-const MCP_SERVER_NAME = "codgrep-mcp";
+const MCP_SERVER_NAME = "flashgrep-mcp";
 const MCP_SERVER_VERSION = "0.1.0";
 const SUPPORTED_PROTOCOL_VERSIONS = [
   "2025-11-25",
@@ -631,7 +631,7 @@ async function spawnBackend(options) {
       backend.exitSignal = signal;
       rejectPendingRequests(
         backend,
-        new Error(formatBackendExit(backend, "codgrep backend exited")),
+        new Error(formatBackendExit(backend, "flashgrep backend exited")),
       );
       resolve({ code, signal });
     });
@@ -647,7 +647,7 @@ async function spawnBackend(options) {
     await withTimeout(
       initializeBackend(backend),
       START_TIMEOUT_MS,
-      `failed to initialize codgrep backend within ${START_TIMEOUT_MS}ms`,
+      `failed to initialize flashgrep backend within ${START_TIMEOUT_MS}ms`,
     );
     return backend;
   } catch (error) {
@@ -664,19 +664,19 @@ function selectDaemonProgram(explicitProgram) {
   if (explicitProgram) {
     return explicitProgram;
   }
-  if (process.env.CODGREP_DAEMON_BIN) {
-    return process.env.CODGREP_DAEMON_BIN;
+  if (process.env.FLASHGREP_DAEMON_BIN) {
+    return process.env.FLASHGREP_DAEMON_BIN;
   }
 
-  const releaseBinary = path.resolve(__dirname, "../../target/release/cg");
+  const releaseBinary = path.resolve(__dirname, "../../target/release/flashgrep");
   if (fs.existsSync(releaseBinary)) {
     return releaseBinary;
   }
-  const debugBinary = path.resolve(__dirname, "../../target/debug/cg");
+  const debugBinary = path.resolve(__dirname, "../../target/debug/flashgrep");
   if (fs.existsSync(debugBinary)) {
     return debugBinary;
   }
-  return "cg";
+  return "flashgrep";
 }
 
 async function initializeBackend(backend) {
@@ -703,7 +703,7 @@ async function pingDaemon(backend) {
 
 function sendDaemonRequest(backend, method, params) {
   if (backend.exited) {
-    return Promise.reject(new Error(formatBackendExit(backend, "codgrep backend exited")));
+    return Promise.reject(new Error(formatBackendExit(backend, "flashgrep backend exited")));
   }
   if (backend.spawnError) {
     return Promise.reject(backend.spawnError);
@@ -761,7 +761,7 @@ async function readBackendMessages(backend) {
   if (!backend.exited) {
     rejectPendingRequests(
       backend,
-      new Error("codgrep backend closed stdio without sending a response"),
+      new Error("flashgrep backend closed stdio without sending a response"),
     );
   }
 }
@@ -800,7 +800,7 @@ function resolveRepoPath(defaultRepoPath, overrideRepoPath) {
 }
 
 function resolveStorageRoot(defaultStorageRoot, overrideStorageRoot, repoPath) {
-  return overrideStorageRoot ?? defaultStorageRoot ?? path.join(repoPath, ".codgrep-index-engine");
+  return overrideStorageRoot ?? defaultStorageRoot ?? path.join(repoPath, ".flashgrep-index-engine");
 }
 
 function toolDefinitions() {
@@ -809,7 +809,7 @@ function toolDefinitions() {
       name: "search_code",
       title: "Search Code",
       description:
-        "Run a codgrep search against the configured repository or a repo_path override.",
+        "Run a flashgrep search against the configured repository or a repo_path override.",
       inputSchema: {
         type: "object",
         properties: {
@@ -868,7 +868,7 @@ function toolDefinitions() {
       name: "glob_files",
       title: "Glob Files",
       description:
-        "Resolve visible files using codgrep's ignore, glob, and file type rules.",
+        "Resolve visible files using flashgrep's ignore, glob, and file type rules.",
       inputSchema: {
         type: "object",
         properties: {
@@ -895,7 +895,7 @@ function toolDefinitions() {
       name: "repo_status",
       title: "Repo Status",
       description:
-        "Open the repository in the session backend and return its current codgrep status.",
+        "Open the repository in the session backend and return its current flashgrep status.",
       inputSchema: {
         type: "object",
         properties: {
@@ -910,7 +910,7 @@ function toolDefinitions() {
     {
       name: "refresh_repo",
       title: "Refresh Repo",
-      description: "Ask codgrep to refresh workspace state for the repository.",
+      description: "Ask flashgrep to refresh workspace state for the repository.",
       inputSchema: {
         type: "object",
         properties: {
@@ -919,7 +919,7 @@ function toolDefinitions() {
           ),
           storage_root: schemaString("Override index storage root for this call."),
           force: schemaBool(
-            "Force a refresh even if codgrep thinks the repo is up to date.",
+            "Force a refresh even if flashgrep thinks the repo is up to date.",
           ),
         },
         additionalProperties: false,
@@ -1197,7 +1197,7 @@ async function shutdownBackend(backend) {
       await withTimeout(
         sendDaemonRequest(backend, "shutdown"),
         SHUTDOWN_TIMEOUT_MS,
-        "timed out waiting for codgrep backend shutdown",
+        "timed out waiting for flashgrep backend shutdown",
       );
     } catch {
       // Fall through to process termination below.
@@ -1210,14 +1210,14 @@ async function shutdownBackend(backend) {
       await withTimeout(
         backend.exitPromise,
         SHUTDOWN_TIMEOUT_MS,
-        "timed out waiting for codgrep backend to exit after SIGTERM",
+        "timed out waiting for flashgrep backend to exit after SIGTERM",
       );
     } catch {
       backend.child.kill("SIGKILL");
       await withTimeout(
         backend.exitPromise,
         SHUTDOWN_TIMEOUT_MS,
-        "timed out waiting for codgrep backend to exit after SIGKILL",
+        "timed out waiting for flashgrep backend to exit after SIGKILL",
       ).catch(() => {});
     }
   }

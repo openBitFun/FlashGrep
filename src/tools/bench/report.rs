@@ -170,10 +170,10 @@ pub(super) struct RawSample<'a> {
 
 fn runner_sort_key(runner: &str) -> usize {
     match runner {
-        "codgrep" => 0,
+        "flashgrep" => 0,
         "rg" => 1,
-        "codgrep_worktree_build" => 2,
-        "codgrep_worktree" => 3,
+        "flashgrep_worktree_build" => 2,
+        "flashgrep_worktree" => 3,
         _ => 4,
     }
 }
@@ -184,19 +184,19 @@ fn runner_display_name(runner: &str) -> &'static str {
 
 fn classify_runner(runner: &str) -> RunnerLabel {
     match runner {
-        "codgrep" => RunnerLabel {
-            display: "codgrep [daemon-steady-state]",
-            family: "codgrep",
+        "flashgrep" => RunnerLabel {
+            display: "flashgrep [daemon-steady-state]",
+            family: "flashgrep",
             mode: "daemon_steady_state",
         },
-        "codgrep_worktree_build" => RunnerLabel {
-            display: "codgrep_worktree_build [dirty-first-query]",
-            family: "codgrep",
+        "flashgrep_worktree_build" => RunnerLabel {
+            display: "flashgrep_worktree_build [dirty-first-query]",
+            family: "flashgrep",
             mode: "dirty_first_query",
         },
-        "codgrep_worktree" => RunnerLabel {
-            display: "codgrep_worktree [dirty-cached-query]",
-            family: "codgrep",
+        "flashgrep_worktree" => RunnerLabel {
+            display: "flashgrep_worktree [dirty-cached-query]",
+            family: "flashgrep",
             mode: "dirty_cached_query",
         },
         "rg" => RunnerLabel {

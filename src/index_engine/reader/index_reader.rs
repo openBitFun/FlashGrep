@@ -961,11 +961,11 @@ impl IndexSnapshotReader {
     }
 
     fn profile_candidate_sources_enabled() -> bool {
-        env::var_os("CODGREP_PROFILE_CANDIDATE_SOURCES").is_some()
+        env::var_os("FLASHGREP_PROFILE_CANDIDATE_SOURCES").is_some()
     }
 
     fn profile_search_phases_enabled() -> bool {
-        env::var_os("CODGREP_PROFILE_SEARCH_PHASES").is_some()
+        env::var_os("FLASHGREP_PROFILE_SEARCH_PHASES").is_some()
     }
 
     fn collect_candidate_source_profile(

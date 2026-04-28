@@ -5,7 +5,7 @@ use std::{
     time::Instant,
 };
 
-use codgrep::{BuildConfig, QueryConfig, SearchEngine, SearchMode, SearchPolicy};
+use flashgrep::{BuildConfig, QueryConfig, SearchEngine, SearchMode, SearchPolicy};
 
 const RG_CHUNK_SIZE: usize = 512;
 
@@ -31,7 +31,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let repo = repo.ok_or("--repo is required")?;
-    let index = index.unwrap_or_else(|| repo.join(".codgrep-index-engine"));
+    let index = index.unwrap_or_else(|| repo.join(".flashgrep-index-engine"));
     let pattern = pattern.ok_or("--pattern is required")?;
     let config = QueryConfig {
         regex_pattern: pattern.clone(),
@@ -68,10 +68,10 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     println!("index={}", index.display());
     println!("pattern={pattern}");
     println!("candidate_docs={}", candidate_paths.len());
-    println!("codgrep_total_secs={full_secs:.6}");
+    println!("flashgrep_total_secs={full_secs:.6}");
     println!("candidate_secs={candidate_secs:.6}");
     println!(
-        "codgrep_verify_estimated_secs={:.6}",
+        "flashgrep_verify_estimated_secs={:.6}",
         (full_secs - candidate_secs).max(0.0)
     );
     if let Some(rg_secs) = rg_secs {
@@ -81,7 +81,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
             candidate_secs + rg_secs
         );
     }
-    println!("codgrep_match_lines={}", full.matched_lines);
+    println!("flashgrep_match_lines={}", full.matched_lines);
     if let Some(rg_match_count) = rg_match_count {
         println!("rg_match_lines={rg_match_count}");
     }
@@ -89,7 +89,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     if let Some(rg_match_count) = rg_match_count {
         if full.matched_lines != rg_match_count {
             return Err(format!(
-                "count mismatch: codgrep={} rg={}",
+                "count mismatch: flashgrep={} rg={}",
                 full.matched_lines, rg_match_count
             )
             .into());

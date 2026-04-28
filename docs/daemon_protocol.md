@@ -2,7 +2,7 @@
 
 ## 目标
 
-`codgrep` 对外稳定接口以 daemon 进程协议为准。
+`flashgrep` 对外稳定接口以 daemon 进程协议为准。
 
 对接入方式的建议是：
 
@@ -100,11 +100,11 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 协议层不预留宿主产品私有目录名。
 
-当前实现只把下面这些路径视为 `codgrep` 自己的内部产物：
+当前实现只把下面这些路径视为 `flashgrep` 自己的内部产物：
 
-- `.codgrep-index-engine`
-- `.codgrep-index`（legacy 兼容保留，仅用于忽略旧产物）
-- `.codgrep-bench`
+- `.flashgrep-index-engine`
+- `.flashgrep-index`（legacy 兼容保留，仅用于忽略旧产物）
+- `.flashgrep-bench`
 
 此外，调用方显式传入的 `storage_root` 也会被视为内部路径并从扫描/搜索候选中排除。
 
@@ -114,9 +114,9 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 {
   "repo_id": "/path/to/repo",
   "repo_path": "/path/to/repo",
-  "storage_root": "/path/to/repo/.codgrep-index-engine",
-  "base_snapshot_root": "/path/to/repo/.codgrep-index-engine/base-snapshot",
-  "workspace_overlay_root": "/path/to/repo/.codgrep-index-engine/workspace-overlay",
+  "storage_root": "/path/to/repo/.flashgrep-index-engine",
+  "base_snapshot_root": "/path/to/repo/.flashgrep-index-engine/base-snapshot",
+  "workspace_overlay_root": "/path/to/repo/.flashgrep-index-engine/workspace-overlay",
   "phase": "ready_dirty",
   "snapshot_key": "base-git:abc123+cfg:deadbeef",
   "last_probe_unix_secs": 1710000000,
@@ -316,7 +316,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
   "kind": "initialize_result",
   "protocol_version": 1,
   "server_info": {
-    "name": "codgrep",
+    "name": "flashgrep",
     "version": "0.1.0"
   },
   "capabilities": {

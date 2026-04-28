@@ -480,7 +480,7 @@ where
 pub(super) fn workspace_overlay_index_root(repo_path: &std::path::Path) -> PathBuf {
     fs::canonicalize(repo_path)
         .unwrap_or_else(|_| repo_path.to_path_buf())
-        .join(".codgrep-index-engine")
+        .join(".flashgrep-index-engine")
         .join("workspace-overlay")
 }
 

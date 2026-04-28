@@ -97,7 +97,7 @@ pub(super) fn run_custom(
             case_insensitive: config.custom_case_insensitive,
         };
 
-        let mut runners = vec![run_codgrep_custom_trace_benchmark(
+        let mut runners = vec![run_flashgrep_custom_trace_benchmark(
             &benchmark,
             &storage_root,
             cache_paths.as_ref(),
@@ -152,7 +152,7 @@ pub(super) fn run_custom(
                 case_insensitive: config.custom_case_insensitive,
             };
 
-            let mut runners = vec![run_codgrep_custom_benchmark(
+            let mut runners = vec![run_flashgrep_custom_benchmark(
                 &benchmark,
                 &storage_root,
                 cache_paths.as_ref(),
@@ -215,12 +215,12 @@ fn custom_storage_root(repo_path: &Path, target_label: &str, config: &BenchConfi
     );
     config
         .suite_dir
-        .join(".codgrep-bench")
+        .join(".flashgrep-bench")
         .join("custom-runtime")
         .join(suffix)
 }
 
-fn run_codgrep_custom_benchmark(
+fn run_flashgrep_custom_benchmark(
     benchmark: &CustomBenchmarkCase,
     storage_root: &Path,
     cache_paths: Option<&BenchCachePaths>,
@@ -235,13 +235,13 @@ fn run_codgrep_custom_benchmark(
 
         for _ in 0..config.warmup_iter {
             prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
-            let _ = run_codgrep_custom_daemon_once(&daemon, benchmark, config)?;
+            let _ = run_flashgrep_custom_daemon_once(&daemon, benchmark, config)?;
         }
 
         for iter in 0..config.bench_iter {
             prepare_sample(super::CacheRunner::Bitfun, cache_paths, config)?;
             let started = Instant::now();
-            let outcome = run_codgrep_custom_daemon_once(&daemon, benchmark, config)?;
+            let outcome = run_flashgrep_custom_daemon_once(&daemon, benchmark, config)?;
             let duration_secs = started.elapsed().as_secs_f64();
             candidate_docs = Some(outcome.candidate_docs);
             match_count = outcome.match_count;
@@ -251,7 +251,7 @@ fn run_codgrep_custom_benchmark(
                 writer.write_sample(RawSample {
                     benchmark: &benchmark.name,
                     corpus: &benchmark.target,
-                    runner: "codgrep",
+                    runner: "flashgrep",
                     iteration: iter,
                     duration_secs,
                     candidate_docs,
@@ -261,7 +261,7 @@ fn run_codgrep_custom_benchmark(
         }
 
         Ok(build_summary(
-            "codgrep".into(),
+            "flashgrep".into(),
             durations,
             candidate_docs,
             match_count,
@@ -270,7 +270,7 @@ fn run_codgrep_custom_benchmark(
     finish_daemon_run(daemon, result)
 }
 
-fn run_codgrep_custom_trace_benchmark(
+fn run_flashgrep_custom_trace_benchmark(
     benchmark: &CustomBenchmarkTrace,
     storage_root: &Path,
     cache_paths: Option<&BenchCachePaths>,
@@ -316,7 +316,7 @@ fn run_codgrep_custom_trace_benchmark(
                 writer.write_sample(RawSample {
                     benchmark: &benchmark.name,
                     corpus: &benchmark.target,
-                    runner: "codgrep",
+                    runner: "flashgrep",
                     iteration: iter,
                     duration_secs,
                     candidate_docs: Some(outcome.candidate_docs),
@@ -326,7 +326,7 @@ fn run_codgrep_custom_trace_benchmark(
         }
 
         Ok(build_summary(
-            "codgrep".into(),
+            "flashgrep".into(),
             durations,
             Some(mean_usize(total_candidate_docs, config.bench_iter)),
             mean_usize(total_match_count, config.bench_iter),
@@ -335,7 +335,7 @@ fn run_codgrep_custom_trace_benchmark(
     finish_daemon_run(daemon, result)
 }
 
-fn run_codgrep_custom_daemon_once(
+fn run_flashgrep_custom_daemon_once(
     daemon: &super::BenchDaemon,
     benchmark: &CustomBenchmarkCase,
     config: &BenchConfig,
@@ -482,9 +482,9 @@ fn run_worktree_custom_benchmark(
         &benchmark.name,
         &benchmark.target,
         if build_overlay_each_sample {
-            "codgrep_worktree_build"
+            "flashgrep_worktree_build"
         } else {
-            "codgrep_worktree"
+            "flashgrep_worktree"
         },
         Some(&benchmark.pattern),
         benchmark.case_insensitive,
@@ -506,9 +506,9 @@ fn run_worktree_custom_trace_benchmark(
         &fixture.storage_root,
         benchmark,
         if build_overlay_each_sample {
-            "codgrep_worktree_build"
+            "flashgrep_worktree_build"
         } else {
-            "codgrep_worktree"
+            "flashgrep_worktree"
         },
         cache_paths_for_fixture(fixture, build_overlay_each_sample),
         config,
@@ -531,7 +531,7 @@ fn run_workspace_benchmark(
     let pattern = pattern.ok_or_else(|| {
         AppError::InvalidPattern("single-pattern worktree benchmark requires a pattern".into())
     })?;
-    let build_overlay_each_sample = runner == "codgrep_worktree_build";
+    let build_overlay_each_sample = runner == "flashgrep_worktree_build";
     let daemon = (!build_overlay_each_sample)
         .then(|| start_bench_daemon(repo_path, storage_root, config))
         .transpose()?;
@@ -601,7 +601,7 @@ fn run_workspace_trace_benchmark(
     config: &BenchConfig,
     mut raw_writer: Option<&mut RawWriter>,
 ) -> Result<super::RunnerSummary> {
-    let build_overlay_each_sample = runner == "codgrep_worktree_build";
+    let build_overlay_each_sample = runner == "flashgrep_worktree_build";
     let daemon = (!build_overlay_each_sample)
         .then(|| start_bench_daemon(repo_path, storage_root, config))
         .transpose()?;

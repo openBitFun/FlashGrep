@@ -59,7 +59,7 @@ impl RepoRuntime {
             Ok(watcher) => watcher,
             Err(error) => {
                 eprintln!(
-                    "codgrep: failed to start workspace watcher for {}: {error}",
+                    "flashgrep: failed to start workspace watcher for {}: {error}",
                     repo_path.display()
                 );
                 self.workspace_watcher_active
@@ -69,7 +69,7 @@ impl RepoRuntime {
         };
         if let Err(error) = watcher.watch(&repo_path, RecursiveMode::Recursive) {
             eprintln!(
-                "codgrep: failed to watch workspace {}: {error}",
+                "flashgrep: failed to watch workspace {}: {error}",
                 repo_path.display()
             );
             self.workspace_watcher_active
@@ -87,7 +87,7 @@ impl RepoRuntime {
                 Ok(Ok(event)) => self.handle_workspace_notify_event(event),
                 Ok(Err(error)) => {
                     eprintln!(
-                        "codgrep: workspace watcher error for {}: {error}",
+                        "flashgrep: workspace watcher error for {}: {error}",
                         self.build_config.repo_path.display()
                     );
                     self.enqueue_workspace_events(Vec::new(), true);

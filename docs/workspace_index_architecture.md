@@ -2,7 +2,7 @@
 
 ## Goal
 
-`codgrep` 当前 daemon/runtime 主线已经不是“base snapshot + query-time dirty repair”，也不是把 workspace 增量直接暴露给查询线程的可变写路径。查询真相源只剩两层只读 snapshot：
+`flashgrep` 当前 daemon/runtime 主线已经不是“base snapshot + query-time dirty repair”，也不是把 workspace 增量直接暴露给查询线程的可变写路径。查询真相源只剩两层只读 snapshot：
 
 1. `base snapshot`
    对应某个 Git `HEAD` 或 repo fingerprint 的稳定基线快照。

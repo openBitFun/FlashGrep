@@ -1,4 +1,4 @@
-# codgrep
+# flashgrep
 
 本项目是一个本地 regex 预筛索引系统骨架，目标是把全库正则搜索拆成两段：
 
@@ -37,7 +37,7 @@
 
 ## 存储布局
 
-repo 默认把索引数据落在 `.codgrep-index-engine/`：
+repo 默认把索引数据落在 `.flashgrep-index-engine/`：
 
 - `base-snapshot/`
   只读基线 snapshot，按 snapshot key 分目录保存。
@@ -49,10 +49,10 @@ repo 默认把索引数据落在 `.codgrep-index-engine/`：
 ## 快速开始
 
 ```bash
-cargo run --bin cg -- serve
+cargo run --bin flashgrep -- serve
 ```
 
-推荐把 `codgrep` 当成一个独立常驻进程来使用，形态更接近本地搜索 server，而不是 ripgrep 风格的一次性搜索 CLI。
+推荐把 `flashgrep` 当成一个独立常驻进程来使用，形态更接近本地搜索 server，而不是 ripgrep 风格的一次性搜索 CLI。
 
 如果你使用 `ManagedDaemonClient`：
 
@@ -64,45 +64,45 @@ cargo run --bin cg -- serve
 
 ```bash
 # 前台拉起 server
-cargo run --bin cg -- serve --bind 127.0.0.1:4597
+cargo run --bin flashgrep -- serve --bind 127.0.0.1:4597
 
 # 注册或打开一个 repo
-cargo run --bin cg -- daemon open --repo /path/to/repo
+cargo run --bin flashgrep -- daemon open --repo /path/to/repo
 
 # 对 repo 建索引
-cargo run --bin cg -- daemon build --repo-id /path/to/repo
+cargo run --bin flashgrep -- daemon build --repo-id /path/to/repo
 
 # 通过 daemon 发搜索请求
-cargo run --bin cg -- daemon search --repo-id /path/to/repo 'foo.*bar'
+cargo run --bin flashgrep -- daemon search --repo-id /path/to/repo 'foo.*bar'
 
 # 通过 daemon 做路径 glob / scope 解析
-cargo run --bin cg -- daemon glob --repo-id /path/to/repo -g '*.rs' src
+cargo run --bin flashgrep -- daemon glob --repo-id /path/to/repo -g '*.rs' src
 
 # 查询 repo 状态
-cargo run --bin cg -- daemon status --repo-id /path/to/repo
+cargo run --bin flashgrep -- daemon status --repo-id /path/to/repo
 
 # 关闭 repo，或关闭整个 server
-cargo run --bin cg -- daemon close --repo-id /path/to/repo
-cargo run --bin cg -- daemon shutdown
+cargo run --bin flashgrep -- daemon close --repo-id /path/to/repo
+cargo run --bin flashgrep -- daemon shutdown
 ```
 
 ## MCP 集成
 
-如果你想把 `codgrep` 作为 MCP server 暴露给别的项目，而不改宿主源码，可以直接启动：
+如果你想把 `flashgrep` 作为 MCP server 暴露给别的项目，而不改宿主源码，可以直接启动：
 
 ```bash
 # Node MCP server，固定 repo
 node src/mcp/server.js --repo /path/to/repo
 
-# 也可以显式指定索引目录或 codgrep daemon 二进制
-node src/mcp/server.js --repo /path/to/repo --storage-root /tmp/codgrep-index
-node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/cg
+# 也可以显式指定索引目录或 flashgrep daemon 二进制
+node src/mcp/server.js --repo /path/to/repo --storage-root /tmp/flashgrep-index
+node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
 ```
 
 这个 MCP server 当前暴露 5 个 tools：
 
 - `search_code`
-  对 repo 执行 codgrep 搜索；不会隐式建索引。如果 repo 还没有 base snapshot，会直接报错，要求先调用 `build_index`，或者显式允许 `allow_scan_fallback`。
+  对 repo 执行 flashgrep 搜索；不会隐式建索引。如果 repo 还没有 base snapshot，会直接报错，要求先调用 `build_index`，或者显式允许 `allow_scan_fallback`。
 - `glob_files`
   按 ignore/glob/type 规则返回当前可见文件。
 - `repo_status`
@@ -117,10 +117,10 @@ node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/cg
 ```json
 {
   "mcpServers": {
-    "codgrep": {
+    "flashgrep": {
       "command": "node",
       "args": [
-        "/absolute/path/to/codgrep/src/mcp/server.js",
+        "/absolute/path/to/flashgrep/src/mcp/server.js",
         "--repo",
         "/path/to/repo"
       ]
@@ -134,17 +134,17 @@ node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/cg
 - 如果启动时已经传了 `--repo`，tool 调用里可以省略 `repo_path`。
 - 如果没有传 `--repo`，每次 tool 调用都需要带 `repo_path`。
 - MCP transport 走 stdio，framing 使用 `Content-Length`。
-- MCP server 自身是 Node 进程；它会在本次 MCP session 内拉起并持有一个 `cg serve --stdio` 后端子进程。
-- 如果没显式传 `--daemon-bin`，server 会优先尝试 `target/release/cg`、`target/debug/cg`，最后回退到环境里的 `cg`。
+- MCP server 自身是 Node 进程；它会在本次 MCP session 内拉起并持有一个 `flashgrep serve --stdio` 后端子进程。
+- 如果没显式传 `--daemon-bin`，server 会优先尝试 `target/release/flashgrep`、`target/debug/flashgrep`，最后回退到环境里的 `flashgrep`。
 
 如果只是离线准备索引或做 bench，也保留这两个入口：
 
 ```bash
 # 通过 managed daemon 自动拉起/连接 server，并确保 repo 已可搜索
-cargo run --bin cg -- build --repo /path/to/repo
+cargo run --bin flashgrep -- build --repo /path/to/repo
 
 # benchmark 仍是本地运维工具入口
-cargo run --bin cg -- bench --suite-dir bench_data
+cargo run --bin flashgrep -- bench --suite-dir bench_data
 ```
 
 当前 CLI 语义：
@@ -161,13 +161,13 @@ cargo run --bin cg -- bench --suite-dir bench_data
 
 - daemon protocol request/response/notification schema
 - `DaemonClient` / `ManagedDaemonClient`
-- `cg serve` 与 `cg daemon *` 这些围绕 daemon 的工具入口
+- `flashgrep serve` 与 `flashgrep daemon *` 这些围绕 daemon 的工具入口
 
 其中：
 
 - `daemon::protocol` 是跨语言/跨进程集成时的规范基线。
-- 下游产品应自己在客户端侧封装 SDK / service facade；`codgrep` 不再内置 Rust SDK facade。
-- `codgrep` 这边的交付物以 daemon 二进制 `cg` 为主；像 BitFun 这类宿主只需要打包 `cg` 并按协议接入。
+- 下游产品应自己在客户端侧封装 SDK / service facade；`flashgrep` 不再内置 Rust SDK facade。
+- `flashgrep` 这边的交付物以 daemon 二进制 `flashgrep` 为主；像 BitFun 这类宿主只需要打包 `flashgrep` 并按协议接入。
 - crate 根上仍然保留若干库导出，主要服务于本地工具、测试和专家向集成，不应当作稳定产品接入面。
 
 入口选择（推荐）：
@@ -178,13 +178,13 @@ cargo run --bin cg -- bench --suite-dir bench_data
 
 路径边界约定：
 
-- `codgrep` 只把自己的产物目录 `.codgrep-index`、`.codgrep-bench`，以及调用方显式配置的 `index_path` 视为内部路径。
-- `codgrep` 不会内建保留某个宿主产品目录名；像 `.bitfun`、`.idea`、`.vscode` 这类目录是否排除，应由接入方或 ignore 规则决定。
+- `flashgrep` 只把自己的产物目录 `.flashgrep-index`、`.flashgrep-bench`，以及调用方显式配置的 `index_path` 视为内部路径。
+- `flashgrep` 不会内建保留某个宿主产品目录名；像 `.bitfun`、`.idea`、`.vscode` 这类目录是否排除，应由接入方或 ignore 规则决定。
 
 最小接入示例：
 
 ```rust
-use codgrep::daemon::{
+use flashgrep::daemon::{
     protocol::{
         ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request,
         SearchModeConfig, SearchParams,
@@ -229,8 +229,8 @@ let response = client.send(Request::Search {
 
 如果宿主产品只需要打包资源：
 
-- 打包 `cg` 二进制到产品资源目录。
-- 启动时通过 `CODGREP_DAEMON_BIN` 或显式路径把二进制位置传给调用侧。
+- 打包 `flashgrep` 二进制到产品资源目录。
+- 启动时通过 `FLASHGREP_DAEMON_BIN` 或显式路径把二进制位置传给调用侧。
 - 客户端自己管理更高层的 repo session、事件订阅、重试策略和 API facade。
 
 核心职责边界（固定定义）：
@@ -267,7 +267,7 @@ daemon 运行时维护两类 workspace 状态：
 ## Benchmark
 
 当前项目已集成一版兼容 ripgrep `benchsuite` 命名方式的 benchmark runner。
-benchmark 的 `codgrep` 结果只统计上层 daemon/service 查询路径；不再提供底层 direct benchmark 口径。
+benchmark 的 `flashgrep` 结果只统计上层 daemon/service 查询路径；不再提供底层 direct benchmark 口径。
 
 语料目录默认按下面布局准备：
 
@@ -278,20 +278,20 @@ benchmark 的 `codgrep` 结果只统计上层 daemon/service 查询路径；不�
 运行示例：
 
 ```bash
-cargo run --bin cg -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter linux_literal --rebuild
+cargo run --bin flashgrep -- bench --suite-dir /Users/user/workspace/flashgrep/bench_data --filter linux_literal --rebuild
 ```
 
 如果希望顺带对比 `rg`：
 
 ```bash
-cargo run --bin cg -- bench --suite-dir /Users/user/workspace/codgrep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
+cargo run --bin flashgrep -- bench --suite-dir /Users/user/workspace/flashgrep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
 ```
 
 如果希望 dirty worktree 更贴近“只改了几份文件”的 agent 场景，可以给 worktree fixture 加一个文件数上限。这个模式会从完整语料里抽一个保留真实目录结构的小型子仓库，并保证包含当前 benchmark 需要命中的文件：
 
 ```bash
-cargo run --bin cg -- bench \
-  --suite-dir /Users/user/workspace/codgrep/bench_data \
+cargo run --bin flashgrep -- bench \
+  --suite-dir /Users/user/workspace/flashgrep/bench_data \
   --filter linux_literal \
   --compare-worktree \
   --worktree-sample-files 32 \
@@ -301,8 +301,8 @@ cargo run --bin cg -- bench \
 如果希望比较 cold query，可以切到 `cold` cache mode。这个模式会在每个 sample 前主动驱逐本次 benchmark 会访问到的 index / corpus 文件页缓存；如果你还想连系统级 page cache 一起清掉，可以额外提供一个 hook：
 
 ```bash
-cargo run --bin cg -- bench \
-  --suite-dir /Users/user/workspace/codgrep/bench_data \
+cargo run --bin flashgrep -- bench \
+  --suite-dir /Users/user/workspace/flashgrep/bench_data \
   --filter linux_literal \
   --compare-rg \
   --cache-mode cold \
@@ -312,7 +312,7 @@ cargo run --bin cg -- bench \
 
 说明：
 
-- `codgrep` 的 benchmark 会单独统计索引构建时间和查询时间。
+- `flashgrep` 的 benchmark 会单独统计索引构建时间和查询时间。
 - `--compare-worktree` 会额外跑 dirty worktree 查询路径；当前实现直接走“base snapshot + query-time dirty repair”，不再依赖持久化 overlay cache。
 - `--worktree-sample-files <N>` 只影响 `--compare-worktree` 的 fixture 构造：不再复制完整目录，而是抽一个最多 `N` 个文本文件的小型真实子仓库。这个模式更适合测“少量 dirty 文件”的真实查询成本；不传时仍然保留完整仓库 worst-case。
 - `rg` 对比项只统计直接搜索耗时，不包含任何建索引步骤。

@@ -14,7 +14,7 @@ use super::{
     BitfunOutcome, CacheRunner, RgSearchScope, RunnerSummary,
 };
 
-pub(super) fn run_codgrep_benchmark(
+pub(super) fn run_flashgrep_benchmark(
     benchmark: BenchmarkCase,
     storage_root: &Path,
     suite_dir: &Path,
@@ -30,13 +30,13 @@ pub(super) fn run_codgrep_benchmark(
 
         for _ in 0..config.warmup_iter {
             prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
-            let _ = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
+            let _ = run_flashgrep_daemon_once(&daemon, benchmark, &target, config)?;
         }
 
         for iter in 0..config.bench_iter {
             prepare_sample(CacheRunner::Bitfun, cache_paths, config)?;
             let started = Instant::now();
-            let matches = run_codgrep_daemon_once(&daemon, benchmark, &target, config)?;
+            let matches = run_flashgrep_daemon_once(&daemon, benchmark, &target, config)?;
             let duration_secs = started.elapsed().as_secs_f64();
             match_count = matches.match_count;
             durations.push(duration_secs);
@@ -45,7 +45,7 @@ pub(super) fn run_codgrep_benchmark(
                 writer.write_sample(RawSample {
                     benchmark: benchmark.name,
                     corpus: benchmark.corpus.label(),
-                    runner: "codgrep",
+                    runner: "flashgrep",
                     iteration: iter,
                     duration_secs,
                     candidate_docs: Some(matches.candidate_docs),
@@ -55,7 +55,7 @@ pub(super) fn run_codgrep_benchmark(
         }
 
         Ok(build_summary(
-            "codgrep".into(),
+            "flashgrep".into(),
             durations,
             None,
             match_count,
@@ -153,9 +153,9 @@ pub(super) fn run_worktree_benchmark(
                     benchmark: benchmark.name,
                     corpus: benchmark.corpus.label(),
                     runner: if build_overlay_each_sample {
-                        "codgrep_worktree_build"
+                        "flashgrep_worktree_build"
                     } else {
-                        "codgrep_worktree"
+                        "flashgrep_worktree"
                     },
                     iteration: iter,
                     duration_secs,
@@ -167,9 +167,9 @@ pub(super) fn run_worktree_benchmark(
 
         Ok(build_summary(
             if build_overlay_each_sample {
-                "codgrep_worktree_build".into()
+                "flashgrep_worktree_build".into()
             } else {
-                "codgrep_worktree".into()
+                "flashgrep_worktree".into()
             },
             durations,
             candidate_docs,
@@ -214,7 +214,7 @@ fn run_rg_once(
     super::parse_rg_count_output(&output.stdout)
 }
 
-fn run_codgrep_daemon_once(
+fn run_flashgrep_daemon_once(
     daemon: &super::BenchDaemon,
     benchmark: BenchmarkCase,
     target: &Path,

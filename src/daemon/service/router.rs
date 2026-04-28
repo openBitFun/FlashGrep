@@ -58,7 +58,7 @@ impl DaemonService {
                     Response::InitializeResult {
                         protocol_version: 1,
                         server_info: ServerInfo {
-                            name: "codgrep".into(),
+                            name: "flashgrep".into(),
                             version: env!("CARGO_PKG_VERSION").into(),
                         },
                         capabilities: build_server_capabilities(params.capabilities),

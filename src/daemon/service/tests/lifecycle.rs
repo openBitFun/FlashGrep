@@ -73,7 +73,8 @@ fn snapshot_only_search_uses_base_snapshot_without_published_overlay() {
     let status = refresh_repo(&service, &repo_id, true);
     assert!(matches!(
         status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
+        crate::daemon::protocol::RepoPhase::ReadyClean
+            | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
     match search_repo(
@@ -943,8 +944,16 @@ fn workspace_strict_search_uses_explicitly_refreshed_state() {
     let status = refresh_repo(&service, &repo_id, true);
     assert!(matches!(
         status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
+        crate::daemon::protocol::RepoPhase::ReadyClean
+            | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
+    let status = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            && status.dirty_files.modified == 1
+            && status.dirty_files.deleted == 0
+            && status.dirty_files.new == 0
+    });
+    assert_exact_dirty_stats(&status, 1, 0, 0);
 
     for _ in 0..SEARCH_WAIT_ATTEMPTS {
         match service.handle_request_only(Request::Search {

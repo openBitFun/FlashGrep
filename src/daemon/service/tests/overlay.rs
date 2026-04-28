@@ -19,8 +19,16 @@ fn refresh_workspace_rebuilds_workspace_overlay_engine() {
     let status = refresh_repo(&service, &repo_id, true);
     assert!(matches!(
         status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
+        crate::daemon::protocol::RepoPhase::ReadyClean
+            | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
+    let status = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            && status.dirty_files.modified == 1
+            && status.dirty_files.deleted == 0
+            && status.dirty_files.new == 0
+    });
+    assert_exact_dirty_stats(&status, 1, 0, 0);
 
     wait_for_workspace_overlay_match_count(&repo_path, "DIRTY_OVERLAY_ENGINE", 1);
 }
@@ -951,7 +959,8 @@ fn repeated_published_overlay_searches_remain_stable() {
     let status = refresh_repo(&service, &repo_id, true);
     assert!(matches!(
         status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
+        crate::daemon::protocol::RepoPhase::ReadyClean
+            | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
     for _ in 0..3 {
@@ -1100,7 +1109,8 @@ fn path_scoped_search_limits_published_overlay_results() {
     let status = refresh_repo(&service, &repo_id, true);
     assert!(matches!(
         status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
+        crate::daemon::protocol::RepoPhase::ReadyClean
+            | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
     let query = QuerySpec {

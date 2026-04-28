@@ -9,7 +9,7 @@ use std::{
     time::{Duration, Instant, SystemTime, UNIX_EPOCH},
 };
 
-use codgrep::{
+use flashgrep::{
     daemon::{
         protocol::{
             ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, RepoRef, Request,
@@ -46,7 +46,7 @@ struct ScenarioResult {
     edited_files: usize,
     samples: usize,
     rg_matched_lines_mean: f64,
-    codgrep_matched_lines_mean: f64,
+    flashgrep_matched_lines_mean: f64,
     missing_lines_mean: f64,
     recall_ratio_mean: f64,
     settle_backend: String,
@@ -54,8 +54,8 @@ struct ScenarioResult {
     detection_ms_stddev: f64,
     settle_ms_mean: f64,
     settle_ms_stddev: f64,
-    codgrep_query_ms_mean: f64,
-    codgrep_query_ms_stddev: f64,
+    flashgrep_query_ms_mean: f64,
+    flashgrep_query_ms_stddev: f64,
     rg_median_ms_mean: f64,
     rg_median_ms_stddev: f64,
     status_dirty_paths_mean: f64,
@@ -67,13 +67,13 @@ struct ScenarioSampleResult {
     sample_index: usize,
     edited_files: usize,
     rg_matched_lines: usize,
-    codgrep_matched_lines: usize,
+    flashgrep_matched_lines: usize,
     missing_lines: usize,
     recall_ratio: f64,
     settle_backend: String,
     detection_ms: f64,
     settle_ms: f64,
-    codgrep_query_ms: f64,
+    flashgrep_query_ms: f64,
     rg_median_ms: f64,
     status_dirty_paths: usize,
 }
@@ -128,13 +128,14 @@ struct BenchWorkspace {
 
 impl BenchWorkspace {
     fn new(source_repo: &Path, in_place: bool) -> Result<Self> {
-        if let Some(worktree_path) = configured_path("CODGREP_BENCH_WORKTREE")? {
-            let storage_root = configured_path("CODGREP_BENCH_STORAGE_ROOT")?.ok_or_else(|| {
-                codgrep::AppError::InvalidIndex(
-                    "CODGREP_BENCH_STORAGE_ROOT is required when CODGREP_BENCH_WORKTREE is set"
+        if let Some(worktree_path) = configured_path("FLASHGREP_BENCH_WORKTREE")? {
+            let storage_root =
+                configured_path("FLASHGREP_BENCH_STORAGE_ROOT")?.ok_or_else(|| {
+                    flashgrep::AppError::InvalidIndex(
+                    "FLASHGREP_BENCH_STORAGE_ROOT is required when FLASHGREP_BENCH_WORKTREE is set"
                         .into(),
                 )
-            })?;
+                })?;
             return Ok(Self {
                 cleanup_detached_worktree: false,
                 source_repo: None,
@@ -146,8 +147,8 @@ impl BenchWorkspace {
         }
 
         if in_place {
-            let storage_root = configured_path("CODGREP_BENCH_STORAGE_ROOT")?
-                .unwrap_or_else(|| source_repo.join(".codgrep-dirty-bench-index-engine"));
+            let storage_root = configured_path("FLASHGREP_BENCH_STORAGE_ROOT")?
+                .unwrap_or_else(|| source_repo.join(".flashgrep-dirty-bench-index-engine"));
             return Ok(Self {
                 cleanup_detached_worktree: false,
                 source_repo: None,
@@ -158,7 +159,7 @@ impl BenchWorkspace {
             });
         }
 
-        if let Some(root) = configured_path("CODGREP_BENCH_ROOT")? {
+        if let Some(root) = configured_path("FLASHGREP_BENCH_ROOT")? {
             fs::create_dir_all(&root)?;
             let worktree_path = root.join("repo");
             if !worktree_path.exists() {
@@ -173,7 +174,7 @@ impl BenchWorkspace {
                     ],
                 )?;
             }
-            let storage_root = configured_path("CODGREP_BENCH_STORAGE_ROOT")?
+            let storage_root = configured_path("FLASHGREP_BENCH_STORAGE_ROOT")?
                 .unwrap_or_else(|| root.join("index"));
             return Ok(Self {
                 cleanup_detached_worktree: false,
@@ -190,7 +191,7 @@ impl BenchWorkspace {
             .expect("clock should be after unix epoch")
             .as_secs();
         let root = env::temp_dir().join(format!(
-            "codgrep-dirty-bench-{timestamp}-{}",
+            "flashgrep-dirty-bench-{timestamp}-{}",
             std::process::id()
         ));
         fs::create_dir_all(&root)?;
@@ -219,7 +220,7 @@ impl BenchWorkspace {
         if let Some(source_repo) = self.source_repo.as_ref() {
             if *source_repo != self.worktree_path {
                 run_git(&self.worktree_path, ["reset", "--hard", "HEAD"])?;
-                let added_root = self.worktree_path.join("codgrep_bench_added");
+                let added_root = self.worktree_path.join("flashgrep_bench_added");
                 if added_root.exists() {
                     fs::remove_dir_all(added_root)?;
                 }
@@ -227,7 +228,7 @@ impl BenchWorkspace {
             }
         }
         restore_baseline_files(baseline_files)?;
-        let added_root = self.worktree_path.join("codgrep_bench_added");
+        let added_root = self.worktree_path.join("flashgrep_bench_added");
         if added_root.exists() {
             fs::remove_dir_all(added_root)?;
         }
@@ -265,10 +266,10 @@ fn main() -> Result<()> {
         .unwrap_or_else(|| PathBuf::from("/Users/user/workspace/chromium-src"));
     let query = args
         .next()
-        .or_else(|| env::var("CODGREP_DIRTY_BENCH_QUERY").ok())
+        .or_else(|| env::var("FLASHGREP_DIRTY_BENCH_QUERY").ok())
         .unwrap_or_else(|| DEFAULT_QUERY.to_string());
     let source_repo = fs::canonicalize(source_repo)?;
-    let in_place = env::var("CODGREP_BENCH_IN_PLACE").ok().as_deref() == Some("1");
+    let in_place = env::var("FLASHGREP_BENCH_IN_PLACE").ok().as_deref() == Some("1");
     let bench_mode = bench_mode();
     let bench_iters = bench_iters();
     let scenario_samples = scenario_samples();
@@ -298,29 +299,30 @@ fn main() -> Result<()> {
         min_sparse_len: 3,
         max_sparse_len: 8,
     };
-    let prepare_mode = if codgrep::index_engine::WorkspaceBaseSnapshotIndex::read_snapshot_metadata(
-        &build_config,
-    )?
-    .is_some()
-    {
-        eprintln!(
-            "reusing existing base snapshot for {}",
-            worktree.worktree_path.display()
-        );
-        "reused_base_snapshot"
-    } else {
-        eprintln!(
-            "building base snapshot for {}",
-            worktree.worktree_path.display()
-        );
-        SearchEngine::new(build_config.clone()).build_base_snapshot()?;
-        "built_base_snapshot"
-    };
+    let prepare_mode =
+        if flashgrep::index_engine::WorkspaceBaseSnapshotIndex::read_snapshot_metadata(
+            &build_config,
+        )?
+        .is_some()
+        {
+            eprintln!(
+                "reusing existing base snapshot for {}",
+                worktree.worktree_path.display()
+            );
+            "reused_base_snapshot"
+        } else {
+            eprintln!(
+                "building base snapshot for {}",
+                worktree.worktree_path.display()
+            );
+            SearchEngine::new(build_config.clone()).build_base_snapshot()?;
+            "built_base_snapshot"
+        };
     let build_elapsed_ms = elapsed_ms(build_started.elapsed().as_secs_f64());
 
     let candidate_relative_paths = git_grep_files(&source_repo, &query)?;
     if candidate_relative_paths.len() < max_size {
-        return Err(codgrep::AppError::InvalidIndex(format!(
+        return Err(flashgrep::AppError::InvalidIndex(format!(
             "expected at least {max_size} tracked files for query {query}, found {}",
             candidate_relative_paths.len()
         )));
@@ -343,9 +345,9 @@ fn main() -> Result<()> {
     )?;
     worktree.reset_start_clean(&baseline_files)?;
 
-    let scenario_filter = env::var("CODGREP_BENCH_SCENARIOS").ok();
+    let scenario_filter = env::var("FLASHGREP_BENCH_SCENARIOS").ok();
     let scenarios = filter_scenarios(build_scenarios(&sizes), scenario_filter.as_deref());
-    let cg_path = codgrep_executable()?;
+    let cg_path = flashgrep_executable()?;
     let mut sample_results = Vec::new();
     let mut results = Vec::with_capacity(scenarios.len());
     let mut detection_results = Vec::with_capacity(scenarios.len());
@@ -366,7 +368,7 @@ fn main() -> Result<()> {
                 sample_index,
                 scenario_samples,
             )?;
-            let repo = open_codgrep_repo(&cg_path, &worktree.worktree_path, &storage_root)?;
+            let repo = open_flashgrep_repo(&cg_path, &worktree.worktree_path, &storage_root)?;
             wait_for_dirty_paths(&repo, 0, Duration::from_secs(180))?;
             apply_scenario(
                 &worktree.worktree_path,
@@ -413,7 +415,7 @@ fn main() -> Result<()> {
                 expected_dirty_paths,
                 Duration::from_secs(180),
             )?;
-            let query_measurement = run_codgrep_query_with_consistency(
+            let query_measurement = run_flashgrep_query_with_consistency(
                 &repo,
                 &query,
                 ConsistencyMode::WorkspaceEventual,
@@ -431,13 +433,13 @@ fn main() -> Result<()> {
                 sample_index,
                 edited_files: expected_dirty_paths,
                 rg_matched_lines: rg_count,
-                codgrep_matched_lines: query_measurement.matched_lines,
+                flashgrep_matched_lines: query_measurement.matched_lines,
                 missing_lines,
                 recall_ratio,
                 settle_backend: settle_measurement.backend,
                 detection_ms,
                 settle_ms,
-                codgrep_query_ms: query_measurement.elapsed_ms,
+                flashgrep_query_ms: query_measurement.elapsed_ms,
                 rg_median_ms: rg_median,
                 status_dirty_paths,
             };
@@ -502,7 +504,7 @@ fn apply_scenario(
         let path = &candidates[cursor];
         cursor += 1;
         let mut file = fs::OpenOptions::new().append(true).open(path)?;
-        writeln!(file, "\n// CODGREP_DIRTY_BENCH_MOD_{index}: {query}")?;
+        writeln!(file, "\n// FLASHGREP_DIRTY_BENCH_MOD_{index}: {query}")?;
     }
 
     for _ in 0..scenario.delete_count {
@@ -512,7 +514,7 @@ fn apply_scenario(
     }
 
     if scenario.add_count > 0 {
-        let root = repo_path.join("codgrep_bench_added").join(&scenario.name);
+        let root = repo_path.join("flashgrep_bench_added").join(&scenario.name);
         fs::create_dir_all(&root)?;
         for index in 0..scenario.add_count {
             let path = root.join(format!("added_{index:04}.cc"));
@@ -534,13 +536,13 @@ fn clone_sample_result(result: &ScenarioSampleResult) -> ScenarioSampleResult {
         sample_index: result.sample_index,
         edited_files: result.edited_files,
         rg_matched_lines: result.rg_matched_lines,
-        codgrep_matched_lines: result.codgrep_matched_lines,
+        flashgrep_matched_lines: result.flashgrep_matched_lines,
         missing_lines: result.missing_lines,
         recall_ratio: result.recall_ratio,
         settle_backend: result.settle_backend.clone(),
         detection_ms: result.detection_ms,
         settle_ms: result.settle_ms,
-        codgrep_query_ms: result.codgrep_query_ms,
+        flashgrep_query_ms: result.flashgrep_query_ms,
         rg_median_ms: result.rg_median_ms,
         status_dirty_paths: result.status_dirty_paths,
     }
@@ -568,10 +570,10 @@ fn aggregate_scenario_results(
                 .map(|sample| sample.rg_matched_lines as f64)
                 .collect::<Vec<_>>(),
         ),
-        codgrep_matched_lines_mean: mean(
+        flashgrep_matched_lines_mean: mean(
             &samples
                 .iter()
-                .map(|sample| sample.codgrep_matched_lines as f64)
+                .map(|sample| sample.flashgrep_matched_lines as f64)
                 .collect::<Vec<_>>(),
         ),
         missing_lines_mean: mean(
@@ -611,16 +613,16 @@ fn aggregate_scenario_results(
                 .map(|sample| sample.settle_ms)
                 .collect::<Vec<_>>(),
         ),
-        codgrep_query_ms_mean: mean(
+        flashgrep_query_ms_mean: mean(
             &samples
                 .iter()
-                .map(|sample| sample.codgrep_query_ms)
+                .map(|sample| sample.flashgrep_query_ms)
                 .collect::<Vec<_>>(),
         ),
-        codgrep_query_ms_stddev: stddev(
+        flashgrep_query_ms_stddev: stddev(
             &samples
                 .iter()
-                .map(|sample| sample.codgrep_query_ms)
+                .map(|sample| sample.flashgrep_query_ms)
                 .collect::<Vec<_>>(),
         ),
         rg_median_ms_mean: mean(
@@ -644,7 +646,11 @@ fn aggregate_scenario_results(
     }
 }
 
-fn open_codgrep_repo(cg_path: &Path, repo_path: &Path, storage_root: &Path) -> Result<DaemonRepo> {
+fn open_flashgrep_repo(
+    cg_path: &Path,
+    repo_path: &Path,
+    storage_root: &Path,
+) -> Result<DaemonRepo> {
     let client = ManagedDaemonClient::new()
         .with_daemon_program(OsString::from(cg_path))
         .with_start_timeout(std::time::Duration::from_secs(120));
@@ -660,7 +666,7 @@ fn open_codgrep_repo(cg_path: &Path, repo_path: &Path, storage_root: &Path) -> R
     })
 }
 
-fn run_codgrep_query_with_consistency(
+fn run_flashgrep_query_with_consistency(
     repo: &DaemonRepo,
     query: &str,
     consistency: ConsistencyMode,
@@ -678,14 +684,14 @@ fn run_codgrep_query_with_consistency(
     let elapsed_ms = elapsed_ms(started.elapsed().as_secs_f64());
 
     match outcome {
-        codgrep::daemon::protocol::Response::SearchCompleted {
+        flashgrep::daemon::protocol::Response::SearchCompleted {
             backend, results, ..
         } => Ok(SearchMeasurement {
             matched_lines: results.matched_lines,
             backend: format!("{backend:?}"),
             elapsed_ms,
         }),
-        other => Err(codgrep::AppError::Protocol(format!(
+        other => Err(flashgrep::AppError::Protocol(format!(
             "unexpected search response: {other:?}"
         ))),
     }
@@ -706,18 +712,21 @@ fn wait_for_workspace_strict_ready(
             observed_dirty = true;
         }
         if observed_dirty {
-            match run_codgrep_query_with_consistency(repo, query, ConsistencyMode::WorkspaceStrict)
-            {
+            match run_flashgrep_query_with_consistency(
+                repo,
+                query,
+                ConsistencyMode::WorkspaceStrict,
+            ) {
                 Ok(measurement) => {
                     return Ok((elapsed_ms(started.elapsed().as_secs_f64()), measurement));
                 }
-                Err(codgrep::AppError::Protocol(message))
+                Err(flashgrep::AppError::Protocol(message))
                     if message.contains("strict search requires") => {}
                 Err(error) => return Err(error),
             }
         }
         if started.elapsed() >= timeout {
-            return Err(codgrep::AppError::Protocol(format!(
+            return Err(flashgrep::AppError::Protocol(format!(
                 "timed out waiting for strict workspace readiness after observing {expected_dirty_paths} dirty paths"
             )));
         }
@@ -727,8 +736,8 @@ fn wait_for_workspace_strict_ready(
 
 fn shutdown_daemon(repo: &DaemonRepo) -> Result<()> {
     match repo.client.send(Request::Shutdown)? {
-        codgrep::daemon::protocol::Response::ShutdownAck => Ok(()),
-        other => Err(codgrep::AppError::Protocol(format!(
+        flashgrep::daemon::protocol::Response::ShutdownAck => Ok(()),
+        other => Err(flashgrep::AppError::Protocol(format!(
             "unexpected shutdown response: {other:?}"
         ))),
     }
@@ -744,7 +753,7 @@ fn wait_for_dirty_paths(repo: &DaemonRepo, expected: usize, timeout: Duration) -
             },
         })?;
         match response {
-            codgrep::daemon::protocol::Response::RepoStatus { status } => {
+            flashgrep::daemon::protocol::Response::RepoStatus { status } => {
                 let dirty_paths = status.dirty_files.modified
                     + status.dirty_files.deleted
                     + status.dirty_files.new;
@@ -752,13 +761,13 @@ fn wait_for_dirty_paths(repo: &DaemonRepo, expected: usize, timeout: Duration) -
                     return Ok(elapsed_ms(started.elapsed().as_secs_f64()));
                 }
                 if started.elapsed() >= timeout {
-                    return Err(codgrep::AppError::Protocol(format!(
+                    return Err(flashgrep::AppError::Protocol(format!(
                         "timed out waiting for dirty path count {expected}; last observed {dirty_paths}"
                     )));
                 }
             }
             other => {
-                return Err(codgrep::AppError::Protocol(format!(
+                return Err(flashgrep::AppError::Protocol(format!(
                     "unexpected repo status response: {other:?}"
                 )))
             }
@@ -774,10 +783,10 @@ fn repo_dirty_paths(repo: &DaemonRepo) -> Result<usize> {
         },
     })?;
     match response {
-        codgrep::daemon::protocol::Response::RepoStatus { status } => {
+        flashgrep::daemon::protocol::Response::RepoStatus { status } => {
             Ok(status.dirty_files.modified + status.dirty_files.deleted + status.dirty_files.new)
         }
-        other => Err(codgrep::AppError::Protocol(format!(
+        other => Err(flashgrep::AppError::Protocol(format!(
             "unexpected repo status response: {other:?}"
         ))),
     }
@@ -800,7 +809,7 @@ fn run_rg_query(repo_path: &Path, query: &str) -> Result<(usize, f64)> {
     let elapsed_ms = elapsed_ms(started.elapsed().as_secs_f64());
 
     if !output.status.success() && output.status.code() != Some(1) {
-        return Err(codgrep::AppError::InvalidIndex(format!(
+        return Err(flashgrep::AppError::InvalidIndex(format!(
             "rg failed with status {}",
             output.status
         )));
@@ -836,13 +845,13 @@ fn parse_rg_count_output(stdout: &[u8]) -> Result<usize> {
     for line in text.lines() {
         if let Some((_, count)) = line.rsplit_once(':') {
             total += count.trim().parse::<usize>().map_err(|error| {
-                codgrep::AppError::InvalidIndex(format!(
+                flashgrep::AppError::InvalidIndex(format!(
                     "failed to parse rg count line {line:?}: {error}"
                 ))
             })?;
         } else if !line.trim().is_empty() {
             total += line.trim().parse::<usize>().map_err(|error| {
-                codgrep::AppError::InvalidIndex(format!(
+                flashgrep::AppError::InvalidIndex(format!(
                     "failed to parse single-count rg output {line:?}: {error}"
                 ))
             })?;
@@ -858,7 +867,7 @@ fn git_grep_files(repo_path: &Path, pattern: &str) -> Result<Vec<PathBuf>> {
         .args(["grep", "-l", "-z", pattern])
         .output()?;
     if !output.status.success() {
-        return Err(codgrep::AppError::InvalidIndex(format!(
+        return Err(flashgrep::AppError::InvalidIndex(format!(
             "git grep failed with status {}",
             output.status
         )));
@@ -946,7 +955,7 @@ fn select_scenario_candidates(
         return Ok(Vec::new());
     }
     if candidates.len() < needed {
-        return Err(codgrep::AppError::InvalidIndex(format!(
+        return Err(flashgrep::AppError::InvalidIndex(format!(
             "expected at least {needed} candidate files, found {}",
             candidates.len()
         )));
@@ -971,7 +980,7 @@ fn run_git<const N: usize>(repo_path: &Path, args: [&str; N]) -> Result<()> {
         .args(args)
         .output()?;
     if !output.status.success() {
-        return Err(codgrep::AppError::InvalidIndex(format!(
+        return Err(flashgrep::AppError::InvalidIndex(format!(
             "git {:?} failed in {}: {}",
             args,
             repo_path.display(),
@@ -1006,8 +1015,8 @@ fn restore_baseline_files(files: &[BaselineFile]) -> Result<()> {
     Ok(())
 }
 
-fn codgrep_executable() -> Result<PathBuf> {
-    if let Ok(path) = env::var("CARGO_BIN_EXE_cg") {
+fn flashgrep_executable() -> Result<PathBuf> {
+    if let Ok(path) = env::var("CARGO_BIN_EXE_flashgrep") {
         let path = PathBuf::from(path);
         if path.exists() {
             return Ok(path);
@@ -1018,21 +1027,21 @@ fn codgrep_executable() -> Result<PathBuf> {
     let candidates = [
         current
             .parent()
-            .map(|parent| parent.join("cg"))
-            .unwrap_or_else(|| PathBuf::from("target/release/cg")),
+            .map(|parent| parent.join("flashgrep"))
+            .unwrap_or_else(|| PathBuf::from("target/release/flashgrep")),
         current
             .parent()
             .and_then(Path::parent)
-            .map(|parent| parent.join("cg"))
-            .unwrap_or_else(|| PathBuf::from("target/release/cg")),
-        PathBuf::from("/Users/user/workspace/codgrep/target/release/cg"),
+            .map(|parent| parent.join("flashgrep"))
+            .unwrap_or_else(|| PathBuf::from("target/release/flashgrep")),
+        PathBuf::from("/Users/user/workspace/flashgrep/target/release/flashgrep"),
     ];
     for candidate in candidates {
         if candidate.exists() {
             return Ok(candidate);
         }
     }
-    Ok(PathBuf::from("cg"))
+    Ok(PathBuf::from("flashgrep"))
 }
 
 fn median_ms(mut values: Vec<f64>) -> f64 {
@@ -1073,7 +1082,7 @@ fn elapsed_ms(seconds: f64) -> f64 {
 }
 
 fn bench_iters() -> usize {
-    env::var("CODGREP_BENCH_ITERS")
+    env::var("FLASHGREP_BENCH_ITERS")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1081,7 +1090,7 @@ fn bench_iters() -> usize {
 }
 
 fn scenario_samples() -> usize {
-    env::var("CODGREP_BENCH_SAMPLES")
+    env::var("FLASHGREP_BENCH_SAMPLES")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
         .filter(|value| *value > 0)
@@ -1089,7 +1098,7 @@ fn scenario_samples() -> usize {
 }
 
 fn bench_mode() -> BenchMode {
-    match env::var("CODGREP_BENCH_MODE")
+    match env::var("FLASHGREP_BENCH_MODE")
         .ok()
         .as_deref()
         .map(str::trim)
@@ -1111,7 +1120,7 @@ fn configured_path(name: &str) -> Result<Option<PathBuf>> {
 }
 
 fn scenario_sizes() -> Vec<usize> {
-    let Some(value) = env::var("CODGREP_BENCH_SIZES").ok() else {
+    let Some(value) = env::var("FLASHGREP_BENCH_SIZES").ok() else {
         return DEFAULT_SIZES.to_vec();
     };
 
@@ -1137,7 +1146,7 @@ fn print_results(
     println!("RESULTS");
     println!("base_snapshot_build_ms={base_snapshot_build_ms:.2}");
     println!(
-        "sample,scenario,edited_files,rg_matched_lines,codgrep_matched_lines,missing_lines,recall_ratio,settle_backend,detection_ms,settle_ms,codgrep_query_ms,rg_median_ms,status_dirty_paths"
+        "sample,scenario,edited_files,rg_matched_lines,flashgrep_matched_lines,missing_lines,recall_ratio,settle_backend,detection_ms,settle_ms,flashgrep_query_ms,rg_median_ms,status_dirty_paths"
     );
     for result in sample_results {
         println!(
@@ -1146,20 +1155,20 @@ fn print_results(
             result.scenario,
             result.edited_files,
             result.rg_matched_lines,
-            result.codgrep_matched_lines,
+            result.flashgrep_matched_lines,
             result.missing_lines,
             result.recall_ratio,
             result.settle_backend,
             result.detection_ms,
             result.settle_ms,
-            result.codgrep_query_ms,
+            result.flashgrep_query_ms,
             result.rg_median_ms,
             result.status_dirty_paths
         );
     }
     println!("SUMMARY");
     println!(
-        "scenario,edited_files,samples,rg_matched_lines_mean,codgrep_matched_lines_mean,missing_lines_mean,recall_ratio_mean,settle_backend,detection_ms_mean,detection_ms_stddev,settle_ms_mean,settle_ms_stddev,codgrep_query_ms_mean,codgrep_query_ms_stddev,rg_median_ms_mean,rg_median_ms_stddev,status_dirty_paths_mean"
+        "scenario,edited_files,samples,rg_matched_lines_mean,flashgrep_matched_lines_mean,missing_lines_mean,recall_ratio_mean,settle_backend,detection_ms_mean,detection_ms_stddev,settle_ms_mean,settle_ms_stddev,flashgrep_query_ms_mean,flashgrep_query_ms_stddev,rg_median_ms_mean,rg_median_ms_stddev,status_dirty_paths_mean"
     );
     for result in results {
         println!(
@@ -1168,7 +1177,7 @@ fn print_results(
             result.edited_files,
             result.samples,
             result.rg_matched_lines_mean,
-            result.codgrep_matched_lines_mean,
+            result.flashgrep_matched_lines_mean,
             result.missing_lines_mean,
             result.recall_ratio_mean,
             result.settle_backend,
@@ -1176,8 +1185,8 @@ fn print_results(
             result.detection_ms_stddev,
             result.settle_ms_mean,
             result.settle_ms_stddev,
-            result.codgrep_query_ms_mean,
-            result.codgrep_query_ms_stddev,
+            result.flashgrep_query_ms_mean,
+            result.flashgrep_query_ms_stddev,
             result.rg_median_ms_mean,
             result.rg_median_ms_stddev,
             result.status_dirty_paths_mean

@@ -67,7 +67,7 @@ impl Default for EngineConfig {
     fn default() -> Self {
         Self {
             shard_id: ShardId("default".into()),
-            index_root: PathBuf::from(".codgrep-index-engine"),
+            index_root: PathBuf::from(".flashgrep-index-engine"),
             refresh_interval: Duration::from_millis(500),
             merge_policy: MergePolicyConfig::default(),
             tokenizer: PostingTokenizerConfig::default(),

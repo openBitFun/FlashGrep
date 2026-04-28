@@ -5,7 +5,7 @@ use std::{
     process::Command,
 };
 
-use codgrep::{QueryConfig, SearchEngine, SearchMode, SearchPolicy};
+use flashgrep::{QueryConfig, SearchEngine, SearchMode, SearchPolicy};
 
 const RG_CHUNK_SIZE: usize = 512;
 
@@ -34,13 +34,13 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
     }
 
     let repo = repo.ok_or("--repo is required")?;
-    let index = index.unwrap_or_else(|| repo.join(".codgrep-index-engine"));
+    let index = index.unwrap_or_else(|| repo.join(".flashgrep-index-engine"));
     let pattern = pattern.ok_or("--pattern is required")?;
 
-    let engine = SearchEngine::new(codgrep::BuildConfig {
+    let engine = SearchEngine::new(flashgrep::BuildConfig {
         repo_path: repo.clone(),
         storage_root: index,
-        ..codgrep::BuildConfig::default()
+        ..flashgrep::BuildConfig::default()
     });
     let config = QueryConfig {
         regex_pattern: pattern.clone(),
@@ -50,7 +50,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         ..QueryConfig::default()
     };
 
-    let codgrep_counts = engine
+    let flashgrep_counts = engine
         .count_matches_by_file_including_zero(&config, None)?
         .into_iter()
         .map(|count| (count.path, count.matched_lines))
@@ -62,28 +62,28 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
         .matched_lines;
     let rg_counts = run_rg_count_by_file(&repo, &pattern, case_insensitive, Some(&visible_paths))?;
 
-    let paths = codgrep_counts
+    let paths = flashgrep_counts
         .keys()
         .cloned()
         .chain(rg_counts.keys().cloned())
         .collect::<BTreeSet<_>>();
 
-    let codgrep_total = total;
+    let flashgrep_total = total;
     let rg_total: usize = rg_counts.values().sum();
     println!("visible_files={}", visible_paths.len());
-    println!("codgrep_total={codgrep_total}");
+    println!("flashgrep_total={flashgrep_total}");
     println!("rg_total={rg_total}");
 
     let mut diff_count = 0usize;
     for path in paths {
-        let codgrep = codgrep_counts.get(&path).copied().unwrap_or_default();
+        let flashgrep = flashgrep_counts.get(&path).copied().unwrap_or_default();
         let rg = rg_counts.get(&path).copied().unwrap_or_default();
-        if codgrep == rg {
+        if flashgrep == rg {
             continue;
         }
         diff_count += 1;
         if diff_count <= limit {
-            println!("{path}\tcodgrep={codgrep}\trg={rg}");
+            println!("{path}\tflashgrep={flashgrep}\trg={rg}");
         }
     }
     println!("diff_files={diff_count}");

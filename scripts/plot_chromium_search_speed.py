@@ -10,7 +10,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 
 
-CODGREP_COLOR = "#2F7D6B"
+FLASHGREP_COLOR = "#2F7D6B"
 RG_COLOR = "#C46A3F"
 GRID_COLOR = "#E5E9ED"
 TEXT_COLOR = "#333940"
@@ -103,13 +103,19 @@ def draw_panel(
     pattern_labels: dict[str, str],
 ) -> None:
     labels = [prettify_pattern(pattern_labels.get(benchmark, benchmark)) for benchmark in benchmarks]
-    codgrep = [values[b]["codgrep"] for b in benchmarks]
+    flashgrep = [values[b]["flashgrep"] for b in benchmarks]
     rg = [values[b]["rg"] for b in benchmarks]
 
     y = np.arange(len(benchmarks))
     height = 0.34
 
-    codgrep_bars = ax.barh(y - height / 2, codgrep, height, color=CODGREP_COLOR, label="codgrep")
+    flashgrep_bars = ax.barh(
+        y - height / 2,
+        flashgrep,
+        height,
+        color=FLASHGREP_COLOR,
+        label="flashgrep",
+    )
     rg_bars = ax.barh(y + height / 2, rg, height, color=RG_COLOR, label="ripgrep")
 
     ax.set_yticks(y, labels, fontsize=12, color=TEXT_COLOR)
@@ -126,13 +132,13 @@ def draw_panel(
     ax.spines["bottom"].set_linewidth(1.6)
     ax.invert_yaxis()
 
-    min_value = min(min(codgrep), min(rg))
-    max_value = max(max(codgrep), max(rg))
+    min_value = min(min(flashgrep), min(rg))
+    max_value = max(max(flashgrep), max(rg))
     ax.set_xlim(min_value / 1.7, max_value * 2.0)
     ticks = log_ticks(min_value, max_value)
     ax.set_xticks(ticks, labels=[format_secs(tick) for tick in ticks])
 
-    for bars in (codgrep_bars, rg_bars):
+    for bars in (flashgrep_bars, rg_bars):
         for bar in bars:
             value = bar.get_width()
             ax.text(
@@ -167,7 +173,7 @@ def plot_single(
 
     fig, ax = plt.subplots(figsize=(18, 10.6), dpi=100)
     fig.subplots_adjust(left=0.19, right=0.97, top=0.84, bottom=0.10)
-    fig.text(0.055, 0.965, "codgrep and ripgrep on chromium-src", fontsize=33, color=TEXT_COLOR)
+    fig.text(0.055, 0.965, "flashgrep and ripgrep on chromium-src", fontsize=33, color=TEXT_COLOR)
     fig.text(0.055, 0.915, subtitle, fontsize=16, color=TICK_COLOR)
 
     draw_panel(ax, panel_title, values, benchmarks, pattern_labels)
@@ -219,7 +225,7 @@ def build_charts(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Plot chromium codgrep vs ripgrep benchmark charts from benchmark CSV files."
+        description="Plot chromium flashgrep vs ripgrep benchmark charts from benchmark CSV files."
     )
     parser.add_argument("--first-csv", required=True, type=Path)
     parser.add_argument("--warm-csv", required=True, type=Path)

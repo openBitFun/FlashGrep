@@ -1,5 +1,5 @@
 fn main() {
-    match codgrep::run_cli() {
+    match flashgrep::run_cli() {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(error) => {

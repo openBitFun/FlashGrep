@@ -25,7 +25,7 @@ impl RepoRuntime {
                     Ok(index) => index,
                     Err(error) => {
                         eprintln!(
-                        "codgrep: failed to open base snapshot index engine for {} during bootstrap: {error}",
+                        "flashgrep: failed to open base snapshot index engine for {} during bootstrap: {error}",
                         self.build_config.repo_path.display()
                     );
                         None
@@ -55,7 +55,7 @@ impl RepoRuntime {
             };
             if let Err(error) = prewarm_result {
                 eprintln!(
-                    "codgrep: failed to prewarm base snapshot search state for {} during bootstrap: {error}",
+                    "flashgrep: failed to prewarm base snapshot search state for {} during bootstrap: {error}",
                     self.build_config.repo_path.display()
                 );
             }
@@ -64,7 +64,7 @@ impl RepoRuntime {
         if base_snapshot_ready {
             if let Err(error) = self.preload_base_snapshot_catalog() {
                 eprintln!(
-                    "codgrep: failed to preload base snapshot catalog for {} during bootstrap: {error}",
+                    "flashgrep: failed to preload base snapshot catalog for {} during bootstrap: {error}",
                     self.build_config.repo_path.display()
                 );
                 self.clear_base_snapshot_catalog();

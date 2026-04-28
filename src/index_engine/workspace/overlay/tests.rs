@@ -28,7 +28,7 @@ use crate::{
 fn build_config(repo: &Path) -> BuildConfig {
     BuildConfig {
         repo_path: repo.to_path_buf(),
-        storage_root: repo.join(".codgrep-index-engine"),
+        storage_root: repo.join(".flashgrep-index-engine"),
         tokenizer: TokenizerMode::SparseNgram,
         corpus_mode: CorpusMode::NoIgnore,
         include_hidden: true,

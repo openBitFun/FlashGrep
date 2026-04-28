@@ -2,7 +2,7 @@
 
 ## Goal
 
-`codgrep` 的增量索引运行时有三块状态，但查询真相源只有两层只读 snapshot：
+`flashgrep` 的增量索引运行时有三块状态，但查询真相源只有两层只读 snapshot：
 
 1. `base snapshot`
    只读、稳定、锚定某个 Git snapshot 或 repo fingerprint。
@@ -237,7 +237,7 @@ Clean@Base
 ## Directory Layout
 
 ```text
-.codgrep-index-engine/
+.flashgrep-index-engine/
   base-snapshot/
     <snapshot-key>/
       ...

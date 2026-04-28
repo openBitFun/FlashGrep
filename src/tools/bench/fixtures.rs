@@ -27,7 +27,7 @@ pub(super) fn prepare_dirty_worktree_fixture(
     required_patterns: &[DirtyPattern],
 ) -> Result<DirtyWorktreeFixture> {
     let fixture_root = suite_dir
-        .join(".codgrep-bench-worktrees")
+        .join(".flashgrep-bench-worktrees")
         .join("worktrees")
         .join(fixture_dir_name(
             fixture_label,

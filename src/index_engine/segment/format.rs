@@ -350,7 +350,7 @@ fn is_path_offsets_rebuildable_error(error: &AppError) -> bool {
 
 impl FileSegmentDocTable {
     pub fn open(dir: &Path) -> Result<Self> {
-        let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
+        let profile_open = env::var_os("FLASHGREP_PROFILE_OPEN_SEGMENT").is_some();
 
         let path_map_started = Instant::now();
         let path_map_file = File::open(dir.join(PATH_MAP_FILE))?;

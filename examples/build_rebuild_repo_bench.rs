@@ -4,7 +4,7 @@ use std::{
     time::Instant,
 };
 
-use codgrep::{BuildConfig, CorpusMode, Result, SearchEngine, TokenizerMode};
+use flashgrep::{BuildConfig, CorpusMode, Result, SearchEngine, TokenizerMode};
 
 const MAX_FILE_SIZE: u64 = 512 * 1024 * 1024;
 const DEFAULT_REPOS: [&str; 4] = [
@@ -21,7 +21,7 @@ fn main() -> Result<()> {
         DEFAULT_REPOS.iter().map(PathBuf::from).collect::<Vec<_>>()
     };
 
-    let bench_root = env::var("CODGREP_BUILD_BENCH_ROOT")
+    let bench_root = env::var("FLASHGREP_BUILD_BENCH_ROOT")
         .map(PathBuf::from)
         .unwrap_or_else(|_| PathBuf::from("tmp/build-rebuild-bench"));
     fs::create_dir_all(&bench_root)?;

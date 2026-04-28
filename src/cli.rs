@@ -23,7 +23,7 @@ use crate::{
 };
 
 #[derive(Debug, Parser)]
-#[command(name = "cg")]
+#[command(name = "flashgrep")]
 #[command(about = "Repository search server and daemon tooling", version)]
 #[command(subcommand_required = true, arg_required_else_help = true)]
 struct Cli {
@@ -587,7 +587,7 @@ fn open_index_engine(args: &EngineRepoArgs) -> Result<IndexEngine> {
     let index_root = args
         .index_root
         .clone()
-        .unwrap_or_else(|| repo_root.join(".codgrep-index-engine"));
+        .unwrap_or_else(|| repo_root.join(".flashgrep-index-engine"));
     IndexEngine::open(EngineConfig {
         shard_id: ShardId(repo_root.to_string_lossy().into_owned()),
         index_root,
@@ -1000,7 +1000,7 @@ fn combine_daemon_patterns(patterns: &[String], fixed_strings: bool) -> String {
 fn run_bench(config: BenchConfig) -> Result<bool> {
     if cfg!(debug_assertions) {
         eprintln!(
-            "warning: cg bench is running from a debug build; performance results will be pessimistic. use `cargo run --release -- bench ...` or `target/release/cg bench ...` for representative numbers."
+            "warning: flashgrep bench is running from a debug build; performance results will be pessimistic. use `cargo run --release -- bench ...` or `target/release/flashgrep bench ...` for representative numbers."
         );
     }
     let report = bench::run(&config)?;
@@ -1017,9 +1017,9 @@ mod tests {
         let status = crate::daemon::protocol::RepoStatus {
             repo_id: "/tmp/repo".into(),
             repo_path: "/tmp/repo".into(),
-            storage_root: "/tmp/repo/.codgrep-index-engine".into(),
-            base_snapshot_root: "/tmp/repo/.codgrep-index-engine/base-snapshot".into(),
-            workspace_overlay_root: "/tmp/repo/.codgrep-index-engine/workspace-overlay".into(),
+            storage_root: "/tmp/repo/.flashgrep-index-engine".into(),
+            base_snapshot_root: "/tmp/repo/.flashgrep-index-engine/base-snapshot".into(),
+            workspace_overlay_root: "/tmp/repo/.flashgrep-index-engine/workspace-overlay".into(),
             phase: crate::daemon::protocol::RepoPhase::ReadyDirty,
             snapshot_key: Some("snapshot-key".into()),
             last_probe_unix_secs: Some(1),

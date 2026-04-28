@@ -4,7 +4,7 @@ use std::{
     process::Command,
 };
 
-use codgrep::{BuildConfig, CorpusMode, QueryConfig, SearchEngine, SearchMode, TokenizerMode};
+use flashgrep::{BuildConfig, CorpusMode, QueryConfig, SearchEngine, SearchMode, TokenizerMode};
 use tempfile::{tempdir, TempDir};
 
 pub struct TestRepo {
@@ -19,7 +19,7 @@ impl TestRepo {
         let repo_dir = temp.path().join("repo");
         fs::create_dir_all(&repo_dir).expect("test should succeed");
         let repo = fs::canonicalize(&repo_dir).expect("test should succeed");
-        let index = repo.join(".codgrep-index-engine");
+        let index = repo.join(".flashgrep-index-engine");
         Self {
             _temp: temp,
             repo,

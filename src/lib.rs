@@ -28,7 +28,7 @@ pub use error::{AppError, Result};
 )]
 pub use base_snapshot_build::{BaseSnapshotBuildMode, BaseSnapshotBuildOptions};
 #[deprecated(
-    note = "Use the daemon process API (`codgrep::daemon::protocol`); library exports are not the stable external interface."
+    note = "Use the daemon process API (`flashgrep::daemon::protocol`); library exports are not the stable external interface."
 )]
 pub use config::{BuildConfig, CorpusMode, QueryConfig, TokenizerMode};
 #[deprecated(

@@ -434,7 +434,7 @@ mod tests {
             .expect("write should succeed");
         let build_config = BuildConfig {
             repo_path: repo_path.clone(),
-            storage_root: repo_path.join(".codgrep-index-engine"),
+            storage_root: repo_path.join(".flashgrep-index-engine"),
             tokenizer: TokenizerMode::Trigram,
             corpus_mode: CorpusMode::RespectIgnore,
             include_hidden: false,

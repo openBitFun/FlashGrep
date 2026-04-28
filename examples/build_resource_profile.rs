@@ -11,7 +11,7 @@ use std::{
     time::{Duration, Instant},
 };
 
-use codgrep::{
+use flashgrep::{
     experimental::{IndexProgress, IndexProgressPhase},
     BaseSnapshotBuildOptions, BuildConfig, CorpusMode, Result, SearchEngine, TokenizerMode,
 };
@@ -42,19 +42,19 @@ struct SampleRow {
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
     let repo_path = args.next().map(PathBuf::from).ok_or_else(|| {
-        codgrep::AppError::Protocol(
+        flashgrep::AppError::Protocol(
             "usage: cargo run --release --example build_resource_profile -- <repo_path> <storage_root> <csv_output>"
                 .into(),
         )
     })?;
     let storage_root = args.next().map(PathBuf::from).ok_or_else(|| {
-        codgrep::AppError::Protocol(
+        flashgrep::AppError::Protocol(
             "usage: cargo run --release --example build_resource_profile -- <repo_path> <storage_root> <csv_output>"
                 .into(),
         )
     })?;
     let csv_output = args.next().map(PathBuf::from).ok_or_else(|| {
-        codgrep::AppError::Protocol(
+        flashgrep::AppError::Protocol(
             "usage: cargo run --release --example build_resource_profile -- <repo_path> <storage_root> <csv_output>"
                 .into(),
         )
@@ -68,9 +68,11 @@ fn main() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
 
-    let sample_interval =
-        Duration::from_millis(read_env_u64("CODGREP_PROFILE_SAMPLE_MS", DEFAULT_SAMPLE_MS));
-    let max_file_size = read_env_u64("CODGREP_PROFILE_MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE);
+    let sample_interval = Duration::from_millis(read_env_u64(
+        "FLASHGREP_PROFILE_SAMPLE_MS",
+        DEFAULT_SAMPLE_MS,
+    ));
+    let max_file_size = read_env_u64("FLASHGREP_PROFILE_MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE);
 
     let build_config = BuildConfig {
         repo_path: repo_path.clone(),
@@ -144,7 +146,7 @@ fn main() -> Result<()> {
 
     let rows = sampler
         .join()
-        .map_err(|_| codgrep::AppError::Protocol("resource sampler thread panicked".into()))??;
+        .map_err(|_| flashgrep::AppError::Protocol("resource sampler thread panicked".into()))??;
     write_csv(&csv_output, &rows)?;
 
     let peak_cpu_pct = rows.iter().map(|row| row.cpu_pct).fold(0.0_f64, f64::max);
@@ -177,7 +179,7 @@ fn sample_once(
     let index_size_mb = dir_size_bytes(storage_root)? as f64 / (1024.0 * 1024.0);
     let progress = shared_progress
         .lock()
-        .map_err(|_| codgrep::AppError::Protocol("progress mutex poisoned".into()))?
+        .map_err(|_| flashgrep::AppError::Protocol("progress mutex poisoned".into()))?
         .clone();
 
     Ok(SampleRow {
@@ -197,7 +199,7 @@ fn current_process_stats(pid: u32) -> Result<(f64, f64)> {
         .args(["-o", "%cpu=", "-o", "rss=", "-p", &pid.to_string()])
         .output()?;
     if !output.status.success() {
-        return Err(codgrep::AppError::Protocol(format!(
+        return Err(flashgrep::AppError::Protocol(format!(
             "ps failed for pid {pid}: {}",
             String::from_utf8_lossy(&output.stderr).trim()
         )));
@@ -206,21 +208,23 @@ fn current_process_stats(pid: u32) -> Result<(f64, f64)> {
     let line = text
         .lines()
         .find(|line| !line.trim().is_empty())
-        .ok_or_else(|| codgrep::AppError::Protocol(format!("ps returned no row for pid {pid}")))?;
+        .ok_or_else(|| {
+            flashgrep::AppError::Protocol(format!("ps returned no row for pid {pid}"))
+        })?;
     let mut columns = line.split_whitespace();
     let cpu_pct = columns
         .next()
-        .ok_or_else(|| codgrep::AppError::Protocol("missing cpu column from ps".into()))?
+        .ok_or_else(|| flashgrep::AppError::Protocol("missing cpu column from ps".into()))?
         .parse::<f64>()
         .map_err(|error| {
-            codgrep::AppError::Protocol(format!("invalid cpu value from ps: {error}"))
+            flashgrep::AppError::Protocol(format!("invalid cpu value from ps: {error}"))
         })?;
     let rss_kb = columns
         .next()
-        .ok_or_else(|| codgrep::AppError::Protocol("missing rss column from ps".into()))?
+        .ok_or_else(|| flashgrep::AppError::Protocol("missing rss column from ps".into()))?
         .parse::<f64>()
         .map_err(|error| {
-            codgrep::AppError::Protocol(format!("invalid rss value from ps: {error}"))
+            flashgrep::AppError::Protocol(format!("invalid rss value from ps: {error}"))
         })?;
     Ok((cpu_pct, rss_kb / 1024.0))
 }

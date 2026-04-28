@@ -49,7 +49,7 @@ pub fn serve(options: ServerOptions) -> Result<()> {
     let state_guard = StateFileGuard {
         path: options.state_file.clone(),
     };
-    println!("codgrep daemon listening on {local_addr}");
+    println!("flashgrep daemon listening on {local_addr}");
 
     let running = Arc::new(AtomicBool::new(true));
     let service = DaemonService::new();
