@@ -38,7 +38,7 @@ use self::{
     custom::run_custom,
     fixtures::prepare_dirty_worktree_fixture,
     report::{print_report as print_report_impl, RawWriter},
-    standard::{run_codgrep_benchmark, run_rg_benchmark, run_worktree_benchmark},
+    standard::{run_flashgrep_benchmark, run_rg_benchmark, run_worktree_benchmark},
 };
 
 #[derive(Debug, Clone)]
@@ -437,7 +437,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
     for corpus in corpora {
         ensure_corpus_exists(corpus, &config.suite_dir)?;
         let repo_path = corpus.repo_path(&config.suite_dir);
-        let storage_root = config.suite_dir.join(".codgrep-bench").join(format!(
+        let storage_root = config.suite_dir.join(".flashgrep-bench").join(format!(
             "{}-{}-{}",
             corpus.label(),
             config.corpus_mode.as_str(),
@@ -506,7 +506,7 @@ pub(crate) fn run(config: &BenchConfig) -> Result<BenchReport> {
             ))
         })?;
         let cache_paths = cache_paths.get(&benchmark.corpus);
-        let mut runners = vec![run_codgrep_benchmark(
+        let mut runners = vec![run_flashgrep_benchmark(
             benchmark,
             storage_root,
             &config.suite_dir,
@@ -765,8 +765,8 @@ fn escape_ignore_pattern(path: &str) -> String {
     escaped
 }
 
-fn codgrep_executable() -> Result<PathBuf> {
-    if let Ok(path) = env::var("CARGO_BIN_EXE_cg") {
+fn flashgrep_executable() -> Result<PathBuf> {
+    if let Ok(path) = env::var("CARGO_BIN_EXE_flashgrep") {
         let candidate = PathBuf::from(path);
         if candidate.exists() {
             return Ok(candidate);
@@ -776,19 +776,20 @@ fn codgrep_executable() -> Result<PathBuf> {
     let current = env::current_exe()?;
     if current
         .file_stem()
-        .is_some_and(|stem| stem == std::ffi::OsStr::new("cg"))
+        .is_some_and(|stem| stem == std::ffi::OsStr::new("flashgrep"))
     {
         return Ok(current);
     }
 
     let candidates = [
-        current
-            .parent()
-            .map_or_else(|| PathBuf::from("cg"), |parent| parent.join("cg")),
-        current
-            .parent()
-            .and_then(Path::parent)
-            .map_or_else(|| PathBuf::from("cg"), |parent| parent.join("cg")),
+        current.parent().map_or_else(
+            || PathBuf::from("flashgrep"),
+            |parent| parent.join("flashgrep"),
+        ),
+        current.parent().and_then(Path::parent).map_or_else(
+            || PathBuf::from("flashgrep"),
+            |parent| parent.join("flashgrep"),
+        ),
     ];
     for candidate in candidates {
         if candidate.exists() {
@@ -796,7 +797,7 @@ fn codgrep_executable() -> Result<PathBuf> {
         }
     }
 
-    Ok(PathBuf::from("cg"))
+    Ok(PathBuf::from("flashgrep"))
 }
 
 pub(super) fn start_bench_daemon(
@@ -828,7 +829,7 @@ pub(super) fn start_bench_daemon(
         refresh: Default::default(),
     };
     let state_file = daemon_state_file_path(&ensure_params)?;
-    let daemon_program = codgrep_executable()?;
+    let daemon_program = flashgrep_executable()?;
     let mut child = spawn_bench_daemon_process(&daemon_program, &state_file)?;
     let (addr, repo_id) = wait_for_bench_daemon_ready(&mut child, &state_file, &ensure_params)?;
     Ok(BenchDaemon {
@@ -1180,6 +1181,3 @@ fn send_shutdown_request(addr: &str) -> Result<()> {
         Err(error) => Err(error.into()),
     }
 }
-
-#[cfg(test)]
-use self::fixtures::copy_tree;

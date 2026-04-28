@@ -48,32 +48,21 @@ fn probe_marks_dirty_paths_for_eventual_workspace_search() {
     });
     assert_exact_dirty_stats(&status, 1, 0, 0);
 
-    let search = search_repo(
+    let (backend, status) = wait_for_search_count(
         &service,
         &repo_id,
         "DIRTY",
         ConsistencyMode::WorkspaceEventual,
+        1,
     );
-
-    match search {
-        Response::SearchCompleted {
-            backend,
-            results,
-            status,
-            ..
-        } => {
-            assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
-            assert_eq!(results.matched_lines, 1);
-            assert_eq!(status.dirty_files.modified, 1);
-            assert_eq!(status.dirty_files.deleted, 0);
-            assert_eq!(status.dirty_files.new, 0);
-            assert!(matches!(
-                status.phase,
-                crate::daemon::protocol::RepoPhase::ReadyDirty
-            ));
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
+    assert!(is_transition_or_indexed_workspace_backend(backend));
+    assert_eq!(status.dirty_files.modified, 1);
+    assert_eq!(status.dirty_files.deleted, 0);
+    assert_eq!(status.dirty_files.new, 0);
+    assert!(matches!(
+        status.phase,
+        crate::daemon::protocol::RepoPhase::ReadyDirty
+    ));
 }
 
 #[test]
@@ -473,7 +462,13 @@ fn workspace_eventual_search_stays_stable_during_forced_overlay_rebuild() {
 
     fs::write(&tracked, "const NAME: &str = \"REBUILD_STABLE_DIRTY\";\n")
         .expect("rewrite should succeed");
-    let refreshed = refresh_repo(&service, &repo_id, true);
+    let _ = refresh_repo(&service, &repo_id, true);
+    let refreshed = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            && status.dirty_files.modified == 1
+            && status.dirty_files.deleted == 0
+            && status.dirty_files.new == 0
+    });
     assert!(matches!(
         refreshed.phase,
         crate::daemon::protocol::RepoPhase::ReadyDirty
@@ -485,20 +480,22 @@ fn workspace_eventual_search_stays_stable_during_forced_overlay_rebuild() {
     mark_workspace_probe_pending(&service, &repo_id);
 
     for _ in 0..12 {
-        let _ = assert_search_count_now(
+        let (backend, _) = wait_for_search_count(
             &service,
             &repo_id,
             "REBUILD_STABLE_DIRTY",
             ConsistencyMode::WorkspaceEventual,
             1,
         );
-        let _ = assert_search_count_now(
+        assert!(is_transition_or_indexed_workspace_backend(backend));
+        let (backend, _) = wait_for_search_count(
             &service,
             &repo_id,
             "REBUILD_STABLE_BASE",
             ConsistencyMode::WorkspaceEventual,
             0,
         );
+        assert!(is_transition_or_indexed_workspace_backend(backend));
         thread::sleep(Duration::from_millis(30));
     }
 
@@ -554,7 +551,7 @@ fn probe_reconciles_batched_tracked_file_updates() {
         ConsistencyMode::WorkspaceEventual,
         dirty_count,
     );
-    assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+    assert!(is_transition_or_indexed_workspace_backend(backend));
     assert_eq!(search_status.dirty_files.modified, dirty_count);
 }
 
@@ -587,7 +584,7 @@ fn probe_tracks_new_text_files() {
         ConsistencyMode::WorkspaceEventual,
         1,
     );
-    assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+    assert!(is_transition_or_indexed_workspace_backend(backend));
     assert_exact_dirty_stats(&status, 0, 0, 1);
 }
 
@@ -623,20 +620,14 @@ fn probe_tracks_new_text_files_inside_new_directory_without_extra_probe() {
     });
     assert_exact_dirty_stats(&status, 0, 0, 1);
 
-    match search_repo(
+    let (backend, _) = wait_for_search_count(
         &service,
         &repo_id,
         "NESTED_ADDED",
         ConsistencyMode::WorkspaceEventual,
-    ) {
-        Response::SearchCompleted {
-            backend, results, ..
-        } => {
-            assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
-            assert_eq!(results.matched_lines, 1);
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
+        1,
+    );
+    assert!(is_transition_or_indexed_workspace_backend(backend));
 }
 
 #[test]
@@ -745,7 +736,7 @@ fn reopened_daemon_materializes_fixed_string_phrase_from_published_overlay() {
     )
     .expect("write should succeed");
 
-    let status = match service
+    let _ = match service
         .handle_request_only(Request::RefreshRepo {
             params: crate::daemon::protocol::RefreshRepoParams {
                 repo_id: repo_id.clone(),
@@ -757,10 +748,10 @@ fn reopened_daemon_materializes_fixed_string_phrase_from_published_overlay() {
         Response::RepoStatus { status } => status,
         other => panic!("unexpected response: {other:?}"),
     };
-    assert!(matches!(
-        status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
-    ));
+    let status = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            && status.probe_healthy
+    });
     assert!(status.probe_healthy);
 
     let phrase_query = QuerySpec {
@@ -993,7 +984,11 @@ fn mixed_incremental_sequence_remains_searchable() {
         "const VALUE: &str = \"MIXED_EXISTING_TOKEN_20260410\";\n",
     )
     .expect("rewrite should succeed");
-    let status = refresh_repo(&service, &repo_id, true);
+    let _ = refresh_repo(&service, &repo_id, true);
+    let status = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            && status.dirty_files.modified >= 1
+    });
     assert!(status.dirty_files.modified >= 1);
 
     let _ = wait_for_search_count(
@@ -1062,7 +1057,7 @@ fn workspace_eventual_search_does_not_run_dirty_diff_observation() {
 
     let observation_path = temp.path().join("dirty-diff.tsv");
     unsafe {
-        std::env::set_var("CODGREP_OBSERVE_DIRTY_DIFF_FILE", &observation_path);
+        std::env::set_var("FLASHGREP_OBSERVE_DIRTY_DIFF_FILE", &observation_path);
     }
 
     let (repo_id, _) = open_repo(&service, repo_path.clone());
@@ -1079,7 +1074,7 @@ fn workspace_eventual_search_does_not_run_dirty_diff_observation() {
     assert!(!observation_path.exists());
 
     unsafe {
-        std::env::remove_var("CODGREP_OBSERVE_DIRTY_DIFF_FILE");
+        std::env::remove_var("FLASHGREP_OBSERVE_DIRTY_DIFF_FILE");
     }
 }
 

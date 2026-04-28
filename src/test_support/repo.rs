@@ -20,7 +20,7 @@ impl TestRepo {
         let repo_dir = temp.path().join("repo");
         fs::create_dir_all(&repo_dir).expect("repo dir should succeed");
         let repo = fs::canonicalize(&repo_dir).expect("repo dir should canonicalize");
-        let index = repo.join(".codgrep-index-engine");
+        let index = repo.join(".flashgrep-index-engine");
         Self {
             _temp: temp,
             repo,

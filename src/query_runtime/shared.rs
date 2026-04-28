@@ -1,10 +1,7 @@
-use std::{fs::File, path::Path};
+use std::{fs, path::Path};
 
 use grep_regex::{RegexMatcher, RegexMatcherBuilder};
-#[cfg(not(target_os = "macos"))]
-use grep_searcher::MmapChoice;
 use grep_searcher::{BinaryDetection, SearcherBuilder};
-use memmap2::Mmap;
 
 use crate::{
     config::QueryConfig,
@@ -45,13 +42,6 @@ pub(crate) fn configure_verifier_searcher(builder: &mut SearcherBuilder, multili
     builder
         .binary_detection(BinaryDetection::quit(b'\0'))
         .multi_line(multiline_verifier);
-    #[cfg(not(target_os = "macos"))]
-    {
-        // This project already uses file-backed mmaps in other hot paths. Using
-        // the searcher's mmap path lets candidate verification behave more like
-        // ripgrep on stable files.
-        builder.memory_map(unsafe { MmapChoice::auto() });
-    }
 }
 
 pub(super) fn build_line_starts(bytes: &[u8]) -> Vec<usize> {
@@ -80,8 +70,8 @@ pub(super) fn with_verify_path_bytes<T, F>(path: &Path, op: F) -> Result<T>
 where
     F: FnOnce(&[u8]) -> Result<T>,
 {
-    let file = match File::open(path) {
-        Ok(file) => file,
+    let bytes = match fs::read(path) {
+        Ok(bytes) => bytes,
         Err(error)
             if matches!(
                 error.kind(),
@@ -93,12 +83,11 @@ where
         Err(error) => return Err(error.into()),
     };
 
-    if file.metadata()?.len() == 0 {
+    if bytes.is_empty() {
         return op(&[]);
     }
 
-    let mmap = unsafe { Mmap::map(&file)? };
-    op(mmap.as_ref())
+    op(&bytes)
 }
 
 pub(super) fn validate_doc_ids(doc_count: usize, doc_ids: &[u32]) -> Result<()> {

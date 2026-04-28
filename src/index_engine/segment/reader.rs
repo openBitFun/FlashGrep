@@ -181,7 +181,6 @@ pub struct FileSegmentReader {
     git_blob_reader: Option<GitBlobReader>,
     decoded_keys: LazyDocCache<DocKey>,
     decoded_source_bytes: LazyDocCache<Arc<[u8]>>,
-    decoded_worktree_verify_mmaps: LazyDocCache<Arc<Mmap>>,
     decoded_documents: LazyDocCache<IndexDocument>,
     decoded_metadata: LazyDocCache<SegmentDocMetadataValue>,
 }
@@ -201,7 +200,7 @@ impl FileSegmentReader {
         repo_root: Option<PathBuf>,
         base_head_commit: Option<String>,
     ) -> Result<Self> {
-        let profile_open = env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some();
+        let profile_open = env::var_os("FLASHGREP_PROFILE_OPEN_SEGMENT").is_some();
         let reader_init_started = Instant::now();
         let git_blob_reader = match (base_head_commit.as_ref(), repo_root.as_deref()) {
             (Some(_), Some(repo_root)) => Some(GitBlobReader::new(repo_root)?),
@@ -209,7 +208,6 @@ impl FileSegmentReader {
         };
         let decoded_keys = LazyDocCache::new(doc_table.len());
         let decoded_source_bytes = LazyDocCache::new(doc_table.len());
-        let decoded_worktree_verify_mmaps = LazyDocCache::new(doc_table.len());
         let decoded_documents = LazyDocCache::new(doc_table.len());
         let decoded_metadata = LazyDocCache::new(doc_table.len());
         if profile_open {
@@ -230,7 +228,6 @@ impl FileSegmentReader {
             git_blob_reader,
             decoded_keys,
             decoded_source_bytes,
-            decoded_worktree_verify_mmaps,
             decoded_documents,
             decoded_metadata,
         })
@@ -255,7 +252,7 @@ impl FileSegmentReader {
                 self.segment_source_label()
             ))
         })?;
-        if env::var_os("CODGREP_PROFILE_OPEN_SEGMENT").is_some() {
+        if env::var_os("FLASHGREP_PROFILE_OPEN_SEGMENT").is_some() {
             eprintln!(
                 "segment_path_doc_ids id={} build_ms={:.3} doc_count={}",
                 self.meta.segment_id.0,
@@ -399,56 +396,23 @@ impl FileSegmentReader {
         )
     }
 
-    fn load_worktree_verify_mmap(&self, doc_id: usize) -> Result<Option<Arc<Mmap>>> {
+    fn worktree_verify_source(&self, doc_id: SegmentDocId) -> Result<SegmentVerifySource> {
         let key = self.doc_key(doc_id as SegmentDocId)?;
         let path = self.repo_path_for_key(key)?;
-        let file = match File::open(&path) {
-            Ok(file) => file,
+        match File::open(&path) {
+            Ok(_) => Ok(SegmentVerifySource::Path(path)),
             Err(error)
                 if matches!(
                     error.kind(),
                     std::io::ErrorKind::NotFound | std::io::ErrorKind::IsADirectory
                 ) =>
             {
-                return Ok(None);
+                Ok(SegmentVerifySource::Bytes(Arc::<[u8]>::from(
+                    Vec::<u8>::new(),
+                )))
             }
             Err(error) => return Err(error.into()),
-        };
-        if file.metadata()?.len() == 0 {
-            return Ok(None);
         }
-        Ok(Some(Arc::new(unsafe { Mmap::map(&file)? })))
-    }
-
-    fn worktree_verify_source(&self, doc_id: SegmentDocId) -> Result<SegmentVerifySource> {
-        let doc_id = doc_id as usize;
-        let cache = self.decoded_worktree_verify_mmaps.get(doc_id)?;
-        if let Some(mmap) = cache.get() {
-            return Ok(SegmentVerifySource::Mmap(Arc::clone(mmap)));
-        }
-
-        let Some(mmap) = self.load_worktree_verify_mmap(doc_id)? else {
-            return Ok(SegmentVerifySource::Bytes(Arc::<[u8]>::from(
-                Vec::<u8>::new(),
-            )));
-        };
-
-        if cache.set(Arc::clone(&mmap)).is_err() {
-            let mmap = cache.get().ok_or_else(|| {
-                AppError::Protocol(format!(
-                    "failed to initialize cached segment worktree mmap {doc_id} from {}",
-                    self.segment_source_label()
-                ))
-            })?;
-            return Ok(SegmentVerifySource::Mmap(Arc::clone(mmap)));
-        }
-        let mmap = cache.get().ok_or_else(|| {
-            AppError::Protocol(format!(
-                "failed to read cached segment worktree mmap {doc_id} from {}",
-                self.segment_source_label()
-            ))
-        })?;
-        Ok(SegmentVerifySource::Mmap(Arc::clone(mmap)))
     }
 }
 

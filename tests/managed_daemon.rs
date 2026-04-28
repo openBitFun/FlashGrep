@@ -4,7 +4,7 @@ use std::{
     thread,
 };
 
-use codgrep::daemon::{
+use flashgrep::daemon::{
     daemon_state_file_path,
     protocol::{
         ConsistencyMode, EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec,
@@ -22,7 +22,7 @@ fn managed_client_spawns_ensures_and_searches() {
     fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
         .expect("write should succeed");
 
-    let managed = ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_cg"));
+    let managed = ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_flashgrep"));
     let ensure = managed
         .ensure_repo(EnsureRepoParams {
             repo_path: repo_path.clone(),
@@ -34,8 +34,8 @@ fn managed_client_spawns_ensures_and_searches() {
     assert_eq!(ensure.indexed_docs, Some(1));
     assert!(matches!(
         ensure.status.phase,
-        codgrep::daemon::protocol::RepoPhase::ReadyClean
-            | codgrep::daemon::protocol::RepoPhase::ReadyDirty
+        flashgrep::daemon::protocol::RepoPhase::ReadyClean
+            | flashgrep::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
     let search = managed
@@ -62,7 +62,7 @@ fn managed_client_spawns_ensures_and_searches() {
                     top_k_tokens: 6,
                     max_count: None,
                     global_max_results: None,
-                    search_mode: codgrep::daemon::protocol::SearchModeConfig::CountOnly,
+                    search_mode: flashgrep::daemon::protocol::SearchModeConfig::CountOnly,
                 },
                 scope: PathScope::default(),
                 consistency: ConsistencyMode::WorkspaceEventual,
@@ -72,7 +72,7 @@ fn managed_client_spawns_ensures_and_searches() {
         .expect("search should succeed");
 
     match search {
-        codgrep::daemon::protocol::Response::SearchCompleted {
+        flashgrep::daemon::protocol::Response::SearchCompleted {
             backend,
             results,
             status,
@@ -80,13 +80,13 @@ fn managed_client_spawns_ensures_and_searches() {
         } => {
             assert!(matches!(
                 backend,
-                codgrep::daemon::protocol::SearchBackend::IndexedClean
+                flashgrep::daemon::protocol::SearchBackend::IndexedClean
             ));
             assert_eq!(results.matched_lines, 1);
             assert!(matches!(
                 status.phase,
-                codgrep::daemon::protocol::RepoPhase::ReadyClean
-                    | codgrep::daemon::protocol::RepoPhase::ReadyDirty
+                flashgrep::daemon::protocol::RepoPhase::ReadyClean
+                    | flashgrep::daemon::protocol::RepoPhase::ReadyDirty
             ));
         }
         other => panic!("unexpected response: {other:?}"),
@@ -94,7 +94,7 @@ fn managed_client_spawns_ensures_and_searches() {
 
     let client = DaemonClient::new(ensure.addr);
     client
-        .send(codgrep::daemon::protocol::Request::Shutdown)
+        .send(flashgrep::daemon::protocol::Request::Shutdown)
         .expect("shutdown should succeed");
 }
 
@@ -115,7 +115,7 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
     let state_file =
         daemon_state_file_path(&ensure_params).expect("state file path should resolve");
     let managed =
-        Arc::new(ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_cg")));
+        Arc::new(ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_flashgrep")));
     let barrier = Arc::new(Barrier::new(4));
 
     let handles = (0..4)
@@ -145,7 +145,7 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
 
     let client = DaemonClient::new(first.addr.clone());
     client
-        .send(codgrep::daemon::protocol::Request::Shutdown)
+        .send(flashgrep::daemon::protocol::Request::Shutdown)
         .expect("shutdown should succeed");
 }
 
@@ -170,7 +170,7 @@ fn managed_client_glob_uses_daemon_protocol_scope() {
     )
     .expect("write should succeed");
 
-    let managed = ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_cg"));
+    let managed = ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_flashgrep"));
     let response = managed
         .glob(
             EnsureRepoParams {
@@ -191,7 +191,7 @@ fn managed_client_glob_uses_daemon_protocol_scope() {
         .expect("glob should succeed");
 
     match response {
-        codgrep::daemon::protocol::Response::GlobCompleted {
+        flashgrep::daemon::protocol::Response::GlobCompleted {
             repo_id,
             paths,
             status,
@@ -217,7 +217,7 @@ fn managed_client_can_open_without_ensuring_index() {
     fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
         .expect("write should succeed");
 
-    let managed = ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_cg"));
+    let managed = ManagedDaemonClient::new().with_daemon_program(env!("CARGO_BIN_EXE_flashgrep"));
     let opened = managed
         .open_repo(OpenRepoParams {
             repo_path,
@@ -228,14 +228,14 @@ fn managed_client_can_open_without_ensuring_index() {
         .expect("open should succeed");
     assert!(matches!(
         opened.status.phase,
-        codgrep::daemon::protocol::RepoPhase::Opening
-            | codgrep::daemon::protocol::RepoPhase::MissingBaseSnapshot
-            | codgrep::daemon::protocol::RepoPhase::ReadyClean
-            | codgrep::daemon::protocol::RepoPhase::ReadyDirty
+        flashgrep::daemon::protocol::RepoPhase::Opening
+            | flashgrep::daemon::protocol::RepoPhase::MissingBaseSnapshot
+            | flashgrep::daemon::protocol::RepoPhase::ReadyClean
+            | flashgrep::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
     let client = DaemonClient::new(opened.addr);
     client
-        .send(codgrep::daemon::protocol::Request::Shutdown)
+        .send(flashgrep::daemon::protocol::Request::Shutdown)
         .expect("shutdown should succeed");
 }

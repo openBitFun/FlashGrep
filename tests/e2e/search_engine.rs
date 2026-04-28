@@ -1,4 +1,4 @@
-use codgrep::{BuildConfig, SearchBackend, SearchEngine, SearchPolicy, TokenizerMode};
+use flashgrep::{BuildConfig, SearchBackend, SearchEngine, SearchPolicy, TokenizerMode};
 
 use crate::common::{count_matches_query, query, TestRepo};
 

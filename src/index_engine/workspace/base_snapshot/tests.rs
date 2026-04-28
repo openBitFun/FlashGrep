@@ -7,9 +7,9 @@ use tempfile::TempDir;
 
 use super::{
     base_snapshot_input_files_from_repository_files, estimated_term_entry_bytes,
-    merge_sorted_posting_runs, reusable_base_snapshot_shards, write_sorted_posting_runs,
-    write_spilled_posting_record, BaseSnapshotInputFile, PostingBuckets, PostingBucketsState,
-    PostingRecord, WorkspaceBaseSnapshotIndex,
+    merge_sorted_posting_runs, write_sorted_posting_runs, write_spilled_posting_record,
+    BaseSnapshotInputFile, PostingBuckets, PostingBucketsState, PostingRecord,
+    WorkspaceBaseSnapshotIndex,
 };
 use crate::base_snapshot_build::BaseSnapshotBuildOptions;
 use crate::config::{BuildConfig, CorpusMode, TokenizerMode};
@@ -431,7 +431,7 @@ fn git_base_snapshot_writes_per_doc_source_kind() {
 
     assert_eq!(
         source_kinds.get("clean.rs"),
-        Some(&SegmentDocSourceKind::Worktree)
+        Some(&SegmentDocSourceKind::GitHeadBlob)
     );
     assert_eq!(
         source_kinds.get("dirty.rs"),

@@ -39,9 +39,9 @@ pub fn is_workspace_internal_path(path: &Path) -> bool {
     path.components().any(|component| {
         matches!(
             component.as_os_str(),
-            component if component == OsStr::new(".codgrep-index")
-                || component == OsStr::new(".codgrep-index-engine")
-                || component == OsStr::new(".codgrep-bench")
+            component if component == OsStr::new(".flashgrep-index")
+                || component == OsStr::new(".flashgrep-index-engine")
+                || component == OsStr::new(".flashgrep-bench")
         )
     })
 }
@@ -270,15 +270,15 @@ mod tests {
     }
 
     #[test]
-    fn workspace_internal_path_detects_codgrep_artifacts() {
+    fn workspace_internal_path_detects_flashgrep_artifacts() {
         assert!(is_workspace_internal_path(Path::new(
-            "/tmp/repo/.codgrep-index/docs.bin"
+            "/tmp/repo/.flashgrep-index/docs.bin"
         )));
         assert!(is_workspace_internal_path(Path::new(
-            "/tmp/repo/subdir/.codgrep-bench/results.json"
+            "/tmp/repo/subdir/.flashgrep-bench/results.json"
         )));
         assert!(!is_workspace_internal_path(Path::new(
-            "/tmp/repo/.bitfun/search/codgrep-index/docs.bin"
+            "/tmp/repo/.bitfun/search/flashgrep-index/docs.bin"
         )));
         assert!(!is_workspace_internal_path(Path::new(
             "/tmp/repo/src/main.rs"
@@ -286,18 +286,19 @@ mod tests {
     }
 
     #[test]
-    fn scan_paths_excludes_codgrep_internal_files_and_configured_index_path() {
+    fn scan_paths_excludes_flashgrep_internal_files_and_configured_index_path() {
         let temp = TempDir::new().expect("temp dir should succeed");
         let repo = temp.path().join("repo");
         fs::create_dir_all(repo.join("src")).expect("src dir should succeed");
-        fs::create_dir_all(repo.join(".codgrep-bench")).expect(".codgrep-bench dir should succeed");
+        fs::create_dir_all(repo.join(".flashgrep-bench"))
+            .expect(".flashgrep-bench dir should succeed");
         fs::create_dir_all(repo.join(".bitfun").join("sessions"))
             .expect(".bitfun dir should succeed");
-        fs::create_dir_all(repo.join(".bitfun").join("search").join("codgrep-index"))
+        fs::create_dir_all(repo.join(".bitfun").join("search").join("flashgrep-index"))
             .expect("index dir should succeed");
         fs::write(repo.join("src").join("main.rs"), "fn main() {}\n")
             .expect("main.rs should be written");
-        fs::write(repo.join(".codgrep-bench").join("summary.json"), "{}\n")
+        fs::write(repo.join(".flashgrep-bench").join("summary.json"), "{}\n")
             .expect("bench file should be written");
         fs::write(
             repo.join(".bitfun").join("sessions").join("turn-0000.json"),
@@ -307,7 +308,7 @@ mod tests {
         fs::write(
             repo.join(".bitfun")
                 .join("search")
-                .join("codgrep-index")
+                .join("flashgrep-index")
                 .join("docs.bin"),
             "index\n",
         )
@@ -315,7 +316,7 @@ mod tests {
 
         let scanned = scan_paths(
             &[PathBuf::from(&repo)],
-            Some(&repo.join(".bitfun").join("search").join("codgrep-index")),
+            Some(&repo.join(".bitfun").join("search").join("flashgrep-index")),
             ScanOptions {
                 respect_ignore: false,
                 include_hidden: true,

@@ -202,9 +202,7 @@ impl RepoRuntime {
             return;
         }
 
-        if matches!(error, AppError::Io(io_error) if io_error.kind() == std::io::ErrorKind::NotFound)
-            && !self.build_config.repo_path.exists()
-        {
+        if self.should_suppress_workspace_overlay_io_error(error) {
             return;
         }
 
@@ -212,7 +210,7 @@ impl RepoRuntime {
             "failed to {operation} workspace overlay engine: {error}"
         ));
         eprintln!(
-            "codgrep: failed to {operation} workspace overlay engine for {}: {error}",
+            "flashgrep: failed to {operation} workspace overlay engine for {}: {error}",
             self.build_config.repo_path.display()
         );
     }
@@ -234,6 +232,16 @@ impl RepoRuntime {
             .as_ref()
             .and_then(|overlay| overlay.runtime_stats().ok())
             .map(workspace_overlay_status_from_runtime)
+    }
+
+    pub(super) fn should_suppress_workspace_overlay_io_error(&self, error: &AppError) -> bool {
+        if !matches!(error, AppError::Io(_)) {
+            return false;
+        }
+        if self.shutting_down.load(Ordering::Relaxed) {
+            return true;
+        }
+        !self.build_config.repo_path.exists() || !self.build_config.storage_root.exists()
     }
 }
 

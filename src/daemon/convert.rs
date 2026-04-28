@@ -183,7 +183,7 @@ pub(super) fn build_config_from_open(
     max_sparse_len: usize,
 ) -> BuildConfig {
     BuildConfig {
-        storage_root: storage_root.unwrap_or_else(|| repo_path.join(".codgrep-index-engine")),
+        storage_root: storage_root.unwrap_or_else(|| repo_path.join(".flashgrep-index-engine")),
         repo_path,
         tokenizer: match tokenizer {
             proto::TokenizerModeConfig::Trigram => TokenizerMode::Trigram,

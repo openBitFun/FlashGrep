@@ -288,7 +288,7 @@ impl WorkspaceOverlayIndex {
 
         let merge_result = self.engine.admin().maintain();
         if let Err(error) = &merge_result {
-            eprintln!("codgrep: workspace overlay background merge failed: {error}");
+            eprintln!("flashgrep: workspace overlay background merge failed: {error}");
         }
 
         {
@@ -446,14 +446,14 @@ fn remove_overlay_artifact(path: &Path) -> Result<()> {
 }
 
 fn remove_dir_all_with_retry(path: &Path) -> Result<()> {
-    const REMOVE_DIR_RETRY_ATTEMPTS: usize = 5;
-    const REMOVE_DIR_RETRY_DELAY_MS: u64 = 20;
+    const REMOVE_DIR_RETRY_ATTEMPTS: usize = 20;
+    const REMOVE_DIR_RETRY_DELAY_MS: u64 = 50;
 
     for attempt in 0..REMOVE_DIR_RETRY_ATTEMPTS {
         match fs::remove_dir_all(path) {
             Ok(()) => return Ok(()),
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
-            Err(error) if is_directory_not_empty_error(&error) => {
+            Err(error) if is_retryable_remove_dir_error(&error) => {
                 if attempt + 1 == REMOVE_DIR_RETRY_ATTEMPTS {
                     return Err(error.into());
                 }
@@ -466,8 +466,12 @@ fn remove_dir_all_with_retry(path: &Path) -> Result<()> {
     Ok(())
 }
 
-fn is_directory_not_empty_error(error: &std::io::Error) -> bool {
-    error.kind() == std::io::ErrorKind::DirectoryNotEmpty || error.raw_os_error() == Some(66)
+fn is_retryable_remove_dir_error(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::DirectoryNotEmpty
+        || error.kind() == std::io::ErrorKind::PermissionDenied
+        || error.raw_os_error() == Some(5)
+        || error.raw_os_error() == Some(32)
+        || error.raw_os_error() == Some(66)
 }
 
 fn workspace_overlay_index_root(build_config: &BuildConfig) -> PathBuf {

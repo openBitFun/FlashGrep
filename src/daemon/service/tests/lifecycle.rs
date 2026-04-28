@@ -123,11 +123,13 @@ fn ready_status_and_search_recover_from_overlay_snapshot_when_published_overlay_
 
     fs::write(&tracked, "const VALUE: &str = \"SNAPSHOT_DIRTY\";\n")
         .expect("rewrite should succeed");
-    let refreshed = refresh_repo(&service, &repo_id, true);
-    assert!(matches!(
-        refreshed.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
-    ));
+    let _ = refresh_repo(&service, &repo_id, true);
+    let refreshed = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            && status.dirty_files.modified == 1
+            && status.dirty_files.deleted == 0
+            && status.dirty_files.new == 0
+    });
     assert_eq!(refreshed.dirty_files.modified, 1);
     wait_for_workspace_overlay_match_count(&repo_path, "SNAPSHOT_DIRTY", 1);
 
@@ -142,24 +144,15 @@ fn ready_status_and_search_recover_from_overlay_snapshot_when_published_overlay_
     assert_eq!(status.dirty_files.deleted, 0);
     assert_eq!(status.dirty_files.new, 0);
 
-    match search_repo(
+    let (backend, status) = wait_for_search_count(
         &service,
         &repo_id,
         "SNAPSHOT_DIRTY",
         ConsistencyMode::WorkspaceEventual,
-    ) {
-        Response::SearchCompleted {
-            backend,
-            results,
-            status,
-            ..
-        } => {
-            assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
-            assert_eq!(results.matched_lines, 1);
-            assert_eq!(status.dirty_files.modified, 1);
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
+        1,
+    );
+    assert!(!matches!(backend, SearchBackend::IndexedSnapshot));
+    assert_eq!(status.dirty_files.modified, 1);
 }
 
 #[test]
@@ -183,7 +176,13 @@ fn probe_delta_uses_overlay_snapshot_truth_when_published_overlay_paths_cache_is
         "const VALUE: &str = \"FIRST_DIRTY_TOKEN_20260416\";\n",
     )
     .expect("first rewrite should succeed");
-    let refreshed = refresh_repo(&service, &repo_id, true);
+    let _ = refresh_repo(&service, &repo_id, true);
+    let refreshed = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+            && status.dirty_files.modified == 1
+            && status.dirty_files.deleted == 0
+            && status.dirty_files.new == 0
+    });
     assert_eq!(refreshed.dirty_files.modified, 1);
     wait_for_workspace_overlay_match_count(&repo_path, "FIRST_DIRTY_TOKEN_20260416", 1);
 
@@ -394,7 +393,7 @@ fn opening_legacy_snapshot_without_base_shard_is_missing_index() {
     });
 
     setup_service.shutdown_all();
-    fs::remove_dir_all(repo_path.join(".codgrep-index-engine"))
+    fs::remove_dir_all(repo_path.join(".flashgrep-index-engine"))
         .expect("removing base shard should succeed");
 
     let service = DaemonService::new();

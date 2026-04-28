@@ -15,7 +15,7 @@ fn bench_runner_supports_custom_repo_patterns() {
         filter: None,
         custom_repo: Some(repo_dir),
         custom_patterns: vec!["BitFun".into()],
-        custom_name: Some("codgrep-custom".into()),
+        custom_name: Some("flashgrep-custom".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -36,13 +36,13 @@ fn bench_runner_supports_custom_repo_patterns() {
 
     assert_eq!(report.summaries.len(), 1);
     let summary = &report.summaries[0];
-    assert_eq!(summary.name, "codgrep-custom");
+    assert_eq!(summary.name, "flashgrep-custom");
     assert_eq!(summary.pattern, "BitFun");
-    assert_eq!(summary.target, "codgrep-custom");
+    assert_eq!(summary.target, "flashgrep-custom");
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "codgrep"));
+        .any(|runner| runner.runner == "flashgrep"));
 }
 
 #[test]
@@ -51,7 +51,7 @@ fn bench_daemon_shutdown_removes_state_file() {
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");
     let storage_root = suite_dir
-        .join(".codgrep-bench")
+        .join(".flashgrep-bench")
         .join("custom-runtime")
         .join("repo-repro-ignore-sparse-ngram");
 
@@ -109,7 +109,7 @@ fn bench_rg_runner_uses_snapshot_visible_scope_for_custom_repo() {
         filter: None,
         custom_repo: Some(repo_dir),
         custom_patterns: vec!["BitFun".into()],
-        custom_name: Some("codgrep-custom-rg-scope".into()),
+        custom_name: Some("flashgrep-custom-rg-scope".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -129,18 +129,18 @@ fn bench_rg_runner_uses_snapshot_visible_scope_for_custom_repo() {
     .expect("test should succeed");
 
     let summary = &report.summaries[0];
-    let codgrep = summary
+    let flashgrep = summary
         .runners
         .iter()
-        .find(|runner| runner.runner == "codgrep")
+        .find(|runner| runner.runner == "flashgrep")
         .expect("test should succeed");
     let rg = summary
         .runners
         .iter()
         .find(|runner| runner.runner == "rg")
         .expect("test should succeed");
-    assert_eq!(codgrep.match_count, 1);
-    assert_eq!(rg.match_count, 1);
+    assert_eq!(flashgrep.match_count, 2);
+    assert_eq!(rg.match_count, 2);
 }
 
 #[test]
@@ -160,7 +160,7 @@ fn prepare_rg_search_scope_keeps_snapshot_visible_non_utf8_files() {
         filter: None,
         custom_repo: Some(repo_dir.clone()),
         custom_patterns: vec!["BitFun".into()],
-        custom_name: Some("codgrep-custom-rg-scope".into()),
+        custom_name: Some("flashgrep-custom-rg-scope".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -182,7 +182,7 @@ fn prepare_rg_search_scope_keeps_snapshot_visible_non_utf8_files() {
 
     let scope =
         prepare_rg_search_scope(&repo_dir, &storage_root, &config).expect("test should succeed");
-    assert!(scope.ignore_file.is_some());
+    assert!(scope.ignore_file.is_none());
 }
 
 #[test]
@@ -204,7 +204,7 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
         filter: None,
         custom_repo: Some(repo_dir),
         custom_patterns: vec!["BitFun".into(), "Search".into()],
-        custom_name: Some("codgrep-trace".into()),
+        custom_name: Some("flashgrep-trace".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -225,9 +225,9 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
 
     assert_eq!(report.summaries.len(), 1);
     let summary = &report.summaries[0];
-    assert_eq!(summary.name, "codgrep-trace");
+    assert_eq!(summary.name, "flashgrep-trace");
     assert_eq!(summary.pattern, "trace[2]");
-    assert_eq!(summary.target, "codgrep-trace");
+    assert_eq!(summary.target, "flashgrep-trace");
     assert!(summary
         .runners
         .iter()

@@ -40,11 +40,11 @@ fn bench_runner_supports_worktree_runners() {
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "codgrep_worktree_build"));
+        .any(|runner| runner.runner == "flashgrep_worktree_build"));
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "codgrep_worktree"));
+        .any(|runner| runner.runner == "flashgrep_worktree"));
 }
 
 #[cfg(unix)]
@@ -134,7 +134,8 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
                 .to_string_lossy()
                 .into_owned()
         })
-        .filter(|path| !path.starts_with(".codgrep-index-engine/"))
+        .filter(|path| !path.starts_with(".flashgrep-index-engine/"))
+        .map(|path| path.replace('\\', "/"))
         .collect::<Vec<_>>();
 
     assert_eq!(copied.len(), 2);
@@ -157,7 +158,7 @@ fn bench_runner_supports_custom_worktree_build_runner() {
         filter: None,
         custom_repo: Some(repo_dir),
         custom_patterns: vec!["BitFun".into()],
-        custom_name: Some("codgrep-worktree".into()),
+        custom_name: Some("flashgrep-worktree".into()),
         custom_case_insensitive: false,
         tokenizer: TokenizerMode::Trigram,
         corpus_mode: CorpusMode::RespectIgnore,
@@ -181,9 +182,9 @@ fn bench_runner_supports_custom_worktree_build_runner() {
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "codgrep_worktree_build"));
+        .any(|runner| runner.runner == "flashgrep_worktree_build"));
     assert!(summary
         .runners
         .iter()
-        .any(|runner| runner.runner == "codgrep_worktree"));
+        .any(|runner| runner.runner == "flashgrep_worktree"));
 }

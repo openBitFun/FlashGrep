@@ -3,6 +3,8 @@ use std::{
     fs,
     io::ErrorKind,
     path::{Path, PathBuf},
+    thread,
+    time::Duration,
     time::{SystemTime, UNIX_EPOCH},
 };
 
@@ -13,6 +15,8 @@ use crate::{error::Result, worktree_diff::DirtyPathKind};
 use super::{DirtyPathSet, DirtyStats, RepoRuntime};
 
 const DIRTY_CATALOG_VERSION: u32 = 1;
+const DIRTY_CATALOG_PERSIST_RETRY_ATTEMPTS: usize = 20;
+const DIRTY_CATALOG_PERSIST_RETRY_DELAY_MS: u64 = 50;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -101,7 +105,6 @@ impl DirtyCatalog {
         let Some(parent) = path.parent() else {
             return Ok(());
         };
-        fs::create_dir_all(parent)?;
         let encoded = serde_json::to_vec_pretty(&DirtyCatalogFile {
             version: DIRTY_CATALOG_VERSION,
             entries: self
@@ -123,9 +126,7 @@ impl DirtyCatalog {
             ))
         })?;
         let tmp_path = path.with_extension("tmp");
-        fs::write(&tmp_path, encoded)?;
-        fs::rename(tmp_path, path)?;
-        Ok(())
+        persist_dirty_catalog_bytes_with_retry(parent, path, &tmp_path, &encoded)
     }
 
     pub(super) fn recover_startup(&mut self) {
@@ -242,6 +243,49 @@ impl DirtyCatalog {
             }
         }
     }
+}
+
+fn persist_dirty_catalog_bytes_with_retry(
+    parent: &Path,
+    path: &Path,
+    tmp_path: &Path,
+    encoded: &[u8],
+) -> Result<()> {
+    for attempt in 0..DIRTY_CATALOG_PERSIST_RETRY_ATTEMPTS {
+        match persist_dirty_catalog_bytes(parent, path, tmp_path, encoded) {
+            Ok(()) => return Ok(()),
+            Err(error) if is_retryable_dirty_catalog_persist_error(&error) => {
+                if attempt + 1 == DIRTY_CATALOG_PERSIST_RETRY_ATTEMPTS {
+                    return Err(error.into());
+                }
+                let _ = fs::remove_file(tmp_path);
+                thread::sleep(Duration::from_millis(
+                    DIRTY_CATALOG_PERSIST_RETRY_DELAY_MS,
+                ));
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn persist_dirty_catalog_bytes(
+    parent: &Path,
+    path: &Path,
+    tmp_path: &Path,
+    encoded: &[u8],
+) -> std::io::Result<()> {
+    fs::create_dir_all(parent)?;
+    fs::write(tmp_path, encoded)?;
+    fs::rename(tmp_path, path)
+}
+
+fn is_retryable_dirty_catalog_persist_error(error: &std::io::Error) -> bool {
+    matches!(
+        error.kind(),
+        ErrorKind::PermissionDenied | ErrorKind::NotFound | ErrorKind::AlreadyExists
+    ) || error.raw_os_error() == Some(5)
+        || error.raw_os_error() == Some(32)
 }
 
 pub(super) fn dirty_catalog_path(storage_root: &Path) -> PathBuf {

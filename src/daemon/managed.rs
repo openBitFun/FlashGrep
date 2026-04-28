@@ -258,7 +258,7 @@ impl ManagedDaemonClient {
         }
         let program = select_daemon_program(
             self.daemon_program.clone(),
-            std::env::var_os("CODGREP_DAEMON_BIN"),
+            std::env::var_os("FLASHGREP_DAEMON_BIN"),
             std::env::current_exe().ok(),
         );
 
@@ -297,7 +297,7 @@ fn select_daemon_program(
     explicit_program
         .or(env_program)
         .or_else(|| current_exe.map(PathBuf::into_os_string))
-        .unwrap_or_else(|| OsString::from("cg"))
+        .unwrap_or_else(|| OsString::from("flashgrep"))
 }
 
 struct StartupLockGuard {
@@ -374,26 +374,27 @@ mod tests {
     #[test]
     fn select_daemon_program_prefers_explicit_program() {
         let selected = select_daemon_program(
-            Some(OsString::from("/tmp/explicit-cg")),
-            Some(OsString::from("/tmp/env-cg")),
-            Some(PathBuf::from("/tmp/current-cg")),
+            Some(OsString::from("/tmp/explicit-flashgrep")),
+            Some(OsString::from("/tmp/env-flashgrep")),
+            Some(PathBuf::from("/tmp/current-flashgrep")),
         );
-        assert_eq!(selected, OsString::from("/tmp/explicit-cg"));
+        assert_eq!(selected, OsString::from("/tmp/explicit-flashgrep"));
     }
 
     #[test]
     fn select_daemon_program_falls_back_to_env_program() {
         let selected = select_daemon_program(
             None,
-            Some(OsString::from("/tmp/env-cg")),
-            Some(PathBuf::from("/tmp/current-cg")),
+            Some(OsString::from("/tmp/env-flashgrep")),
+            Some(PathBuf::from("/tmp/current-flashgrep")),
         );
-        assert_eq!(selected, OsString::from("/tmp/env-cg"));
+        assert_eq!(selected, OsString::from("/tmp/env-flashgrep"));
     }
 
     #[test]
     fn select_daemon_program_falls_back_to_current_exe() {
-        let selected = select_daemon_program(None, None, Some(PathBuf::from("/tmp/current-cg")));
-        assert_eq!(selected, OsString::from("/tmp/current-cg"));
+        let selected =
+            select_daemon_program(None, None, Some(PathBuf::from("/tmp/current-flashgrep")));
+        assert_eq!(selected, OsString::from("/tmp/current-flashgrep"));
     }
 }

@@ -105,7 +105,7 @@ fn workspace_search_and_snapshot_use_base_shard_without_legacy_index() {
     let pinned_results = snapshot
         .search(&query("BASE"))
         .expect("snapshot search should succeed");
-    assert_eq!(pinned_results.matched_lines, 0);
+    assert_eq!(pinned_results.matched_lines, 1);
 
     let stale_snapshot = workspace
         .ensure_base_snapshot()

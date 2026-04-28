@@ -8,10 +8,11 @@ mod term_dict;
 mod writer;
 
 pub(crate) use format::{
-    file_name_from_logical_path, language_from_logical_path, read_encoded_source_bytes_view,
-    read_index_document_from_inline_slice, read_segment_meta, write_path_offsets_file,
-    write_segment_documents, write_segment_meta, FileSegmentDocTable, SegmentDocRecord,
-    SegmentDocSourceKind, DOCS_FILE, PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
+    encoded_source_bytes_len, file_name_from_logical_path, language_from_logical_path,
+    read_encoded_source_bytes_view, read_index_document_from_inline_slice, read_segment_meta,
+    write_path_offsets_file, write_segment_documents, write_segment_meta, write_source_bytes,
+    FileSegmentDocTable, SegmentDocRecord, SegmentDocSourceKind, DOCS_FILE, PATH_MAP_FILE,
+    PATH_OFFSETS_FILE, SEGMENT_META_FILE,
 };
 pub use format::{DeleteSegmentBuildOutput, DeleteSegmentMeta, SegmentBuildOutput, SegmentMeta};
 pub(crate) use mmap::{advise_mmap_random, advise_mmap_sequential};

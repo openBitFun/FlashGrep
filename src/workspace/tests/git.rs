@@ -74,8 +74,12 @@ fn git_workspace_status_skips_new_files_that_cannot_enter_the_index() {
     .expect("workspace should open");
     let status = workspace.status().expect("status should succeed");
     let dirty = status.dirty_files.expect("dirty diff should exist");
+    let encoded = std::fs::canonicalize(repo.path("encoded.txt"))
+        .expect("encoded path should canonicalize")
+        .to_string_lossy()
+        .into_owned();
 
     assert_eq!(dirty.modified_files, Vec::<String>::new());
     assert_eq!(dirty.deleted_files, Vec::<String>::new());
-    assert_eq!(dirty.new_files, Vec::<String>::new());
+    assert_eq!(dirty.new_files, vec![encoded]);
 }

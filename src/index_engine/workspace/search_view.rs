@@ -285,6 +285,8 @@ fn merge_search_results(mut base: SearchResults, mut overlay: SearchResults) -> 
         .saturating_add(overlay.candidate_docs)
         .saturating_sub(overlapping_paths);
     base.bytes_searched += overlay.bytes_searched;
+    base.matched_lines += overlay.matched_lines;
+    base.matched_occurrences += overlay.matched_occurrences;
     base.hits
         .retain(|hit| !overlay_paths.contains(hit.path.as_str()));
     base.file_counts
@@ -434,8 +436,12 @@ fn recompute_result_totals(results: &mut SearchResults) {
             .iter()
             .map(|count| count.matched_lines)
             .sum()
-    } else {
+    } else if !results.hits.is_empty() {
         matched_lines_from_hits
+    } else if !results.file_match_counts.is_empty() {
+        results.matched_lines
+    } else {
+        0
     };
     results.matched_occurrences = if !results.file_match_counts.is_empty() {
         results
@@ -443,8 +449,10 @@ fn recompute_result_totals(results: &mut SearchResults) {
             .iter()
             .map(|count| count.matched_occurrences)
             .sum()
-    } else {
+    } else if !results.hits.is_empty() {
         matched_occurrences_from_hits
+    } else {
+        0
     };
 }
 
@@ -526,7 +534,7 @@ mod tests {
     fn search_current_snapshot_requires_base_snapshot_reader() {
         let temp = TempDir::new().expect("temp dir");
         let repo = temp.path().join("repo");
-        let index = repo.join(".codgrep-index-engine");
+        let index = repo.join(".flashgrep-index-engine");
         fs::create_dir_all(&repo).expect("create repo");
         fs::write(repo.join("base.txt"), "BASE_SNAPSHOT_FALLBACK_TOKEN\n").expect("write base");
         materialize_base_snapshot_shard(&repo, &index);
@@ -547,7 +555,7 @@ mod tests {
     fn search_workspace_snapshots_shadow_base_with_overlay_live_keys() {
         let temp = TempDir::new().expect("temp dir");
         let repo = temp.path().join("repo");
-        let index = repo.join(".codgrep-index-engine");
+        let index = repo.join(".flashgrep-index-engine");
         fs::create_dir_all(&repo).expect("create repo");
         let file_path = repo.join("base.txt");
         fs::write(&file_path, "OLD_TOKEN\n").expect("write base file");
@@ -622,7 +630,7 @@ mod tests {
     fn search_workspace_snapshots_shadow_base_with_overlay_deletes() {
         let temp = TempDir::new().expect("temp dir");
         let repo = temp.path().join("repo");
-        let index = repo.join(".codgrep-index-engine");
+        let index = repo.join(".flashgrep-index-engine");
         fs::create_dir_all(&repo).expect("create repo");
         let file_path = repo.join("base.txt");
         fs::write(&file_path, "OLD_TOKEN\n").expect("write base file");

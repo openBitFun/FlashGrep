@@ -28,9 +28,10 @@ use crate::{
         manifest::{FileManifestStore, Manifest, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
-            collect_document_posting_terms_from_text, write_path_offsets_file, write_segment_meta,
-            FileSegmentStore, PostingsStreamWriter, SegmentDocSourceKind, SegmentMeta,
-            TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
+            collect_document_posting_terms_from_text, encoded_source_bytes_len,
+            write_path_offsets_file, write_segment_meta, write_source_bytes, FileSegmentStore,
+            PostingsStreamWriter, SegmentDocSourceKind, SegmentMeta, TermDictStreamWriter,
+            DOCS_FILE, PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
         },
         writer::IndexDocument,
         DocKey, GitRevision, ManifestId, RepoId, SegmentId, ShardId,
@@ -56,6 +57,7 @@ const DOCS_VERSION: u32 = 4;
 const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
 const SEGMENT_FILE_VERSION: u32 = 1;
 const COUNT_OFFSET: u64 = 12;
+const DOC_RECORD_LEN: u64 = 72;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceBaseSnapshotMetadata {
@@ -161,9 +163,19 @@ struct BulkBaseSegmentWriter {
     path_entry_offsets: Vec<u64>,
     path_map_len: u64,
     docs: BufWriter<File>,
+    staged_source_path: PathBuf,
+    staged_sources: BufWriter<File>,
+    pending_inline_sources: Vec<PendingInlineSource>,
+    staged_source_bytes: u64,
     posting_buckets: PostingBuckets,
     doc_count: u32,
     total_source_bytes: u64,
+}
+
+struct PendingInlineSource {
+    record_offset: u64,
+    relative_offset: u64,
+    source_len: u32,
 }
 
 struct PreparedBaseDocument {
@@ -235,6 +247,8 @@ impl BulkBaseSegmentWriter {
 
         let mut path_map = BufWriter::new(File::create(segment_dir.join(PATH_MAP_FILE))?);
         let mut docs = BufWriter::new(File::create(segment_dir.join(DOCS_FILE))?);
+        let staged_source_path = segment_dir.join("docs.inline.tmp");
+        let staged_sources = BufWriter::new(File::create(&staged_source_path)?);
         let posting_buckets = PostingBuckets::new(&segment_dir);
 
         write_segment_header(&mut path_map, PATH_MAP_MAGIC)?;
@@ -248,6 +262,10 @@ impl BulkBaseSegmentWriter {
             path_entry_offsets: Vec::new(),
             path_map_len: COUNT_OFFSET + 4,
             docs,
+            staged_source_path,
+            staged_sources,
+            pending_inline_sources: Vec::new(),
+            staged_source_bytes: 0,
             posting_buckets,
             doc_count: 0,
             total_source_bytes: 0,
@@ -261,6 +279,7 @@ impl BulkBaseSegmentWriter {
             posting_terms,
             source_kind,
         } = prepared;
+        let record_offset = COUNT_OFFSET + 4 + u64::from(doc_id) * DOC_RECORD_LEN;
 
         self.path_entry_offsets.push(self.path_map_len);
         write_string_to(&mut self.path_map, &document.repo_id.0)?;
@@ -272,6 +291,25 @@ impl BulkBaseSegmentWriter {
             .checked_add(repo_id_len)
             .and_then(|len| len.checked_add(logical_path_len))
             .ok_or_else(|| AppError::ValueOutOfRange("path map offset overflow".into()))?;
+
+        if matches!(source_kind, SegmentDocSourceKind::Inline) {
+            let encoded_len = encoded_source_bytes_len(&document.source_bytes)?;
+            let source_len = u32::try_from(encoded_len).map_err(|_| {
+                AppError::ValueOutOfRange("inline source length exceeds u32 range".into())
+            })?;
+            write_source_bytes(&mut self.staged_sources, &document.source_bytes)?;
+            self.pending_inline_sources.push(PendingInlineSource {
+                record_offset,
+                relative_offset: self.staged_source_bytes,
+                source_len,
+            });
+            self.staged_source_bytes = self
+                .staged_source_bytes
+                .checked_add(encoded_len)
+                .ok_or_else(|| {
+                    AppError::ValueOutOfRange("base snapshot source staging overflow".into())
+                })?;
+        }
 
         write_u32_to(&mut self.docs, doc_id)?;
         write_u64_to(&mut self.docs, 0)?;
@@ -298,12 +336,31 @@ impl BulkBaseSegmentWriter {
         patch_segment_count(&mut self.docs, self.doc_count)?;
 
         self.path_map.flush()?;
-        self.docs.flush()?;
+        self.staged_sources.flush()?;
 
         if self.doc_count == 0 {
             fs::remove_dir_all(&self.segment_dir)?;
             return Ok(None);
         }
+
+        let source_data_start = COUNT_OFFSET + 4 + u64::from(self.doc_count) * DOC_RECORD_LEN;
+        for inline in &self.pending_inline_sources {
+            patch_doc_source_location(
+                &mut self.docs,
+                inline.record_offset,
+                source_data_start
+                    .checked_add(inline.relative_offset)
+                    .ok_or_else(|| {
+                        AppError::ValueOutOfRange("base snapshot source offset overflow".into())
+                    })?,
+                inline.source_len,
+            )?;
+        }
+        self.docs.seek(SeekFrom::End(0))?;
+        let mut staged_source_reader = BufReader::new(File::open(&self.staged_source_path)?);
+        std::io::copy(&mut staged_source_reader, &mut self.docs)?;
+        self.docs.flush()?;
+        let _ = fs::remove_file(&self.staged_source_path);
 
         let segment_dir = self.segment_dir.clone();
         let segment_id = self.segment_id.clone();
@@ -1491,31 +1548,14 @@ fn next_staging_root(build_config: &BuildConfig) -> PathBuf {
 
 fn publish_staged_base_snapshot(build_config: &BuildConfig, staged_root: &Path) -> Result<()> {
     let final_root = WorkspaceBaseSnapshotIndex::index_root(build_config);
-    let previous_root = final_root.exists().then(|| {
-        WorkspaceBaseSnapshotIndex::storage_root(build_config).join(format!(
-            "{BASE_SNAPSHOT_BUILD_STALE_PREFIX}{}",
-            now_unix_nanos()
-        ))
-    });
-
-    if let Some(previous_root) = &previous_root {
-        fs::rename(&final_root, previous_root)?;
+    if !final_root.exists() {
+        fs::rename(staged_root, &final_root)?;
+        return Ok(());
     }
 
-    match fs::rename(staged_root, &final_root) {
-        Ok(()) => {
-            if let Some(previous_root) = previous_root {
-                let _ = fs::remove_dir_all(previous_root);
-            }
-            Ok(())
-        }
-        Err(error) => {
-            if let Some(previous_root) = previous_root {
-                let _ = fs::rename(previous_root, &final_root);
-            }
-            Err(error.into())
-        }
-    }
+    merge_directory_contents(staged_root, &final_root)?;
+    fs::remove_dir_all(staged_root)?;
+    Ok(())
 }
 
 fn parse_snapshot_revision(snapshot_key: &str) -> Option<GitRevision> {
@@ -1815,14 +1855,14 @@ fn prepare_base_document(
     Ok(Some(PreparedBaseDocument {
         document,
         posting_terms,
-        source_kind: segment_doc_source_kind(&file.source),
+        source_kind: segment_doc_source_kind(file),
     }))
 }
 
-fn segment_doc_source_kind(source: &BaseSnapshotFileSource) -> SegmentDocSourceKind {
-    match source {
-        BaseSnapshotFileSource::Worktree => SegmentDocSourceKind::Worktree,
-        BaseSnapshotFileSource::GitHeadBlob { .. } => SegmentDocSourceKind::GitHeadBlob,
+fn segment_doc_source_kind(file: &BaseSnapshotInputFile) -> SegmentDocSourceKind {
+    match file.fingerprint {
+        BaseSnapshotFileFingerprint::Worktree { .. } => SegmentDocSourceKind::Inline,
+        BaseSnapshotFileFingerprint::GitObject { .. } => SegmentDocSourceKind::GitHeadBlob,
     }
 }
 
@@ -2018,6 +2058,47 @@ fn patch_segment_count(writer: &mut BufWriter<File>, count: u32) -> Result<()> {
     writer.seek(SeekFrom::Start(COUNT_OFFSET))?;
     write_u32_to(writer, count)?;
     writer.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+fn patch_doc_source_location(
+    writer: &mut BufWriter<File>,
+    record_offset: u64,
+    source_offset: u64,
+    source_len: u32,
+) -> Result<()> {
+    writer.flush()?;
+    writer.seek(SeekFrom::Start(record_offset + 4))?;
+    write_u64_to(writer, source_offset)?;
+    write_u32_to(writer, source_len)?;
+    writer.seek(SeekFrom::End(0))?;
+    Ok(())
+}
+
+fn merge_directory_contents(source: &Path, destination: &Path) -> Result<()> {
+    fs::create_dir_all(destination)?;
+    for entry in fs::read_dir(source)? {
+        let entry = entry?;
+        let source_path = entry.path();
+        let destination_path = destination.join(entry.file_name());
+        if source_path.is_dir() {
+            if destination_path.exists() {
+                merge_directory_contents(&source_path, &destination_path)?;
+                fs::remove_dir_all(&source_path)?;
+            } else {
+                fs::rename(&source_path, &destination_path)?;
+            }
+            continue;
+        }
+
+        if destination_path.exists() {
+            fs::remove_file(&destination_path)?;
+        } else if let Some(parent) = destination_path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::copy(&source_path, &destination_path)?;
+        fs::remove_file(&source_path)?;
+    }
     Ok(())
 }
 

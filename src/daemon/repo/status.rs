@@ -169,6 +169,9 @@ impl RepoRuntime {
         let published_overlay_paths = match self.published_overlay_paths() {
             Ok(paths) => paths,
             Err(error) => {
+                if self.should_suppress_workspace_overlay_io_error(&error) {
+                    return;
+                }
                 self.mark_workspace_probe_pending_with_error(format!(
                     "failed to derive workspace overlay state: {error}"
                 ));

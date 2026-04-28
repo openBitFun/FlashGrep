@@ -1,4 +1,4 @@
-use codgrep::{advanced::PathFilter, advanced::PathFilterArgs, QueryConfig, SearchMode};
+use flashgrep::{advanced::PathFilter, advanced::PathFilterArgs, QueryConfig, SearchMode};
 
 use crate::common::{count_matches_query, count_query, query, TestRepo};
 
@@ -40,7 +40,10 @@ fn build_respects_gitignore_by_default() {
 
     let results = repo
         .engine()
-        .search(&count_query("PM_RESUME"), codgrep::SearchPolicy::IndexOnly)
+        .search(
+            &count_query("PM_RESUME"),
+            flashgrep::SearchPolicy::IndexOnly,
+        )
         .expect("test should succeed");
 
     assert_eq!(results.results.candidate_docs, 0);
@@ -54,18 +57,18 @@ fn build_can_disable_ignore_rules() {
     repo.write(".gitignore", "ignored.rs\n");
     let ignored = repo.write("ignored.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
-    repo.build_with(codgrep::BuildConfig {
-        corpus_mode: codgrep::CorpusMode::NoIgnore,
+    repo.build_with(flashgrep::BuildConfig {
+        corpus_mode: flashgrep::CorpusMode::NoIgnore,
         ..repo.trigram_build_config()
     });
 
-    let engine = codgrep::SearchEngine::new(codgrep::BuildConfig {
-        corpus_mode: codgrep::CorpusMode::NoIgnore,
+    let engine = flashgrep::SearchEngine::new(flashgrep::BuildConfig {
+        corpus_mode: flashgrep::CorpusMode::NoIgnore,
         ..repo.trigram_build_config()
     });
     let query = count_query("PM_RESUME");
     let results = engine
-        .search(&query, codgrep::SearchPolicy::IndexOnly)
+        .search(&query, flashgrep::SearchPolicy::IndexOnly)
         .expect("test should succeed")
         .results;
 
@@ -86,12 +89,12 @@ fn indexed_search_includes_non_utf8_text_files() {
     let utf8 = repo.write("utf8.txt", "Content-Security-Policy\n");
     let latin1 = repo.write_bytes("latin1.txt", b"Content-Security-Policy\xff\n");
 
-    let engine = codgrep::SearchEngine::new(repo.sparse_build_config());
+    let engine = flashgrep::SearchEngine::new(repo.sparse_build_config());
     engine.build_base_snapshot().expect("test should succeed");
 
     let query = count_query("Content-Security-Policy");
     let results = engine
-        .search(&query, codgrep::SearchPolicy::IndexOnly)
+        .search(&query, flashgrep::SearchPolicy::IndexOnly)
         .expect("test should succeed")
         .results;
     assert_eq!(results.candidate_docs, 2);
@@ -136,11 +139,11 @@ fn build_can_include_hidden_files() {
     let repo = TestRepo::new();
     let hidden = repo.write(".secret.rs", "const NAME: &str = \"PM_RESUME\";\n");
 
-    repo.build_with(codgrep::BuildConfig {
+    repo.build_with(flashgrep::BuildConfig {
         include_hidden: true,
         ..repo.trigram_build_config()
     });
-    let engine = codgrep::SearchEngine::new(codgrep::BuildConfig {
+    let engine = flashgrep::SearchEngine::new(flashgrep::BuildConfig {
         include_hidden: true,
         ..repo.trigram_build_config()
     });
@@ -182,7 +185,11 @@ fn search_can_be_restricted_to_selected_paths() {
     )
     .expect("test should succeed");
     let results = engine
-        .search_with_filter(&query, Some(&src_filter), codgrep::SearchPolicy::IndexOnly)
+        .search_with_filter(
+            &query,
+            Some(&src_filter),
+            flashgrep::SearchPolicy::IndexOnly,
+        )
         .expect("test should succeed");
     assert_eq!(results.results.hits.len(), 1);
     assert_eq!(results.results.hits[0].path, src.to_string_lossy());
@@ -246,7 +253,7 @@ fn search_can_be_restricted_to_exact_file_path() {
         .search_with_filter(
             &query("abc"),
             Some(&file_filter),
-            codgrep::SearchPolicy::IndexOnly,
+            flashgrep::SearchPolicy::IndexOnly,
         )
         .expect("test should succeed");
     assert_eq!(literal.results.hits.len(), 1);
@@ -285,7 +292,7 @@ fn count_total_matches_are_exposed_via_search_engine_api() {
     let query = count_matches_query("PM_RESUME");
     let engine = repo.engine();
     let results = engine
-        .search(&query, codgrep::SearchPolicy::IndexOnly)
+        .search(&query, flashgrep::SearchPolicy::IndexOnly)
         .expect("test should succeed")
         .results;
     assert_eq!(results.matched_lines, 2);

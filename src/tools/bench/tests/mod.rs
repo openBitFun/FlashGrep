@@ -3,9 +3,8 @@ use std::{fs, path::Path};
 use tempfile::tempdir;
 
 use super::{
-    bench_build_config, benchmark_scope_roots, copy_tree, ensure_bench_base_snapshot,
-    parse_rg_count_output, prepare_rg_search_scope, run, start_bench_daemon, BenchCacheMode,
-    BenchConfig,
+    bench_build_config, benchmark_scope_roots, ensure_bench_base_snapshot, parse_rg_count_output,
+    prepare_rg_search_scope, run, start_bench_daemon, BenchCacheMode, BenchConfig,
 };
 use super::{fixtures::prepare_dirty_worktree_fixture, DirtyPattern};
 use crate::config::{CorpusMode, TokenizerMode};

@@ -1,6 +1,6 @@
 use std::{cell::Cell, fs, path::Path, rc::Rc, thread, time::Duration};
 
-use codgrep::{
+use flashgrep::{
     advanced::{json::JsonSearchReport, BaseSnapshotKind},
     experimental::{IndexProgress, IndexProgressPhase},
     AppError, BaseSnapshotBuildOptions, WorkspaceIndex, WorkspaceIndexOptions,
@@ -443,8 +443,8 @@ fn workspace_json_report_reflects_latest_worktree_view() {
         .files
         .iter()
         .map(|file| match &file.path {
-            codgrep::advanced::json::JsonData::Text { text } => text.clone(),
-            codgrep::advanced::json::JsonData::Bytes { .. } => {
+            flashgrep::advanced::json::JsonData::Text { text } => text.clone(),
+            flashgrep::advanced::json::JsonData::Bytes { .. } => {
                 panic!("test expected utf-8 path")
             }
         })
