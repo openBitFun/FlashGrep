@@ -60,7 +60,7 @@ pub(crate) fn diff_against_snapshot_catalog(
     let mut modified_files = Vec::new();
     let mut deleted_files = Vec::new();
     for (path, state) in &base {
-        match current.get(path) {
+        match current.get(path.as_str()) {
             Some(current_state) if current_state == state => {}
             Some(_) => modified_files.push(path.clone()),
             None => deleted_files.push(path.clone()),

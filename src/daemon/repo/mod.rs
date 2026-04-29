@@ -31,25 +31,15 @@ use super::{
     rg_backend::{run_rg_glob, run_rg_search},
     service::ServiceNotificationEvent,
 };
-#[path = "repo/base.rs"]
 mod base;
-#[path = "repo/catalog.rs"]
 mod catalog;
-#[path = "repo/dirty_catalog.rs"]
 mod dirty_catalog;
-#[path = "repo/maintenance.rs"]
 mod maintenance;
-#[path = "repo/overlay.rs"]
 mod overlay;
-#[path = "repo/query.rs"]
 mod query;
-#[path = "repo/status.rs"]
 mod status;
-#[path = "repo/tasks.rs"]
 mod tasks;
-#[path = "repo/watch.rs"]
 mod watch;
-#[path = "repo/workspace.rs"]
 mod workspace;
 
 use maintenance::MaintenanceWorkerState;

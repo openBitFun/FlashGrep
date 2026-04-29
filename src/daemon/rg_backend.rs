@@ -358,7 +358,10 @@ fn build_rg_scope_command(build_config: &BuildConfig, scope: &PathFilterArgs) ->
 
 fn build_rg_files_command(build_config: &BuildConfig) -> Command {
     let mut command = Command::new("rg");
-    command.current_dir(&build_config.repo_path).arg("--color").arg("never");
+    command
+        .current_dir(&build_config.repo_path)
+        .arg("--color")
+        .arg("never");
     if !rg_diagnostics_enabled() {
         command.arg("--no-messages");
     }

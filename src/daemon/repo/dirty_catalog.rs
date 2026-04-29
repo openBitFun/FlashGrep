@@ -259,9 +259,7 @@ fn persist_dirty_catalog_bytes_with_retry(
                     return Err(error.into());
                 }
                 let _ = fs::remove_file(tmp_path);
-                thread::sleep(Duration::from_millis(
-                    DIRTY_CATALOG_PERSIST_RETRY_DELAY_MS,
-                ));
+                thread::sleep(Duration::from_millis(DIRTY_CATALOG_PERSIST_RETRY_DELAY_MS));
             }
             Err(error) => return Err(error.into()),
         }

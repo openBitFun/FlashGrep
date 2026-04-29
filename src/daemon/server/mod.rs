@@ -21,9 +21,7 @@ use crate::{
     error::{AppError, Result},
 };
 
-#[path = "server/codec.rs"]
 mod codec;
-#[path = "server/connection.rs"]
 mod connection;
 
 use codec::{read_content_length_request, write_content_length_message};

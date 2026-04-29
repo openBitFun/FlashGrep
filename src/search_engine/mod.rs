@@ -12,9 +12,7 @@ use crate::{
     worktree_diff::{diff_against_snapshot_catalog, IndexWorktreeDiff},
 };
 
-#[path = "search_engine/document.rs"]
 mod document;
-#[path = "search_engine/scan.rs"]
 mod scan;
 
 pub(crate) use document::{SearchDocument, SearchDocumentSource};
