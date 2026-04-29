@@ -1,5 +1,6 @@
 use std::{
     collections::HashMap,
+    env,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
     process::Command,
@@ -39,12 +40,14 @@ pub(super) fn run_rg_glob(
     let mut command = build_rg_files_command(build_config);
     command.arg("--files");
     append_rg_scope_roots(&mut command, build_config, scope);
+    let command_debug = format!("{command:?}");
 
     let output = command.output()?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err(AppError::Protocol(format!(
-            "rg glob failed with status {}: {}",
+            "rg glob failed with status {} (command: {}): {}",
             output.status,
+            command_debug,
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
@@ -122,12 +125,14 @@ fn run_rg_count_command(
     } else {
         command.arg("--count");
     }
+    let command_debug = format!("{command:?}");
 
     let output = command.output()?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err(AppError::Protocol(format!(
-            "rg fallback failed with status {}: {}",
+            "rg fallback failed with status {} (command: {}): {}",
             output.status,
+            command_debug,
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
@@ -175,12 +180,14 @@ fn run_rg_json_search(
     } else if matches!(query.search_mode, SearchMode::FirstHitOnly) {
         command.arg("-m").arg("1");
     }
+    let command_debug = format!("{command:?}");
 
     let output = command.output()?;
     if !output.status.success() && output.status.code() != Some(1) {
         return Err(AppError::Protocol(format!(
-            "rg fallback failed with status {}: {}",
+            "rg fallback failed with status {} (command: {}): {}",
             output.status,
+            command_debug,
             String::from_utf8_lossy(&output.stderr).trim()
         )));
     }
@@ -311,9 +318,11 @@ fn build_rg_scope_command(build_config: &BuildConfig, scope: &PathFilterArgs) ->
         .current_dir(&build_config.repo_path)
         .arg("--color")
         .arg("never")
-        .arg("--no-messages")
         .arg("--max-filesize")
         .arg(build_config.max_file_size.to_string());
+    if !rg_diagnostics_enabled() {
+        command.arg("--no-messages");
+    }
     if matches!(build_config.corpus_mode, CorpusMode::NoIgnore) {
         command.arg("--no-ignore");
     }
@@ -349,11 +358,10 @@ fn build_rg_scope_command(build_config: &BuildConfig, scope: &PathFilterArgs) ->
 
 fn build_rg_files_command(build_config: &BuildConfig) -> Command {
     let mut command = Command::new("rg");
-    command
-        .current_dir(&build_config.repo_path)
-        .arg("--color")
-        .arg("never")
-        .arg("--no-messages");
+    command.current_dir(&build_config.repo_path).arg("--color").arg("never");
+    if !rg_diagnostics_enabled() {
+        command.arg("--no-messages");
+    }
     if matches!(build_config.corpus_mode, CorpusMode::NoIgnore) {
         command.arg("--no-ignore");
     }
@@ -366,6 +374,10 @@ fn build_rg_files_command(build_config: &BuildConfig) -> Command {
         command.arg("-g").arg(format!("!{exclude_glob}"));
     }
     command
+}
+
+fn rg_diagnostics_enabled() -> bool {
+    env::var_os("FLASHGREP_LOG_TRANSITION_FALLBACKS").is_some()
 }
 
 fn append_rg_scope_roots(

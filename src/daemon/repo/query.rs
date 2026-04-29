@@ -1,4 +1,5 @@
 use std::{
+    env,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
     time::Duration,
@@ -196,12 +197,6 @@ impl RepoRuntime {
                             && matches!(request.consistency, SearchConsistency::WorkspaceEventual)
                         {
                             self.schedule_workspace_probe(Duration::from_millis(0));
-                            return self.search_during_transition(
-                                &request,
-                                &scope,
-                                filter.as_ref(),
-                                response_status,
-                            );
                         }
                         if !workspace_snapshot.has_base_snapshot() {
                             self.schedule_workspace_probe(Duration::from_millis(0));
@@ -535,13 +530,27 @@ impl RepoRuntime {
                 status: self.status_snapshot(),
                 results,
             }),
-            Err(_) => Ok(SearchResponse {
-                repo_id: self.repo_id.clone(),
-                backend: QueryBackend::ScanFallback,
-                consistency_applied: request.consistency,
-                status: self.status_snapshot(),
-                results: self.scan_search_fallback(&request.query, filter)?,
-            }),
+            Err(error) => {
+                if transition_fallback_logging_enabled() {
+                    eprintln!(
+                        "flashgrep: transition rg fallback failed for repo={} phase={} consistency={:?} dirty=({},{},{}) pattern={:?}: {error}",
+                        self.repo_id,
+                        repo_phase_label(status.phase),
+                        request.consistency,
+                        status.dirty_files.modified,
+                        status.dirty_files.deleted,
+                        status.dirty_files.new,
+                        request.query.regex_pattern
+                    );
+                }
+                Ok(SearchResponse {
+                    repo_id: self.repo_id.clone(),
+                    backend: QueryBackend::ScanFallback,
+                    consistency_applied: request.consistency,
+                    status: self.status_snapshot(),
+                    results: self.scan_search_fallback(&request.query, filter)?,
+                })
+            }
         }
     }
 
@@ -564,6 +573,10 @@ fn repo_phase_label(phase: RepoPhase) -> &'static str {
         RepoPhase::RebuildingBaseSnapshot => "rebuilding_base_snapshot",
         RepoPhase::Degraded => "degraded",
     }
+}
+
+fn transition_fallback_logging_enabled() -> bool {
+    env::var_os("FLASHGREP_LOG_TRANSITION_FALLBACKS").is_some()
 }
 
 fn build_path_filter(repo_root: &Path, args: &PathFilterArgs) -> Result<Option<PathFilter>> {

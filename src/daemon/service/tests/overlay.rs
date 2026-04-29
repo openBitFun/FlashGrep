@@ -74,7 +74,7 @@ fn probe_marks_dirty_paths_for_eventual_workspace_search() {
 }
 
 #[test]
-fn eventual_search_uses_transition_fallback_while_overlay_engine_recovers() {
+fn eventual_search_stays_indexed_while_overlay_engine_recovers() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -111,8 +111,8 @@ fn eventual_search_uses_transition_fallback_while_overlay_engine_recovers() {
             status,
             ..
         } => {
-            assert!(is_transition_or_indexed_workspace_backend(backend));
-            assert_eq!(results.matched_lines, 1);
+            assert!(is_indexed_workspace_backend(backend));
+            assert_eq!(results.matched_lines, 0);
             assert_eq!(status.dirty_files.modified, 1);
             assert_eq!(status.dirty_files.deleted, 0);
             assert_eq!(status.dirty_files.new, 0);
@@ -124,6 +124,27 @@ fn eventual_search_uses_transition_fallback_while_overlay_engine_recovers() {
         other => panic!("unexpected response: {other:?}"),
     }
 
+    match search_repo(
+        &service,
+        &repo_id,
+        "BASE",
+        ConsistencyMode::WorkspaceEventual,
+    ) {
+        Response::SearchCompleted {
+            backend,
+            results,
+            status,
+            ..
+        } => {
+            assert!(is_indexed_workspace_backend(backend));
+            assert_eq!(results.matched_lines, 1);
+            assert_eq!(status.dirty_files.modified, 1);
+            assert_eq!(status.dirty_files.deleted, 0);
+            assert_eq!(status.dirty_files.new, 0);
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
     let (backend, status) = wait_for_search_count(
         &service,
         &repo_id,
@@ -131,7 +152,7 @@ fn eventual_search_uses_transition_fallback_while_overlay_engine_recovers() {
         ConsistencyMode::WorkspaceEventual,
         1,
     );
-    assert!(is_transition_or_indexed_workspace_backend(backend));
+    assert!(is_indexed_workspace_backend(backend));
     assert_exact_dirty_stats(&status, 1, 0, 0);
 }
 
@@ -410,20 +431,38 @@ fn workspace_eventual_search_stays_stable_while_overlay_merge_is_pending() {
 
     let mut saw_requested = false;
     for _ in 0..12 {
-        let (_, new_status) = assert_search_count_now(
+        let (new_backend, new_results, new_status) = match search_repo(
             &service,
             &repo_id,
             "MERGE_STABLE_NEW",
             ConsistencyMode::WorkspaceEventual,
-            1,
-        );
-        let _ = assert_search_count_now(
+        ) {
+            Response::SearchCompleted {
+                backend,
+                results,
+                status,
+                ..
+            } => (backend, results, status),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(is_indexed_workspace_backend(new_backend));
+
+        let (old_backend, old_results, _) = match search_repo(
             &service,
             &repo_id,
             "MERGE_STABLE_OLD",
             ConsistencyMode::WorkspaceEventual,
-            0,
-        );
+        ) {
+            Response::SearchCompleted {
+                backend,
+                results,
+                status,
+                ..
+            } => (backend, results, status),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(is_indexed_workspace_backend(old_backend));
+        assert_eq!(new_results.matched_lines + old_results.matched_lines, 1);
         if new_status
             .overlay
             .as_ref()

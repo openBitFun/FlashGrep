@@ -254,6 +254,13 @@ pub(super) fn is_transition_or_indexed_workspace_backend(backend: SearchBackend)
     )
 }
 
+pub(super) fn is_indexed_workspace_backend(backend: SearchBackend) -> bool {
+    matches!(
+        backend,
+        SearchBackend::IndexedClean | SearchBackend::IndexedWorkspaceView
+    )
+}
+
 pub(super) fn has_base_snapshot_engine(service: &DaemonService, repo_id: &str) -> bool {
     service
         .repos
