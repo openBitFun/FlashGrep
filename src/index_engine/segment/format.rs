@@ -17,7 +17,7 @@ use crate::index_engine::{
     types::{DeleteSegmentId, DocKey, RepoId, SegmentId, SeqNo},
     writer::IndexDocument,
 };
-use crate::{AppError, Result};
+use crate::{fs_atomic::replace_file, AppError, Result};
 
 pub(crate) const SEGMENT_META_FILE: &str = "SEGMENT_META.json";
 pub(crate) const DOCS_FILE: &str = "docs.bin";
@@ -336,7 +336,7 @@ pub(crate) fn write_path_offsets_file(path: &Path, offsets: &[u64]) -> Result<()
 
     let tmp_path = path.with_extension("tmp");
     fs::write(&tmp_path, &buffer)?;
-    fs::rename(tmp_path, path)?;
+    replace_file(&tmp_path, path)?;
     Ok(())
 }
 

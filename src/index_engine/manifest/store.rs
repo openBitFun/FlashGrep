@@ -5,7 +5,7 @@ use std::{
     sync::{Arc, Mutex, RwLock},
 };
 
-use crate::{AppError, Result};
+use crate::{fs_atomic::replace_file, AppError, Result};
 
 use super::{Manifest, ManifestMeta};
 
@@ -149,7 +149,7 @@ impl FileManifestStore {
         fs::write(&path, encoded)?;
         let tmp_current = self.current_path.with_extension("tmp");
         fs::write(&tmp_current, format!("{file_name}\n"))?;
-        fs::rename(tmp_current, &self.current_path)?;
+        replace_file(&tmp_current, &self.current_path)?;
         Ok(())
     }
 }

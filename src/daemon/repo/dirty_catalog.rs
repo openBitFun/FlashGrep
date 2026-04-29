@@ -10,7 +10,7 @@ use std::{
 
 use serde::{Deserialize, Serialize};
 
-use crate::{error::Result, worktree_diff::DirtyPathKind};
+use crate::{error::Result, fs_atomic::replace_file, worktree_diff::DirtyPathKind};
 
 use super::{DirtyPathSet, DirtyStats, RepoRuntime};
 
@@ -277,7 +277,7 @@ fn persist_dirty_catalog_bytes(
 ) -> std::io::Result<()> {
     fs::create_dir_all(parent)?;
     fs::write(tmp_path, encoded)?;
-    fs::rename(tmp_path, path)
+    replace_file(tmp_path, path)
 }
 
 fn is_retryable_dirty_catalog_persist_error(error: &std::io::Error) -> bool {
