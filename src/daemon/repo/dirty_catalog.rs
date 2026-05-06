@@ -216,12 +216,6 @@ impl DirtyCatalog {
         self.visible_dirty_paths().stats()
     }
 
-    pub(super) fn has_pending_entries(&self) -> bool {
-        self.entries
-            .values()
-            .any(|entry| entry.state != DirtyCatalogState::ReadyOverlay)
-    }
-
     pub(super) fn mark_building(&mut self, paths: &DirtyPathSet) {
         self.mark_paths(paths, DirtyCatalogState::Building);
     }
@@ -345,14 +339,6 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         catalog.pending_dirty_paths()
-    }
-
-    pub(super) fn dirty_catalog_has_pending(&self) -> bool {
-        let catalog = match self.dirty_catalog.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        catalog.has_pending_entries()
     }
 
     fn update_dirty_catalog_state(

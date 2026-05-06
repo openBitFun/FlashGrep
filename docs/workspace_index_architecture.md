@@ -53,8 +53,7 @@ overlay snapshot 也是 daemon runtime 负责维护，但它只承担已发布�
 - overlay 先在后台构建，再一次性 publish。
 - 查询时通过 `WorkspaceSearchView` 合并 `base snapshot + published overlay snapshot`。
 
-`WorkspaceEventual` 模式下，daemon 可以复用当前 overlay 状态；
-`WorkspaceStrict` / refresh 路径则要求当前 workspace 没有 pending dirty，且 overlay 已经发布到可读 snapshot。
+`WorkspaceEventual` 模式下，daemon 直接复用当前已发布的 overlay 状态。
 
 ### Library Facades
 

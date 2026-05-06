@@ -23,8 +23,8 @@ use crate::{
     daemon::{
         daemon_state_file_path,
         protocol::{
-            ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request,
-            RequestEnvelope, Response, ResponseEnvelope, SearchModeConfig, SearchParams,
+            EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request, RequestEnvelope, Response,
+            ResponseEnvelope, SearchModeConfig, SearchParams,
         },
         DaemonClient,
     },
@@ -886,7 +886,6 @@ pub(super) fn run_daemon_search_count(
             types: Vec::new(),
             type_not: Vec::new(),
         },
-        consistency: ConsistencyMode::WorkspaceEventual,
         allow_scan_fallback: false,
     })?;
 

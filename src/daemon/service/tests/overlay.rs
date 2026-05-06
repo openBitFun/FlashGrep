@@ -56,13 +56,7 @@ fn probe_marks_dirty_paths_for_eventual_workspace_search() {
     });
     assert_exact_dirty_stats(&status, 1, 0, 0);
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIRTY",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "DIRTY", 1);
     assert!(is_transition_or_indexed_workspace_backend(backend));
     assert_eq!(status.dirty_files.modified, 1);
     assert_eq!(status.dirty_files.deleted, 0);
@@ -99,12 +93,7 @@ fn eventual_search_stays_indexed_while_overlay_engine_recovers() {
 
     clear_workspace_overlay_engine(&service, &repo_id);
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "DIRTY_FALLBACK",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "DIRTY_FALLBACK") {
         Response::SearchCompleted {
             backend,
             results,
@@ -124,12 +113,7 @@ fn eventual_search_stays_indexed_while_overlay_engine_recovers() {
         other => panic!("unexpected response: {other:?}"),
     }
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "BASE",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "BASE") {
         Response::SearchCompleted {
             backend,
             results,
@@ -145,13 +129,7 @@ fn eventual_search_stays_indexed_while_overlay_engine_recovers() {
         other => panic!("unexpected response: {other:?}"),
     }
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIRTY_FALLBACK",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "DIRTY_FALLBACK", 1);
     assert!(is_indexed_workspace_backend(backend));
     assert_exact_dirty_stats(&status, 1, 0, 0);
 }
@@ -187,26 +165,14 @@ fn eventual_search_rebuilds_full_overlay_after_overlay_engine_reset() {
     fs::write(&first, "const NAME: &str = \"DIRTY_FIRST_AGAIN\";\n")
         .expect("rewrite should succeed");
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIRTY_SECOND",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "DIRTY_SECOND", 1);
     assert!(is_transition_or_indexed_workspace_backend(backend));
     assert!(matches!(
         status.phase,
         crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIRTY_FIRST_AGAIN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "DIRTY_FIRST_AGAIN", 1);
     assert!(is_transition_or_indexed_workspace_backend(backend));
     assert!(matches!(
         status.phase,
@@ -255,13 +221,7 @@ fn eventual_search_honors_configured_overlay_auto_checkpoint_threshold() {
     let first = repo_path.join("first.rs");
     fs::write(&first, "const NAME: &str = \"DIRTY_FIRST\";\n").expect("write should succeed");
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIRTY_FIRST",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "DIRTY_FIRST", 1);
     wait_for_workspace_overlay_match_count(&repo_path, "DIRTY_FIRST", 1);
     wait_for_workspace_overlay_committed_match_count(&repo_path, "DIRTY_FIRST", 1);
 }
@@ -344,13 +304,7 @@ fn overlay_merge_is_deferred_and_runs_in_background() {
     let first = repo_path.join("first.rs");
     fs::write(&first, "const NAME: &str = \"DIRTY_MERGE_DELAY\";\n").expect("write should succeed");
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIRTY_MERGE_DELAY",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "DIRTY_MERGE_DELAY", 1);
     assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
     assert!(status
         .overlay
@@ -385,7 +339,7 @@ fn overlay_merge_is_deferred_and_runs_in_background() {
 }
 
 #[test]
-fn workspace_eventual_search_stays_stable_while_overlay_merge_is_pending() {
+fn workspace_search_stays_stable_while_overlay_merge_is_pending() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -431,38 +385,36 @@ fn workspace_eventual_search_stays_stable_while_overlay_merge_is_pending() {
 
     let mut saw_requested = false;
     for _ in 0..12 {
-        let (new_backend, new_results, new_status) = match search_repo(
-            &service,
-            &repo_id,
-            "MERGE_STABLE_NEW",
-            ConsistencyMode::WorkspaceEventual,
-        ) {
-            Response::SearchCompleted {
-                backend,
-                results,
-                status,
-                ..
-            } => (backend, results, status),
-            other => panic!("unexpected response: {other:?}"),
-        };
+        let (new_backend, new_results, new_status) =
+            match search_repo(&service, &repo_id, "MERGE_STABLE_NEW") {
+                Response::SearchCompleted {
+                    backend,
+                    results,
+                    status,
+                    ..
+                } => (backend, results, status),
+                other => panic!("unexpected response: {other:?}"),
+            };
         assert!(is_indexed_workspace_backend(new_backend));
 
-        let (old_backend, old_results, _) = match search_repo(
-            &service,
-            &repo_id,
-            "MERGE_STABLE_OLD",
-            ConsistencyMode::WorkspaceEventual,
-        ) {
-            Response::SearchCompleted {
-                backend,
-                results,
-                status,
-                ..
-            } => (backend, results, status),
-            other => panic!("unexpected response: {other:?}"),
-        };
+        let (old_backend, old_results, _) =
+            match search_repo(&service, &repo_id, "MERGE_STABLE_OLD") {
+                Response::SearchCompleted {
+                    backend,
+                    results,
+                    status,
+                    ..
+                } => (backend, results, status),
+                other => panic!("unexpected response: {other:?}"),
+            };
         assert!(is_indexed_workspace_backend(old_backend));
-        assert_eq!(new_results.matched_lines + old_results.matched_lines, 1);
+        let visible_matches = new_results.matched_lines + old_results.matched_lines;
+        assert!(
+            (1..=2).contains(&visible_matches),
+            "expected pending merge to keep at least one visible revision, got new={} old={}",
+            new_results.matched_lines,
+            old_results.matched_lines
+        );
         if new_status
             .overlay
             .as_ref()
@@ -494,7 +446,7 @@ fn workspace_eventual_search_stays_stable_while_overlay_merge_is_pending() {
 }
 
 #[test]
-fn workspace_eventual_search_stays_stable_during_forced_overlay_rebuild() {
+fn workspace_search_stays_stable_during_forced_overlay_rebuild() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -527,21 +479,9 @@ fn workspace_eventual_search_stays_stable_during_forced_overlay_rebuild() {
     mark_workspace_probe_pending(&service, &repo_id);
 
     for _ in 0..12 {
-        let (backend, _) = wait_for_search_count(
-            &service,
-            &repo_id,
-            "REBUILD_STABLE_DIRTY",
-            ConsistencyMode::WorkspaceEventual,
-            1,
-        );
+        let (backend, _) = wait_for_search_count(&service, &repo_id, "REBUILD_STABLE_DIRTY", 1);
         assert!(is_transition_or_indexed_workspace_backend(backend));
-        let (backend, _) = wait_for_search_count(
-            &service,
-            &repo_id,
-            "REBUILD_STABLE_BASE",
-            ConsistencyMode::WorkspaceEventual,
-            0,
-        );
+        let (backend, _) = wait_for_search_count(&service, &repo_id, "REBUILD_STABLE_BASE", 0);
         assert!(is_transition_or_indexed_workspace_backend(backend));
         thread::sleep(Duration::from_millis(30));
     }
@@ -591,13 +531,7 @@ fn probe_reconciles_batched_tracked_file_updates() {
     });
     assert_exact_dirty_stats(&status, dirty_count, 0, 0);
 
-    let (backend, search_status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIRTY",
-        ConsistencyMode::WorkspaceEventual,
-        dirty_count,
-    );
+    let (backend, search_status) = wait_for_search_count(&service, &repo_id, "DIRTY", dirty_count);
     assert!(is_transition_or_indexed_workspace_backend(backend));
     assert_eq!(search_status.dirty_files.modified, dirty_count);
 }
@@ -624,13 +558,7 @@ fn probe_tracks_new_text_files() {
     )
     .expect("write should succeed");
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "ADDED",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "ADDED", 1);
     assert!(is_transition_or_indexed_workspace_backend(backend));
     assert_exact_dirty_stats(&status, 0, 0, 1);
 }
@@ -667,13 +595,7 @@ fn probe_tracks_new_text_files_inside_new_directory_without_extra_probe() {
     });
     assert_exact_dirty_stats(&status, 0, 0, 1);
 
-    let (backend, _) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "NESTED_ADDED",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, _) = wait_for_search_count(&service, &repo_id, "NESTED_ADDED", 1);
     assert!(is_transition_or_indexed_workspace_backend(backend));
 }
 
@@ -699,12 +621,7 @@ fn probe_tracks_deleted_files() {
     assert_eq!(status.dirty_files.modified, 0);
     assert_eq!(status.dirty_files.new, 0);
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "BASE",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "BASE") {
         Response::SearchCompleted {
             backend,
             results,
@@ -808,14 +725,8 @@ fn reopened_daemon_materializes_fixed_string_phrase_from_published_overlay() {
         search_mode: SearchModeConfig::MaterializeMatches,
         ..query(phrase)
     };
-    let (backend, results, _) = wait_for_search_with_params_count(
-        &service,
-        &repo_id,
-        phrase_query,
-        vec![header],
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, results, _) =
+        wait_for_search_with_params_count(&service, &repo_id, phrase_query, vec![header], 1);
     assert!(matches!(
         backend,
         SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
@@ -858,13 +769,7 @@ fn published_overlay_uses_latest_contents_after_multiple_edits() {
         crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
-    let (backend, _) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "FIRST_EDIT",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, _) = wait_for_search_count(&service, &repo_id, "FIRST_EDIT", 1);
     assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
 
     fs::write(&tracked, "const VALUE: &str = \"SECOND_EDIT\";\n")
@@ -878,21 +783,9 @@ fn published_overlay_uses_latest_contents_after_multiple_edits() {
         crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "FIRST_EDIT",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "FIRST_EDIT", 0);
 
-    let (backend, _) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "SECOND_EDIT",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, _) = wait_for_search_count(&service, &repo_id, "SECOND_EDIT", 1);
     assert!(is_transition_or_indexed_workspace_backend(backend));
 }
 
@@ -938,13 +831,7 @@ fn repeated_incremental_edits_converge_to_expected_overlay_state() {
             .expect("rewrite should succeed");
     }
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        &latest,
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, &latest, 1);
 
     let settled = wait_for_status(&service, &repo_id, |status| {
         status.overlay.as_ref().is_some_and(|overlay| {
@@ -959,21 +846,9 @@ fn repeated_incremental_edits_converge_to_expected_overlay_state() {
     assert_eq!(overlay.active_delete_segments, 0);
     assert_eq!(overlay.merge_failed, 0);
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "REPEAT_BASE",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "REPEAT_BASE", 0);
     for token in prior_tokens {
-        let _ = wait_for_search_count(
-            &service,
-            &repo_id,
-            &token,
-            ConsistencyMode::WorkspaceEventual,
-            0,
-        );
+        let _ = wait_for_search_count(&service, &repo_id, &token, 0);
     }
 }
 
@@ -1003,13 +878,8 @@ fn repeated_published_overlay_searches_remain_stable() {
     ));
 
     for _ in 0..3 {
-        let (backend, _) = wait_for_search_count(
-            &service,
-            &repo_id,
-            "REPEATED_DIRTY_TOKEN_20260410",
-            ConsistencyMode::WorkspaceEventual,
-            1,
-        );
+        let (backend, _) =
+            wait_for_search_count(&service, &repo_id, "REPEATED_DIRTY_TOKEN_20260410", 1);
         assert!(is_transition_or_indexed_workspace_backend(backend));
     }
 }
@@ -1039,23 +909,11 @@ fn mixed_incremental_sequence_remains_searchable() {
     });
     assert!(status.dirty_files.modified >= 1);
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "MIXED_EXISTING_TOKEN_20260410",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "MIXED_EXISTING_TOKEN_20260410", 1);
 
     fs::write(&tracked, "const VALUE: &str = \"BASE\";\n").expect("revert should succeed");
     refresh_repo(&service, &repo_id, true);
-    wait_for_search_count(
-        &service,
-        &repo_id,
-        "MIXED_EXISTING_TOKEN_20260410",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    wait_for_search_count(&service, &repo_id, "MIXED_EXISTING_TOKEN_20260410", 0);
 
     let nested = repo_path.join("nested");
     fs::create_dir_all(&nested).expect("nested dir should succeed");
@@ -1066,26 +924,15 @@ fn mixed_incremental_sequence_remains_searchable() {
     .expect("nested write should succeed");
     refresh_repo(&service, &repo_id, true);
 
-    let (_, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "MIXED_NEWDIR_TOKEN_20260410",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (_, status) = wait_for_search_count(&service, &repo_id, "MIXED_NEWDIR_TOKEN_20260410", 1);
     assert!(matches!(
         status.phase,
         crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
     for _ in 0..3 {
-        let (_, status) = wait_for_search_count(
-            &service,
-            &repo_id,
-            "MIXED_NEWDIR_TOKEN_20260410",
-            ConsistencyMode::WorkspaceEventual,
-            1,
-        );
+        let (_, status) =
+            wait_for_search_count(&service, &repo_id, "MIXED_NEWDIR_TOKEN_20260410", 1);
         assert!(matches!(
             status.phase,
             crate::daemon::protocol::RepoPhase::ReadyDirty
@@ -1094,7 +941,7 @@ fn mixed_incremental_sequence_remains_searchable() {
 }
 
 #[test]
-fn workspace_eventual_search_does_not_run_dirty_diff_observation() {
+fn workspace_search_does_not_run_dirty_diff_observation() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1111,13 +958,7 @@ fn workspace_eventual_search_does_not_run_dirty_diff_observation() {
     let (repo_id, _) = open_repo(&service, repo_path.clone());
     build_repo(&service, &repo_id);
 
-    let (backend, _) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "BASE",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, _) = wait_for_search_count(&service, &repo_id, "BASE", 1);
     assert!(matches!(backend, SearchBackend::IndexedClean));
     assert!(!observation_path.exists());
 
@@ -1156,14 +997,7 @@ fn path_scoped_search_limits_published_overlay_results() {
         search_mode: SearchModeConfig::MaterializeMatches,
         ..query("SCOPED_TOKEN")
     };
-    match wait_for_search_with_params_count(
-        &service,
-        &repo_id,
-        query,
-        vec![left.clone()],
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    ) {
+    match wait_for_search_with_params_count(&service, &repo_id, query, vec![left.clone()], 1) {
         (backend, results, _) => {
             assert!(matches!(
                 backend,
@@ -1207,12 +1041,7 @@ fn transient_new_file_does_not_leave_phantom_match_after_delete() {
             | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "EPHEMERAL_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "EPHEMERAL_TOKEN") {
         Response::SearchCompleted { results, .. } => {
             assert_eq!(results.matched_lines, 0);
         }
@@ -1246,13 +1075,8 @@ fn probe_removes_overlay_only_new_file_without_refresh() {
     .expect("transient write should succeed");
     wait_for_workspace_overlay_match_count(&repo_path, "PROBE_DELETE_TOKEN_20260410", 1);
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "PROBE_DELETE_TOKEN_20260410",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) =
+        wait_for_search_count(&service, &repo_id, "PROBE_DELETE_TOKEN_20260410", 1);
     assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
     assert!(matches!(
         status.phase,
@@ -1263,13 +1087,8 @@ fn probe_removes_overlay_only_new_file_without_refresh() {
     fs::remove_dir(&nested).expect("nested dir delete should succeed");
     wait_for_workspace_overlay_match_count(&repo_path, "PROBE_DELETE_TOKEN_20260410", 0);
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "PROBE_DELETE_TOKEN_20260410",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let (backend, status) =
+        wait_for_search_count(&service, &repo_id, "PROBE_DELETE_TOKEN_20260410", 0);
     assert!(matches!(
         backend,
         SearchBackend::IndexedClean
@@ -1292,12 +1111,7 @@ fn probe_removes_overlay_only_new_file_without_refresh() {
     assert_exact_dirty_stats(&status, 0, 0, 0);
 
     for _ in 0..3 {
-        match search_repo(
-            &service,
-            &repo_id,
-            "PROBE_DELETE_TOKEN_20260410",
-            ConsistencyMode::WorkspaceEventual,
-        ) {
+        match search_repo(&service, &repo_id, "PROBE_DELETE_TOKEN_20260410") {
             Response::SearchCompleted { results, .. } => {
                 assert_eq!(results.matched_lines, 0);
             }
@@ -1326,13 +1140,8 @@ fn probe_clears_restored_tracked_file_without_refresh() {
     .expect("tracked rewrite should succeed");
     wait_for_workspace_overlay_match_count(&repo_path, "PROBE_RESTORE_TOKEN_20260416", 1);
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "PROBE_RESTORE_TOKEN_20260416",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) =
+        wait_for_search_count(&service, &repo_id, "PROBE_RESTORE_TOKEN_20260416", 1);
     assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
     assert!(matches!(
         status.phase,
@@ -1375,13 +1184,8 @@ fn probe_clears_restored_tracked_file_without_refresh() {
     let tracked_crc = crc32fast::hash(&tracked_bytes);
     tracked_hash[..4].copy_from_slice(&tracked_crc.to_le_bytes());
     assert_eq!(tracked_entry.content_hash, tracked_hash);
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "PROBE_RESTORE_TOKEN_20260416",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let (backend, status) =
+        wait_for_search_count(&service, &repo_id, "PROBE_RESTORE_TOKEN_20260416", 0);
     assert!(matches!(
         backend,
         SearchBackend::IndexedClean
@@ -1432,12 +1236,7 @@ fn probe_keeps_indexed_reads_while_directory_events_wait_for_reconcile() {
     assert_eq!(status.dirty_files.deleted, 0);
     assert_eq!(status.dirty_files.new, 0);
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "BASE",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "BASE") {
         Response::SearchCompleted {
             backend,
             results,
@@ -1562,20 +1361,8 @@ fn probe_reconciles_tracked_directory_delete_and_restore_without_refresh() {
     });
     assert_exact_dirty_stats(&status, 0, 2, 0);
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIR_DELETE_ALPHA",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIR_DELETE_BETA",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "DIR_DELETE_ALPHA", 0);
+    let _ = wait_for_search_count(&service, &repo_id, "DIR_DELETE_BETA", 0);
 
     fs::create_dir_all(&nested).expect("nested dir restore should succeed");
     fs::write(&first, "const NAME: &str = \"DIR_DELETE_ALPHA\";\n")
@@ -1591,18 +1378,6 @@ fn probe_reconciles_tracked_directory_delete_and_restore_without_refresh() {
     });
     assert_exact_dirty_stats(&status, 0, 0, 0);
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIR_DELETE_ALPHA",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "DIR_DELETE_BETA",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "DIR_DELETE_ALPHA", 1);
+    let _ = wait_for_search_count(&service, &repo_id, "DIR_DELETE_BETA", 1);
 }

@@ -35,12 +35,7 @@ fn daemon_reports_missing_index_then_builds_and_searches() {
         crate::daemon::protocol::RepoPhase::ReadyClean
     ));
 
-    let search = search_repo(
-        &service,
-        &repo_id,
-        "WORKTREE",
-        ConsistencyMode::WorkspaceEventual,
-    );
+    let search = search_repo(&service, &repo_id, "WORKTREE");
 
     match search {
         Response::SearchCompleted {
@@ -51,58 +46,6 @@ fn daemon_reports_missing_index_then_builds_and_searches() {
                 SearchBackend::IndexedClean | SearchBackend::IndexedWorkspaceView
             ));
             assert_eq!(results.matched_lines, 1);
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
-}
-
-#[test]
-fn snapshot_only_search_uses_base_snapshot_without_published_overlay() {
-    let _serial = daemon_test_serial();
-    let service = DaemonService::new();
-    let temp = tempdir().expect("temp dir should succeed");
-    let repo_path = temp.path().join("repo");
-    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
-    let tracked = repo_path.join("tracked.rs");
-    fs::write(&tracked, "const VALUE: &str = \"BASE_ONLY\";\n").expect("write should succeed");
-
-    let (repo_id, _) = open_repo(&service, repo_path.clone());
-    build_repo(&service, &repo_id);
-
-    fs::write(&tracked, "const VALUE: &str = \"DIRTY_ONLY\";\n").expect("rewrite should succeed");
-    let status = refresh_repo(&service, &repo_id, true);
-    assert!(matches!(
-        status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyClean
-            | crate::daemon::protocol::RepoPhase::ReadyDirty
-    ));
-
-    match search_repo(
-        &service,
-        &repo_id,
-        "BASE_ONLY",
-        ConsistencyMode::SnapshotOnly,
-    ) {
-        Response::SearchCompleted {
-            backend, results, ..
-        } => {
-            assert!(matches!(backend, SearchBackend::IndexedSnapshot));
-            assert_eq!(results.matched_lines, 1);
-        }
-        other => panic!("unexpected response: {other:?}"),
-    }
-
-    match search_repo(
-        &service,
-        &repo_id,
-        "DIRTY_ONLY",
-        ConsistencyMode::SnapshotOnly,
-    ) {
-        Response::SearchCompleted {
-            backend, results, ..
-        } => {
-            assert!(matches!(backend, SearchBackend::IndexedSnapshot));
-            assert_eq!(results.matched_lines, 0);
         }
         other => panic!("unexpected response: {other:?}"),
     }
@@ -145,14 +88,7 @@ fn ready_status_and_search_recover_from_overlay_snapshot_when_published_overlay_
     assert_eq!(status.dirty_files.deleted, 0);
     assert_eq!(status.dirty_files.new, 0);
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "SNAPSHOT_DIRTY",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    assert!(!matches!(backend, SearchBackend::IndexedSnapshot));
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SNAPSHOT_DIRTY", 1);
     assert_eq!(status.dirty_files.modified, 1);
 }
 
@@ -203,34 +139,13 @@ fn probe_delta_uses_overlay_snapshot_truth_when_published_overlay_paths_cache_is
     assert_eq!(status.dirty_files.deleted, 0);
     assert_eq!(status.dirty_files.new, 0);
 
-    let (backend, _) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "FIRST_DIRTY_TOKEN_20260416",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    assert!(
-        !matches!(backend, SearchBackend::IndexedSnapshot),
-        "dirty eventual search must not fall back to stale base-only results"
-    );
-
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "SECOND_DIRTY_TOKEN_20260416",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    assert!(
-        !matches!(backend, SearchBackend::IndexedSnapshot),
-        "dirty eventual search must not fall back to stale base-only results"
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "FIRST_DIRTY_TOKEN_20260416", 1);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SECOND_DIRTY_TOKEN_20260416", 1);
     assert_eq!(status.dirty_files.modified, 2);
 }
 
 #[test]
-fn snapshot_only_search_can_fallback_to_scan_without_base_index() {
+fn workspace_search_uses_transition_fallback_without_base_index() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -254,7 +169,6 @@ fn snapshot_only_search_can_fallback_to_scan_without_base_index() {
                 repo_id,
                 query: query("SCAN_ONLY"),
                 scope: PathScope::default(),
-                consistency: ConsistencyMode::SnapshotOnly,
                 allow_scan_fallback: true,
             },
         })
@@ -263,7 +177,10 @@ fn snapshot_only_search_can_fallback_to_scan_without_base_index() {
         Response::SearchCompleted {
             backend, results, ..
         } => {
-            assert!(matches!(backend, SearchBackend::ScanFallback));
+            assert!(matches!(
+                backend,
+                SearchBackend::RgFallback | SearchBackend::ScanFallback
+            ));
             assert_eq!(results.matched_lines, 1);
         }
         other => panic!("unexpected response: {other:?}"),
@@ -271,7 +188,7 @@ fn snapshot_only_search_can_fallback_to_scan_without_base_index() {
 }
 
 #[test]
-fn reopening_repo_reuses_base_snapshot_shard_for_snapshot_search() {
+fn reopening_repo_reuses_base_snapshot_shard_for_workspace_search() {
     let _serial = daemon_test_serial();
     let setup_service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -304,16 +221,14 @@ fn reopening_repo_reuses_base_snapshot_shard_for_snapshot_search() {
     assert_exact_dirty_stats(&status, 0, 0, 0);
     assert!(has_base_snapshot_engine(&service, &repo_id));
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "REOPEN_BASE_SHARD",
-        ConsistencyMode::SnapshotOnly,
-    ) {
+    match search_repo(&service, &repo_id, "REOPEN_BASE_SHARD") {
         Response::SearchCompleted {
             backend, results, ..
         } => {
-            assert!(matches!(backend, SearchBackend::IndexedSnapshot));
+            assert!(matches!(
+                backend,
+                SearchBackend::IndexedClean | SearchBackend::IndexedWorkspaceView
+            ));
             assert_eq!(results.matched_lines, 1);
         }
         other => panic!("unexpected response: {other:?}"),
@@ -359,13 +274,8 @@ fn reopening_repo_detects_preexisting_dirty_files_during_open() {
     assert!(has_base_snapshot_engine(&service, &repo_id));
     assert_exact_dirty_stats(&status, 0, 0, 1);
 
-    let (backend, search_status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "REOPEN_DIRTY_FILE",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, search_status) =
+        wait_for_search_count(&service, &repo_id, "REOPEN_DIRTY_FILE", 1);
     assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
     assert_eq!(search_status.dirty_files.new, 1);
 }
@@ -445,12 +355,7 @@ fn daemon_ignores_corrupted_legacy_generation_when_base_snapshot_shard_exists() 
         crate::daemon::protocol::RepoPhase::ReadyClean
             | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
-    match search_repo(
-        &service,
-        &repo_id,
-        "WORKTREE",
-        ConsistencyMode::SnapshotOnly,
-    ) {
+    match search_repo(&service, &repo_id, "WORKTREE") {
         Response::SearchCompleted { results, .. } => {
             assert_eq!(results.matched_lines, 1);
         }
@@ -548,7 +453,6 @@ fn scope_roots_must_stay_within_repo_boundary() {
                     roots: vec![outside_root.clone()],
                     ..PathScope::default()
                 },
-                consistency: ConsistencyMode::WorkspaceEventual,
                 allow_scan_fallback: false,
             },
         })
@@ -622,12 +526,7 @@ fn async_base_snapshot_build_returns_task_and_completes() {
     });
     assert!(status.probe_healthy);
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "HELLO",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "HELLO") {
         Response::SearchCompleted { results, .. } => {
             assert_eq!(results.matched_lines, 1);
         }
@@ -660,12 +559,7 @@ fn eventual_search_uses_fallback_while_repo_is_still_opening_or_missing_index() 
         other => panic!("unexpected response: {other:?}"),
     };
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "HELLO",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "HELLO") {
         Response::SearchCompleted {
             backend, results, ..
         } => {
@@ -729,12 +623,7 @@ fn eventual_search_prefers_current_snapshot_while_repo_is_still_opening() {
             | crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "HELLO",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "HELLO") {
         Response::SearchCompleted {
             backend, results, ..
         } => {
@@ -771,12 +660,7 @@ fn eventual_search_keeps_indexed_reads_while_clean_repo_has_pending_reconcile() 
 
     mark_workspace_probe_pending(&service, &repo_id);
 
-    match search_repo(
-        &service,
-        &repo_id,
-        "BASE_PENDING",
-        ConsistencyMode::WorkspaceEventual,
-    ) {
+    match search_repo(&service, &repo_id, "BASE_PENDING") {
         Response::SearchCompleted {
             backend,
             results,
@@ -924,66 +808,4 @@ fn ensure_repo_builds_missing_index_once() {
         }
         other => panic!("unexpected response: {other:?}"),
     }
-}
-
-#[test]
-fn workspace_strict_search_uses_explicitly_refreshed_state() {
-    let _serial = daemon_test_serial();
-    let service = DaemonService::new();
-    let temp = tempdir().expect("temp dir should succeed");
-    let repo_path = temp.path().join("repo");
-    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
-    let tracked = repo_path.join("tracked.rs");
-    fs::write(&tracked, "const NAME: &str = \"BASE\";\n").expect("write should succeed");
-
-    let (repo_id, _) = open_repo(&service, repo_path.clone());
-    build_repo(&service, &repo_id);
-
-    fs::write(&tracked, "const NAME: &str = \"DIRTY\";\n").expect("rewrite should succeed");
-
-    let status = refresh_repo(&service, &repo_id, true);
-    assert!(matches!(
-        status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyClean
-            | crate::daemon::protocol::RepoPhase::ReadyDirty
-    ));
-    let status = wait_for_status(&service, &repo_id, |status| {
-        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
-            && status.dirty_files.modified == 1
-            && status.dirty_files.deleted == 0
-            && status.dirty_files.new == 0
-    });
-    assert_exact_dirty_stats(&status, 1, 0, 0);
-
-    for _ in 0..SEARCH_WAIT_ATTEMPTS {
-        match service.handle_request_only(Request::Search {
-            params: crate::daemon::protocol::SearchParams {
-                repo_id: repo_id.to_string(),
-                query: query("DIRTY"),
-                scope: PathScope::default(),
-                consistency: ConsistencyMode::WorkspaceStrict,
-                allow_scan_fallback: false,
-            },
-        }) {
-            Ok(Response::SearchCompleted {
-                backend,
-                results,
-                status,
-                ..
-            }) => {
-                assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
-                assert_eq!(results.matched_lines, 1);
-                assert!(matches!(
-                    status.phase,
-                    crate::daemon::protocol::RepoPhase::ReadyDirty
-                ));
-                return;
-            }
-            Err(_) => {
-                thread::sleep(Duration::from_millis(50));
-            }
-            other => panic!("unexpected response: {other:?}"),
-        }
-    }
-    panic!("timed out waiting for strict workspace search");
 }

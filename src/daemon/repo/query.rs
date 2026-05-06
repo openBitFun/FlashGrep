@@ -13,10 +13,7 @@ use crate::{
     path_filter::{normalize_path, PathFilter, PathFilterArgs},
 };
 
-use super::{
-    QueryBackend, RepoPhase, RepoRuntime, RepoStatus, SearchConsistency, SearchRequest,
-    SearchResponse,
-};
+use super::{QueryBackend, RepoPhase, RepoRuntime, RepoStatus, SearchRequest, SearchResponse};
 
 struct SearchActivityGuard<'a> {
     runtime: &'a RepoRuntime,
@@ -51,263 +48,171 @@ impl RepoRuntime {
             normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
         let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
         let query_filters = build_query_filters(&self.build_config.repo_path, &scope);
-        match request.consistency {
-            SearchConsistency::SnapshotOnly => {
-                let status = self.status_snapshot();
-                let can_search_opening_snapshot =
-                    matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
-                if matches!(
-                    status.phase,
-                    RepoPhase::Opening
-                        | RepoPhase::MissingBaseSnapshot
-                        | RepoPhase::BuildingBaseSnapshot
-                        | RepoPhase::RebuildingBaseSnapshot
-                ) && !can_search_opening_snapshot
-                {
-                    let (backend, results) = if request.allow_scan_fallback {
-                        (
-                            QueryBackend::ScanFallback,
-                            self.scan_search_fallback(&request.query, filter.as_ref())?,
-                        )
-                    } else {
-                        return Err(AppError::InvalidIndex(
-                            "base snapshot is missing; rebuild the base snapshot".into(),
-                        ));
-                    };
-                    return Ok(SearchResponse {
-                        repo_id: self.repo_id.clone(),
-                        backend,
-                        consistency_applied: request.consistency,
-                        status,
-                        results,
-                    });
+        self.schedule_workspace_probe(Duration::from_millis(0));
+
+        let status = self.status_snapshot();
+        let can_search_opening_snapshot =
+            matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
+        match status.phase {
+            RepoPhase::Opening if !can_search_opening_snapshot => {
+                self.search_during_transition(&request, &scope, filter.as_ref(), status)
+            }
+            RepoPhase::MissingBaseSnapshot
+            | RepoPhase::BuildingBaseSnapshot
+            | RepoPhase::RebuildingBaseSnapshot => {
+                self.search_during_transition(&request, &scope, filter.as_ref(), status)
+            }
+            RepoPhase::Opening | RepoPhase::ReadyClean | RepoPhase::ReadyDirty => {
+                let overlay_engine = match self.workspace_overlay_engine.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
                 }
-                let base_snapshot = self.open_base_snapshot_reader()?;
-                let (backend, results) = match self.workspace_search_view.search_current_snapshot(
+                .as_ref()
+                .cloned();
+                let overlay_snapshot = overlay_engine
+                    .as_ref()
+                    .map(|overlay| match overlay.open_snapshot() {
+                        Ok(snapshot) => Ok(Some(snapshot)),
+                        Err(AppError::InvalidIndex(_)) => Ok(None),
+                        Err(AppError::Io(error))
+                            if error.kind() == std::io::ErrorKind::NotFound =>
+                        {
+                            Ok(None)
+                        }
+                        Err(error) => Err(error),
+                    })
+                    .transpose()?
+                    .flatten();
+                let base_snapshot = match self.open_base_snapshot_reader() {
+                    Ok(snapshot) => snapshot,
+                    Err(AppError::InvalidIndex(_)) => None,
+                    Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        None
+                    }
+                    Err(error) => return Err(error),
+                };
+                let tracked_dirty = self.dirty_catalog_visible_paths();
+                let overlay_snapshot = if tracked_dirty.is_empty() {
+                    None
+                } else {
+                    overlay_snapshot
+                };
+                let workspace_snapshot = self
+                    .workspace_search_view
+                    .open_workspace_query_snapshot(base_snapshot, overlay_snapshot)?;
+                let mut response_status = status.clone();
+                super::status::apply_repo_status_dirty_fields(
+                    &mut response_status,
+                    self.rebuild_dirty_threshold,
+                    tracked_dirty.stats(),
+                );
+                let backend = if tracked_dirty.is_empty() {
+                    QueryBackend::IndexedClean
+                } else {
+                    QueryBackend::IndexedWorkspaceView
+                };
+                let overlay_snapshot_missing = !workspace_snapshot.has_overlay_snapshot();
+                let overlay_snapshot_unavailable_for_dirty =
+                    !tracked_dirty.is_empty() && !workspace_snapshot.has_overlay_snapshot();
+                if overlay_snapshot_unavailable_for_dirty {
+                    self.schedule_workspace_probe(Duration::from_millis(0));
+                }
+                if !workspace_snapshot.has_base_snapshot() {
+                    self.schedule_workspace_probe(Duration::from_millis(0));
+                    return self.search_during_transition(
+                        &request,
+                        &scope,
+                        filter.as_ref(),
+                        response_status,
+                    );
+                }
+                if overlay_snapshot_missing {
+                    self.schedule_workspace_probe(Duration::from_millis(0));
+                }
+                let results = match workspace_snapshot.search(
+                    &self.workspace_search_view,
                     &request.query,
                     &query_filters,
                     filter.as_ref(),
-                    base_snapshot.as_ref(),
+                    true,
                 ) {
-                    Ok(results) => (QueryBackend::IndexedSnapshot, results),
-                    Err(AppError::InvalidIndex(_)) if request.allow_scan_fallback => (
-                        QueryBackend::ScanFallback,
-                        self.scan_search_fallback(&request.query, filter.as_ref())?,
-                    ),
-                    Err(AppError::Io(error))
-                        if error.kind() == std::io::ErrorKind::NotFound
-                            && request.allow_scan_fallback =>
-                    {
-                        (
-                            QueryBackend::ScanFallback,
-                            self.scan_search_fallback(&request.query, filter.as_ref())?,
-                        )
+                    Ok(results) => results,
+                    Err(AppError::InvalidIndex(_)) => {
+                        self.schedule_workspace_probe(Duration::from_millis(0));
+                        match self.workspace_search_view.search_workspace_snapshots(
+                            &request.query,
+                            &query_filters,
+                            filter.as_ref(),
+                            workspace_snapshot.base_snapshot(),
+                            None,
+                        ) {
+                            Ok(results) => results,
+                            Err(AppError::InvalidIndex(_)) => {
+                                return self.search_during_transition(
+                                    &request,
+                                    &scope,
+                                    filter.as_ref(),
+                                    response_status,
+                                );
+                            }
+                            Err(AppError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                return self.search_during_transition(
+                                    &request,
+                                    &scope,
+                                    filter.as_ref(),
+                                    response_status,
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
+                    }
+                    Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                        self.schedule_workspace_probe(Duration::from_millis(0));
+                        match self.workspace_search_view.search_workspace_snapshots(
+                            &request.query,
+                            &query_filters,
+                            filter.as_ref(),
+                            workspace_snapshot.base_snapshot(),
+                            None,
+                        ) {
+                            Ok(results) => results,
+                            Err(AppError::InvalidIndex(_)) => {
+                                return self.search_during_transition(
+                                    &request,
+                                    &scope,
+                                    filter.as_ref(),
+                                    response_status,
+                                );
+                            }
+                            Err(AppError::Io(error))
+                                if error.kind() == std::io::ErrorKind::NotFound =>
+                            {
+                                return self.search_during_transition(
+                                    &request,
+                                    &scope,
+                                    filter.as_ref(),
+                                    response_status,
+                                );
+                            }
+                            Err(error) => return Err(error),
+                        }
                     }
                     Err(error) => return Err(error),
                 };
                 Ok(SearchResponse {
                     repo_id: self.repo_id.clone(),
                     backend,
-                    consistency_applied: request.consistency,
-                    status,
+                    status: response_status,
                     results,
                 })
             }
-            SearchConsistency::WorkspaceEventual | SearchConsistency::WorkspaceStrict => {
-                self.schedule_workspace_probe(Duration::from_millis(0));
-
-                let status = self.status_snapshot();
-                if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
-                    self.ensure_workspace_strict_ready(&status)?;
-                }
-                let can_search_opening_snapshot =
-                    matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
-                match status.phase {
-                    RepoPhase::Opening if !can_search_opening_snapshot => {
-                        self.search_during_transition(&request, &scope, filter.as_ref(), status)
-                    }
-                    RepoPhase::MissingBaseSnapshot
-                    | RepoPhase::BuildingBaseSnapshot
-                    | RepoPhase::RebuildingBaseSnapshot => {
-                        self.search_during_transition(&request, &scope, filter.as_ref(), status)
-                    }
-                    RepoPhase::Opening | RepoPhase::ReadyClean | RepoPhase::ReadyDirty => {
-                        let overlay_engine = match self.workspace_overlay_engine.lock() {
-                            Ok(guard) => guard,
-                            Err(poisoned) => poisoned.into_inner(),
-                        }
-                        .as_ref()
-                        .cloned();
-                        let overlay_snapshot = overlay_engine
-                            .as_ref()
-                            .map(|overlay| match overlay.open_snapshot() {
-                                Ok(snapshot) => Ok(Some(snapshot)),
-                                Err(AppError::InvalidIndex(_)) => Ok(None),
-                                Err(AppError::Io(error))
-                                    if error.kind() == std::io::ErrorKind::NotFound =>
-                                {
-                                    Ok(None)
-                                }
-                                Err(error) => Err(error),
-                            })
-                            .transpose()?
-                            .flatten();
-                        let base_snapshot = match self.open_base_snapshot_reader() {
-                            Ok(snapshot) => snapshot,
-                            Err(AppError::InvalidIndex(_)) => None,
-                            Err(AppError::Io(error))
-                                if error.kind() == std::io::ErrorKind::NotFound =>
-                            {
-                                None
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        let tracked_dirty = self.dirty_catalog_visible_paths();
-                        let overlay_snapshot = if tracked_dirty.is_empty() {
-                            None
-                        } else {
-                            overlay_snapshot
-                        };
-                        let workspace_snapshot = self
-                            .workspace_search_view
-                            .open_workspace_query_snapshot(base_snapshot, overlay_snapshot)?;
-                        let mut response_status = status.clone();
-                        super::status::apply_repo_status_dirty_fields(
-                            &mut response_status,
-                            self.rebuild_dirty_threshold,
-                            tracked_dirty.stats(),
-                        );
-                        let backend = if tracked_dirty.is_empty() {
-                            QueryBackend::IndexedClean
-                        } else {
-                            QueryBackend::IndexedWorkspaceView
-                        };
-                        let overlay_snapshot_missing = !workspace_snapshot.has_overlay_snapshot();
-                        let overlay_snapshot_unavailable_for_dirty =
-                            !tracked_dirty.is_empty() && !workspace_snapshot.has_overlay_snapshot();
-                        if matches!(request.consistency, SearchConsistency::WorkspaceStrict)
-                            && overlay_snapshot_unavailable_for_dirty
-                        {
-                            return Err(AppError::Protocol(format!(
-                                "repo {} strict search requires a readable workspace overlay snapshot; run refresh or wait for background probe",
-                                self.repo_id
-                            )));
-                        }
-                        if overlay_snapshot_unavailable_for_dirty
-                            && matches!(request.consistency, SearchConsistency::WorkspaceEventual)
-                        {
-                            self.schedule_workspace_probe(Duration::from_millis(0));
-                        }
-                        if !workspace_snapshot.has_base_snapshot() {
-                            self.schedule_workspace_probe(Duration::from_millis(0));
-                            return self.search_during_transition(
-                                &request,
-                                &scope,
-                                filter.as_ref(),
-                                response_status,
-                            );
-                        }
-                        if overlay_snapshot_missing {
-                            self.schedule_workspace_probe(Duration::from_millis(0));
-                        }
-                        let results = match workspace_snapshot.search(
-                            &self.workspace_search_view,
-                            &request.query,
-                            &query_filters,
-                            filter.as_ref(),
-                            true,
-                        ) {
-                            Ok(results) => results,
-                            Err(AppError::InvalidIndex(_error))
-                                if matches!(
-                                    request.consistency,
-                                    SearchConsistency::WorkspaceEventual
-                                ) =>
-                            {
-                                self.schedule_workspace_probe(Duration::from_millis(0));
-                                match self.workspace_search_view.search_workspace_snapshots(
-                                    &request.query,
-                                    &query_filters,
-                                    filter.as_ref(),
-                                    workspace_snapshot.base_snapshot(),
-                                    None,
-                                ) {
-                                    Ok(results) => results,
-                                    Err(AppError::InvalidIndex(_error)) => {
-                                        return self.search_during_transition(
-                                            &request,
-                                            &scope,
-                                            filter.as_ref(),
-                                            response_status,
-                                        );
-                                    }
-                                    Err(AppError::Io(error))
-                                        if error.kind() == std::io::ErrorKind::NotFound =>
-                                    {
-                                        return self.search_during_transition(
-                                            &request,
-                                            &scope,
-                                            filter.as_ref(),
-                                            response_status,
-                                        );
-                                    }
-                                    Err(error) => return Err(error),
-                                }
-                            }
-                            Err(AppError::Io(error))
-                                if error.kind() == std::io::ErrorKind::NotFound
-                                    && matches!(
-                                        request.consistency,
-                                        SearchConsistency::WorkspaceEventual
-                                    ) =>
-                            {
-                                self.schedule_workspace_probe(Duration::from_millis(0));
-                                match self.workspace_search_view.search_workspace_snapshots(
-                                    &request.query,
-                                    &query_filters,
-                                    filter.as_ref(),
-                                    workspace_snapshot.base_snapshot(),
-                                    None,
-                                ) {
-                                    Ok(results) => results,
-                                    Err(AppError::InvalidIndex(_)) => {
-                                        return self.search_during_transition(
-                                            &request,
-                                            &scope,
-                                            filter.as_ref(),
-                                            response_status,
-                                        );
-                                    }
-                                    Err(AppError::Io(error))
-                                        if error.kind() == std::io::ErrorKind::NotFound =>
-                                    {
-                                        return self.search_during_transition(
-                                            &request,
-                                            &scope,
-                                            filter.as_ref(),
-                                            response_status,
-                                        );
-                                    }
-                                    Err(error) => return Err(error),
-                                }
-                            }
-                            Err(error) => return Err(error),
-                        };
-                        Ok(SearchResponse {
-                            repo_id: self.repo_id.clone(),
-                            backend,
-                            consistency_applied: request.consistency,
-                            status: response_status,
-                            results,
-                        })
-                    }
-                    RepoPhase::Degraded => Err(AppError::Protocol(
-                        status
-                            .last_error
-                            .unwrap_or_else(|| "repo runtime is degraded".into()),
-                    )),
-                }
-            }
+            RepoPhase::Degraded => Err(AppError::Protocol(
+                status
+                    .last_error
+                    .unwrap_or_else(|| "repo runtime is degraded".into()),
+            )),
         }
     }
 
@@ -369,56 +274,6 @@ impl RepoRuntime {
 
     pub(super) fn workspace_probe_pending(&self) -> bool {
         self.workspace_probe_pending.load(Ordering::Relaxed)
-    }
-
-    fn ensure_workspace_strict_ready(&self, status: &RepoStatus) -> Result<()> {
-        if !status.probe_healthy && !self.strict_snapshot_ready()? {
-            return Err(AppError::Protocol(format!(
-                "repo {} strict search requires a healthy workspace probe loop",
-                self.repo_id
-            )));
-        }
-        if self.workspace_probe_pending() && !self.strict_snapshot_ready()? {
-            return Err(AppError::Protocol(format!(
-                "repo {} strict search requires a settled workspace state; run refresh or wait for background probe",
-                self.repo_id
-            )));
-        }
-        Ok(())
-    }
-
-    fn strict_snapshot_ready(&self) -> Result<bool> {
-        if self.dirty_catalog_has_pending() {
-            return Ok(false);
-        }
-
-        let base_ready = match self.open_base_snapshot_reader() {
-            Ok(Some(_)) => true,
-            Ok(None) | Err(AppError::InvalidIndex(_)) => false,
-            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => false,
-            Err(error) => return Err(error),
-        };
-        if !base_ready {
-            return Ok(false);
-        }
-
-        let overlay_engine = match self.workspace_overlay_engine.lock() {
-            Ok(guard) => guard,
-            Err(poisoned) => poisoned.into_inner(),
-        };
-        if let Some(overlay_index) = overlay_engine.as_ref() {
-            return match overlay_index.open_snapshot() {
-                Ok(_) => Ok(true),
-                Err(AppError::InvalidIndex(_)) => Ok(false),
-                Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(false)
-                }
-                Err(error) => Err(error),
-            };
-        }
-
-        Ok(self.cached_published_overlay_paths().is_empty()
-            && self.dirty_catalog_visible_paths().is_empty())
     }
 
     pub(super) fn rebuild_dirty_paths_from_overlay_snapshot(
@@ -514,29 +369,19 @@ impl RepoRuntime {
         filter: Option<&PathFilter>,
         status: RepoStatus,
     ) -> Result<SearchResponse> {
-        if matches!(request.consistency, SearchConsistency::WorkspaceStrict) {
-            return Err(AppError::Protocol(format!(
-                "repo {} is not ready yet ({})",
-                self.repo_id,
-                repo_phase_label(status.phase)
-            )));
-        }
-
         match super::run_rg_search(&self.build_config, &request.query, scope) {
             Ok(results) => Ok(SearchResponse {
                 repo_id: self.repo_id.clone(),
                 backend: QueryBackend::RgFallback,
-                consistency_applied: request.consistency,
                 status: self.status_snapshot(),
                 results,
             }),
             Err(error) => {
                 if transition_fallback_logging_enabled() {
                     eprintln!(
-                        "flashgrep: transition rg fallback failed for repo={} phase={} consistency={:?} dirty=({},{},{}) pattern={:?}: {error}",
+                        "flashgrep: transition rg fallback failed for repo={} phase={} dirty=({},{},{}) pattern={:?}: {error}",
                         self.repo_id,
                         repo_phase_label(status.phase),
-                        request.consistency,
                         status.dirty_files.modified,
                         status.dirty_files.deleted,
                         status.dirty_files.new,
@@ -546,7 +391,6 @@ impl RepoRuntime {
                 Ok(SearchResponse {
                     repo_id: self.repo_id.clone(),
                     backend: QueryBackend::ScanFallback,
-                    consistency_applied: request.consistency,
                     status: self.status_snapshot(),
                     results: self.scan_search_fallback(&request.query, filter)?,
                 })

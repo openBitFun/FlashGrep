@@ -12,8 +12,8 @@ use std::{
 use flashgrep::{
     daemon::{
         protocol::{
-            ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, RepoRef, Request,
-            SearchModeConfig, SearchParams,
+            EnsureRepoParams, PathScope, QuerySpec, RepoConfig, RepoRef, Request, SearchModeConfig,
+            SearchParams,
         },
         DaemonClient, ManagedDaemonClient,
     },
@@ -24,7 +24,6 @@ const DEFAULT_QUERY: &str = "ScopedAllowBlockingForTesting";
 const DEFAULT_BENCH_ITERS: usize = 5;
 const DEFAULT_SCENARIO_SAMPLES: usize = 3;
 const DEFAULT_SIZES: [usize; 5] = [1, 10, 30, 100, 300];
-const STRICT_READY_POLL_MS: u64 = 200;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum BenchMode {
@@ -90,7 +89,7 @@ struct DetectionResult {
     detection_ms: f64,
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct SearchMeasurement {
     matched_lines: usize,
     backend: String,
@@ -409,17 +408,9 @@ fn main() -> Result<()> {
             let rg_median = median_ms(rg_times);
             let detection_ms =
                 wait_for_dirty_paths(&repo, expected_dirty_paths, Duration::from_secs(180))?;
-            let (settle_ms, settle_measurement) = wait_for_workspace_strict_ready(
-                &repo,
-                &query,
-                expected_dirty_paths,
-                Duration::from_secs(180),
-            )?;
-            let query_measurement = run_flashgrep_query_with_consistency(
-                &repo,
-                &query,
-                ConsistencyMode::WorkspaceEventual,
-            )?;
+            let query_measurement = run_flashgrep_query(&repo, &query)?;
+            let settle_measurement = query_measurement.clone();
+            let settle_ms = detection_ms;
             let status_dirty_paths = repo_dirty_paths(&repo)?;
             let missing_lines = rg_count.saturating_sub(query_measurement.matched_lines);
             let recall_ratio = if rg_count == 0 {
@@ -666,18 +657,13 @@ fn open_flashgrep_repo(
     })
 }
 
-fn run_flashgrep_query_with_consistency(
-    repo: &DaemonRepo,
-    query: &str,
-    consistency: ConsistencyMode,
-) -> Result<SearchMeasurement> {
+fn run_flashgrep_query(repo: &DaemonRepo, query: &str) -> Result<SearchMeasurement> {
     let started = Instant::now();
     let outcome = repo.client.send(Request::Search {
         params: SearchParams {
             repo_id: repo.repo_id.clone(),
             query: count_only_query(query),
             scope: PathScope::default(),
-            consistency,
             allow_scan_fallback: false,
         },
     })?;
@@ -694,43 +680,6 @@ fn run_flashgrep_query_with_consistency(
         other => Err(flashgrep::AppError::Protocol(format!(
             "unexpected search response: {other:?}"
         ))),
-    }
-}
-
-fn wait_for_workspace_strict_ready(
-    repo: &DaemonRepo,
-    query: &str,
-    expected_dirty_paths: usize,
-    timeout: Duration,
-) -> Result<(f64, SearchMeasurement)> {
-    let started = Instant::now();
-    let poll_interval = Duration::from_millis(STRICT_READY_POLL_MS);
-    let mut observed_dirty = false;
-    loop {
-        let dirty_paths = repo_dirty_paths(repo)?;
-        if dirty_paths >= expected_dirty_paths {
-            observed_dirty = true;
-        }
-        if observed_dirty {
-            match run_flashgrep_query_with_consistency(
-                repo,
-                query,
-                ConsistencyMode::WorkspaceStrict,
-            ) {
-                Ok(measurement) => {
-                    return Ok((elapsed_ms(started.elapsed().as_secs_f64()), measurement));
-                }
-                Err(flashgrep::AppError::Protocol(message))
-                    if message.contains("strict search requires") => {}
-                Err(error) => return Err(error),
-            }
-        }
-        if started.elapsed() >= timeout {
-            return Err(flashgrep::AppError::Protocol(format!(
-                "timed out waiting for strict workspace readiness after observing {expected_dirty_paths} dirty paths"
-            )));
-        }
-        thread::sleep(poll_interval);
     }
 }
 

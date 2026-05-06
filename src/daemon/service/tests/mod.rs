@@ -4,8 +4,8 @@ use tempfile::tempdir;
 
 use super::*;
 use crate::daemon::protocol::{
-    ConsistencyMode, EnsureRepoParams, GlobParams, InitializeParams, OpenRepoParams, PathScope,
-    QuerySpec, RepoConfig, Request, Response, SearchBackend, SearchModeConfig, TaskState,
+    EnsureRepoParams, GlobParams, InitializeParams, OpenRepoParams, PathScope, QuerySpec,
+    RepoConfig, Request, Response, SearchBackend, SearchModeConfig, TaskState,
 };
 
 mod branch_switch;

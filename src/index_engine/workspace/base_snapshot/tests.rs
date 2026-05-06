@@ -18,6 +18,7 @@ use crate::index_engine::segment::{
     read_postings_file, read_term_dict_file, FileSegmentDocTable, PostingsStreamWriter,
     SegmentDocSourceKind, TermDictStreamWriter,
 };
+use crate::index_engine::workspace::base_snapshot::reuse::reusable_base_snapshot_shards;
 use crate::index_engine::RepoId;
 use crate::progress::{IndexProgress, IndexProgressPhase};
 

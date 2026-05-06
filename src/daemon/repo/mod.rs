@@ -56,15 +56,7 @@ pub enum RepoPhase {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SearchConsistency {
-    SnapshotOnly,
-    WorkspaceEventual,
-    WorkspaceStrict,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QueryBackend {
-    IndexedSnapshot,
     IndexedClean,
     IndexedWorkspaceView,
     RgFallback,
@@ -178,15 +170,12 @@ pub struct SearchRequest {
     pub repo_id: String,
     pub query: QueryConfig,
     pub path_filter_args: PathFilterArgs,
-    pub consistency: SearchConsistency,
-    pub allow_scan_fallback: bool,
 }
 
 #[derive(Debug, Clone)]
 pub struct SearchResponse {
     pub repo_id: String,
     pub backend: QueryBackend,
-    pub consistency_applied: SearchConsistency,
     pub status: RepoStatus,
     pub results: SearchResults,
 }

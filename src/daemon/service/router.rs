@@ -14,17 +14,14 @@ use crate::{
 use super::DaemonService;
 use crate::daemon::{
     convert::{
-        build_config_from_open, convert_consistency, convert_query_backend, convert_repo_status,
-        convert_search_results, convert_task_status,
+        build_config_from_open, convert_query_backend, convert_repo_status, convert_search_results,
+        convert_task_status,
     },
     protocol::{
-        ClientCapabilities, ConsistencyMode, EnsureRepoParams, ErrorResponse, QuerySpec, Request,
-        RequestEnvelope, Response, SearchProtocolCapabilities, ServerCapabilities, ServerInfo,
+        ClientCapabilities, EnsureRepoParams, ErrorResponse, QuerySpec, Request, RequestEnvelope,
+        Response, SearchProtocolCapabilities, ServerCapabilities, ServerInfo,
     },
-    repo::{
-        GlobRequest, OpenRepoRequest, RepoManager, RepoRefreshPolicy, SearchConsistency,
-        SearchRequest,
-    },
+    repo::{GlobRequest, OpenRepoRequest, RepoManager, RepoRefreshPolicy, SearchRequest},
 };
 
 impl DaemonService {
@@ -63,11 +60,6 @@ impl DaemonService {
                         },
                         capabilities: build_server_capabilities(params.capabilities),
                         search: SearchProtocolCapabilities {
-                            consistency_modes: vec![
-                                ConsistencyMode::SnapshotOnly,
-                                ConsistencyMode::WorkspaceEventual,
-                                ConsistencyMode::WorkspaceStrict,
-                            ],
                             search_modes: vec![
                                 super::super::protocol::SearchModeConfig::CountOnly,
                                 super::super::protocol::SearchModeConfig::CountMatches,
@@ -201,14 +193,11 @@ impl DaemonService {
                     repo_id: params.repo_id,
                     query,
                     path_filter_args: scope,
-                    consistency: convert_consistency_mode(params.consistency),
-                    allow_scan_fallback: params.allow_scan_fallback,
                 })?;
                 Ok((
                     Response::SearchCompleted {
                         repo_id: response.repo_id,
                         backend: convert_query_backend(response.backend),
-                        consistency_applied: convert_consistency(response.consistency_applied),
                         status: convert_repo_status(response.status),
                         results: convert_search_results(response.results),
                     },
@@ -396,13 +385,5 @@ pub(super) fn protocol_error(error: AppError) -> ErrorResponse {
         code: -32001,
         message: error.to_string(),
         data: None,
-    }
-}
-
-fn convert_consistency_mode(mode: ConsistencyMode) -> SearchConsistency {
-    match mode {
-        ConsistencyMode::SnapshotOnly => SearchConsistency::SnapshotOnly,
-        ConsistencyMode::WorkspaceEventual => SearchConsistency::WorkspaceEventual,
-        ConsistencyMode::WorkspaceStrict => SearchConsistency::WorkspaceStrict,
     }
 }

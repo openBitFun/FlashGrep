@@ -2,6 +2,9 @@ use super::*;
 
 #[test]
 fn bench_runner_smoke_test() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path();
     write_standard_suite(suite_dir);
@@ -66,6 +69,9 @@ fn benchmark_scope_roots_uses_repo_relative_paths_for_daemon_queries() {
 #[cfg(target_os = "linux")]
 #[test]
 fn cold_bench_runs_hook_before_each_iteration() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path();
     fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");
@@ -121,6 +127,9 @@ fn cold_bench_runs_hook_before_each_iteration() {
 
 #[test]
 fn bench_report_labels_worktree_runner_modes() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path();
     write_standard_suite(suite_dir);
@@ -166,6 +175,9 @@ fn bench_report_labels_worktree_runner_modes() {
 
 #[test]
 fn bench_raw_output_includes_runner_family_and_mode() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path();
     write_standard_suite(suite_dir);

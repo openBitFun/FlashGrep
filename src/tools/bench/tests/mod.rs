@@ -1,4 +1,4 @@
-use std::{fs, path::Path};
+use std::{fs, io::ErrorKind, net::TcpListener, path::Path};
 
 use tempfile::tempdir;
 
@@ -13,6 +13,20 @@ use crate::tools::bench::report::render_report;
 mod custom;
 mod smoke;
 mod worktree;
+
+fn supports_tcp_daemon_tests() -> bool {
+    match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipping TCP daemon bench test in restricted environment: {error}");
+            false
+        }
+        Err(error) => panic!("failed to probe TCP daemon bench support: {error}"),
+    }
+}
 
 fn write_standard_suite(suite_dir: &Path) {
     fs::create_dir_all(suite_dir.join("linux")).expect("test should succeed");

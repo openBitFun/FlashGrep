@@ -5,9 +5,8 @@ use clap::{ArgAction, Args, Parser, Subcommand, ValueEnum};
 use crate::{
     config::{CorpusMode, TokenizerMode},
     daemon::protocol::{
-        ConsistencyMode, EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec,
-        RepoConfig, SearchModeConfig, SearchParams,
-        DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
+        EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec, RepoConfig,
+        SearchModeConfig, SearchParams, DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
     },
     tools::bench::BenchQueryMode,
     tools::bench::{BenchCacheMode, BenchConfig},
@@ -367,8 +366,6 @@ pub(super) struct DaemonSearchArgs {
     pub(super) count: bool,
     #[arg(long = "count-matches", default_value_t = false)]
     pub(super) count_matches: bool,
-    #[arg(long, value_enum, default_value = "workspace-eventual")]
-    pub(super) consistency: DaemonConsistencyArg,
     #[arg(long, default_value_t = false)]
     pub(super) allow_scan_fallback: bool,
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
@@ -405,7 +402,6 @@ impl DaemonSearchArgs {
             quiet,
             count,
             count_matches,
-            consistency,
             allow_scan_fallback,
             glob,
             iglob,
@@ -444,7 +440,6 @@ impl DaemonSearchArgs {
                 file_type,
                 file_type_not,
             ),
-            consistency: consistency.into(),
             allow_scan_fallback,
         }
     }
@@ -511,13 +506,6 @@ pub(super) enum CorpusArg {
     NoIgnore,
 }
 
-#[derive(Debug, Clone, Copy, ValueEnum)]
-pub(super) enum DaemonConsistencyArg {
-    SnapshotOnly,
-    WorkspaceEventual,
-    WorkspaceStrict,
-}
-
 impl From<TokenizerArg> for TokenizerMode {
     fn from(value: TokenizerArg) -> Self {
         match value {
@@ -568,16 +556,6 @@ impl From<BenchQueryArg> for BenchQueryMode {
         match value {
             BenchQueryArg::Same => BenchQueryMode::Same,
             BenchQueryArg::Trace => BenchQueryMode::Trace,
-        }
-    }
-}
-
-impl From<DaemonConsistencyArg> for ConsistencyMode {
-    fn from(value: DaemonConsistencyArg) -> Self {
-        match value {
-            DaemonConsistencyArg::SnapshotOnly => ConsistencyMode::SnapshotOnly,
-            DaemonConsistencyArg::WorkspaceEventual => ConsistencyMode::WorkspaceEventual,
-            DaemonConsistencyArg::WorkspaceStrict => ConsistencyMode::WorkspaceStrict,
         }
     }
 }

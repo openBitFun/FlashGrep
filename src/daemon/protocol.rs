@@ -146,8 +146,6 @@ pub struct SearchParams {
     #[serde(default)]
     pub scope: PathScope,
     #[serde(default)]
-    pub consistency: ConsistencyMode,
-    #[serde(default)]
     pub allow_scan_fallback: bool,
 }
 
@@ -286,15 +284,6 @@ pub enum SearchModeConfig {
     MaterializeMatches,
 }
 
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
-#[serde(rename_all = "snake_case")]
-pub enum ConsistencyMode {
-    SnapshotOnly,
-    #[default]
-    WorkspaceEventual,
-    WorkspaceStrict,
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct ResponseEnvelope {
@@ -406,7 +395,6 @@ pub enum Response {
     SearchCompleted {
         repo_id: String,
         backend: SearchBackend,
-        consistency_applied: ConsistencyMode,
         status: RepoStatus,
         results: SearchResults,
     },
@@ -446,7 +434,6 @@ pub struct ServerCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SearchProtocolCapabilities {
-    pub consistency_modes: Vec<ConsistencyMode>,
     pub search_modes: Vec<SearchModeConfig>,
 }
 
@@ -589,7 +576,6 @@ pub enum TaskPhase {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchBackend {
-    IndexedSnapshot,
     IndexedClean,
     IndexedWorkspaceView,
     RgFallback,

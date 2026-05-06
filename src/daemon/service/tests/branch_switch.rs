@@ -41,13 +41,7 @@ fn ensure_repo_replaces_runtime_when_storage_root_changes() {
         other => panic!("unexpected response: {other:?}"),
     };
     assert_eq!(PathBuf::from(&first_status.storage_root), storage_a);
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "STORAGE_SWITCH_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "STORAGE_SWITCH_TOKEN", 1);
 
     fs::remove_dir_all(&storage_a).expect("old storage root delete should succeed");
 
@@ -84,13 +78,7 @@ fn ensure_repo_replaces_runtime_when_storage_root_changes() {
     assert!(settled.probe_healthy);
     assert_eq!(settled.last_error, None);
 
-    let (backend, status) = wait_for_search_count(
-        &service,
-        &repo_id,
-        "STORAGE_SWITCH_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "STORAGE_SWITCH_TOKEN", 1);
     assert!(matches!(backend, SearchBackend::IndexedClean));
     assert_eq!(PathBuf::from(&status.storage_root), storage_b);
 }
@@ -139,20 +127,8 @@ fn git_branch_checkout_reconciles_large_worktree_switches() {
             && status.dirty_files.new == 0
     });
     assert!(status.probe_healthy);
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "MAIN_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "LEGACY_BRANCH_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "MAIN_TOKEN", 1);
+    let _ = wait_for_search_count(&service, &repo_id, "LEGACY_BRANCH_TOKEN", 1);
 
     git_checkout_new_branch(&repo_path, "feature");
     fs::remove_dir_all(&old_dir).expect("old dir delete should succeed");
@@ -173,27 +149,9 @@ fn git_branch_checkout_reconciles_large_worktree_switches() {
         crate::daemon::protocol::RepoPhase::ReadyDirty
     ));
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "FEATURE_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "FEATURE_DIR_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "MAIN_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "FEATURE_TOKEN", 1);
+    let _ = wait_for_search_count(&service, &repo_id, "FEATURE_DIR_TOKEN", 1);
+    let _ = wait_for_search_count(&service, &repo_id, "MAIN_TOKEN", 0);
     let status = wait_for_status(&service, &repo_id, |status| {
         matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
             && status.dirty_files.modified >= 1
@@ -218,27 +176,9 @@ fn git_branch_checkout_reconciles_large_worktree_switches() {
     });
     assert!(status.probe_healthy);
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "MAIN_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "FEATURE_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "FEATURE_DIR_TOKEN",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "MAIN_TOKEN", 1);
+    let _ = wait_for_search_count(&service, &repo_id, "FEATURE_TOKEN", 0);
+    let _ = wait_for_search_count(&service, &repo_id, "FEATURE_DIR_TOKEN", 0);
 }
 
 #[test]
@@ -329,34 +269,7 @@ fn background_base_rebuild_after_branch_switch_keeps_search_available() {
                     | crate::daemon::protocol::RepoPhase::ReadyClean
             ));
 
-            match search_repo(
-                &service,
-                &repo_id,
-                "MAIN_TOKEN",
-                ConsistencyMode::SnapshotOnly,
-            ) {
-                Response::SearchCompleted { backend, .. } => {
-                    assert!(matches!(backend, SearchBackend::IndexedSnapshot));
-                }
-                other => panic!("unexpected response: {other:?}"),
-            }
-            match search_repo(
-                &service,
-                &repo_id,
-                "FEATURE_TOKEN",
-                ConsistencyMode::SnapshotOnly,
-            ) {
-                Response::SearchCompleted { backend, .. } => {
-                    assert!(matches!(backend, SearchBackend::IndexedSnapshot));
-                }
-                other => panic!("unexpected response: {other:?}"),
-            }
-            match search_repo(
-                &service,
-                &repo_id,
-                "FEATURE_TOKEN",
-                ConsistencyMode::WorkspaceEventual,
-            ) {
+            match search_repo(&service, &repo_id, "FEATURE_TOKEN") {
                 Response::SearchCompleted { results, .. } => {
                     assert_eq!(results.matched_lines, 1);
                 }
@@ -384,22 +297,8 @@ fn background_base_rebuild_after_branch_switch_keeps_search_available() {
     assert!(!settled.rebuild_recommended);
     assert_exact_dirty_stats(&settled, 0, 0, 0);
 
-    let (backend, _) = assert_search_count_now(
-        &service,
-        &repo_id,
-        "FEATURE_TOKEN",
-        ConsistencyMode::SnapshotOnly,
-        1,
-    );
-    assert!(matches!(backend, SearchBackend::IndexedSnapshot));
-    let (backend, _) = assert_search_count_now(
-        &service,
-        &repo_id,
-        "MAIN_TOKEN",
-        ConsistencyMode::SnapshotOnly,
-        0,
-    );
-    assert!(matches!(backend, SearchBackend::IndexedSnapshot));
+    let _ = assert_search_count_now(&service, &repo_id, "FEATURE_TOKEN", 1);
+    let _ = assert_search_count_now(&service, &repo_id, "MAIN_TOKEN", 0);
 }
 
 #[test]
@@ -421,18 +320,6 @@ fn atomic_rename_replace_updates_tracked_file_contents() {
         .expect("temp write should succeed");
     fs::rename(&temp_file, &tracked).expect("atomic replace should succeed");
 
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "ATOMIC_REPLACED",
-        ConsistencyMode::WorkspaceEventual,
-        1,
-    );
-    let _ = wait_for_search_count(
-        &service,
-        &repo_id,
-        "ATOMIC_BASE",
-        ConsistencyMode::WorkspaceEventual,
-        0,
-    );
+    let _ = wait_for_search_count(&service, &repo_id, "ATOMIC_REPLACED", 1);
+    let _ = wait_for_search_count(&service, &repo_id, "ATOMIC_BASE", 0);
 }

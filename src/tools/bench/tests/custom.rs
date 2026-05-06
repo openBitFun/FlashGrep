@@ -2,6 +2,9 @@ use super::*;
 
 #[test]
 fn bench_runner_supports_custom_repo_patterns() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");
@@ -47,6 +50,9 @@ fn bench_runner_supports_custom_repo_patterns() {
 
 #[test]
 fn bench_daemon_shutdown_removes_state_file() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");
@@ -95,6 +101,9 @@ fn bench_daemon_shutdown_removes_state_file() {
 
 #[test]
 fn bench_rg_runner_uses_snapshot_visible_scope_for_custom_repo() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");
@@ -187,6 +196,9 @@ fn prepare_rg_search_scope_keeps_snapshot_visible_non_utf8_files() {
 
 #[test]
 fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");

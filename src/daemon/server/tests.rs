@@ -1,6 +1,8 @@
 use std::{
     fs,
+    io::ErrorKind,
     io::{BufRead, BufReader, BufWriter, Write},
+    net::TcpListener,
     net::TcpStream,
     thread,
     time::Duration,
@@ -18,8 +20,25 @@ use crate::daemon::{
     DaemonClient,
 };
 
+fn supports_tcp_server_tests() -> bool {
+    match TcpListener::bind("127.0.0.1:0") {
+        Ok(listener) => {
+            drop(listener);
+            true
+        }
+        Err(error) if error.kind() == ErrorKind::PermissionDenied => {
+            eprintln!("skipping TCP daemon server test in restricted environment: {error}");
+            false
+        }
+        Err(error) => panic!("failed to probe TCP daemon server support: {error}"),
+    }
+}
+
 #[test]
 fn serve_writes_and_removes_state_file() {
+    if !supports_tcp_server_tests() {
+        return;
+    }
     let temp = tempdir().expect("temp dir should succeed");
     let state_file = temp.path().join("daemon-state.json");
 
@@ -57,6 +76,9 @@ fn serve_writes_and_removes_state_file() {
 
 #[test]
 fn initialized_connection_receives_task_notifications() {
+    if !supports_tcp_server_tests() {
+        return;
+    }
     let temp = tempdir().expect("temp dir should succeed");
     let state_file = temp.path().join("daemon-state.json");
     let repo_path = temp.path().join("repo");

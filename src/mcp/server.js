@@ -186,7 +186,6 @@ class McpServer {
         search_mode: args.search_mode,
       },
       scope: buildPathScope(args),
-      consistency: args.consistency,
       allow_scan_fallback: args.allow_scan_fallback,
     });
 
@@ -541,12 +540,6 @@ function parseSearchArguments(value) {
       ],
       "materialize_matches",
     ),
-    consistency: enumValue(
-      value.consistency,
-      "consistency",
-      ["snapshot_only", "workspace_eventual", "workspace_strict"],
-      "workspace_eventual",
-    ),
     allow_scan_fallback: Boolean(value.allow_scan_fallback),
   };
 }
@@ -840,10 +833,6 @@ function toolDefinitions() {
               "first_hit_only",
               "materialize_matches",
             ],
-          },
-          consistency: {
-            type: "string",
-            enum: ["snapshot_only", "workspace_eventual", "workspace_strict"],
           },
           allow_scan_fallback: schemaBool(
             "Allow scan fallback if indexed execution cannot serve the query.",

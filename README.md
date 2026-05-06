@@ -186,8 +186,8 @@ cargo run --bin flashgrep -- bench --suite-dir bench_data
 ```rust
 use flashgrep::daemon::{
     protocol::{
-        ConsistencyMode, EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request,
-        SearchModeConfig, SearchParams,
+        EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request, SearchModeConfig,
+        SearchParams,
     },
     DaemonClient, ManagedDaemonClient,
 };
@@ -221,7 +221,6 @@ let response = client.send(Request::Search {
             search_mode: SearchModeConfig::CountOnly,
         },
         scope: PathScope::default(),
-        consistency: ConsistencyMode::WorkspaceEventual,
         allow_scan_fallback: false,
     },
 })?;
@@ -262,7 +261,7 @@ daemon 运行时维护两类 workspace 状态：
 
 - 查询只读取 `base snapshot + published overlay`。
 - 未发布 overlay 在进程重启后允许丢失，daemon 会通过 startup rescan 补回。
-- `WorkspaceStrict` 在 pending dirty 未发布时可能拒绝执行；`WorkspaceEventual` 可以使用当前已发布视图。
+- 查询统一使用 `WorkspaceEventual`，直接读取当前 `base snapshot + published overlay` 视图。
 
 ## Benchmark
 

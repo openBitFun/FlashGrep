@@ -204,7 +204,7 @@ merge 是后台维护行为，不改变“只有 published manifest 可见”这
 - `overlay.rs`
   执行 rebuild/apply-delta/publish
 - `query.rs`
-  选择 `indexed_snapshot / indexed_workspace_view / fallback`
+  选择 `indexed_clean / indexed_workspace_view / fallback`
 - `status.rs`
   生成 repo 对外状态
 - `tasks.rs`

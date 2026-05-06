@@ -1,7 +1,11 @@
+use super::super::fixtures::copy_tree;
 use super::*;
 
 #[test]
 fn bench_runner_supports_worktree_runners() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path();
     write_standard_suite(suite_dir);
@@ -145,6 +149,9 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
 
 #[test]
 fn bench_runner_supports_custom_worktree_build_runner() {
+    if !supports_tcp_daemon_tests() {
+        return;
+    }
     let temp = tempdir().expect("test should succeed");
     let suite_dir = temp.path().join("suite");
     let repo_dir = temp.path().join("repo");

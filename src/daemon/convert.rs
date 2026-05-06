@@ -13,7 +13,7 @@ use super::{
     protocol as proto,
     repo::{
         DirtyStats, QueryBackend, RepoPhase, RepoStatus, RepoTaskKind, RepoTaskState,
-        RepoTaskStatus, SearchConsistency, WorkspaceOverlayStatus,
+        RepoTaskStatus, WorkspaceOverlayStatus,
     },
 };
 
@@ -144,7 +144,6 @@ pub(super) fn convert_task_phase(phase: IndexProgressPhase) -> proto::TaskPhase 
 
 pub(super) fn convert_query_backend(backend: QueryBackend) -> proto::SearchBackend {
     match backend {
-        QueryBackend::IndexedSnapshot => proto::SearchBackend::IndexedSnapshot,
         QueryBackend::IndexedClean => proto::SearchBackend::IndexedClean,
         QueryBackend::IndexedWorkspaceView => proto::SearchBackend::IndexedWorkspaceView,
         QueryBackend::RgFallback => proto::SearchBackend::RgFallback,
@@ -161,14 +160,6 @@ pub(super) fn convert_repo_phase(phase: RepoPhase) -> proto::RepoPhase {
         RepoPhase::ReadyDirty => proto::RepoPhase::ReadyDirty,
         RepoPhase::RebuildingBaseSnapshot => proto::RepoPhase::RebuildingBaseSnapshot,
         RepoPhase::Degraded => proto::RepoPhase::Degraded,
-    }
-}
-
-pub(super) fn convert_consistency(consistency: SearchConsistency) -> proto::ConsistencyMode {
-    match consistency {
-        SearchConsistency::SnapshotOnly => proto::ConsistencyMode::SnapshotOnly,
-        SearchConsistency::WorkspaceEventual => proto::ConsistencyMode::WorkspaceEventual,
-        SearchConsistency::WorkspaceStrict => proto::ConsistencyMode::WorkspaceStrict,
     }
 }
 

@@ -219,7 +219,6 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
   "kind": "search_completed",
   "repo_id": "/path/to/repo",
   "backend": "indexed_workspace_view",
-  "consistency_applied": "workspace_eventual",
   "status": {},
   "results": {
     "candidate_docs": 42,
@@ -234,7 +233,6 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 `backend` 枚举：
 
-- `indexed_snapshot`
 - `indexed_clean`
 - `indexed_workspace_view`
 - `rg_fallback`
@@ -334,11 +332,6 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
     "status_notifications": true
   },
   "search": {
-    "consistency_modes": [
-      "snapshot_only",
-      "workspace_eventual",
-      "workspace_strict"
-    ],
     "search_modes": [
       "count_only",
       "count_matches",
@@ -620,7 +613,6 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
     "types": [],
     "type_not": []
   },
-  "consistency": "workspace_eventual",
   "allow_scan_fallback": false
 }
 ```
@@ -635,7 +627,6 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 调用方应至少读取：
 
 - `backend`
-- `consistency_applied`
 - `status`
 
 这样才能判断本次是否：

@@ -10,9 +10,9 @@ use std::{
 
 use super::*;
 use crate::daemon::protocol::{
-    ConsistencyMode, EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec,
-    RepoConfig, RepoStatus as RepoStatusPayload, Request, Response, SearchBackend,
-    SearchModeConfig, TaskStatus as TaskStatusPayload,
+    EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec, RepoConfig,
+    RepoStatus as RepoStatusPayload, Request, Response, SearchBackend, SearchModeConfig,
+    TaskStatus as TaskStatusPayload,
 };
 use crate::index_engine::{
     query::{QueryFilters, QueryRequest},
@@ -200,19 +200,13 @@ pub(super) fn query(pattern: &str) -> QuerySpec {
     }
 }
 
-pub(super) fn search_repo(
-    service: &DaemonService,
-    repo_id: &str,
-    pattern: &str,
-    consistency: ConsistencyMode,
-) -> Response {
+pub(super) fn search_repo(service: &DaemonService, repo_id: &str, pattern: &str) -> Response {
     service
         .handle_request_only(Request::Search {
             params: crate::daemon::protocol::SearchParams {
                 repo_id: repo_id.to_string(),
                 query: query(pattern),
                 scope: PathScope::default(),
-                consistency,
                 allow_scan_fallback: false,
             },
         })
@@ -329,7 +323,6 @@ pub(super) fn wait_for_search_count(
     service: &DaemonService,
     repo_id: &str,
     pattern: &str,
-    consistency: ConsistencyMode,
     expected: usize,
 ) -> (SearchBackend, RepoStatusPayload) {
     let mut last_observed = None;
@@ -339,7 +332,6 @@ pub(super) fn wait_for_search_count(
                 repo_id: repo_id.to_string(),
                 query: query(pattern),
                 scope: PathScope::default(),
-                consistency,
                 allow_scan_fallback: false,
             },
         }) {
@@ -374,10 +366,9 @@ pub(super) fn assert_search_count_now(
     service: &DaemonService,
     repo_id: &str,
     pattern: &str,
-    consistency: ConsistencyMode,
     expected: usize,
 ) -> (SearchBackend, RepoStatusPayload) {
-    match search_repo(service, repo_id, pattern, consistency) {
+    match search_repo(service, repo_id, pattern) {
         Response::SearchCompleted {
             backend,
             results,
@@ -399,7 +390,6 @@ pub(super) fn wait_for_search_with_params_count(
     repo_id: &str,
     query: QuerySpec,
     roots: Vec<PathBuf>,
-    consistency: ConsistencyMode,
     expected: usize,
 ) -> (
     SearchBackend,
@@ -415,7 +405,6 @@ pub(super) fn wait_for_search_with_params_count(
                     roots: roots.clone(),
                     ..PathScope::default()
                 },
-                consistency,
                 allow_scan_fallback: false,
             },
         }) {
