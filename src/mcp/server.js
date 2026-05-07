@@ -661,11 +661,17 @@ function selectDaemonProgram(explicitProgram) {
     return process.env.FLASHGREP_DAEMON_BIN;
   }
 
-  const releaseBinary = path.resolve(__dirname, "../../target/release/flashgrep");
+  const binaryFileName = process.platform === "win32" ? "flashgrep.exe" : "flashgrep";
+  const packagedBinary = path.resolve(__dirname, "../bin", binaryFileName);
+  if (fs.existsSync(packagedBinary)) {
+    return packagedBinary;
+  }
+
+  const releaseBinary = path.resolve(__dirname, "../../target/release", binaryFileName);
   if (fs.existsSync(releaseBinary)) {
     return releaseBinary;
   }
-  const debugBinary = path.resolve(__dirname, "../../target/debug/flashgrep");
+  const debugBinary = path.resolve(__dirname, "../../target/debug", binaryFileName);
   if (fs.existsSync(debugBinary)) {
     return debugBinary;
   }
