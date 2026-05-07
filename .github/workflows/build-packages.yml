@@ -91,7 +91,8 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
+          GH_REPO: ${{ github.repository }}
         run: |
-          gh release view "$TAG_NAME" >/dev/null 2>&1 \
-            || gh release create "$TAG_NAME" --verify-tag --generate-notes
-          gh release upload "$TAG_NAME" release-assets/* --clobber
+          gh release view "$TAG_NAME" --repo "$GH_REPO" >/dev/null 2>&1 \
+            || gh release create "$TAG_NAME" --repo "$GH_REPO" --verify-tag --generate-notes
+          gh release upload "$TAG_NAME" release-assets/* --repo "$GH_REPO" --clobber
