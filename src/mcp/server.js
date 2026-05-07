@@ -662,11 +662,6 @@ function selectDaemonProgram(explicitProgram) {
   }
 
   const binaryFileName = process.platform === "win32" ? "flashgrep.exe" : "flashgrep";
-  const packagedBinary = path.resolve(__dirname, "../bin", binaryFileName);
-  if (fs.existsSync(packagedBinary)) {
-    return packagedBinary;
-  }
-
   const releaseBinary = path.resolve(__dirname, "../../target/release", binaryFileName);
   if (fs.existsSync(releaseBinary)) {
     return releaseBinary;
