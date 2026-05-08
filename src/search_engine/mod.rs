@@ -338,22 +338,36 @@ mod tests {
 
     use super::{SearchBackend, SearchEngine, SearchPolicy};
 
-    fn materialize_fixed_query(pattern: &str) -> QueryConfig {
+    fn line_match_fixed_query(pattern: &str) -> QueryConfig {
         QueryConfig {
             regex_pattern: regex::escape(pattern),
             patterns: vec![pattern.to_string()],
             fixed_strings: true,
-            search_mode: SearchMode::MaterializeMatches,
+            search_mode: SearchMode::LineMatches,
             ..QueryConfig::default()
         }
     }
 
-    fn materialize_regex_query(pattern: &str, global_max_results: Option<usize>) -> QueryConfig {
+    fn line_match_regex_query(pattern: &str, global_max_results: Option<usize>) -> QueryConfig {
         QueryConfig {
             regex_pattern: pattern.to_string(),
             patterns: vec![pattern.to_string()],
             global_max_results,
-            search_mode: SearchMode::MaterializeMatches,
+            search_mode: SearchMode::LineMatches,
+            ..QueryConfig::default()
+        }
+    }
+
+    fn line_match_fixed_query_with_limit(
+        pattern: &str,
+        max_count: usize,
+    ) -> QueryConfig {
+        QueryConfig {
+            regex_pattern: regex::escape(pattern),
+            patterns: vec![pattern.to_string()],
+            fixed_strings: true,
+            max_count: Some(max_count),
+            search_mode: SearchMode::LineMatches,
             ..QueryConfig::default()
         }
     }
@@ -368,14 +382,13 @@ mod tests {
             Arc::<[u8]>::from(format!("prefix {pattern} suffix\n").into_bytes()),
         )];
 
-        let results = search_documents(&materialize_fixed_query(pattern), &documents)
+        let results = search_documents(&line_match_fixed_query(pattern), &documents)
             .expect("search should succeed");
 
         assert_eq!(results.matched_lines, 1);
         assert_eq!(results.matched_occurrences, 1);
-        assert_eq!(results.hits.len(), 1);
-        assert_eq!(results.hits[0].matches.len(), 1);
-        assert_eq!(results.hits[0].matches[0].matched_text, pattern);
+        assert_eq!(results.line_matches.len(), 1);
+        assert_eq!(results.line_matches[0].line_text, format!("prefix {pattern} suffix"));
     }
 
     #[test]
@@ -388,13 +401,35 @@ mod tests {
             Arc::<[u8]>::from(format!("prefix {pattern} suffix\n").into_bytes()),
         )];
 
-        let results = search_documents(&materialize_fixed_query(pattern), &documents)
+        let results = search_documents(&line_match_fixed_query(pattern), &documents)
             .expect("search should succeed");
 
         assert_eq!(results.matched_lines, 1);
         assert_eq!(results.matched_occurrences, 1);
-        assert_eq!(results.hits.len(), 1);
-        assert_eq!(results.hits[0].matches[0].matched_text, pattern);
+        assert_eq!(results.line_matches.len(), 1);
+        assert!(results.line_matches[0].line_text.contains(pattern));
+    }
+
+    #[test]
+    fn search_documents_returns_each_matching_line_for_fixed_string_queries() {
+        let pattern = "needle";
+        let documents = vec![SearchDocument::from_loaded_bytes(
+            "doc.txt".into(),
+            32,
+            0,
+            Arc::<[u8]>::from(b"needle one\nskip me\nneedle two\n".to_vec()),
+        )];
+
+        let results = search_documents(&line_match_fixed_query(pattern), &documents)
+            .expect("search should succeed");
+
+        assert_eq!(results.matched_lines, 2);
+        assert_eq!(results.matched_occurrences, 2);
+        assert_eq!(results.line_matches.len(), 2);
+        assert_eq!(results.line_matches[0].line_number, 1);
+        assert_eq!(results.line_matches[0].line_text, "needle one");
+        assert_eq!(results.line_matches[1].line_number, 3);
+        assert_eq!(results.line_matches[1].line_text, "needle two");
     }
 
     #[test]
@@ -414,12 +449,12 @@ mod tests {
             ),
         ];
 
-        let results = search_documents(&materialize_regex_query(r"foo\d", Some(2)), &documents)
+        let results = search_documents(&line_match_regex_query(r"foo\d", Some(2)), &documents)
             .expect("search should succeed");
 
         assert_eq!(results.matched_lines, 2);
         assert_eq!(results.searches_with_match, 1);
-        assert_eq!(results.hits.len(), 1);
+        assert_eq!(results.line_matches.len(), 2);
     }
 
     #[test]
@@ -452,7 +487,7 @@ mod tests {
 
         let response = engine
             .search(
-                &materialize_fixed_query("BASE_SHARD_ONLY"),
+                &line_match_fixed_query("BASE_SHARD_ONLY"),
                 SearchPolicy::IndexOnly,
             )
             .expect("search should succeed");
@@ -477,5 +512,49 @@ mod tests {
             engine.stale_reason().expect("stale reason should succeed"),
             Some(format!("indexed file changed: {expected_path}"))
         );
+    }
+
+    #[test]
+    fn indexed_search_honors_match_limit_in_parallel_verify() {
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+
+        for i in 0..130 {
+            let file_path = repo_path.join(format!("src/file_{i:03}.txt"));
+            let parent = file_path.parent().expect("file should have parent");
+            fs::create_dir_all(parent).expect("parent dir should succeed");
+            fs::write(&file_path, "before\nTARGET\nbetween\nTARGET\nafter\n")
+                .expect("write should succeed");
+        }
+
+        let engine = SearchEngine::new(BuildConfig {
+            repo_path: repo_path.clone(),
+            storage_root: repo_path.join(".flashgrep-index-engine"),
+            tokenizer: TokenizerMode::Trigram,
+            corpus_mode: CorpusMode::RespectIgnore,
+            include_hidden: false,
+            max_file_size: 1024 * 1024,
+            min_sparse_len: 3,
+            max_sparse_len: 32,
+        });
+        engine.build_base_snapshot().expect("build should succeed");
+
+        let response = engine
+            .search(
+                &line_match_fixed_query_with_limit("TARGET", 1),
+                SearchPolicy::IndexOnly,
+            )
+            .expect("search should succeed");
+
+        assert_eq!(response.backend, SearchBackend::Index);
+        assert_eq!(response.results.searches_with_match, 130);
+        assert_eq!(response.results.matched_lines, 130);
+        assert_eq!(response.results.matched_occurrences, 130);
+        assert_eq!(response.results.line_matches.len(), 130);
+
+        for matched in &response.results.line_matches {
+            assert_eq!(matched.line_text, "TARGET");
+        }
     }
 }

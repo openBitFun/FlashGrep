@@ -68,12 +68,13 @@ impl VerifyPlan {
         candidate_ids: &[u32],
         doc_count: usize,
         resolve_source: &F,
+        max_results: Option<usize>,
     ) -> Result<Vec<DocMatchCount>>
     where
         F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
     {
         validate_doc_ids(doc_count, candidate_ids)?;
-        if should_parallel_verify(candidate_ids.len()) {
+        if max_results.is_none() && should_parallel_verify(candidate_ids.len()) {
             let results = candidate_ids
                 .par_iter()
                 .enumerate()
@@ -116,6 +117,9 @@ impl VerifyPlan {
                         matched_lines: stats.matched_lines,
                         matched_occurrences: stats.matched_occurrences,
                     });
+                    if max_results.is_some_and(|limit| counts.len() >= limit) {
+                        break;
+                    }
                 }
             }
             Ok(counts)

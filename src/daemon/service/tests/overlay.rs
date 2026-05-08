@@ -722,7 +722,7 @@ fn reopened_daemon_materializes_fixed_string_phrase_from_published_overlay() {
         pattern: regex::escape(phrase),
         patterns: vec![phrase.into()],
         fixed_strings: true,
-        search_mode: SearchModeConfig::MaterializeMatches,
+        search_mode: SearchModeConfig::LineMatches,
         ..query(phrase)
     };
     let (backend, results, _) =
@@ -731,17 +731,16 @@ fn reopened_daemon_materializes_fixed_string_phrase_from_published_overlay() {
         backend,
         SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
     ));
-    assert!(!results.hits.is_empty());
+    assert!(!results.line_matches.is_empty());
     assert!(results
-        .hits
+        .line_matches
         .iter()
-        .any(|hit| hit.path.ends_with("tracked.h")));
+        .any(|matched| matched.path.ends_with("tracked.h")));
     assert!(results
-        .hits
+        .line_matches
         .iter()
-        .flat_map(|hit| hit.matches.iter())
         .any(|matched| matched
-            .snippet
+            .line_text
             .contains("VersionTuple probe validation content gamma")));
 }
 
@@ -994,7 +993,7 @@ fn path_scoped_search_limits_published_overlay_results() {
     ));
 
     let query = QuerySpec {
-        search_mode: SearchModeConfig::MaterializeMatches,
+        search_mode: SearchModeConfig::LineMatches,
         ..query("SCOPED_TOKEN")
     };
     match wait_for_search_with_params_count(&service, &repo_id, query, vec![left.clone()], 1) {
@@ -1003,12 +1002,9 @@ fn path_scoped_search_limits_published_overlay_results() {
                 backend,
                 SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
             ));
-            assert_eq!(results.hits.len(), 1);
-            assert!(results.hits[0].path.ends_with("left.rs"));
-            assert!(results.hits[0]
-                .matches
-                .iter()
-                .any(|matched| matched.snippet.contains("SCOPED_TOKEN")));
+            assert_eq!(results.line_matches.len(), 1);
+            assert!(results.line_matches[0].path.ends_with("left.rs"));
+            assert!(results.line_matches[0].line_text.contains("SCOPED_TOKEN"));
         }
     }
 }

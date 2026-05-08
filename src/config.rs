@@ -120,8 +120,6 @@ pub struct QueryConfig {
     pub fixed_strings: bool,
     pub word_regexp: bool,
     pub line_regexp: bool,
-    pub before_context: usize,
-    pub after_context: usize,
     pub top_k_tokens: usize,
     pub max_count: Option<usize>,
     pub global_max_results: Option<usize>,
@@ -129,13 +127,8 @@ pub struct QueryConfig {
 }
 
 impl QueryConfig {
-    pub fn has_context(&self) -> bool {
-        self.before_context > 0 || self.after_context > 0
-    }
-
     pub fn effective_global_max_results(&self) -> Option<usize> {
-        self.global_max_results
-            .filter(|limit| *limit > 0 && self.search_mode.materializes_matches())
+        self.global_max_results.filter(|limit| *limit > 0)
     }
 }
 
@@ -150,12 +143,10 @@ impl Default for QueryConfig {
             fixed_strings: false,
             word_regexp: false,
             line_regexp: false,
-            before_context: 0,
-            after_context: 0,
             top_k_tokens: 6,
             max_count: None,
             global_max_results: None,
-            search_mode: SearchMode::MaterializeMatches,
+            search_mode: SearchMode::LineMatches,
         }
     }
 }

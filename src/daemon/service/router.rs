@@ -61,10 +61,10 @@ impl DaemonService {
                         capabilities: build_server_capabilities(params.capabilities),
                         search: SearchProtocolCapabilities {
                             search_modes: vec![
+                                super::super::protocol::SearchModeConfig::FilesWithMatches,
+                                super::super::protocol::SearchModeConfig::LineMatches,
                                 super::super::protocol::SearchModeConfig::CountOnly,
                                 super::super::protocol::SearchModeConfig::CountMatches,
-                                super::super::protocol::SearchModeConfig::FirstHitOnly,
-                                super::super::protocol::SearchModeConfig::MaterializeMatches,
                             ],
                         },
                     },
@@ -343,18 +343,16 @@ fn convert_query_spec(query: QuerySpec) -> Result<QueryConfig> {
         fixed_strings: query.fixed_strings,
         word_regexp: query.word_regexp,
         line_regexp: query.line_regexp,
-        before_context: query.before_context,
-        after_context: query.after_context,
         top_k_tokens: query.top_k_tokens,
         max_count: query.max_count,
         global_max_results: query.global_max_results,
         search_mode: match query.search_mode {
+            super::super::protocol::SearchModeConfig::FilesWithMatches => {
+                SearchMode::FilesWithMatches
+            }
+            super::super::protocol::SearchModeConfig::LineMatches => SearchMode::LineMatches,
             super::super::protocol::SearchModeConfig::CountOnly => SearchMode::CountOnly,
             super::super::protocol::SearchModeConfig::CountMatches => SearchMode::CountMatches,
-            super::super::protocol::SearchModeConfig::FirstHitOnly => SearchMode::FirstHitOnly,
-            super::super::protocol::SearchModeConfig::MaterializeMatches => {
-                SearchMode::MaterializeMatches
-            }
         },
     })
 }

@@ -328,9 +328,10 @@ impl WorkspaceIndex {
         let final_results = if dirty_results.candidate_docs == 0
             && dirty_results.matched_lines == 0
             && dirty_results.matched_occurrences == 0
+            && dirty_results.matched_paths.is_empty()
+            && dirty_results.line_matches.is_empty()
             && dirty_results.file_counts.is_empty()
             && dirty_results.file_match_counts.is_empty()
-            && dirty_results.hits.is_empty()
         {
             base_results.clone()
         } else {

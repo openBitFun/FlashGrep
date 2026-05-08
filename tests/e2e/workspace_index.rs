@@ -1,7 +1,7 @@
 use std::{cell::Cell, fs, path::Path, rc::Rc, thread, time::Duration};
 
 use flashgrep::{
-    advanced::{json::JsonSearchReport, BaseSnapshotKind},
+    advanced::BaseSnapshotKind,
     experimental::{IndexProgress, IndexProgressPhase},
     AppError, BaseSnapshotBuildOptions, WorkspaceIndex, WorkspaceIndexOptions,
 };
@@ -34,11 +34,12 @@ fn hit_paths(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
     let mut paths = workspace
         .search(&query(pattern))
         .expect("test should succeed")
-        .hits
+        .line_matches
         .into_iter()
-        .map(|hit| hit.path)
+        .map(|matched| matched.path)
         .collect::<Vec<_>>();
     paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -46,11 +47,12 @@ fn hit_paths_current_view(workspace: &WorkspaceIndex, pattern: &str) -> Vec<Stri
     let mut paths = workspace
         .search(&query(pattern))
         .expect("test should succeed")
-        .hits
+        .line_matches
         .into_iter()
-        .map(|hit| hit.path)
+        .map(|matched| matched.path)
         .collect::<Vec<_>>();
     paths.sort();
+    paths.dedup();
     paths
 }
 
@@ -236,16 +238,16 @@ fn workspace_snapshot_freezes_materialized_overlay_snapshot() {
     let snapshot_paths = snapshot
         .search(&query("DIRTY_ONE"))
         .expect("test should succeed")
-        .hits
+        .line_matches
         .into_iter()
-        .map(|hit| hit.path)
+        .map(|matched| matched.path)
         .collect::<Vec<_>>();
     let snapshot_new_paths = snapshot
         .search(&query("DIRTY_TWO"))
         .expect("test should succeed")
-        .hits
+        .line_matches
         .into_iter()
-        .map(|hit| hit.path)
+        .map(|matched| matched.path)
         .collect::<Vec<_>>();
     let workspace_paths = hit_paths_current_view(&workspace, "DIRTY_TWO");
 
@@ -432,23 +434,16 @@ fn workspace_json_report_reflects_latest_worktree_view() {
     workspace
         .ensure_base_snapshot()
         .expect("test should succeed");
-    let report = JsonSearchReport::from_search_results(
-        &workspace
-            .search(&query("DIRTY_NAME"))
-            .expect("test should succeed"),
-    );
-    assert!(report.has_match());
-    assert_eq!(report.files.len(), 2);
-    let paths = report
-        .files
-        .iter()
-        .map(|file| match &file.path {
-            flashgrep::advanced::json::JsonData::Text { text } => text.clone(),
-            flashgrep::advanced::json::JsonData::Bytes { .. } => {
-                panic!("test expected utf-8 path")
-            }
-        })
+    let mut paths = workspace
+        .search(&query("DIRTY_NAME"))
+        .expect("test should succeed")
+        .line_matches
+        .into_iter()
+        .map(|matched| matched.path)
         .collect::<Vec<_>>();
+    paths.sort();
+    paths.dedup();
+    assert_eq!(paths.len(), 2);
     assert!(paths.contains(&tracked.to_string_lossy().into_owned()));
     assert!(paths.contains(&new_file.to_string_lossy().into_owned()));
 }

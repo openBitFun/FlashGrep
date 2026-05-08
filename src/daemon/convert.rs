@@ -6,7 +6,7 @@ use std::{
 use crate::{
     config::{BuildConfig, CorpusMode, TokenizerMode},
     progress::IndexProgressPhase,
-    search::{SearchLine, SearchResults},
+    search::SearchResults,
 };
 
 use super::{
@@ -29,6 +29,16 @@ pub(super) fn convert_search_results(results: SearchResults) -> proto::SearchRes
         bytes_searched: results.bytes_searched,
         matched_lines: results.matched_lines,
         matched_occurrences: results.matched_occurrences,
+        matched_paths: results.matched_paths,
+        line_matches: results
+            .line_matches
+            .into_iter()
+            .map(|matched| proto::LineMatch {
+                path: matched.path,
+                line_number: matched.line_number,
+                line_text: matched.line_text,
+            })
+            .collect(),
         file_counts: results
             .file_counts
             .into_iter()
@@ -43,46 +53,6 @@ pub(super) fn convert_search_results(results: SearchResults) -> proto::SearchRes
             .map(|count| proto::FileMatchCount {
                 path: count.path,
                 matched_occurrences: count.matched_occurrences,
-            })
-            .collect(),
-        hits: results
-            .hits
-            .into_iter()
-            .map(|hit| proto::SearchHit {
-                path: hit.path,
-                matches: hit
-                    .matches
-                    .into_iter()
-                    .map(|matched| proto::FileMatch {
-                        location: proto::MatchLocation {
-                            line: matched.location.line,
-                            column: matched.location.column,
-                        },
-                        snippet: matched.snippet,
-                        matched_text: matched.matched_text,
-                    })
-                    .collect(),
-                lines: hit
-                    .lines
-                    .into_iter()
-                    .map(|line| match line {
-                        SearchLine::Match(value) => proto::SearchLine::Match {
-                            value: proto::FileMatch {
-                                location: proto::MatchLocation {
-                                    line: value.location.line,
-                                    column: value.location.column,
-                                },
-                                snippet: value.snippet,
-                                matched_text: value.matched_text,
-                            },
-                        },
-                        SearchLine::Context(context) => proto::SearchLine::Context {
-                            line_number: context.line_number,
-                            snippet: context.snippet,
-                        },
-                        SearchLine::ContextBreak => proto::SearchLine::ContextBreak,
-                    })
-                    .collect(),
             })
             .collect(),
     }

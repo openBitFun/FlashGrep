@@ -1,5 +1,4 @@
 use std::{
-    collections::HashMap,
     env,
     io::{BufRead, BufReader},
     path::{Path, PathBuf},
@@ -13,9 +12,7 @@ use crate::{
     error::{AppError, Result},
     path_filter::{PathFilter, PathFilterArgs},
     path_utils::normalize_lexical_path,
-    search::{
-        FileContext, FileMatch, MatchLocation, SearchHit, SearchLine, SearchMode, SearchResults,
-    },
+    search::{FileCount, FileMatchCount, LineMatch, SearchMode, SearchResults},
 };
 
 pub(super) fn run_rg_search(
@@ -24,11 +21,10 @@ pub(super) fn run_rg_search(
     scope: &PathFilterArgs,
 ) -> Result<SearchResults> {
     match query.search_mode {
+        SearchMode::FilesWithMatches => run_rg_files_with_matches(build_config, query, scope),
+        SearchMode::LineMatches => run_rg_line_matches(build_config, query, scope),
         SearchMode::CountOnly => run_rg_count_search(build_config, query, scope, false),
         SearchMode::CountMatches => run_rg_count_search(build_config, query, scope, true),
-        SearchMode::FirstHitOnly | SearchMode::MaterializeMatches => {
-            run_rg_json_search(build_config, query, scope)
-        }
     }
 }
 
@@ -77,6 +73,19 @@ pub(super) fn run_rg_glob(
     Ok(paths)
 }
 
+fn run_rg_files_with_matches(
+    build_config: &BuildConfig,
+    query: &QueryConfig,
+    scope: &PathFilterArgs,
+) -> Result<SearchResults> {
+    let counts = run_rg_count_search(build_config, query, scope, false)?;
+    Ok(SearchResults {
+        matched_paths: counts.file_counts.iter().map(|count| count.path.clone()).collect(),
+        file_counts: Vec::new(),
+        ..counts
+    })
+}
+
 fn run_rg_count_search(
     build_config: &BuildConfig,
     query: &QueryConfig,
@@ -92,7 +101,7 @@ fn run_rg_count_search(
             matched_occurrences,
             file_counts
                 .into_iter()
-                .map(|count| crate::search::FileMatchCount {
+                .map(|count| FileMatchCount {
                     path: count.path,
                     matched_occurrences: count.matched_lines,
                 })
@@ -101,84 +110,29 @@ fn run_rg_count_search(
     } else {
         (0, Vec::new())
     };
+
     Ok(SearchResults {
         candidate_docs: searches_with_match,
         searches_with_match,
         bytes_searched: 0,
         matched_lines,
         matched_occurrences,
+        matched_paths: Vec::new(),
+        line_matches: Vec::new(),
         file_counts,
         file_match_counts,
-        hits: Vec::new(),
     })
 }
 
-fn run_rg_count_command(
-    build_config: &BuildConfig,
-    query: &QueryConfig,
-    scope: &PathFilterArgs,
-    count_matches: bool,
-) -> Result<(usize, usize, Vec<crate::search::FileCount>)> {
-    let mut command = build_rg_base_command(build_config, query, scope);
-    if count_matches {
-        command.arg("--count-matches");
-    } else {
-        command.arg("--count");
-    }
-    let command_debug = format!("{command:?}");
-
-    let output = command.output()?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(AppError::Protocol(format!(
-            "rg fallback failed with status {} (command: {}): {}",
-            output.status,
-            command_debug,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    let mut matched_total = 0usize;
-    let mut searches_with_match = 0usize;
-    let mut file_counts = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
-        let Some((path, count)) = line.rsplit_once(':') else {
-            continue;
-        };
-        let count = count.parse::<usize>().map_err(|error| {
-            AppError::Protocol(format!("failed to parse rg count output {line:?}: {error}"))
-        })?;
-        if count == 0 {
-            continue;
-        }
-        matched_total += count;
-        searches_with_match += 1;
-        file_counts.push(crate::search::FileCount {
-            path: normalize_lexical_path(&build_config.repo_path.join(path))
-                .to_string_lossy()
-                .into_owned(),
-            matched_lines: count,
-        });
-    }
-    Ok((matched_total, searches_with_match, file_counts))
-}
-
-fn run_rg_json_search(
+fn run_rg_line_matches(
     build_config: &BuildConfig,
     query: &QueryConfig,
     scope: &PathFilterArgs,
 ) -> Result<SearchResults> {
     let mut command = build_rg_base_command(build_config, query, scope);
     command.arg("--json");
-    if query.before_context > 0 {
-        command.arg("-B").arg(query.before_context.to_string());
-    }
-    if query.after_context > 0 {
-        command.arg("-A").arg(query.after_context.to_string());
-    }
     if let Some(max_count) = query.max_count {
         command.arg("-m").arg(max_count.to_string());
-    } else if matches!(query.search_mode, SearchMode::FirstHitOnly) {
-        command.arg("-m").arg("1");
     }
     let command_debug = format!("{command:?}");
 
@@ -193,9 +147,8 @@ fn run_rg_json_search(
     }
 
     let reader = BufReader::new(output.stdout.as_slice());
-    let mut hits = Vec::<SearchHit>::new();
-    let mut hit_indexes = HashMap::<String, usize>::new();
-    let mut matched_lines = 0usize;
+    let max_results = query.effective_global_max_results().unwrap_or(usize::MAX);
+    let mut line_matches = Vec::<LineMatch>::new();
     let mut matched_occurrences = 0usize;
 
     for line in reader.lines() {
@@ -206,74 +159,107 @@ fn run_rg_json_search(
         let event: Value = serde_json::from_str(&line).map_err(|error| {
             AppError::Protocol(format!("failed to decode rg json event: {error}"))
         })?;
-        let Some(kind) = event.get("type").and_then(Value::as_str) else {
+        if event.get("type").and_then(Value::as_str) != Some("match") {
+            continue;
+        }
+        let data = event.get("data").unwrap_or(&Value::Null);
+        let Some(path) = rg_text_field(data.get("path")) else {
             continue;
         };
-        let data = event.get("data").unwrap_or(&Value::Null);
-        match kind {
-            "match" => {
-                let Some(path) = rg_text_field(data.get("path")) else {
-                    continue;
-                };
-                let line_number = rg_line_number(data).unwrap_or(1);
-                let snippet = rg_text_field(data.get("lines")).unwrap_or_default();
-                let snippet = trim_rg_newline(&snippet).to_string();
-                let index = ensure_rg_hit(&mut hits, &mut hit_indexes, &path);
-                push_rg_context_break_if_needed(&mut hits[index], line_number);
-                let submatches = data
-                    .get("submatches")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                if submatches.is_empty() {
-                    continue;
-                }
-                matched_lines += 1;
-                for submatch in submatches {
-                    let file_match = rg_file_match(&snippet, line_number, &submatch)
-                        .unwrap_or_else(|| FileMatch {
-                            location: MatchLocation {
-                                line: line_number,
-                                column: 1,
-                            },
-                            snippet: snippet.clone(),
-                            matched_text: snippet.clone(),
-                        });
-                    hits[index].matches.push(file_match.clone());
-                    hits[index].lines.push(SearchLine::Match(file_match));
-                    matched_occurrences += 1;
-                }
-            }
-            "context" => {
-                let Some(path) = rg_text_field(data.get("path")) else {
-                    continue;
-                };
-                let line_number = rg_line_number(data).unwrap_or(1);
-                let snippet = rg_text_field(data.get("lines")).unwrap_or_default();
-                let snippet = trim_rg_newline(&snippet).to_string();
-                let index = ensure_rg_hit(&mut hits, &mut hit_indexes, &path);
-                push_rg_context_break_if_needed(&mut hits[index], line_number);
-                hits[index].lines.push(SearchLine::Context(FileContext {
-                    line_number,
-                    snippet,
-                }));
-            }
-            _ => {}
+        let Some(line_number) = rg_line_number(data) else {
+            continue;
+        };
+        let snippet = rg_text_field(data.get("lines")).unwrap_or_default();
+        let snippet = trim_rg_newline(&snippet).to_string();
+        let path = normalize_lexical_path(&build_config.repo_path.join(path))
+            .to_string_lossy()
+            .into_owned();
+        line_matches.push(LineMatch {
+            path,
+            line_number,
+            line_text: snippet,
+        });
+        matched_occurrences += data
+            .get("submatches")
+            .and_then(Value::as_array)
+            .map_or(1, Vec::len);
+        if line_matches.len() >= max_results {
+            break;
         }
     }
 
-    let searches_with_match = hits.iter().filter(|hit| !hit.matches.is_empty()).count();
-    hits.retain(|hit| !hit.matches.is_empty());
+    let searches_with_match = line_matches
+        .iter()
+        .map(|matched| matched.path.as_str())
+        .collect::<std::collections::BTreeSet<_>>()
+        .len();
     Ok(SearchResults {
         candidate_docs: searches_with_match,
         searches_with_match,
         bytes_searched: 0,
-        matched_lines,
+        matched_lines: line_matches.len(),
         matched_occurrences,
+        matched_paths: Vec::new(),
+        line_matches,
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
-        hits,
     })
+}
+
+fn run_rg_count_command(
+    build_config: &BuildConfig,
+    query: &QueryConfig,
+    scope: &PathFilterArgs,
+    count_matches: bool,
+) -> Result<(usize, usize, Vec<FileCount>)> {
+    let mut command = build_rg_base_command(build_config, query, scope);
+    if count_matches {
+        command.arg("--count-matches");
+    } else {
+        command.arg("--count");
+    }
+    if let Some(max_count) = query.max_count {
+        command.arg("-m").arg(max_count.to_string());
+    }
+    let command_debug = format!("{command:?}");
+
+    let output = command.output()?;
+    if !output.status.success() && output.status.code() != Some(1) {
+        return Err(AppError::Protocol(format!(
+            "rg fallback failed with status {} (command: {}): {}",
+            output.status,
+            command_debug,
+            String::from_utf8_lossy(&output.stderr).trim()
+        )));
+    }
+
+    let max_results = query.effective_global_max_results().unwrap_or(usize::MAX);
+    let mut matched_total = 0usize;
+    let mut searches_with_match = 0usize;
+    let mut file_counts = Vec::new();
+    for line in String::from_utf8_lossy(&output.stdout).lines() {
+        let Some((path, count)) = line.rsplit_once(':') else {
+            continue;
+        };
+        let count = count.parse::<usize>().map_err(|error| {
+            AppError::Protocol(format!("failed to parse rg count output {line:?}: {error}"))
+        })?;
+        if count == 0 {
+            continue;
+        }
+        if file_counts.len() >= max_results {
+            break;
+        }
+        matched_total += count;
+        searches_with_match += 1;
+        file_counts.push(FileCount {
+            path: normalize_lexical_path(&build_config.repo_path.join(path))
+                .to_string_lossy()
+                .into_owned(),
+            matched_lines: count,
+        });
+    }
+    Ok((matched_total, searches_with_match, file_counts))
 }
 
 fn build_rg_base_command(
@@ -452,60 +438,4 @@ fn rg_line_number(data: &Value) -> Option<usize> {
 
 fn trim_rg_newline(value: &str) -> &str {
     value.trim_end_matches(['\r', '\n'])
-}
-
-fn ensure_rg_hit(
-    hits: &mut Vec<SearchHit>,
-    indexes: &mut HashMap<String, usize>,
-    path: &str,
-) -> usize {
-    if let Some(index) = indexes.get(path).copied() {
-        return index;
-    }
-    let index = hits.len();
-    hits.push(SearchHit {
-        path: path.to_string(),
-        matches: Vec::new(),
-        lines: Vec::new(),
-    });
-    indexes.insert(path.to_string(), index);
-    index
-}
-
-fn push_rg_context_break_if_needed(hit: &mut SearchHit, line_number: usize) {
-    let previous_line = hit.lines.iter().rev().find_map(|line| match line {
-        SearchLine::Match(value) => Some(value.location.line),
-        SearchLine::Context(value) => Some(value.line_number),
-        SearchLine::ContextBreak => None,
-    });
-    if previous_line.is_some_and(|previous| line_number > previous.saturating_add(1))
-        && !matches!(hit.lines.last(), Some(SearchLine::ContextBreak))
-    {
-        hit.lines.push(SearchLine::ContextBreak);
-    }
-}
-
-fn rg_file_match(snippet: &str, line_number: usize, submatch: &Value) -> Option<FileMatch> {
-    let start = submatch.get("start")?.as_u64()?;
-    let end = submatch.get("end")?.as_u64()?;
-    let start = usize::try_from(start).ok()?;
-    let end = usize::try_from(end).ok()?;
-    let matched_text = submatch
-        .get("match")
-        .and_then(|value| value.get("text"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .or_else(|| snippet.get(start..end).map(ToOwned::to_owned))
-        .unwrap_or_default();
-    let column = snippet
-        .get(..start)
-        .map_or(1, |prefix| prefix.chars().count() + 1);
-    Some(FileMatch {
-        location: MatchLocation {
-            line: line_number,
-            column,
-        },
-        snippet: snippet.to_string(),
-        matched_text,
-    })
 }

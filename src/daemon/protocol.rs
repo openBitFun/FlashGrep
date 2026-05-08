@@ -173,10 +173,6 @@ pub struct QuerySpec {
     pub word_regexp: bool,
     #[serde(default)]
     pub line_regexp: bool,
-    #[serde(default)]
-    pub before_context: usize,
-    #[serde(default)]
-    pub after_context: usize,
     #[serde(default = "default_top_k_tokens")]
     pub top_k_tokens: usize,
     #[serde(default)]
@@ -277,11 +273,11 @@ pub enum CorpusModeConfig {
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, Default)]
 #[serde(rename_all = "snake_case")]
 pub enum SearchModeConfig {
+    FilesWithMatches,
+    #[default]
+    LineMatches,
     CountOnly,
     CountMatches,
-    FirstHitOnly,
-    #[default]
-    MaterializeMatches,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -590,10 +586,13 @@ pub struct SearchResults {
     pub matched_lines: usize,
     pub matched_occurrences: usize,
     #[serde(default)]
+    pub matched_paths: Vec<String>,
+    #[serde(default)]
+    pub line_matches: Vec<LineMatch>,
+    #[serde(default)]
     pub file_counts: Vec<FileCount>,
     #[serde(default)]
     pub file_match_counts: Vec<FileMatchCount>,
-    pub hits: Vec<SearchHit>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -609,31 +608,10 @@ pub struct FileMatchCount {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct SearchHit {
+pub struct LineMatch {
     pub path: String,
-    pub matches: Vec<FileMatch>,
-    pub lines: Vec<SearchLine>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct FileMatch {
-    pub location: MatchLocation,
-    pub snippet: String,
-    pub matched_text: String,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct MatchLocation {
-    pub line: usize,
-    pub column: usize,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(tag = "kind", rename_all = "snake_case")]
-pub enum SearchLine {
-    Match { value: FileMatch },
-    Context { line_number: usize, snippet: String },
-    ContextBreak,
+    pub line_number: usize,
+    pub line_text: String,
 }
 
 fn default_top_k_tokens() -> usize {

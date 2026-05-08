@@ -33,9 +33,8 @@ use crate::{
         requires_multiline_verification, verify_candidate_sources_with_resolver, CountVerifyKind,
         CountVerifyPlan, LinePrefilter, SearchVerifyPlan, VerifyCandidateSource,
     },
-    search::{
-        FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine, SearchResults,
-    },
+    search::{FileCount, FileMatchCount, SearchResults},
+    search_engine::{search_documents, SearchDocument},
     Result,
 };
 use regex::RegexBuilder;
@@ -43,8 +42,8 @@ use regex::RegexBuilder;
 pub use self::catalog::{SnapshotPathCatalog, SnapshotPathEntry, SnapshotVisibleKeys};
 
 use self::query_helpers::{
-    accumulate_doc_search, document_matches_query_plan, empty_results, matches_filters,
-    matches_key_filters, query_request_to_runtime_config,
+    document_matches_query_plan, empty_results, matches_filters, matches_key_filters,
+    query_request_to_runtime_config,
 };
 
 #[cfg(test)]
@@ -459,45 +458,39 @@ impl IndexSnapshotReader {
         &self,
         query: &QueryRequest,
         plan: &QueryPlan,
-        regex: &regex::Regex,
+        _regex: &regex::Regex,
     ) -> Result<SearchResults> {
-        self.search_with_regex_profiled(query, plan, regex, None, None)
+        self.search_with_regex_profiled(query, plan, None, None)
     }
 
     fn search_with_regex_profiled(
         &self,
         query: &QueryRequest,
         plan: &QueryPlan,
-        regex: &regex::Regex,
         mut phases: Option<&mut SearchPhaseProfile>,
         candidate_build: Option<&mut CandidateBuildProfile>,
     ) -> Result<SearchResults> {
-        let mut results = empty_results();
         let candidate_started = Instant::now();
         let effective_docs = self.candidate_documents_profiled(query, plan, candidate_build)?;
         if let Some(phases) = phases.as_deref_mut() {
             phases.collect_candidates = candidate_started.elapsed();
         }
 
-        results.candidate_docs = effective_docs.len();
-        results.bytes_searched = effective_docs
-            .values()
-            .map(|document| document.source_bytes.len() as u64)
-            .sum();
-
         let verify_started = Instant::now();
-        for doc in effective_docs.values() {
-            if !matches_filters(doc, query) {
-                results.candidate_docs -= 1;
-                results.bytes_searched -= doc.source_bytes.len() as u64;
-                continue;
-            }
-
-            accumulate_doc_search(doc, query, regex, &mut results);
-            if query.top_k.is_some_and(|limit| results.hits.len() >= limit) {
-                break;
-            }
-        }
+        let config = query_request_to_runtime_config(query);
+        let documents = effective_docs
+            .values()
+            .filter(|doc| matches_filters(doc, query))
+            .map(|doc| {
+                SearchDocument::from_loaded_bytes(
+                    doc.logical_path.clone(),
+                    doc.size,
+                    doc.modified_at,
+                    doc.source_bytes.clone(),
+                )
+            })
+            .collect::<Vec<_>>();
+        let results = search_documents(&config, &documents)?;
         if let Some(phases) = phases.as_mut() {
             phases.verify = verify_started.elapsed();
         }
@@ -554,6 +547,7 @@ mod tests {
             pattern: pattern.into(),
             mode: SearchMode::CountOnly,
             case_insensitive,
+            max_count: None,
             top_k: None,
             filters: QueryFilters::default(),
             prefer_worktree_for_git_head_blob: false,

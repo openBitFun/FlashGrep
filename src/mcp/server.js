@@ -93,9 +93,9 @@ class McpServer {
       });
     }
 
-    const instructions = this.options.repoPath
-      ? `Tools operate on ${this.options.repoPath} by default. Individual tool calls may override repo_path.`
-      : "Tool calls must provide repo_path unless the server is started with --repo.";
+    const instructions =
+      `Tools operate on ${this.options.repoPath} by default. ` +
+      "Individual tool calls may override repo_path.";
 
     return successResponse(id, {
       protocolVersion,
@@ -178,8 +178,6 @@ class McpServer {
         fixed_strings: args.fixed_strings,
         word_regexp: args.word_regexp,
         line_regexp: args.line_regexp,
-        before_context: args.before_context,
-        after_context: args.after_context,
         top_k_tokens: args.top_k_tokens,
         max_count: args.max_count,
         global_max_results: args.global_max_results,
@@ -390,7 +388,7 @@ class ContentLengthTransport {
 
 function parseServerArgs(argv) {
   const args = {
-    repoPath: undefined,
+    repoPath: normalizeExistingPath(process.cwd()),
     storageRoot: undefined,
     daemonBin: undefined,
     config: {
@@ -521,24 +519,15 @@ function parseSearchArguments(value) {
     multiline_dotall: Boolean(value.multiline_dotall),
     word_regexp: Boolean(value.word_regexp),
     line_regexp: Boolean(value.line_regexp),
-    before_context: nonNegativeOrDefault(value.before_context, 0, "before_context"),
-    after_context: nonNegativeOrDefault(value.after_context, 0, "after_context"),
     top_k_tokens: nonNegativeOrDefault(value.top_k_tokens, 6, "top_k_tokens"),
     max_count: nullableNonNegative(value.max_count, "max_count"),
-    global_max_results: nullableNonNegative(
-      value.global_max_results,
-      "global_max_results",
-    ),
+    global_max_results:
+      nullableNonNegative(value.global_max_results, "global_max_results") ?? 100,
     search_mode: enumValue(
       value.search_mode,
       "search_mode",
-      [
-        "count_only",
-        "count_matches",
-        "first_hit_only",
-        "materialize_matches",
-      ],
-      "materialize_matches",
+      ["files_with_matches", "line_matches", "count_only", "count_matches"],
+      "line_matches",
     ),
     allow_scan_fallback: Boolean(value.allow_scan_fallback),
   };
@@ -787,7 +776,7 @@ function resolveRepoPath(defaultRepoPath, overrideRepoPath) {
   const repoPath = overrideRepoPath ?? defaultRepoPath;
   if (!repoPath) {
     throw new Error(
-      "repo_path is required when the MCP server is started without --repo",
+      "repo_path is required when no default repository path is configured",
     );
   }
   return repoPath;
@@ -808,7 +797,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo.",
+            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
           pattern: schemaString("Primary regex or literal pattern."),
@@ -819,21 +808,14 @@ function toolDefinitions() {
           multiline_dotall: schemaBool("Make . match newlines when multiline is enabled."),
           word_regexp: schemaBool("Require word boundaries around matches."),
           line_regexp: schemaBool("Require the whole line to match."),
-          before_context: schemaInteger("Number of context lines before each match."),
-          after_context: schemaInteger("Number of context lines after each match."),
           top_k_tokens: schemaInteger("Planner token budget. Default is 6."),
           max_count: schemaNullableInteger("Per-pattern result cap."),
           global_max_results: schemaNullableInteger(
-            "Global result cap across the request.",
+            "Maximum number of matching files to return. Defaults to 100.",
           ),
           search_mode: {
             type: "string",
-            enum: [
-              "count_only",
-              "count_matches",
-              "first_hit_only",
-              "materialize_matches",
-            ],
+            enum: ["files_with_matches", "line_matches", "count_only", "count_matches"],
           },
           allow_scan_fallback: schemaBool(
             "Allow scan fallback if indexed execution cannot serve the query.",
@@ -863,7 +845,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo.",
+            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
           glob: schemaStringArray("Include glob filters."),
@@ -890,7 +872,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo.",
+            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
         },
@@ -905,7 +887,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo.",
+            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
           force: schemaBool(
@@ -924,7 +906,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo.",
+            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
         },
@@ -1142,7 +1124,7 @@ function printHelp() {
   process.stdout.write(`Usage: node src/mcp/server.js [OPTIONS]
 
 Options:
-  --repo <REPO>
+  --repo <REPO>  (defaults to the server process cwd)
   --storage-root <STORAGE_ROOT>
   --daemon-bin <DAEMON_BIN>
   --tokenizer <trigram|sparse-ngram>

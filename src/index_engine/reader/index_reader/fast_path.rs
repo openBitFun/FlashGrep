@@ -15,7 +15,10 @@ impl IndexSnapshotReader {
             && query.filters.languages.is_empty()
             && matches!(
                 query.mode,
-                crate::search::SearchMode::CountOnly | crate::search::SearchMode::CountMatches
+                crate::search::SearchMode::FilesWithMatches
+                    | crate::search::SearchMode::LineMatches
+                    | crate::search::SearchMode::CountOnly
+                    | crate::search::SearchMode::CountMatches
             )
     }
 
@@ -193,10 +196,7 @@ impl IndexSnapshotReader {
             self.log_candidate_source_profile("single_segment_clean", query, profile);
         }
 
-        if matches!(
-            query.mode,
-            crate::search::SearchMode::CountOnly | crate::search::SearchMode::CountMatches
-        ) {
+        if !matches!(query.mode, crate::search::SearchMode::LineMatches) {
             let verify_started = Instant::now();
             let config = query_request_to_runtime_config(query);
             let multiline_verifier = requires_multiline_verification(&config)?;
@@ -208,7 +208,11 @@ impl IndexSnapshotReader {
                 &config,
                 multiline_verifier,
                 line_prefilter,
-                if matches!(query.mode, crate::search::SearchMode::CountOnly) {
+                if matches!(
+                    query.mode,
+                    crate::search::SearchMode::FilesWithMatches
+                        | crate::search::SearchMode::CountOnly
+                ) {
                     CountVerifyKind::Lines
                 } else {
                     CountVerifyKind::Occurrences
@@ -218,38 +222,31 @@ impl IndexSnapshotReader {
                 &filtered_candidate_ids,
                 reader.doc_count(),
                 &|doc_id| self.verify_source_for_query(&reader, query, doc_id),
+                config.effective_global_max_results(),
             )?;
             let searches_with_match = counts.len();
             let matched_lines = counts.iter().map(|count| count.matched_lines).sum();
             let matched_occurrences = counts.iter().map(|count| count.matched_occurrences).sum();
-            let (file_counts, file_match_counts) =
-                if matches!(query.mode, crate::search::SearchMode::CountOnly) {
-                    (
-                        counts
-                            .into_iter()
-                            .map(|count| {
-                                Ok(FileCount {
-                                    path: reader.doc_key(count.doc_id)?.logical_path.clone(),
-                                    matched_lines: count.matched_lines,
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                        Vec::new(),
-                    )
-                } else {
-                    (
-                        Vec::new(),
-                        counts
-                            .into_iter()
-                            .map(|count| {
-                                Ok(FileMatchCount {
-                                    path: reader.doc_key(count.doc_id)?.logical_path.clone(),
-                                    matched_occurrences: count.matched_occurrences,
-                                })
-                            })
-                            .collect::<Result<Vec<_>>>()?,
-                    )
-                };
+            let mut matched_paths = Vec::new();
+            let mut file_counts = Vec::new();
+            let mut file_match_counts = Vec::new();
+            for count in counts {
+                let path = reader.doc_key(count.doc_id)?.logical_path.clone();
+                match query.mode {
+                    crate::search::SearchMode::FilesWithMatches => matched_paths.push(path),
+                    crate::search::SearchMode::CountOnly => file_counts.push(FileCount {
+                        path,
+                        matched_lines: count.matched_lines,
+                    }),
+                    crate::search::SearchMode::CountMatches => {
+                        file_match_counts.push(FileMatchCount {
+                            path,
+                            matched_occurrences: count.matched_occurrences,
+                        })
+                    }
+                    crate::search::SearchMode::LineMatches => unreachable!(),
+                }
+            }
             phases.verify = verify_started.elapsed();
             return Ok(SearchResults {
                 candidate_docs: filtered_candidate_ids.len(),
@@ -257,9 +254,10 @@ impl IndexSnapshotReader {
                 bytes_searched: candidate_bytes,
                 matched_lines,
                 matched_occurrences,
+                matched_paths,
+                line_matches: Vec::new(),
                 file_counts,
                 file_match_counts,
-                hits: Vec::new(),
             });
         }
         let config = query_request_to_runtime_config(query);
@@ -281,11 +279,8 @@ impl IndexSnapshotReader {
                 &matcher,
                 line_prefilter_ref,
                 multiline_verifier,
-                query.mode,
-                None,
-                None,
-                0,
-                0,
+                config.max_count,
+                config.effective_global_max_results(),
             )?;
             let mut results = empty_results();
             results.candidate_docs = filtered_candidate_ids.len();
@@ -293,14 +288,16 @@ impl IndexSnapshotReader {
                 results.bytes_searched += task.outcome.bytes_searched;
                 results.matched_lines += task.outcome.matched_lines;
                 results.matched_occurrences += task.outcome.matched_occurrences;
-                if !task.outcome.matches.is_empty() {
+                if !task.outcome.line_matches.is_empty() {
                     results.searches_with_match += 1;
                     let path = reader.doc_key(task.doc_id)?.logical_path.clone();
-                    results.hits.push(SearchHit {
-                        path,
-                        matches: task.outcome.matches,
-                        lines: task.outcome.lines,
-                    });
+                    results.line_matches.extend(task.outcome.line_matches.into_iter().map(
+                        |matched| crate::search::LineMatch {
+                            path: path.clone(),
+                            line_number: matched.line_number,
+                            line_text: matched.line_text,
+                        },
+                    ));
                 } else if task.outcome.matched_lines > 0 || task.outcome.matched_occurrences > 0 {
                     results.searches_with_match += 1;
                 }
@@ -320,18 +317,23 @@ impl IndexSnapshotReader {
             results.bytes_searched += outcome.bytes_searched;
             results.matched_lines += outcome.matched_lines;
             results.matched_occurrences += outcome.matched_occurrences;
-            if !outcome.matches.is_empty() {
+            if !outcome.line_matches.is_empty() {
                 results.searches_with_match += 1;
                 let path = reader.doc_key(doc_id)?.logical_path.clone();
-                results.hits.push(SearchHit {
-                    path,
-                    matches: outcome.matches,
-                    lines: outcome.lines,
-                });
+                results.line_matches.extend(outcome.line_matches.into_iter().map(|matched| {
+                    crate::search::LineMatch {
+                        path: path.clone(),
+                        line_number: matched.line_number,
+                        line_text: matched.line_text,
+                    }
+                }));
             } else if outcome.matched_lines > 0 || outcome.matched_occurrences > 0 {
                 results.searches_with_match += 1;
             }
-            if query.top_k.is_some_and(|limit| results.hits.len() >= limit) {
+            if query
+                .top_k
+                .is_some_and(|limit| results.line_matches.len() >= limit)
+            {
                 phases.verify = verify_started.elapsed();
                 return Ok(results);
             }
@@ -413,15 +415,16 @@ impl IndexSnapshotReader {
 
         let verify_started = Instant::now();
         let mut results = empty_results();
-        if matches!(
-            query.mode,
-            crate::search::SearchMode::CountOnly | crate::search::SearchMode::CountMatches
-        ) {
+        if !matches!(query.mode, crate::search::SearchMode::LineMatches) {
             let verify_plan = CountVerifyPlan::compile(
                 &config,
                 multiline_verifier,
                 line_prefilter,
-                if matches!(query.mode, crate::search::SearchMode::CountOnly) {
+                if matches!(
+                    query.mode,
+                    crate::search::SearchMode::FilesWithMatches
+                        | crate::search::SearchMode::CountOnly
+                ) {
                     CountVerifyKind::Lines
                 } else {
                     CountVerifyKind::Occurrences
@@ -435,6 +438,7 @@ impl IndexSnapshotReader {
                             &filtered_candidate_ids,
                             reader.doc_count(),
                             &|doc_id| self.verify_source_for_query(&reader, query, doc_id),
+                            config.effective_global_max_results(),
                         )?;
 
                         let mut segment = SegmentCountResults {
@@ -449,26 +453,29 @@ impl IndexSnapshotReader {
                             ..SegmentCountResults::default()
                         };
 
-                        if matches!(query.mode, crate::search::SearchMode::CountOnly) {
-                            segment.file_counts = counts
-                                .into_iter()
-                                .map(|count| {
-                                    Ok(FileCount {
-                                        path: reader.doc_key(count.doc_id)?.logical_path.clone(),
+                        for count in counts {
+                            let path = reader.doc_key(count.doc_id)?.logical_path.clone();
+                            match query.mode {
+                                crate::search::SearchMode::FilesWithMatches => {
+                                    segment.file_counts.push(FileCount {
+                                        path,
                                         matched_lines: count.matched_lines,
-                                    })
-                                })
-                                .collect::<Result<Vec<_>>>()?;
-                        } else {
-                            segment.file_match_counts = counts
-                                .into_iter()
-                                .map(|count| {
-                                    Ok(FileMatchCount {
-                                        path: reader.doc_key(count.doc_id)?.logical_path.clone(),
+                                    });
+                                }
+                                crate::search::SearchMode::CountOnly => {
+                                    segment.file_counts.push(FileCount {
+                                        path,
+                                        matched_lines: count.matched_lines,
+                                    });
+                                }
+                                crate::search::SearchMode::CountMatches => {
+                                    segment.file_match_counts.push(FileMatchCount {
+                                        path,
                                         matched_occurrences: count.matched_occurrences,
-                                    })
-                                })
-                                .collect::<Result<Vec<_>>>()?;
+                                    });
+                                }
+                                crate::search::SearchMode::LineMatches => unreachable!(),
+                            }
                         }
 
                         Ok(segment)
@@ -483,11 +490,17 @@ impl IndexSnapshotReader {
                 results.bytes_searched += segment.bytes_searched;
                 results.matched_lines += segment.matched_lines;
                 results.matched_occurrences += segment.matched_occurrences;
-                results.file_counts.extend(segment.file_counts);
+                if matches!(query.mode, crate::search::SearchMode::FilesWithMatches) {
+                    results
+                        .matched_paths
+                        .extend(segment.file_counts.into_iter().map(|count| count.path));
+                } else {
+                    results.file_counts.extend(segment.file_counts);
+                }
                 results.file_match_counts.extend(segment.file_match_counts);
             }
-            results
-                .file_counts
+            results.matched_paths.sort_unstable();
+            results.file_counts
                 .sort_unstable_by(|left, right| left.path.cmp(&right.path));
             results
                 .file_match_counts
@@ -512,23 +525,22 @@ impl IndexSnapshotReader {
                     &matcher,
                     line_prefilter_ref,
                     multiline_verifier,
-                    query.mode,
-                    None,
-                    None,
-                    0,
-                    0,
+                    config.max_count,
+                    config.effective_global_max_results(),
                 )?;
                 for task in outcomes {
                     results.matched_lines += task.outcome.matched_lines;
                     results.matched_occurrences += task.outcome.matched_occurrences;
-                    if !task.outcome.matches.is_empty() {
+                    if !task.outcome.line_matches.is_empty() {
                         results.searches_with_match += 1;
                         let path = reader.doc_key(task.doc_id)?.logical_path.clone();
-                        results.hits.push(SearchHit {
-                            path,
-                            matches: task.outcome.matches,
-                            lines: task.outcome.lines,
-                        });
+                        results.line_matches.extend(task.outcome.line_matches.into_iter().map(
+                            |matched| crate::search::LineMatch {
+                                path: path.clone(),
+                                line_number: matched.line_number,
+                                line_text: matched.line_text,
+                            },
+                        ));
                     } else if task.outcome.matched_lines > 0 || task.outcome.matched_occurrences > 0
                     {
                         results.searches_with_match += 1;
@@ -543,30 +555,39 @@ impl IndexSnapshotReader {
                 let outcome = runtime.verify_source(&source)?;
                 results.matched_lines += outcome.matched_lines;
                 results.matched_occurrences += outcome.matched_occurrences;
-                if !outcome.matches.is_empty() {
+                if !outcome.line_matches.is_empty() {
                     results.searches_with_match += 1;
                     let path = reader.doc_key(doc_id)?.logical_path.clone();
-                    results.hits.push(SearchHit {
-                        path,
-                        matches: outcome.matches,
-                        lines: outcome.lines,
-                    });
+                    results.line_matches.extend(outcome.line_matches.into_iter().map(
+                        |matched| crate::search::LineMatch {
+                            path: path.clone(),
+                            line_number: matched.line_number,
+                            line_text: matched.line_text,
+                        },
+                    ));
                 } else if outcome.matched_lines > 0 || outcome.matched_occurrences > 0 {
                     results.searches_with_match += 1;
                 }
-                if query.top_k.is_some_and(|limit| results.hits.len() >= limit) {
-                    results
-                        .hits
-                        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+                if query
+                    .top_k
+                    .is_some_and(|limit| results.line_matches.len() >= limit)
+                {
+                    results.line_matches.sort_unstable_by(|left, right| {
+                        left.path
+                            .cmp(&right.path)
+                            .then(left.line_number.cmp(&right.line_number))
+                    });
                     phases.verify = verify_started.elapsed();
                     return Ok(results);
                 }
             }
         }
 
-        results
-            .hits
-            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+        results.line_matches.sort_unstable_by(|left, right| {
+            left.path
+                .cmp(&right.path)
+                .then(left.line_number.cmp(&right.line_number))
+        });
         phases.verify = verify_started.elapsed();
         Ok(results)
     }

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     io,
     path::{Path, PathBuf},
     sync::Arc,
@@ -7,7 +6,7 @@ use std::{
 
 use grep_matcher::Matcher;
 use grep_regex::RegexMatcher;
-use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkContext, SinkFinish, SinkMatch};
+use grep_searcher::{Searcher, SearcherBuilder, Sink, SinkFinish, SinkMatch};
 use memmap2::Mmap;
 use rayon::prelude::*;
 use regex_syntax::{
@@ -18,10 +17,9 @@ use regex_syntax::{
 use crate::{
     config::QueryConfig,
     error::Result,
-    search::{FileContext, FileMatch, MatchLocation, SearchLine, SearchMode},
+    search::LineMatch,
 };
 
-use super::literal::{count_unique_match_lines, PureLiteralMatcher};
 use super::query::LinePrefilter;
 pub(crate) use super::shared::build_regex_matcher as build_matcher;
 use super::shared::{
@@ -30,8 +28,6 @@ use super::shared::{
 };
 
 const MAX_LOOK_AHEAD: usize = 128;
-// Materializing matches is more expensive than posting-list recall, and on large repos we still
-// want parallel verification once candidate sets reach the low hundreds.
 const VERIFY_PARALLEL_THRESHOLD: usize = 128;
 
 #[derive(Debug, Clone)]
@@ -44,13 +40,9 @@ pub(crate) enum VerifyCandidateSource {
 #[derive(Debug, Clone)]
 pub(crate) struct VerifyPlan {
     matcher: RegexMatcher,
-    literal_matcher: Option<PureLiteralMatcher>,
     line_prefilter: Option<LinePrefilter>,
     multiline_verifier: bool,
-    mode: SearchMode,
     max_count: Option<usize>,
-    before_context: usize,
-    after_context: usize,
 }
 
 impl VerifyPlan {
@@ -61,36 +53,17 @@ impl VerifyPlan {
     ) -> Result<Self> {
         Ok(Self {
             matcher: build_matcher(config, multiline_verifier)?,
-            literal_matcher: if config.max_count.is_none()
-                && config.before_context == 0
-                && config.after_context == 0
-            {
-                PureLiteralMatcher::compile(config, multiline_verifier)?
-            } else {
-                None
-            },
             line_prefilter: (!multiline_verifier).then_some(line_prefilter).flatten(),
             multiline_verifier,
-            mode: config.search_mode,
             max_count: config.max_count,
-            before_context: config.before_context,
-            after_context: config.after_context,
         })
     }
 
     pub(crate) fn create_runtime(&self) -> VerifyRuntime<'_> {
         VerifyRuntime {
             matcher: &self.matcher,
-            literal_matcher: self.literal_matcher.as_ref(),
             line_prefilter: self.line_prefilter.as_ref(),
-            verifier: build_verifier(
-                self.multiline_verifier,
-                self.mode,
-                self.max_count,
-                self.before_context,
-                self.after_context,
-            ),
-            mode: self.mode,
+            verifier: build_verifier(self.multiline_verifier, self.max_count),
         }
     }
 }
@@ -118,11 +91,8 @@ pub(crate) fn verify_candidate_sources_with_resolver<F>(
     matcher: &RegexMatcher,
     line_prefilter: Option<&LinePrefilter>,
     multiline_verifier: bool,
-    mode: SearchMode,
     max_count: Option<usize>,
     global_max_results: Option<usize>,
-    before_context: usize,
-    after_context: usize,
 ) -> Result<Vec<SearchTaskOutcome>>
 where
     F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
@@ -134,23 +104,12 @@ where
                 .par_iter()
                 .enumerate()
                 .map_init(
-                    || {
-                        (
-                            matcher.clone(),
-                            build_verifier(
-                                multiline_verifier,
-                                mode,
-                                max_count,
-                                before_context,
-                                after_context,
-                            ),
-                        )
-                    },
+                    || (matcher.clone(), build_verifier(multiline_verifier, max_count)),
                     |(matcher, verifier), (ordinal, &doc_id)| {
                         validate_doc_id(doc_count, doc_id)?;
                         let source = resolve_source(doc_id)?;
                         let outcome =
-                            verify_source(&source, matcher, None, line_prefilter, verifier, mode)?;
+                            verify_source(&source, matcher, line_prefilter, verifier)?;
                         Ok(SearchTaskOutcome {
                             ordinal,
                             doc_id,
@@ -166,21 +125,14 @@ where
             }
             outcomes
         } else {
-            let mut verifier = build_verifier(
-                multiline_verifier,
-                mode,
-                max_count,
-                before_context,
-                after_context,
-            );
+            let mut verifier = build_verifier(multiline_verifier, max_count);
             let mut outcomes = Vec::with_capacity(candidate_ids.len());
             let mut consumed_results = 0usize;
             for (ordinal, &doc_id) in candidate_ids.iter().enumerate() {
                 validate_doc_id(doc_count, doc_id)?;
                 let source = resolve_source(doc_id)?;
-                let outcome =
-                    verify_source(&source, matcher, None, line_prefilter, &mut verifier, mode)?;
-                consumed_results += outcome_result_units(mode, &outcome);
+                let outcome = verify_source(&source, matcher, line_prefilter, &mut verifier)?;
+                consumed_results += outcome.line_matches.len();
                 outcomes.push(SearchTaskOutcome {
                     ordinal,
                     doc_id,
@@ -196,20 +148,11 @@ where
     Ok(outcomes)
 }
 
-fn outcome_result_units(mode: SearchMode, outcome: &VerifyOutcome) -> usize {
-    match mode {
-        SearchMode::CountMatches => outcome.matched_occurrences,
-        SearchMode::FirstHitOnly => usize::from(!outcome.matches.is_empty()),
-        SearchMode::CountOnly | SearchMode::MaterializeMatches => outcome.matched_lines,
-    }
-}
-
 pub(crate) struct VerifyOutcome {
     pub(crate) matched_lines: usize,
     pub(crate) matched_occurrences: usize,
     pub(crate) bytes_searched: u64,
-    pub(crate) matches: Vec<FileMatch>,
-    pub(crate) lines: Vec<SearchLine>,
+    pub(crate) line_matches: Vec<LineMatch>,
 }
 
 pub(crate) struct SearchTaskOutcome {
@@ -220,10 +163,8 @@ pub(crate) struct SearchTaskOutcome {
 
 pub(crate) struct VerifyRuntime<'a> {
     matcher: &'a RegexMatcher,
-    literal_matcher: Option<&'a PureLiteralMatcher>,
     line_prefilter: Option<&'a LinePrefilter>,
     verifier: Searcher,
-    mode: SearchMode,
 }
 
 impl VerifyRuntime<'_> {
@@ -234,36 +175,18 @@ impl VerifyRuntime<'_> {
         verify_source(
             source,
             self.matcher,
-            self.literal_matcher,
             self.line_prefilter,
             &mut self.verifier,
-            self.mode,
         )
     }
 }
 
-fn build_verifier(
-    multiline_verifier: bool,
-    mode: SearchMode,
-    max_count: Option<usize>,
-    before_context: usize,
-    after_context: usize,
-) -> Searcher {
+fn build_verifier(multiline_verifier: bool, max_count: Option<usize>) -> Searcher {
     let mut builder = SearcherBuilder::new();
-    builder.line_number(mode.materializes_matches());
+    builder.line_number(true);
     configure_verifier_searcher(&mut builder, multiline_verifier);
-    if mode.materializes_matches() {
-        builder
-            .before_context(before_context)
-            .after_context(after_context);
-    }
-    let limit = if matches!(mode, SearchMode::FirstHitOnly) {
-        Some(1)
-    } else {
-        max_count.and_then(|count| u64::try_from(count).ok())
-    };
-    if limit.is_some() {
-        builder.max_matches(limit);
+    if let Some(limit) = max_count.and_then(|count| u64::try_from(count).ok()) {
+        builder.max_matches(Some(limit));
     }
     builder.build()
 }
@@ -273,11 +196,8 @@ fn verify_path(
     matcher: &RegexMatcher,
     line_prefilter: Option<&LinePrefilter>,
     verifier: &mut Searcher,
-    mode: SearchMode,
 ) -> Result<VerifyOutcome> {
-    with_verify_path_bytes(path, |bytes| {
-        verify_slice(bytes, matcher, line_prefilter, verifier, mode)
-    })
+    with_verify_path_bytes(path, |bytes| verify_slice(bytes, matcher, line_prefilter, verifier))
 }
 
 fn verify_slice(
@@ -285,9 +205,8 @@ fn verify_slice(
     matcher: &RegexMatcher,
     line_prefilter: Option<&LinePrefilter>,
     verifier: &mut Searcher,
-    mode: SearchMode,
 ) -> Result<VerifyOutcome> {
-    let mut sink = VerifySink::new(matcher, mode);
+    let mut sink = VerifySink::new(matcher);
     if let Some(prefilter) = line_prefilter {
         let wrapped = LinePrefilterMatcher::new(matcher, prefilter);
         verifier.search_slice(&wrapped, bytes, &mut sink)?;
@@ -300,85 +219,13 @@ fn verify_slice(
 fn verify_source(
     source: &VerifyCandidateSource,
     matcher: &RegexMatcher,
-    literal_matcher: Option<&PureLiteralMatcher>,
     line_prefilter: Option<&LinePrefilter>,
     verifier: &mut Searcher,
-    mode: SearchMode,
 ) -> Result<VerifyOutcome> {
-    if let Some(matcher) = literal_matcher {
-        match source {
-            VerifyCandidateSource::Bytes(bytes) => {
-                return Ok(verify_literal_bytes(bytes, matcher, mode));
-            }
-            VerifyCandidateSource::Mmap(mmap) => {
-                return Ok(verify_literal_bytes(mmap.as_ref(), matcher, mode));
-            }
-            VerifyCandidateSource::Path(_) => {}
-        }
-    }
     match source {
-        VerifyCandidateSource::Path(path) => {
-            verify_path(path, matcher, line_prefilter, verifier, mode)
-        }
-        VerifyCandidateSource::Bytes(bytes) => {
-            verify_slice(bytes, matcher, line_prefilter, verifier, mode)
-        }
-        VerifyCandidateSource::Mmap(mmap) => {
-            verify_slice(mmap.as_ref(), matcher, line_prefilter, verifier, mode)
-        }
-    }
-}
-
-fn verify_literal_bytes(
-    bytes: &[u8],
-    matcher: &PureLiteralMatcher,
-    mode: SearchMode,
-) -> VerifyOutcome {
-    match mode {
-        SearchMode::CountOnly | SearchMode::CountMatches => {
-            let stats = matcher.count(bytes);
-            VerifyOutcome {
-                matched_lines: stats.matched_lines,
-                matched_occurrences: stats.matched_occurrences,
-                bytes_searched: stats.bytes_searched,
-                matches: Vec::new(),
-                lines: Vec::new(),
-            }
-        }
-        SearchMode::FirstHitOnly => {
-            let matches = matcher.collect_matches(bytes, true);
-            let matched_lines = count_unique_match_lines(&matches);
-            let matched_occurrences = matches.len();
-            let lines = matches
-                .iter()
-                .cloned()
-                .map(SearchLine::Match)
-                .collect::<Vec<_>>();
-            VerifyOutcome {
-                matched_lines,
-                matched_occurrences,
-                bytes_searched: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                matches,
-                lines,
-            }
-        }
-        SearchMode::MaterializeMatches => {
-            let matches = matcher.collect_matches(bytes, false);
-            let matched_lines = count_unique_match_lines(&matches);
-            let matched_occurrences = matches.len();
-            let lines = matches
-                .iter()
-                .cloned()
-                .map(SearchLine::Match)
-                .collect::<Vec<_>>();
-            VerifyOutcome {
-                matched_lines,
-                matched_occurrences,
-                bytes_searched: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-                matches,
-                lines,
-            }
-        }
+        VerifyCandidateSource::Path(path) => verify_path(path, matcher, line_prefilter, verifier),
+        VerifyCandidateSource::Bytes(bytes) => verify_slice(bytes, matcher, line_prefilter, verifier),
+        VerifyCandidateSource::Mmap(mmap) => verify_slice(mmap.as_ref(), matcher, line_prefilter, verifier),
     }
 }
 
@@ -495,46 +342,22 @@ fn class_can_match_line_terminator(class: &Class) -> bool {
     }
 }
 
-struct OffsetLocation {
-    line: usize,
-    column: usize,
-    line_start_offset: usize,
-    line_end_offset: usize,
-}
-
-fn offset_to_location(offset: usize, line_starts: &[usize], text_len: usize) -> OffsetLocation {
-    let line_index = line_index_for_offset(offset, line_starts);
-    let line_start = line_starts[line_index];
-    let line_end = line_starts.get(line_index + 1).copied().unwrap_or(text_len);
-
-    OffsetLocation {
-        line: line_index + 1,
-        column: offset.saturating_sub(line_start) + 1,
-        line_start_offset: line_start,
-        line_end_offset: line_end,
-    }
-}
-
 struct VerifySink<'m> {
     matcher: &'m RegexMatcher,
-    mode: SearchMode,
     matched_lines: usize,
     matched_occurrences: usize,
     bytes_searched: u64,
-    matches: Vec<FileMatch>,
-    lines: Vec<SearchLine>,
+    line_matches: Vec<LineMatch>,
 }
 
 impl<'m> VerifySink<'m> {
-    fn new(matcher: &'m RegexMatcher, mode: SearchMode) -> Self {
+    fn new(matcher: &'m RegexMatcher) -> Self {
         Self {
             matcher,
-            mode,
             matched_lines: 0,
             matched_occurrences: 0,
             bytes_searched: 0,
-            matches: Vec::new(),
-            lines: Vec::new(),
+            line_matches: Vec::new(),
         }
     }
 
@@ -543,98 +366,8 @@ impl<'m> VerifySink<'m> {
             matched_lines: self.matched_lines,
             matched_occurrences: self.matched_occurrences,
             bytes_searched: self.bytes_searched,
-            matches: self.matches,
-            lines: self.lines,
+            line_matches: self.line_matches,
         }
-    }
-
-    fn record_match_group(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> io::Result<bool> {
-        match self.mode {
-            SearchMode::CountOnly => {
-                if searcher.multi_line() {
-                    self.matched_lines += mat.lines().count().max(1);
-                } else {
-                    self.matched_lines += 1;
-                }
-                Ok(true)
-            }
-            SearchMode::CountMatches => {
-                let buffer = mat.buffer();
-                let range = mat.bytes_range_in_buffer();
-                let line_starts = build_line_starts(buffer);
-                let mut seen_lines = HashSet::new();
-                let mut matched_occurrences = 0usize;
-                find_iter_at_in_context(searcher, self.matcher, buffer, range, |matched| {
-                    record_line_span(&mut seen_lines, &line_starts, matched);
-                    matched_occurrences += 1;
-                    true
-                })
-                .map_err(io_error_from_matcher)?;
-                if !seen_lines.is_empty() {
-                    self.matched_lines += seen_lines.len();
-                }
-                self.matched_occurrences += matched_occurrences;
-                Ok(true)
-            }
-            SearchMode::FirstHitOnly => {
-                let buffer = mat.buffer();
-                let range = mat.bytes_range_in_buffer();
-                let line_starts = build_line_starts(buffer);
-                let base_line = buffer_base_line_number(mat, &line_starts);
-                let mut seen_lines = HashSet::new();
-                let mut first_match = None;
-                find_iter_at_in_context(searcher, self.matcher, buffer, range, |matched| {
-                    record_line_span(&mut seen_lines, &line_starts, matched);
-                    first_match = Some(matched);
-                    false
-                })?;
-                let Some(matched) = first_match else {
-                    return Ok(true);
-                };
-                self.matched_lines += seen_lines.len().max(1);
-                self.matched_occurrences += 1;
-                let file_match = build_file_match(buffer, matched, &line_starts, base_line);
-                self.matches.push(file_match.clone());
-                self.lines.push(SearchLine::Match(file_match));
-                Ok(false)
-            }
-            SearchMode::MaterializeMatches => {
-                let buffer = mat.buffer();
-                let range = mat.bytes_range_in_buffer();
-                let line_starts = build_line_starts(buffer);
-                let base_line = buffer_base_line_number(mat, &line_starts);
-                let mut seen_lines = HashSet::new();
-                find_iter_at_in_context(searcher, self.matcher, buffer, range, |matched| {
-                    record_line_span(&mut seen_lines, &line_starts, matched);
-                    self.matched_occurrences += 1;
-                    let file_match = build_file_match(buffer, matched, &line_starts, base_line);
-                    self.matches.push(file_match.clone());
-                    self.lines.push(SearchLine::Match(file_match));
-                    true
-                })
-                .map_err(io_error_from_matcher)?;
-                if !seen_lines.is_empty() {
-                    self.matched_lines += seen_lines.len();
-                }
-                Ok(true)
-            }
-        }
-    }
-
-    fn record_context(&mut self, context: &SinkContext<'_>) -> bool {
-        if !self.mode.materializes_matches() {
-            return true;
-        }
-        let line_number = context
-            .line_number()
-            .and_then(|line| usize::try_from(line).ok())
-            .unwrap_or(1);
-        self.lines.push(SearchLine::Context(FileContext {
-            line_number,
-            snippet: String::from_utf8_lossy(trim_line_terminator_bytes(context.bytes()))
-                .into_owned(),
-        }));
-        true
     }
 }
 
@@ -646,20 +379,25 @@ impl Sink for VerifySink<'_> {
         searcher: &Searcher,
         mat: &SinkMatch<'_>,
     ) -> std::result::Result<bool, Self::Error> {
-        self.record_match_group(searcher, mat)
-    }
-
-    fn context(
-        &mut self,
-        _searcher: &Searcher,
-        context: &SinkContext<'_>,
-    ) -> std::result::Result<bool, Self::Error> {
-        Ok(self.record_context(context))
-    }
-
-    fn context_break(&mut self, _searcher: &Searcher) -> std::result::Result<bool, Self::Error> {
-        if self.mode.materializes_matches() {
-            self.lines.push(SearchLine::ContextBreak);
+        let buffer = mat.buffer();
+        let range = mat.bytes_range_in_buffer();
+        let line_starts = build_line_starts(buffer);
+        let base_line = buffer_base_line_number(mat, &line_starts);
+        let mut matched_occurrences = 0usize;
+        find_iter_at_in_context(searcher, self.matcher, buffer, range.clone(), |_| {
+            matched_occurrences += 1;
+            true
+        })
+        .map_err(io_error_from_matcher)?;
+        self.matched_occurrences += matched_occurrences.max(1);
+        self.matched_lines += mat.lines().count().max(1);
+        let line_match = build_line_match(buffer, range.start, &line_starts, base_line);
+        if self
+            .line_matches
+            .last()
+            .is_none_or(|previous| previous.line_number != line_match.line_number || previous.line_text != line_match.line_text)
+        {
+            self.line_matches.push(line_match);
         }
         Ok(true)
     }
@@ -682,25 +420,6 @@ fn buffer_base_line_number(mat: &SinkMatch<'_>, line_starts: &[usize]) -> usize 
             .unwrap_or(usize::MAX)
             .saturating_sub(range_start_line)
     })
-}
-
-fn trim_line_terminator<'b>(
-    searcher: &Searcher,
-    buf: &'b [u8],
-    line: &mut grep_matcher::Match,
-) -> &'b [u8] {
-    let line_term = searcher.line_terminator();
-    if line_term.is_suffix(&buf[*line]) {
-        let mut end = line.end() - 1;
-        if line_term.is_crlf() && end > 0 && buf.get(end - 1) == Some(&b'\r') {
-            end -= 1;
-        }
-        let orig_end = line.end();
-        *line = line.with_end(end);
-        &buf[end..orig_end]
-    } else {
-        &[]
-    }
 }
 
 fn find_iter_at_in_context<F>(
@@ -732,43 +451,46 @@ where
         .map_err(io_error_from_matcher)
 }
 
-fn build_file_match(
+fn trim_line_terminator<'b>(
+    searcher: &Searcher,
+    buf: &'b [u8],
+    line: &mut grep_matcher::Match,
+) -> &'b [u8] {
+    let line_term = searcher.line_terminator();
+    if line_term.is_suffix(&buf[*line]) {
+        let mut end = line.end() - 1;
+        if line_term.is_crlf() && end > 0 && buf.get(end - 1) == Some(&b'\r') {
+            end -= 1;
+        }
+        let orig_end = line.end();
+        *line = line.with_end(end);
+        &buf[end..orig_end]
+    } else {
+        &[]
+    }
+}
+
+fn build_line_match(
     bytes: &[u8],
-    matched: grep_matcher::Match,
+    start: usize,
     line_starts: &[usize],
     base_line: usize,
-) -> FileMatch {
-    let location = offset_to_location(matched.start(), line_starts, bytes.len());
-    let line =
-        trim_line_terminator_bytes(&bytes[location.line_start_offset..location.line_end_offset]);
+) -> LineMatch {
+    let line_index = line_index_for_offset(start, line_starts);
+    let line_start = line_starts[line_index];
+    let line_end = line_starts
+        .get(line_index + 1)
+        .copied()
+        .unwrap_or(bytes.len());
+    let snippet = trim_line_terminator_bytes(&bytes[line_start..line_end]);
 
-    FileMatch {
-        location: MatchLocation {
-            line: base_line + location.line - 1,
-            column: location.column,
-        },
-        snippet: String::from_utf8_lossy(line).into_owned(),
-        matched_text: String::from_utf8_lossy(&bytes[matched]).into_owned(),
+    LineMatch {
+        path: String::new(),
+        line_number: base_line + line_index,
+        line_text: String::from_utf8_lossy(snippet).into_owned(),
     }
 }
 
 fn io_error_from_matcher<E: std::fmt::Display>(error: E) -> io::Error {
     io::Error::other(error.to_string())
-}
-
-fn record_line_span(
-    seen_lines: &mut HashSet<usize>,
-    line_starts: &[usize],
-    matched: grep_matcher::Match,
-) {
-    let start = line_index_for_offset(matched.start(), line_starts);
-    let end_offset = if matched.is_empty() {
-        matched.start()
-    } else {
-        matched.end().saturating_sub(1)
-    };
-    let end = line_index_for_offset(end_offset, line_starts);
-    for line in start..=end {
-        seen_lines.insert(line);
-    }
 }

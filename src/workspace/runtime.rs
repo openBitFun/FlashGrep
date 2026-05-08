@@ -81,11 +81,16 @@ pub(super) fn merge_search_results(
     base.bytes_searched += dirty.bytes_searched;
     base.matched_lines += dirty.matched_lines;
     base.matched_occurrences += dirty.matched_occurrences;
+    base.matched_paths.append(&mut dirty.matched_paths);
+    base.line_matches.append(&mut dirty.line_matches);
     base.file_counts.append(&mut dirty.file_counts);
     base.file_match_counts.append(&mut dirty.file_match_counts);
-    base.hits.append(&mut dirty.hits);
-    base.hits
-        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    base.matched_paths.sort_unstable();
+    base.line_matches.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line_number.cmp(&right.line_number))
+    });
     base.file_counts
         .sort_unstable_by(|left, right| left.path.cmp(&right.path));
     base.file_match_counts

@@ -7,10 +7,7 @@ use regex_syntax::{
 use crate::{
     config::QueryConfig,
     error::{AppError, Result},
-    search::{FileMatch, MatchLocation},
 };
-
-use super::shared::{build_line_starts, line_index_for_offset, trim_line_terminator_bytes};
 
 #[derive(Debug, Clone)]
 pub(crate) struct PureLiteralMatcher {
@@ -21,7 +18,6 @@ pub(crate) struct PureLiteralMatcher {
 pub(crate) struct LiteralScanStats {
     pub(crate) matched_lines: usize,
     pub(crate) matched_occurrences: usize,
-    pub(crate) bytes_searched: u64,
 }
 
 impl PureLiteralMatcher {
@@ -68,38 +64,8 @@ impl PureLiteralMatcher {
         LiteralScanStats {
             matched_lines,
             matched_occurrences,
-            bytes_searched: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
         }
     }
-
-    pub(crate) fn collect_matches(&self, bytes: &[u8], first_only: bool) -> Vec<FileMatch> {
-        let line_starts = build_line_starts(bytes);
-        let mut matches = Vec::new();
-        for matched in self.matcher.find_iter(bytes) {
-            matches.push(build_file_match(
-                bytes,
-                matched.start(),
-                matched.end(),
-                &line_starts,
-            ));
-            if first_only {
-                break;
-            }
-        }
-        matches
-    }
-}
-
-pub(crate) fn count_unique_match_lines(matches: &[FileMatch]) -> usize {
-    let mut lines = 0usize;
-    let mut last_line = None;
-    for matched in matches {
-        if last_line != Some(matched.location.line) {
-            lines += 1;
-            last_line = Some(matched.location.line);
-        }
-    }
-    lines
 }
 
 fn collect_pure_literals(config: &QueryConfig) -> Result<Option<Vec<String>>> {
@@ -164,25 +130,6 @@ fn next_line_end(bytes: &[u8], start: usize) -> usize {
         return bytes.len();
     }
     start + memchr::memchr(b'\n', &bytes[start..]).map_or(bytes.len() - start, |index| index + 1)
-}
-
-fn build_file_match(bytes: &[u8], start: usize, end: usize, line_starts: &[usize]) -> FileMatch {
-    let line_index = line_index_for_offset(start, line_starts);
-    let line_start = line_starts[line_index];
-    let line_end = line_starts
-        .get(line_index + 1)
-        .copied()
-        .unwrap_or(bytes.len());
-    let snippet = trim_line_terminator_bytes(&bytes[line_start..line_end]);
-
-    FileMatch {
-        location: MatchLocation {
-            line: line_index + 1,
-            column: start.saturating_sub(line_start) + 1,
-        },
-        snippet: String::from_utf8_lossy(snippet).into_owned(),
-        matched_text: String::from_utf8_lossy(&bytes[start..end]).into_owned(),
-    }
 }
 
 #[cfg(test)]

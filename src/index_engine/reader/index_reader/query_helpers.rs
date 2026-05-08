@@ -4,6 +4,8 @@ pub(super) fn query_request_to_runtime_config(query: &QueryRequest) -> QueryConf
     QueryConfig {
         regex_pattern: query.pattern.clone(),
         case_insensitive: query.case_insensitive,
+        max_count: query.max_count,
+        global_max_results: query.top_k,
         search_mode: query.mode,
         ..QueryConfig::default()
     }
@@ -67,15 +69,6 @@ pub(super) fn matches_key_filters(key: &DocKey, query: &QueryRequest) -> bool {
     true
 }
 
-pub(super) fn accumulate_doc_search(
-    doc: &IndexDocument,
-    query: &QueryRequest,
-    regex: &regex::Regex,
-    results: &mut SearchResults,
-) {
-    accumulate_search_bytes(&doc.logical_path, &doc.source_bytes, query, regex, results);
-}
-
 pub(super) fn empty_results() -> SearchResults {
     SearchResults {
         candidate_docs: 0,
@@ -83,9 +76,10 @@ pub(super) fn empty_results() -> SearchResults {
         bytes_searched: 0,
         matched_lines: 0,
         matched_occurrences: 0,
+        matched_paths: Vec::new(),
+        line_matches: Vec::new(),
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
-        hits: Vec::new(),
     }
 }
 
@@ -129,85 +123,4 @@ fn path_matches_prefix(path: &str, prefix: &str) -> bool {
         || path
             .strip_prefix(prefix)
             .is_some_and(|suffix| suffix.starts_with(std::path::MAIN_SEPARATOR))
-}
-
-fn accumulate_search_bytes(
-    path: &str,
-    source_bytes: &[u8],
-    query: &QueryRequest,
-    regex: &regex::Regex,
-    results: &mut SearchResults,
-) {
-    let text = String::from_utf8_lossy(source_bytes);
-    let mut doc_matched_lines = 0usize;
-    let mut doc_matched_occurrences = 0usize;
-    let mut doc_matches = Vec::new();
-    let materializes_matches = query.mode.materializes_matches();
-    let first_hit_only = matches!(query.mode, crate::search::SearchMode::FirstHitOnly);
-
-    for (line_index, line) in text.lines().enumerate() {
-        if materializes_matches {
-            let matches = regex.find_iter(line).collect::<Vec<_>>();
-            if matches.is_empty() {
-                continue;
-            }
-
-            doc_matched_lines += 1;
-            doc_matched_occurrences += matches.len();
-            for matched in matches {
-                doc_matches.push(FileMatch {
-                    location: MatchLocation {
-                        line: line_index + 1,
-                        column: matched.start() + 1,
-                    },
-                    snippet: line.to_string(),
-                    matched_text: matched.as_str().to_string(),
-                });
-                if first_hit_only {
-                    break;
-                }
-            }
-            if first_hit_only && !doc_matches.is_empty() {
-                break;
-            }
-            continue;
-        }
-
-        let match_count = regex.find_iter(line).count();
-        if match_count == 0 {
-            continue;
-        }
-
-        doc_matched_lines += 1;
-        doc_matched_occurrences += match_count;
-    }
-
-    if doc_matched_lines == 0 {
-        return;
-    }
-
-    results.searches_with_match += 1;
-    results.matched_lines += doc_matched_lines;
-    results.matched_occurrences += doc_matched_occurrences;
-    results.file_counts.push(FileCount {
-        path: path.to_string(),
-        matched_lines: doc_matched_lines,
-    });
-    results.file_match_counts.push(FileMatchCount {
-        path: path.to_string(),
-        matched_occurrences: doc_matched_occurrences,
-    });
-
-    if materializes_matches {
-        let lines = doc_matches
-            .iter()
-            .cloned()
-            .map(SearchLine::Match)
-            .collect::<Vec<_>>();
-        results.hits.push(SearchHit {
-            path: path.to_string(),
-            matches: doc_matches,
-            lines,
-        });
-    }
 }

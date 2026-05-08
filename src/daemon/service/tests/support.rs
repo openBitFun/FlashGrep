@@ -191,8 +191,6 @@ pub(super) fn query(pattern: &str) -> QuerySpec {
         fixed_strings: false,
         word_regexp: false,
         line_regexp: false,
-        before_context: 0,
-        after_context: 0,
         top_k_tokens: 6,
         max_count: None,
         global_max_results: None,
@@ -492,8 +490,9 @@ pub(super) fn workspace_overlay_match_count(
     })?;
     let results = engine.reader().open_snapshot()?.search(&QueryRequest {
         pattern: pattern.into(),
-        mode: SearchMode::MaterializeMatches,
+        mode: SearchMode::LineMatches,
         case_insensitive: false,
+        max_count: None,
         top_k: None,
         filters: QueryFilters::default(),
         prefer_worktree_for_git_head_blob: false,
@@ -513,8 +512,9 @@ pub(super) fn workspace_overlay_committed_match_count(
     })?;
     let results = engine.reader().open_committed()?.search(&QueryRequest {
         pattern: pattern.into(),
-        mode: SearchMode::MaterializeMatches,
+        mode: SearchMode::LineMatches,
         case_insensitive: false,
+        max_count: None,
         top_k: None,
         filters: QueryFilters::default(),
         prefer_worktree_for_git_head_blob: false,

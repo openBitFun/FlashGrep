@@ -15,14 +15,20 @@ pub(super) fn print_engine_search_results(results: &SearchResults) {
         results.matched_lines,
         results.matched_occurrences
     );
-    for hit in &results.hits {
-        println!("file {}", hit.path);
-        for file_match in &hit.matches {
-            println!(
-                "  {}:{} {}",
-                file_match.location.line, file_match.location.column, file_match.matched_text
-            );
-        }
+    for path in &results.matched_paths {
+        println!("file {path}");
+    }
+    for matched in &results.line_matches {
+        println!("file {}:{} {}", matched.path, matched.line_number, matched.line_text);
+    }
+    for count in &results.file_counts {
+        println!("file {} matched_lines={}", count.path, count.matched_lines);
+    }
+    for count in &results.file_match_counts {
+        println!(
+            "file {} matched_occurrences={}",
+            count.path, count.matched_occurrences
+        );
     }
 }
 

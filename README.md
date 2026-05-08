@@ -132,7 +132,7 @@ node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
 说明：
 
 - 如果启动时已经传了 `--repo`，tool 调用里可以省略 `repo_path`。
-- 如果没有传 `--repo`，每次 tool 调用都需要带 `repo_path`。
+- 如果没有传 `--repo`，server 会默认把启动进程的当前工作目录（`cwd`）当作 repo；如果那不是目标仓库，再在 tool 调用里显式传 `repo_path`。
 - MCP transport 走 stdio，framing 使用 `Content-Length`。
 - MCP server 自身是 Node 进程；它会在本次 MCP session 内拉起并持有一个 `flashgrep serve --stdio` 后端子进程。
 - 如果没显式传 `--daemon-bin`，server 会优先尝试 `target/release/flashgrep`、`target/debug/flashgrep`，最后回退到环境里的 `flashgrep`。
@@ -213,12 +213,10 @@ let response = client.send(Request::Search {
             fixed_strings: true,
             word_regexp: false,
             line_regexp: false,
-            before_context: 0,
-            after_context: 0,
             top_k_tokens: 6,
             max_count: None,
             global_max_results: None,
-            search_mode: SearchModeConfig::CountOnly,
+            search_mode: SearchModeConfig::LineMatches,
         },
         scope: PathScope::default(),
         allow_scan_fallback: false,

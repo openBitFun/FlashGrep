@@ -80,6 +80,7 @@ pub(crate) fn workspace_query_request(query: &crate::QueryConfig) -> QueryReques
         pattern: query.regex_pattern.clone(),
         mode: query.search_mode,
         case_insensitive: query.case_insensitive,
+        max_count: query.max_count,
         top_k: query.global_max_results,
         filters: QueryFilters::default(),
         prefer_worktree_for_git_head_blob: false,
@@ -110,9 +111,10 @@ pub(super) fn empty_search_results() -> SearchResults {
         bytes_searched: 0,
         matched_lines: 0,
         matched_occurrences: 0,
+        matched_paths: Vec::new(),
+        line_matches: Vec::new(),
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
-        hits: Vec::new(),
     }
 }
 

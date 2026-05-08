@@ -43,6 +43,7 @@ fn query(pattern: &str) -> QueryRequest {
         pattern: pattern.into(),
         mode: SearchMode::CountOnly,
         case_insensitive: false,
+        max_count: None,
         top_k: None,
         filters: QueryFilters::default(),
         prefer_worktree_for_git_head_blob: false,

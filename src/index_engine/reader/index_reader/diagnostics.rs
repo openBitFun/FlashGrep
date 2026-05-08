@@ -22,7 +22,7 @@ impl IndexSnapshotReader {
                 matched_lines: results.matched_lines,
                 matched_occurrences: results.matched_occurrences,
                 bytes_searched: results.bytes_searched,
-                hits: results.hits.len(),
+                hits: results.result_units(query.mode),
                 phases,
                 candidate_build: None,
             });
@@ -43,15 +43,12 @@ impl IndexSnapshotReader {
                 matched_lines: results.matched_lines,
                 matched_occurrences: results.matched_occurrences,
                 bytes_searched: results.bytes_searched,
-                hits: results.hits.len(),
+                hits: results.result_units(query.mode),
                 phases,
                 candidate_build: None,
             });
         }
 
-        let regex = RegexBuilder::new(&query.pattern)
-            .case_insensitive(query.case_insensitive)
-            .build()?;
         let prepare_elapsed = prepare_started.elapsed();
         let mut phases = SearchPhaseProfile {
             prepare: prepare_elapsed,
@@ -61,7 +58,6 @@ impl IndexSnapshotReader {
         let results = self.search_with_regex_profiled(
             query,
             &plan,
-            &regex,
             Some(&mut phases),
             Some(&mut candidate_build),
         )?;
@@ -76,7 +72,7 @@ impl IndexSnapshotReader {
             matched_lines: results.matched_lines,
             matched_occurrences: results.matched_occurrences,
             bytes_searched: results.bytes_searched,
-            hits: results.hits.len(),
+            hits: results.result_units(query.mode),
             phases,
             candidate_build: Some(candidate_build),
         })

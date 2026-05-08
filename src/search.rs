@@ -1,21 +1,11 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SearchMode {
+    FilesWithMatches,
+    LineMatches,
     CountOnly,
     CountMatches,
-    FirstHitOnly,
-    MaterializeMatches,
 }
 
-impl SearchMode {
-    pub fn materializes_matches(self) -> bool {
-        matches!(self, Self::MaterializeMatches | Self::FirstHitOnly)
-    }
-}
-
-/// Materialized match payload for one search request.
-///
-/// This is the primary "match body" type. For request-level execution metadata
-/// such as backend selection, use `SearchResponse`.
 #[derive(Debug, Clone)]
 pub struct SearchResults {
     pub candidate_docs: usize,
@@ -23,9 +13,10 @@ pub struct SearchResults {
     pub bytes_searched: u64,
     pub matched_lines: usize,
     pub matched_occurrences: usize,
+    pub matched_paths: Vec<String>,
+    pub line_matches: Vec<LineMatch>,
     pub file_counts: Vec<FileCount>,
     pub file_match_counts: Vec<FileMatchCount>,
-    pub hits: Vec<SearchHit>,
 }
 
 impl SearchResults {
@@ -35,18 +26,19 @@ impl SearchResults {
 
     pub fn result_units(&self, mode: SearchMode) -> usize {
         match mode {
-            SearchMode::CountMatches => self.matched_occurrences,
-            SearchMode::FirstHitOnly => self.searches_with_match,
-            SearchMode::CountOnly | SearchMode::MaterializeMatches => self.matched_lines,
+            SearchMode::LineMatches => self.line_matches.len(),
+            SearchMode::FilesWithMatches | SearchMode::CountOnly | SearchMode::CountMatches => {
+                self.searches_with_match
+            }
         }
     }
 }
 
 #[derive(Debug, Clone)]
-pub struct SearchHit {
+pub struct LineMatch {
     pub path: String,
-    pub matches: Vec<FileMatch>,
-    pub lines: Vec<SearchLine>,
+    pub line_number: usize,
+    pub line_text: String,
 }
 
 #[derive(Debug, Clone)]
@@ -71,30 +63,4 @@ impl FileMatchCount {
     pub fn has_match(&self) -> bool {
         self.matched_occurrences > 0
     }
-}
-
-#[derive(Debug, Clone)]
-pub struct FileMatch {
-    pub location: MatchLocation,
-    pub snippet: String,
-    pub matched_text: String,
-}
-
-#[derive(Debug, Clone)]
-pub struct FileContext {
-    pub line_number: usize,
-    pub snippet: String,
-}
-
-#[derive(Debug, Clone)]
-pub enum SearchLine {
-    Match(FileMatch),
-    Context(FileContext),
-    ContextBreak,
-}
-
-#[derive(Debug, Clone)]
-pub struct MatchLocation {
-    pub line: usize,
-    pub column: usize,
 }

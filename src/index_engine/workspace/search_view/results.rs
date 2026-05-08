@@ -34,18 +34,25 @@ pub(super) fn merge_search_results(
     base.bytes_searched += overlay.bytes_searched;
     base.matched_lines += overlay.matched_lines;
     base.matched_occurrences += overlay.matched_occurrences;
-    base.hits
-        .retain(|hit| !overlay_paths.contains(hit.path.as_str()));
+    base.matched_paths
+        .retain(|path| !overlay_paths.contains(path.as_str()));
+    base.line_matches
+        .retain(|matched| !overlay_paths.contains(matched.path.as_str()));
     base.file_counts
         .retain(|count| !overlay_paths.contains(count.path.as_str()));
     base.file_match_counts
         .retain(|count| !overlay_paths.contains(count.path.as_str()));
+    base.matched_paths.append(&mut overlay.matched_paths);
+    base.line_matches.append(&mut overlay.line_matches);
     base.file_counts.append(&mut overlay.file_counts);
     base.file_match_counts
         .append(&mut overlay.file_match_counts);
-    base.hits.append(&mut overlay.hits);
-    base.hits
-        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+    base.matched_paths.sort_unstable();
+    base.line_matches.sort_unstable_by(|left, right| {
+        left.path
+            .cmp(&right.path)
+            .then(left.line_number.cmp(&right.line_number))
+    });
     base.file_counts
         .sort_unstable_by(|left, right| left.path.cmp(&right.path));
     base.file_match_counts
@@ -61,16 +68,20 @@ pub(super) fn empty_search_results() -> SearchResults {
         bytes_searched: 0,
         matched_lines: 0,
         matched_occurrences: 0,
+        matched_paths: Vec::new(),
+        line_matches: Vec::new(),
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
-        hits: Vec::new(),
     }
 }
 
 pub(super) fn filter_search_results(results: &mut SearchResults, filter: &PathFilter) {
     results
-        .hits
-        .retain(|hit| filter.matches_file(Path::new(&hit.path)));
+        .matched_paths
+        .retain(|path| filter.matches_file(Path::new(path)));
+    results
+        .line_matches
+        .retain(|matched| filter.matches_file(Path::new(&matched.path)));
     results
         .file_counts
         .retain(|count| filter.matches_file(Path::new(&count.path)));
@@ -88,8 +99,11 @@ pub(super) fn exclude_search_results(
     excluded_paths: &HashSet<String>,
 ) {
     results
-        .hits
-        .retain(|hit| !excluded_paths.contains(&hit.path));
+        .matched_paths
+        .retain(|path| !excluded_paths.contains(path));
+    results
+        .line_matches
+        .retain(|matched| !excluded_paths.contains(&matched.path));
     results
         .file_counts
         .retain(|count| !excluded_paths.contains(&count.path));
@@ -102,8 +116,11 @@ pub(super) fn exclude_search_results(
 }
 
 pub(super) fn absolutize_search_results(results: &mut SearchResults, repo_root: &Path) {
-    for hit in &mut results.hits {
-        hit.path = absolutize_path(&hit.path, repo_root);
+    for path in &mut results.matched_paths {
+        *path = absolutize_path(path, repo_root);
+    }
+    for matched in &mut results.line_matches {
+        matched.path = absolutize_path(&matched.path, repo_root);
     }
     for count in &mut results.file_counts {
         count.path = absolutize_path(&count.path, repo_root);
@@ -124,9 +141,10 @@ pub(super) fn absolutize_path(path: &str, repo_root: &Path) -> String {
 
 fn search_result_paths(results: &SearchResults) -> HashSet<&str> {
     results
-        .hits
+        .matched_paths
         .iter()
-        .map(|hit| hit.path.as_str())
+        .map(String::as_str)
+        .chain(results.line_matches.iter().map(|matched| matched.path.as_str()))
         .chain(results.file_counts.iter().map(|count| count.path.as_str()))
         .chain(
             results
@@ -142,19 +160,15 @@ fn unique_result_paths(results: &SearchResults) -> HashSet<&str> {
 }
 
 fn recompute_result_totals(results: &mut SearchResults) {
-    let matched_lines_from_hits = results
-        .hits
-        .iter()
-        .map(|hit| hit.matches.len())
-        .sum::<usize>();
-    let matched_occurrences_from_hits = results
-        .hits
-        .iter()
-        .map(|hit| hit.matches.len())
-        .sum::<usize>();
-
-    results.searches_with_match = if !results.hits.is_empty() {
-        results.hits.len()
+    results.searches_with_match = if !results.matched_paths.is_empty() {
+        results.matched_paths.len()
+    } else if !results.line_matches.is_empty() {
+        results
+            .line_matches
+            .iter()
+            .map(|matched| matched.path.as_str())
+            .collect::<HashSet<_>>()
+            .len()
     } else if !results.file_counts.is_empty() {
         results.file_counts.len()
     } else {
@@ -166,10 +180,10 @@ fn recompute_result_totals(results: &mut SearchResults) {
             .iter()
             .map(|count| count.matched_lines)
             .sum()
-    } else if !results.hits.is_empty() {
-        matched_lines_from_hits
     } else if !results.file_match_counts.is_empty() {
         results.matched_lines
+    } else if !results.line_matches.is_empty() {
+        results.line_matches.len()
     } else {
         0
     };
@@ -179,8 +193,8 @@ fn recompute_result_totals(results: &mut SearchResults) {
             .iter()
             .map(|count| count.matched_occurrences)
             .sum()
-    } else if !results.hits.is_empty() {
-        matched_occurrences_from_hits
+    } else if !results.line_matches.is_empty() {
+        results.matched_occurrences
     } else {
         0
     };

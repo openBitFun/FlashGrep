@@ -354,14 +354,8 @@ pub(super) struct DaemonSearchArgs {
     pub(super) word_regexp: bool,
     #[arg(short = 'x', long = "line-regexp", default_value_t = false)]
     pub(super) line_regexp: bool,
-    #[arg(short = 'A', long = "after-context")]
-    pub(super) after_context: Option<usize>,
-    #[arg(short = 'B', long = "before-context")]
-    pub(super) before_context: Option<usize>,
     #[arg(short = 'm', long = "max-count")]
     pub(super) max_count: Option<usize>,
-    #[arg(short = 'q', long = "quiet", default_value_t = false)]
-    pub(super) quiet: bool,
     #[arg(short = 'c', long = "count", default_value_t = false)]
     pub(super) count: bool,
     #[arg(long = "count-matches", default_value_t = false)]
@@ -396,10 +390,7 @@ impl DaemonSearchArgs {
             multiline_dotall,
             word_regexp,
             line_regexp,
-            after_context,
-            before_context,
             max_count,
-            quiet,
             count,
             count_matches,
             allow_scan_fallback,
@@ -424,12 +415,10 @@ impl DaemonSearchArgs {
                 fixed_strings,
                 word_regexp,
                 line_regexp,
-                before_context: before_context.unwrap_or(0),
-                after_context: after_context.unwrap_or(0),
                 top_k_tokens: 6,
                 max_count,
                 global_max_results: None,
-                search_mode: select_search_mode(quiet, count, count_matches),
+                search_mode: select_search_mode(count, count_matches),
             },
             scope: path_scope(
                 paths,
@@ -580,15 +569,13 @@ fn path_scope(
     }
 }
 
-fn select_search_mode(quiet: bool, count: bool, count_matches: bool) -> SearchModeConfig {
-    if quiet {
-        SearchModeConfig::FirstHitOnly
-    } else if count_matches {
+fn select_search_mode(count: bool, count_matches: bool) -> SearchModeConfig {
+    if count_matches {
         SearchModeConfig::CountMatches
     } else if count {
         SearchModeConfig::CountOnly
     } else {
-        SearchModeConfig::MaterializeMatches
+        SearchModeConfig::LineMatches
     }
 }
 

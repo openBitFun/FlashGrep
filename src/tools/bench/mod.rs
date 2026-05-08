@@ -870,8 +870,6 @@ pub(super) fn run_daemon_search_count(
             fixed_strings: false,
             word_regexp: false,
             line_regexp: false,
-            before_context: 0,
-            after_context: 0,
             top_k_tokens: config.top_k_tokens,
             max_count: None,
             global_max_results: None,

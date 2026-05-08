@@ -109,8 +109,6 @@ fn managed_client_spawns_ensures_and_searches() {
                     fixed_strings: false,
                     word_regexp: false,
                     line_regexp: false,
-                    before_context: 0,
-                    after_context: 0,
                     top_k_tokens: 6,
                     max_count: None,
                     global_max_results: None,

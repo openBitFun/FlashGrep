@@ -11,6 +11,8 @@ node src/mcp/server.js --repo /path/to/repo
 这个 server 会在当前 MCP session 内自己拉起并管理一个 `flashgrep serve --stdio` 子进程。
 MCP server 退出时，会对这个后端发 `shutdown`，必要时再终止进程；不会把它 detach 成独立 daemon。
 
+如果没有传 `--repo`，server 会默认把启动进程的当前工作目录（`cwd`）当作 repo 根目录。
+
 Trae 配置示例：
 
 ```json

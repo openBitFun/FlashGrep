@@ -8,7 +8,6 @@ mod fs_atomic;
 mod git_snapshot;
 mod gitignore;
 pub mod index_engine;
-mod json_output;
 mod path_filter;
 mod path_utils;
 mod planner;
@@ -59,23 +58,10 @@ pub mod advanced {
         RepositoryFile, ScanOptions,
     };
     pub use crate::path_filter::{normalize_path, PathFilter, PathFilterArgs};
-    pub use crate::search::{
-        FileContext, FileCount, FileMatch, FileMatchCount, MatchLocation, SearchHit, SearchLine,
-    };
+    pub use crate::search::{FileCount, FileMatchCount};
     pub use crate::workspace::{
         BaseSnapshotInfo, BaseSnapshotKind, IndexStatus, WorkspaceSnapshot,
     };
-
-    /// JSON event/output model types.
-    ///
-    /// Primarily intended for CLI/integration output adapters; schema may
-    /// evolve over time.
-    pub mod json {
-        pub use crate::json_output::{
-            JsonBegin, JsonContext, JsonData, JsonDuration, JsonEnd, JsonMatch, JsonMessage,
-            JsonSearchFile, JsonSearchReport, JsonStats, JsonSubmatch, JsonSummary,
-        };
-    }
 }
 
 /// Unstable or evolving API surface intended for experimentation.
