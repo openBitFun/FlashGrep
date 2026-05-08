@@ -215,6 +215,7 @@ impl RepoManager {
 
     pub fn open_repo(&self, request: OpenRepoRequest) -> Result<RepoStatus> {
         let build_config = request.build_config.normalized()?;
+        crate::gitignore::ensure_storage_root_ignored(&build_config)?;
         let repo_id = build_config.repo_path.to_string_lossy().into_owned();
         let stale_runtime = {
             let mut repos = match self.repos.lock() {

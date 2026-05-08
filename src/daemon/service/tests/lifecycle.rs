@@ -1,6 +1,92 @@
 use super::*;
 
 #[test]
+fn opening_git_repo_ignores_default_storage_root_in_gitignore() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    init_git_repo(&repo_path);
+
+    let (_, status) = open_repo(&service, repo_path.clone());
+    assert!(matches!(
+        status.phase,
+        crate::daemon::protocol::RepoPhase::MissingBaseSnapshot
+    ));
+
+    let gitignore =
+        fs::read_to_string(repo_path.join(".gitignore")).expect(".gitignore read should succeed");
+    assert_eq!(gitignore, "/.flashgrep-index-engine/\n");
+}
+
+#[test]
+fn opening_git_repo_does_not_duplicate_existing_storage_ignore_entry() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    init_git_repo(&repo_path);
+    fs::write(repo_path.join(".gitignore"), ".flashgrep-index-engine/\n")
+        .expect(".gitignore write should succeed");
+
+    let _ = open_repo(&service, repo_path.clone());
+
+    let gitignore =
+        fs::read_to_string(repo_path.join(".gitignore")).expect(".gitignore read should succeed");
+    assert_eq!(gitignore, ".flashgrep-index-engine/\n");
+}
+
+#[test]
+fn opening_git_repo_ignores_custom_repo_local_storage_root_in_gitignore() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(repo_path.join("custom")).expect("custom dir should succeed");
+    init_git_repo(&repo_path);
+
+    let response = service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: Some(repo_path.join("custom/index")),
+                config: RepoConfig::default(),
+                refresh: Default::default(),
+            },
+        })
+        .expect("open repo should succeed");
+    match response {
+        Response::RepoOpened { status, .. } => {
+            assert!(matches!(
+                status.phase,
+                crate::daemon::protocol::RepoPhase::Opening
+                    | crate::daemon::protocol::RepoPhase::MissingBaseSnapshot
+            ));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    let gitignore =
+        fs::read_to_string(repo_path.join(".gitignore")).expect(".gitignore read should succeed");
+    assert_eq!(gitignore, "/custom/index/\n");
+}
+
+#[test]
+fn opening_non_git_repo_does_not_create_gitignore() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+
+    let _ = open_repo(&service, repo_path.clone());
+
+    assert!(!repo_path.join(".gitignore").exists());
+}
+
+#[test]
 fn daemon_reports_missing_index_then_builds_and_searches() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();

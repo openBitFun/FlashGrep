@@ -6,6 +6,7 @@ pub mod error;
 mod files;
 mod fs_atomic;
 mod git_snapshot;
+mod gitignore;
 pub mod index_engine;
 mod json_output;
 mod path_filter;
