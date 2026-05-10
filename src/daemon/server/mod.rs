@@ -91,6 +91,7 @@ pub fn serve_stdio() -> Result<()> {
 
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
+    let mut explicit_shutdown = false;
     loop {
         let Some(request) = read_content_length_request(&mut reader)? else {
             break;
@@ -102,16 +103,20 @@ pub fn serve_stdio() -> Result<()> {
                 .map_err(|error| AppError::Protocol(format!("failed to send response: {error}")))?;
         }
         if is_shutdown {
+            explicit_shutdown = true;
             break;
         }
     }
 
     service.unregister_connection(connection_id);
-    service.shutdown_all();
     drop(out_tx);
     writer_handle
         .join()
         .map_err(|_| AppError::Protocol("daemon stdio writer thread panicked".into()))??;
+    if !explicit_shutdown {
+        service.wait_for_tasks_idle();
+    }
+    service.shutdown_all();
     Ok(())
 }
 

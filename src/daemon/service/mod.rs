@@ -1,4 +1,8 @@
-use std::{sync::mpsc, sync::Arc};
+use std::{
+    sync::{mpsc, Arc},
+    thread,
+    time::Duration,
+};
 
 use super::{
     protocol::{RequestEnvelope, ResponseEnvelope, ServerMessage},
@@ -36,6 +40,12 @@ impl DaemonService {
 
     pub fn shutdown_all(&self) {
         self.repos.shutdown_all();
+    }
+
+    pub fn wait_for_tasks_idle(&self) {
+        while self.repos.has_active_tasks() {
+            thread::sleep(Duration::from_millis(100));
+        }
     }
 
     #[allow(dead_code)]

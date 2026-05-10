@@ -320,6 +320,14 @@ impl RepoManager {
         Err(AppError::Protocol(format!("unknown task_id: {task_id}")))
     }
 
+    pub fn has_active_tasks(&self) -> bool {
+        let repos = match self.repos.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        repos.values().any(|runtime| runtime.has_active_task())
+    }
+
     pub fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
         self.repo(&request.repo_id)?.search(request)
     }

@@ -6,11 +6,17 @@ use std::{
     time::Duration,
 };
 
+#[cfg(target_os = "linux")]
+use std::{fs, io};
+
 use notify::{Event, EventKind, RecursiveMode, Watcher};
 
 use crate::files::is_workspace_internal_path;
 
 use super::RepoRuntime;
+
+#[cfg(target_os = "linux")]
+const LINUX_INOTIFY_WATCH_BUDGET_PERCENT: u64 = 75;
 
 #[derive(Debug, Default)]
 pub(super) struct WorkspaceEventBuffer {
@@ -53,6 +59,15 @@ impl RepoRuntime {
     fn run_workspace_watcher(self: Arc<Self>) {
         let (tx, rx) = mpsc::channel();
         let repo_path = self.build_config.repo_path.clone();
+        if let Some(reason) = linux_workspace_watcher_skip_reason(&repo_path) {
+            eprintln!(
+                "flashgrep: workspace watcher disabled for {}: {reason}; using polling fallback",
+                repo_path.display()
+            );
+            self.workspace_watcher_active
+                .store(false, std::sync::atomic::Ordering::Relaxed);
+            return;
+        }
         let mut watcher = match notify::recommended_watcher(move |result| {
             let _ = tx.send(result);
         }) {
@@ -168,5 +183,83 @@ impl RepoRuntime {
             return None;
         }
         Some(path)
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn linux_workspace_watcher_skip_reason(repo_path: &Path) -> Option<String> {
+    let max_user_watches = linux_max_user_watches()?;
+    let watch_budget = max_user_watches
+        .saturating_mul(LINUX_INOTIFY_WATCH_BUDGET_PERCENT)
+        .saturating_div(100)
+        .max(1);
+    let directory_count = count_directories_until(repo_path, watch_budget.saturating_add(1));
+    if directory_count <= watch_budget {
+        return None;
+    }
+    Some(format!(
+        "workspace has at least {directory_count} directories, current Linux inotify budget is {watch_budget} of max_user_watches={max_user_watches}"
+    ))
+}
+
+#[cfg(not(target_os = "linux"))]
+fn linux_workspace_watcher_skip_reason(_repo_path: &Path) -> Option<String> {
+    None
+}
+
+#[cfg(target_os = "linux")]
+fn linux_max_user_watches() -> Option<u64> {
+    fs::read_to_string("/proc/sys/fs/inotify/max_user_watches")
+        .ok()?
+        .trim()
+        .parse()
+        .ok()
+}
+
+#[cfg(target_os = "linux")]
+fn count_directories_until(root: &Path, limit: u64) -> u64 {
+    let mut count = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        count = count.saturating_add(1);
+        if count >= limit {
+            break;
+        }
+        push_child_directories(&mut stack, &path);
+    }
+    count
+}
+
+#[cfg(target_os = "linux")]
+fn push_child_directories(stack: &mut Vec<PathBuf>, path: &Path) {
+    let Ok(entries) = fs::read_dir(path) else {
+        return;
+    };
+    for entry in entries {
+        let Ok(entry) = entry else {
+            continue;
+        };
+        let file_type = match entry.file_type() {
+            Ok(file_type) => file_type,
+            Err(error) if error.kind() == io::ErrorKind::NotFound => continue,
+            Err(_) => continue,
+        };
+        if file_type.is_dir() {
+            stack.push(entry.path());
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn count_directories_stops_at_limit() {
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        std::fs::create_dir_all(temp.path().join("a/b/c")).expect("dirs should be created");
+        std::fs::create_dir_all(temp.path().join("d/e")).expect("dirs should be created");
+
+        assert_eq!(super::count_directories_until(temp.path(), 3), 3);
+        assert_eq!(super::count_directories_until(temp.path(), 32), 6);
     }
 }
