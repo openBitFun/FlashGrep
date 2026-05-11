@@ -2,7 +2,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Write},
     net::TcpStream,
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc,
     },
     thread,
@@ -16,6 +16,8 @@ use crate::{
     error::{AppError, Result},
 };
 
+use super::{is_concurrent_request, spawn_request_worker, wait_for_request_workers};
+
 pub(super) fn handle_connection(
     stream: TcpStream,
     service: &DaemonService,
@@ -23,6 +25,7 @@ pub(super) fn handle_connection(
 ) -> Result<()> {
     let reader = BufReader::new(stream.try_clone()?);
     let (out_tx, out_rx) = mpsc::channel::<ServerMessage>();
+    let active_requests = Arc::new(AtomicUsize::new(0));
     let connection_id = service.register_connection(out_tx.clone());
     let writer_handle = thread::spawn(move || -> Result<()> {
         let mut writer = BufWriter::new(stream);
@@ -40,10 +43,23 @@ pub(super) fn handle_connection(
         let request: RequestEnvelope = serde_json::from_str(&line)
             .map_err(|error| AppError::Protocol(format!("invalid daemon request: {error}")))?;
         let is_shutdown = matches!(request.request, Request::Shutdown);
-        if let Some(response) = service.handle_for_connection(Some(connection_id), request) {
-            out_tx
-                .send(ServerMessage::Response(response))
-                .map_err(|error| AppError::Protocol(format!("failed to send response: {error}")))?;
+        if is_concurrent_request(&request) {
+            spawn_request_worker(
+                service.clone(),
+                Some(connection_id),
+                request,
+                out_tx.clone(),
+                active_requests.clone(),
+            );
+        } else {
+            wait_for_request_workers(&active_requests);
+            if let Some(response) = service.handle_for_connection(Some(connection_id), request) {
+                out_tx
+                    .send(ServerMessage::Response(response))
+                    .map_err(|error| {
+                        AppError::Protocol(format!("failed to send response: {error}"))
+                    })?;
+            }
         }
         if is_shutdown {
             running.store(false, Ordering::Relaxed);
@@ -51,6 +67,7 @@ pub(super) fn handle_connection(
         }
     }
 
+    wait_for_request_workers(&active_requests);
     service.unregister_connection(connection_id);
     drop(out_tx);
     writer_handle

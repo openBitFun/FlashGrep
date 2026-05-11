@@ -4,7 +4,7 @@ use std::{
     net::TcpListener,
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
+        atomic::{AtomicBool, AtomicUsize, Ordering},
         mpsc, Arc,
     },
     thread,
@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     daemon::{
-        protocol::{Request, ServerMessage},
+        protocol::{Request, RequestEnvelope, ServerMessage},
         service::DaemonService,
     },
     error::{AppError, Result},
@@ -79,6 +79,7 @@ pub fn serve(options: ServerOptions) -> Result<()> {
 pub fn serve_stdio() -> Result<()> {
     let service = DaemonService::new();
     let (out_tx, out_rx) = mpsc::channel::<ServerMessage>();
+    let active_requests = Arc::new(AtomicUsize::new(0));
     let connection_id = service.register_connection(out_tx.clone());
     let writer_handle = thread::spawn(move || -> Result<()> {
         let stdout = std::io::stdout();
@@ -97,10 +98,23 @@ pub fn serve_stdio() -> Result<()> {
             break;
         };
         let is_shutdown = matches!(request.request, Request::Shutdown | Request::Exit);
-        if let Some(response) = service.handle_for_connection(Some(connection_id), request) {
-            out_tx
-                .send(ServerMessage::Response(response))
-                .map_err(|error| AppError::Protocol(format!("failed to send response: {error}")))?;
+        if is_concurrent_request(&request) {
+            spawn_request_worker(
+                service.clone(),
+                Some(connection_id),
+                request,
+                out_tx.clone(),
+                active_requests.clone(),
+            );
+        } else {
+            wait_for_request_workers(&active_requests);
+            if let Some(response) = service.handle_for_connection(Some(connection_id), request) {
+                out_tx
+                    .send(ServerMessage::Response(response))
+                    .map_err(|error| {
+                        AppError::Protocol(format!("failed to send response: {error}"))
+                    })?;
+            }
         }
         if is_shutdown {
             explicit_shutdown = true;
@@ -108,6 +122,7 @@ pub fn serve_stdio() -> Result<()> {
         }
     }
 
+    wait_for_request_workers(&active_requests);
     service.unregister_connection(connection_id);
     drop(out_tx);
     writer_handle
@@ -118,6 +133,48 @@ pub fn serve_stdio() -> Result<()> {
     }
     service.shutdown_all();
     Ok(())
+}
+
+pub(super) fn is_concurrent_request(request: &RequestEnvelope) -> bool {
+    // Keep stateful protocol operations ordered; only read-only query requests run concurrently.
+    matches!(
+        request.request,
+        Request::Search { .. } | Request::Glob { .. }
+    )
+}
+
+pub(super) fn spawn_request_worker(
+    service: DaemonService,
+    connection_id: Option<u64>,
+    request: RequestEnvelope,
+    out_tx: mpsc::Sender<ServerMessage>,
+    active_requests: Arc<AtomicUsize>,
+) {
+    active_requests.fetch_add(1, Ordering::Relaxed);
+    thread::spawn(move || {
+        let _guard = ActiveRequestGuard {
+            active_requests: active_requests.clone(),
+        };
+        if let Some(response) = service.handle_for_connection(connection_id, request) {
+            let _ = out_tx.send(ServerMessage::Response(response));
+        }
+    });
+}
+
+pub(super) fn wait_for_request_workers(active_requests: &AtomicUsize) {
+    while active_requests.load(Ordering::Relaxed) > 0 {
+        thread::sleep(Duration::from_millis(1));
+    }
+}
+
+struct ActiveRequestGuard {
+    active_requests: Arc<AtomicUsize>,
+}
+
+impl Drop for ActiveRequestGuard {
+    fn drop(&mut self) {
+        self.active_requests.fetch_sub(1, Ordering::Relaxed);
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
