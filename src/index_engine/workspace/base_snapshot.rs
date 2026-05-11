@@ -86,6 +86,19 @@ const BASE_SNAPSHOT_POSTING_BUCKET_COUNT: usize = 64;
 const BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES: usize = 128 * 1024 * 1024;
 const BASE_SNAPSHOT_SHARD_COUNT: usize = 16;
 const BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN: usize = 512 * 1024;
+const BASE_SNAPSHOT_LOW_MEMORY_PREPARE_CHUNK_DOCS: usize = 128;
+const BASE_SNAPSHOT_LOW_MEMORY_IN_MEMORY_POSTING_THRESHOLD_BYTES: usize = 16 * 1024 * 1024;
+const BASE_SNAPSHOT_LOW_MEMORY_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN: usize = 64 * 1024;
+const BASE_SNAPSHOT_LOW_MEMORY_AVAILABLE_BYTES: u64 = 2 * 1024 * 1024 * 1024;
+const BASE_SNAPSHOT_FORCE_SPILL_AVAILABLE_BYTES: u64 = 512 * 1024 * 1024;
+const BASE_SNAPSHOT_MEMORY_PRESSURE_CHECK_DOCS: usize = 64;
+const ENV_BASE_SNAPSHOT_LOW_MEMORY: &str = "FLASHGREP_BASE_SNAPSHOT_LOW_MEMORY";
+const ENV_BASE_SNAPSHOT_PREPARE_CHUNK_DOCS: &str = "FLASHGREP_BASE_SNAPSHOT_PREPARE_CHUNK_DOCS";
+const ENV_BASE_SNAPSHOT_PREPARE_PARALLEL: &str = "FLASHGREP_BASE_SNAPSHOT_PREPARE_PARALLEL";
+const ENV_BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES: &str =
+    "FLASHGREP_BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES";
+const ENV_BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN: &str =
+    "FLASHGREP_BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN";
 const BASE_SNAPSHOT_MANIFEST_ID: &str = "manifest-0000000000000001";
 const SEGMENT_SCHEMA_FINGERPRINT: &str = "segment-publish-v3";
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
@@ -150,6 +163,146 @@ enum ShardBuildMessage {
         total_files: usize,
         outcome: Result<ShardBuildOutcome>,
     },
+}
+
+pub(super) fn base_snapshot_low_memory_mode() -> bool {
+    configured_bool_env(ENV_BASE_SNAPSHOT_LOW_MEMORY)
+        .unwrap_or_else(base_snapshot_detect_low_memory_mode)
+}
+
+pub(super) fn base_snapshot_prepare_chunk_docs() -> usize {
+    base_snapshot_prepare_chunk_docs_for(
+        configured_usize_env(ENV_BASE_SNAPSHOT_PREPARE_CHUNK_DOCS),
+        base_snapshot_low_memory_mode(),
+    )
+}
+
+pub(super) fn base_snapshot_prepare_chunk_docs_for(
+    configured: Option<usize>,
+    low_memory: bool,
+) -> usize {
+    configured
+        .filter(|value| *value > 0)
+        .unwrap_or(if low_memory {
+            BASE_SNAPSHOT_LOW_MEMORY_PREPARE_CHUNK_DOCS
+        } else {
+            BASE_SNAPSHOT_PREPARE_CHUNK_DOCS
+        })
+        .max(1)
+}
+
+pub(super) fn base_snapshot_prepare_parallel_enabled() -> bool {
+    configured_bool_env(ENV_BASE_SNAPSHOT_PREPARE_PARALLEL)
+        .unwrap_or_else(|| !base_snapshot_low_memory_mode())
+}
+
+pub(super) fn base_snapshot_in_memory_posting_threshold_bytes() -> usize {
+    base_snapshot_in_memory_posting_threshold_bytes_for(
+        configured_usize_env(ENV_BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES),
+        base_snapshot_low_memory_mode(),
+    )
+}
+
+pub(super) fn base_snapshot_in_memory_posting_threshold_bytes_for(
+    configured: Option<usize>,
+    low_memory: bool,
+) -> usize {
+    configured
+        .filter(|value| *value > 0)
+        .unwrap_or(if low_memory {
+            BASE_SNAPSHOT_LOW_MEMORY_IN_MEMORY_POSTING_THRESHOLD_BYTES
+        } else {
+            BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES
+        })
+        .max(1)
+}
+
+pub(super) fn base_snapshot_spilled_bucket_sort_max_records_per_run() -> usize {
+    base_snapshot_spilled_bucket_sort_max_records_per_run_for(
+        configured_usize_env(ENV_BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN),
+        base_snapshot_low_memory_mode(),
+    )
+}
+
+pub(super) fn base_snapshot_spilled_bucket_sort_max_records_per_run_for(
+    configured: Option<usize>,
+    low_memory: bool,
+) -> usize {
+    configured
+        .filter(|value| *value > 0)
+        .unwrap_or(if low_memory {
+            BASE_SNAPSHOT_LOW_MEMORY_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN
+        } else {
+            BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN
+        })
+        .max(1)
+}
+
+fn configured_usize_env(name: &str) -> Option<usize> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+}
+
+fn configured_bool_env(name: &str) -> Option<bool> {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| parse_bool_env_value(&value))
+}
+
+fn parse_bool_env_value(value: &str) -> Option<bool> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "1" | "true" | "yes" | "on" => Some(true),
+        "0" | "false" | "no" | "off" => Some(false),
+        _ => None,
+    }
+}
+
+pub(super) fn base_snapshot_detect_low_memory_mode() -> bool {
+    available_memory_bytes()
+        .map(|available| available <= BASE_SNAPSHOT_LOW_MEMORY_AVAILABLE_BYTES)
+        .unwrap_or(false)
+}
+
+pub(super) fn base_snapshot_memory_pressure_should_spill() -> bool {
+    available_memory_bytes()
+        .map(|available| available <= BASE_SNAPSHOT_FORCE_SPILL_AVAILABLE_BYTES)
+        .unwrap_or(false)
+}
+
+fn available_memory_bytes() -> Option<u64> {
+    let system_available = system_available_memory_bytes();
+    let cgroup_available = linux_cgroup_available_bytes();
+    match (system_available, cgroup_available) {
+        (Some(system_available), Some(cgroup_available)) => {
+            Some(system_available.min(cgroup_available))
+        }
+        (Some(system_available), None) => Some(system_available),
+        (None, Some(cgroup_available)) => Some(cgroup_available),
+        (None, None) => None,
+    }
+}
+
+fn system_available_memory_bytes() -> Option<u64> {
+    let mut system = sysinfo::System::new();
+    system.refresh_memory();
+    let available = system.available_memory();
+    (available > 0).then_some(available)
+}
+
+fn linux_cgroup_available_bytes() -> Option<u64> {
+    let max = read_cgroup_memory_value("/sys/fs/cgroup/memory.max")?;
+    let current = read_cgroup_memory_value("/sys/fs/cgroup/memory.current")?;
+    max.checked_sub(current)
+}
+
+fn read_cgroup_memory_value(path: &str) -> Option<u64> {
+    let value = std::fs::read_to_string(path).ok()?;
+    let value = value.trim();
+    if value == "max" {
+        return None;
+    }
+    value.parse::<u64>().ok()
 }
 
 impl WorkspaceBaseSnapshotIndex {

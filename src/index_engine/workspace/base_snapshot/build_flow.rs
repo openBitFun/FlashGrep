@@ -184,7 +184,12 @@ fn base_snapshot_shard_build_parallelism(shard_total: usize) -> usize {
         .ok()
         .and_then(|value| value.parse::<usize>().ok());
     let available = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
-    base_snapshot_shard_build_parallelism_for(shard_total, configured, available)
+    base_snapshot_shard_build_parallelism_for_mode(
+        shard_total,
+        configured,
+        available,
+        base_snapshot_low_memory_mode(),
+    )
 }
 
 pub(super) fn base_snapshot_shard_build_parallelism_for(
@@ -192,12 +197,32 @@ pub(super) fn base_snapshot_shard_build_parallelism_for(
     configured: Option<usize>,
     available_parallelism: usize,
 ) -> usize {
+    base_snapshot_shard_build_parallelism_for_mode(
+        shard_total,
+        configured,
+        available_parallelism,
+        false,
+    )
+}
+
+pub(super) fn base_snapshot_shard_build_parallelism_for_mode(
+    shard_total: usize,
+    configured: Option<usize>,
+    available_parallelism: usize,
+    low_memory: bool,
+) -> usize {
     if shard_total == 0 {
         return 0;
     }
     configured
         .filter(|workers| *workers > 0)
-        .unwrap_or_else(|| available_parallelism.max(1))
+        .unwrap_or_else(|| {
+            if low_memory {
+                1
+            } else {
+                available_parallelism.max(1)
+            }
+        })
         .clamp(1, shard_total)
 }
 
@@ -277,8 +302,11 @@ fn build_base_snapshot_segment(
     )?;
     let processed_files = Arc::new(std::sync::atomic::AtomicUsize::new(0));
 
-    for chunk in files.chunks(BASE_SNAPSHOT_PREPARE_CHUNK_DOCS) {
-        let prepared = if should_parallel_prepare_base_documents(chunk) {
+    let prepare_chunk_docs = base_snapshot_prepare_chunk_docs();
+    for chunk in files.chunks(prepare_chunk_docs) {
+        let prepared = if base_snapshot_prepare_parallel_enabled()
+            && should_parallel_prepare_base_documents(chunk)
+        {
             let processed_files = Arc::clone(&processed_files);
             chunk
                 .par_iter()

@@ -31,6 +31,7 @@ pub(super) struct InMemoryPostingBuckets {
     spill_root: PathBuf,
     memory_threshold_bytes: usize,
     approximate_bytes: usize,
+    appends_since_pressure_check: usize,
     buckets: Vec<HashMap<u64, Vec<u32>>>,
 }
 
@@ -221,7 +222,7 @@ impl PostingBuckets {
         Self {
             state: PostingBucketsState::InMemory(InMemoryPostingBuckets::new(
                 index_root,
-                BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES,
+                base_snapshot_in_memory_posting_threshold_bytes(),
             )),
         }
     }
@@ -269,11 +270,13 @@ impl InMemoryPostingBuckets {
             spill_root: index_root.to_path_buf(),
             memory_threshold_bytes,
             approximate_bytes: 0,
+            appends_since_pressure_check: 0,
             buckets,
         }
     }
 
     fn append_terms(&mut self, doc_id: u32, posting_terms: &[u64]) {
+        self.appends_since_pressure_check = self.appends_since_pressure_check.saturating_add(1);
         for term in posting_terms {
             let bucket_id = posting_bucket_id(*term);
             let bucket = &mut self.buckets[bucket_id];
@@ -290,8 +293,15 @@ impl InMemoryPostingBuckets {
         }
     }
 
-    fn should_spill(&self) -> bool {
-        self.approximate_bytes >= self.memory_threshold_bytes
+    fn should_spill(&mut self) -> bool {
+        if self.approximate_bytes >= self.memory_threshold_bytes {
+            return true;
+        }
+        if self.appends_since_pressure_check < BASE_SNAPSHOT_MEMORY_PRESSURE_CHECK_DOCS {
+            return false;
+        }
+        self.appends_since_pressure_check = 0;
+        base_snapshot_memory_pressure_should_spill()
     }
 
     fn drain_into_spilled(&mut self, spilled: &mut SpilledPostingBuckets) -> Result<()> {
@@ -386,7 +396,7 @@ impl SpilledPostingBuckets {
                 bucket_path,
                 &run_root,
                 bucket_id,
-                BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN,
+                base_snapshot_spilled_bucket_sort_max_records_per_run(),
             )?;
             fs::remove_file(bucket_path)?;
             merge_sorted_posting_runs(&run_paths, &mut term_dict_writer, &mut postings_writer)?;

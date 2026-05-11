@@ -399,6 +399,42 @@ fn base_snapshot_shard_build_parallelism_is_bounded() {
 }
 
 #[test]
+fn base_snapshot_low_memory_tuning_prefers_io_over_memory() {
+    assert_eq!(
+        super::build_flow::base_snapshot_shard_build_parallelism_for_mode(16, None, 8, true),
+        1
+    );
+    assert_eq!(
+        super::base_snapshot_prepare_chunk_docs_for(None, true),
+        super::BASE_SNAPSHOT_LOW_MEMORY_PREPARE_CHUNK_DOCS
+    );
+    assert_eq!(
+        super::base_snapshot_in_memory_posting_threshold_bytes_for(None, true),
+        super::BASE_SNAPSHOT_LOW_MEMORY_IN_MEMORY_POSTING_THRESHOLD_BYTES
+    );
+    assert_eq!(
+        super::base_snapshot_spilled_bucket_sort_max_records_per_run_for(None, true),
+        super::BASE_SNAPSHOT_LOW_MEMORY_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN
+    );
+}
+
+#[test]
+fn base_snapshot_explicit_tuning_overrides_low_memory_defaults() {
+    assert_eq!(
+        super::base_snapshot_prepare_chunk_docs_for(Some(512), true),
+        512
+    );
+    assert_eq!(
+        super::base_snapshot_in_memory_posting_threshold_bytes_for(Some(32 * 1024 * 1024), true),
+        32 * 1024 * 1024
+    );
+    assert_eq!(
+        super::base_snapshot_spilled_bucket_sort_max_records_per_run_for(Some(128 * 1024), true),
+        128 * 1024
+    );
+}
+
+#[test]
 fn git_base_snapshot_writes_per_doc_source_kind() {
     let temp = TempDir::new().expect("temp dir");
     let repo = temp.path().join("repo");
