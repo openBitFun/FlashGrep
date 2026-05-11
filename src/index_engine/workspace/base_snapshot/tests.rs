@@ -375,6 +375,30 @@ fn sharded_base_snapshot_reports_incremental_tokenizing_progress() {
 }
 
 #[test]
+fn base_snapshot_shard_build_parallelism_is_bounded() {
+    assert_eq!(
+        super::build_flow::base_snapshot_shard_build_parallelism_for(0, None, 8),
+        0
+    );
+    assert_eq!(
+        super::build_flow::base_snapshot_shard_build_parallelism_for(16, None, 2),
+        2
+    );
+    assert_eq!(
+        super::build_flow::base_snapshot_shard_build_parallelism_for(16, Some(4), 2),
+        4
+    );
+    assert_eq!(
+        super::build_flow::base_snapshot_shard_build_parallelism_for(3, Some(8), 2),
+        3
+    );
+    assert_eq!(
+        super::build_flow::base_snapshot_shard_build_parallelism_for(16, Some(0), 0),
+        1
+    );
+}
+
+#[test]
 fn git_base_snapshot_writes_per_doc_source_kind() {
     let temp = TempDir::new().expect("temp dir");
     let repo = temp.path().join("repo");

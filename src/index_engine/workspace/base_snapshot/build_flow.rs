@@ -18,13 +18,16 @@ pub(super) fn build_sharded_base_snapshot(
         .map(|shard| shard.files.len())
         .sum::<usize>();
     let tokenizing_progress_total = total_files.max(1);
+    let shard_parallelism = base_snapshot_shard_build_parallelism(shard_total);
     report_progress(
         on_progress,
         IndexProgressPhase::Tokenizing,
         if total_files == 0 {
             "No base snapshot shards to build".into()
         } else {
-            format!("Tokenizing {total_files} base snapshot file(s) across {shard_total} shard(s)")
+            format!(
+                "Tokenizing {total_files} base snapshot file(s) across {shard_total} shard(s) with {shard_parallelism} worker(s)"
+            )
         },
         usize::from(total_files == 0),
         Some(tokenizing_progress_total),
@@ -32,14 +35,23 @@ pub(super) fn build_sharded_base_snapshot(
     let mut outcomes = Vec::with_capacity(shard_total);
     if shard_total > 0 {
         let (tx, rx) = mpsc::channel();
+        let pending_shards = std::sync::Mutex::new(std::collections::VecDeque::from(shard_builds));
         let mut shard_processed = HashMap::<u32, usize>::new();
         let mut completed_shards = 0usize;
         std::thread::scope(|scope| -> Result<()> {
-            for shard in shard_builds {
-                let shard_id = shard.shard_id;
-                let total_files = shard.files.len();
+            for _ in 0..shard_parallelism {
                 let tx = tx.clone();
-                scope.spawn(move || {
+                let pending_shards = &pending_shards;
+                scope.spawn(move || loop {
+                    let Some(shard) = pending_shards
+                        .lock()
+                        .expect("base snapshot shard queue lock poisoned")
+                        .pop_front()
+                    else {
+                        break;
+                    };
+                    let shard_id = shard.shard_id;
+                    let total_files = shard.files.len();
                     let progress_tx = tx.clone();
                     let report_shard_progress = move |processed_files| {
                         let _ = progress_tx.send(ShardBuildMessage::Progress {
@@ -165,6 +177,28 @@ pub(super) fn build_sharded_base_snapshot(
 
     shard_metadata.sort_unstable_by_key(|shard| shard.shard_id);
     Ok((doc_count, shard_metadata))
+}
+
+fn base_snapshot_shard_build_parallelism(shard_total: usize) -> usize {
+    let configured = std::env::var("FLASHGREP_BASE_SNAPSHOT_SHARD_WORKERS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok());
+    let available = std::thread::available_parallelism().map_or(1, std::num::NonZero::get);
+    base_snapshot_shard_build_parallelism_for(shard_total, configured, available)
+}
+
+pub(super) fn base_snapshot_shard_build_parallelism_for(
+    shard_total: usize,
+    configured: Option<usize>,
+    available_parallelism: usize,
+) -> usize {
+    if shard_total == 0 {
+        return 0;
+    }
+    configured
+        .filter(|workers| *workers > 0)
+        .unwrap_or_else(|| available_parallelism.max(1))
+        .clamp(1, shard_total)
 }
 
 fn build_or_reuse_base_snapshot_shard(
