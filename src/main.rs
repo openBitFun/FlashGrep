@@ -3,7 +3,7 @@ fn main() {
         Ok(true) => {}
         Ok(false) => std::process::exit(1),
         Err(error) => {
-            eprintln!("{error}");
+            eprintln!("flashgrep[startup][error] {error}");
             std::process::exit(2);
         }
     }

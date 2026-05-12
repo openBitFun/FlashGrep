@@ -61,7 +61,7 @@ impl RepoRuntime {
         let repo_path = self.build_config.repo_path.clone();
         if let Some(reason) = linux_workspace_watcher_skip_reason(&repo_path) {
             eprintln!(
-                "flashgrep: workspace watcher disabled for {}: {reason}; using polling fallback",
+                "flashgrep[watch][warn] workspace watcher disabled for {}: {reason}; using polling fallback",
                 repo_path.display()
             );
             self.workspace_watcher_active
@@ -74,7 +74,7 @@ impl RepoRuntime {
             Ok(watcher) => watcher,
             Err(error) => {
                 eprintln!(
-                    "flashgrep: failed to start workspace watcher for {}: {error}",
+                    "flashgrep[watch][warn] failed to start workspace watcher for {}: {error}",
                     repo_path.display()
                 );
                 self.workspace_watcher_active
@@ -84,7 +84,7 @@ impl RepoRuntime {
         };
         if let Err(error) = watcher.watch(&repo_path, RecursiveMode::Recursive) {
             eprintln!(
-                "flashgrep: failed to watch workspace {}: {error}",
+                "flashgrep[watch][warn] failed to watch workspace {}: {error}",
                 repo_path.display()
             );
             self.workspace_watcher_active
@@ -93,6 +93,10 @@ impl RepoRuntime {
         }
         self.workspace_watcher_active
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "flashgrep[watch][info] workspace watcher active for {}",
+            repo_path.display()
+        );
 
         while !self
             .shutting_down
@@ -102,7 +106,7 @@ impl RepoRuntime {
                 Ok(Ok(event)) => self.handle_workspace_notify_event(event),
                 Ok(Err(error)) => {
                     eprintln!(
-                        "flashgrep: workspace watcher error for {}: {error}",
+                        "flashgrep[watch][warn] workspace watcher error for {}: {error}",
                         self.build_config.repo_path.display()
                     );
                     self.enqueue_workspace_events(Vec::new(), true);
@@ -114,6 +118,10 @@ impl RepoRuntime {
 
         self.workspace_watcher_active
             .store(false, std::sync::atomic::Ordering::Relaxed);
+        eprintln!(
+            "flashgrep[watch][info] workspace watcher stopped for {}",
+            self.build_config.repo_path.display()
+        );
     }
 
     fn handle_workspace_notify_event(&self, event: Event) {

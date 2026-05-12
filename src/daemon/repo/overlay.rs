@@ -84,6 +84,13 @@ impl RepoRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let planned_dirty = plan.dirty_paths.clone();
         let build_paths = plan.build_paths.clone();
+        let operation = match &plan.kind {
+            WorkspaceOverlayWritePlanKind::Clear => "clear",
+            WorkspaceOverlayWritePlanKind::Rebuild { .. } => "rebuild",
+            WorkspaceOverlayWritePlanKind::ApplyDelta { .. } => "delta",
+        };
+        let dirty_path_count = plan.dirty_path_count();
+        let build_path_count = plan.build_path_count();
         if let Err(error) = self.mark_dirty_catalog_building(&build_paths) {
             self.handle_workspace_overlay_engine_error("mark dirty catalog building", &error);
             return;
@@ -99,6 +106,20 @@ impl RepoRuntime {
         }
         self.replace_published_overlay_paths_cache(planned_dirty);
         self.update_overlay_state();
+        match operation {
+            "clear" => eprintln!(
+                "flashgrep[overlay][info] cleared workspace overlay storage for {}",
+                self.build_config.repo_path.display()
+            ),
+            "rebuild" => eprintln!(
+                "flashgrep[overlay][info] rebuilt workspace overlay for {}: dirty_paths={} build_paths={}",
+                self.build_config.repo_path.display(),
+                dirty_path_count,
+                build_path_count
+            ),
+            "delta" => {}
+            _ => {}
+        }
     }
 
     pub(super) fn reset_workspace_overlay_engine(&self) {
@@ -177,6 +198,13 @@ impl RepoRuntime {
             if dirty.is_empty() {
                 return self.try_reset_workspace_overlay_engine();
             }
+            eprintln!(
+                "flashgrep[overlay][info] workspace overlay engine missing for {}; rebuilding from dirty paths: modified={} deleted={} new={}",
+                self.build_config.repo_path.display(),
+                dirty.modified.len(),
+                dirty.deleted.len(),
+                dirty.new.len()
+            );
             let rebuild = self.build_overlay_rebuild_plan(dirty.clone())?;
             return self.try_apply_overlay_write_plan(rebuild);
         }
@@ -210,7 +238,7 @@ impl RepoRuntime {
             "failed to {operation} workspace overlay engine: {error}"
         ));
         eprintln!(
-            "flashgrep: failed to {operation} workspace overlay engine for {}: {error}",
+            "flashgrep[overlay][warn] failed to {operation} workspace overlay engine for {}: {error}",
             self.build_config.repo_path.display()
         );
     }

@@ -379,7 +379,7 @@ impl RepoRuntime {
             Err(error) => {
                 if transition_fallback_logging_enabled() {
                     eprintln!(
-                        "flashgrep: transition rg fallback failed for repo={} phase={} dirty=({},{},{}) pattern={:?}: {error}",
+                        "flashgrep[query][debug] transition rg fallback failed for repo={} phase={} dirty=({},{},{}) pattern={:?}: {error}",
                         self.repo_id,
                         repo_phase_label(status.phase),
                         status.dirty_files.modified,
