@@ -19,7 +19,8 @@ use self::args::{
     EngineRepoArgs, EngineSearchArgs,
 };
 use self::output::{
-    print_daemon_response, print_daemon_status_response, print_engine_search_results,
+    print_daemon_compact_line_matches, print_daemon_response, print_daemon_status_response,
+    print_engine_search_results,
 };
 
 pub(crate) fn run() -> Result<bool> {
@@ -314,11 +315,23 @@ fn run_daemon(args: DaemonArgs) -> Result<bool> {
             Ok(true)
         }
         DaemonCommands::Search(args) => {
+            let line_match_mode = args.uses_line_match_mode();
             let client = DaemonClient::new(args.repo.connect.addr.clone());
-            let response = client.send(Request::Search {
-                params: args.into_search_params(),
-            })?;
-            print_daemon_response(&response)?;
+            let request = if line_match_mode {
+                Request::SearchLineMatchesCompact {
+                    params: args.into_search_params(),
+                }
+            } else {
+                Request::Search {
+                    params: args.into_search_params(),
+                }
+            };
+            let response = client.send_raw_json_line(request)?;
+            if line_match_mode {
+                print_daemon_compact_line_matches(&response)?;
+            } else {
+                print!("{response}");
+            }
             Ok(true)
         }
         DaemonCommands::Glob(args) => {

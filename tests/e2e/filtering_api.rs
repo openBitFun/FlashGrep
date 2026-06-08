@@ -257,7 +257,10 @@ fn search_can_be_restricted_to_exact_file_path() {
         )
         .expect("test should succeed");
     assert_eq!(literal.results.line_matches.len(), 1);
-    assert_eq!(literal.results.line_matches[0].path, source.to_string_lossy());
+    assert_eq!(
+        literal.results.line_matches[0].path,
+        source.to_string_lossy()
+    );
 }
 
 #[test]

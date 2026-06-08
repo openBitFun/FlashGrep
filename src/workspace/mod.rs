@@ -330,6 +330,7 @@ impl WorkspaceIndex {
             && dirty_results.matched_occurrences == 0
             && dirty_results.matched_paths.is_empty()
             && dirty_results.line_matches.is_empty()
+            && dirty_results.line_match_files.is_empty()
             && dirty_results.file_counts.is_empty()
             && dirty_results.file_match_counts.is_empty()
         {

@@ -14,8 +14,9 @@ use crate::{
 use super::DaemonService;
 use crate::daemon::{
     convert::{
-        build_config_from_open, convert_query_backend, convert_repo_status, convert_search_results,
-        convert_task_status,
+        build_config_from_open, convert_compact_line_match_results,
+        convert_grouped_line_match_results, convert_query_backend, convert_repo_status,
+        convert_search_results, convert_task_status,
     },
     protocol::{
         ClientCapabilities, EnsureRepoParams, ErrorResponse, QuerySpec, Request, RequestEnvelope,
@@ -179,18 +180,9 @@ impl DaemonService {
                 ))
             }
             Request::Search { params } => {
-                let query = convert_query_spec(params.query)?;
-                let scope = PathFilterArgs {
-                    roots: normalize_scope_roots(params.scope.roots),
-                    globs: params.scope.globs,
-                    iglobs: params.scope.iglobs,
-                    type_add: params.scope.type_add,
-                    type_clear: params.scope.type_clear,
-                    types: params.scope.types,
-                    type_not: params.scope.type_not,
-                };
+                let (query, scope, repo_id) = convert_search_params(params)?;
                 let response = self.repos.search(SearchRequest {
-                    repo_id: params.repo_id,
+                    repo_id,
                     query,
                     path_filter_args: scope,
                 })?;
@@ -201,6 +193,42 @@ impl DaemonService {
                         status: convert_repo_status(response.status),
                         results: convert_search_results(response.results),
                     },
+                    None,
+                    false,
+                ))
+            }
+            Request::SearchGroupedLineMatches { params } => {
+                let (mut query, scope, repo_id) = convert_search_params(params)?;
+                query.search_mode = SearchMode::LineMatches;
+                let global_limit = query.effective_global_max_results();
+                let response = self.repos.search(SearchRequest {
+                    repo_id,
+                    query,
+                    path_filter_args: scope,
+                })?;
+                Ok((
+                    Response::SearchGroupedLineMatchesCompleted {
+                        repo_id: response.repo_id,
+                        backend: convert_query_backend(response.backend),
+                        status: convert_repo_status(response.status),
+                        results: convert_grouped_line_match_results(response.results, global_limit),
+                    },
+                    None,
+                    false,
+                ))
+            }
+            Request::SearchLineMatchesCompact { params } => {
+                let (mut query, scope, repo_id) = convert_search_params(params)?;
+                query.search_mode = SearchMode::LineMatches;
+                let global_limit = query.effective_global_max_results();
+                let response = self.repos.search(SearchRequest {
+                    repo_id,
+                    query,
+                    path_filter_args: scope,
+                })?;
+                let results = convert_compact_line_match_results(response.results, global_limit);
+                Ok((
+                    Response::SearchLineMatchesCompactCompleted { results },
                     None,
                     false,
                 ))
@@ -355,6 +383,22 @@ fn convert_query_spec(query: QuerySpec) -> Result<QueryConfig> {
             super::super::protocol::SearchModeConfig::CountMatches => SearchMode::CountMatches,
         },
     })
+}
+
+fn convert_search_params(
+    params: super::super::protocol::SearchParams,
+) -> Result<(QueryConfig, PathFilterArgs, String)> {
+    let query = convert_query_spec(params.query)?;
+    let scope = PathFilterArgs {
+        roots: normalize_scope_roots(params.scope.roots),
+        globs: params.scope.globs,
+        iglobs: params.scope.iglobs,
+        type_add: params.scope.type_add,
+        type_clear: params.scope.type_clear,
+        types: params.scope.types,
+        type_not: params.scope.type_not,
+    };
+    Ok((query, scope, params.repo_id))
 }
 
 fn normalize_scope_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {

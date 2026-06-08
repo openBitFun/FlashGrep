@@ -1,5 +1,11 @@
 # flashgrep
 
+[![version](https://img.shields.io/badge/version-0.2.6-blue.svg)](https://github.com/flashgrep/flashgrep)
+[![rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
+[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+
+> 本地 regex 预筛索引系统 — 字符级倒排索引召回 + 精确 regex 验证，两段式加速全库正则搜索。
+
 本项目是一个本地 regex 预筛索引系统骨架，目标是把全库正则搜索拆成两段：
 
 1. 先用字符级倒排索引召回候选文件。

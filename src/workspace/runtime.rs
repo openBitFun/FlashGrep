@@ -83,6 +83,7 @@ pub(super) fn merge_search_results(
     base.matched_occurrences += dirty.matched_occurrences;
     base.matched_paths.append(&mut dirty.matched_paths);
     base.line_matches.append(&mut dirty.line_matches);
+    base.line_match_files.append(&mut dirty.line_match_files);
     base.file_counts.append(&mut dirty.file_counts);
     base.file_match_counts.append(&mut dirty.file_match_counts);
     base.matched_paths.sort_unstable();
@@ -91,6 +92,8 @@ pub(super) fn merge_search_results(
             .cmp(&right.path)
             .then(left.line_number.cmp(&right.line_number))
     });
+    base.line_match_files
+        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
     base.file_counts
         .sort_unstable_by(|left, right| left.path.cmp(&right.path));
     base.file_match_counts

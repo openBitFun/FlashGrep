@@ -65,6 +65,14 @@ pub enum Request {
     Search {
         params: SearchParams,
     },
+    #[serde(rename = "search/grouped_line_matches")]
+    SearchGroupedLineMatches {
+        params: SearchParams,
+    },
+    #[serde(rename = "search/line_matches_compact")]
+    SearchLineMatchesCompact {
+        params: SearchParams,
+    },
     Glob {
         params: GlobParams,
     },
@@ -394,6 +402,16 @@ pub enum Response {
         status: RepoStatus,
         results: SearchResults,
     },
+    SearchGroupedLineMatchesCompleted {
+        repo_id: String,
+        backend: SearchBackend,
+        status: RepoStatus,
+        results: GroupedLineMatchResults,
+    },
+    SearchLineMatchesCompactCompleted {
+        #[serde(rename = "r")]
+        results: CompactLineMatchResults,
+    },
     GlobCompleted {
         repo_id: String,
         status: RepoStatus,
@@ -596,6 +614,54 @@ pub struct SearchResults {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GroupedLineMatchResults {
+    pub candidate_docs: usize,
+    pub searches_with_match: usize,
+    pub bytes_searched: u64,
+    pub matched_lines: usize,
+    pub matched_occurrences: usize,
+    #[serde(default)]
+    pub limit_reached: bool,
+    #[serde(default)]
+    pub summary: LineMatchSummary,
+    #[serde(default)]
+    pub files: Vec<(String, Vec<usize>)>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CompactLineMatchResults {
+    #[serde(rename = "c")]
+    pub candidate_docs: usize,
+    #[serde(rename = "s")]
+    pub searches_with_match: usize,
+    #[serde(rename = "b")]
+    pub bytes_searched: u64,
+    #[serde(rename = "l")]
+    pub matched_lines: usize,
+    #[serde(rename = "o")]
+    pub matched_occurrences: usize,
+    #[serde(rename = "t", default)]
+    pub limit_reached: bool,
+    #[serde(rename = "u", default)]
+    pub summary: LineMatchSummary,
+    #[serde(rename = "f", default)]
+    pub files: Vec<(String, Vec<usize>)>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LineMatchSummary {
+    pub files_with_matches: usize,
+    #[serde(default)]
+    pub top_files: Vec<LineMatchFileSummary>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LineMatchFileSummary {
+    pub path: String,
+    pub matched_lines: usize,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct FileCount {
     pub path: String,
     pub matched_lines: usize,
@@ -611,7 +677,6 @@ pub struct FileMatchCount {
 pub struct LineMatch {
     pub path: String,
     pub line_number: usize,
-    pub line_text: String,
 }
 
 fn default_top_k_tokens() -> usize {

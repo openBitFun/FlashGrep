@@ -90,6 +90,30 @@ impl DaemonClient {
         result.ok_or_else(|| AppError::Protocol("daemon response missing result".into()))
     }
 
+    pub fn send_raw_json_line(&self, request: Request) -> Result<String> {
+        let request_id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        let envelope = RequestEnvelope {
+            jsonrpc: "2.0".into(),
+            id: Some(request_id),
+            request,
+        };
+
+        let mut connection = self
+            .connection
+            .lock()
+            .map_err(|_| AppError::Protocol("daemon connection mutex poisoned".into()))?;
+        let line = match self.send_raw_with_connection(&mut connection, &envelope) {
+            Ok(line) => line,
+            Err(_) => {
+                *connection = None;
+                self.send_raw_with_connection(&mut connection, &envelope)?
+            }
+        };
+
+        validate_response_id(&line, request_id)?;
+        Ok(line)
+    }
+
     fn send_with_connection(
         &self,
         connection: &mut Option<DaemonConnection>,
@@ -119,6 +143,36 @@ impl DaemonClient {
         }
         serde_json::from_str(&line)
             .map_err(|error| AppError::Protocol(format!("failed to decode response: {error}")))
+    }
+
+    fn send_raw_with_connection(
+        &self,
+        connection: &mut Option<DaemonConnection>,
+        envelope: &RequestEnvelope,
+    ) -> Result<String> {
+        let connection = match connection {
+            Some(connection) => connection,
+            None => {
+                *connection = Some(self.connect()?);
+                connection.as_mut().ok_or_else(|| {
+                    AppError::Protocol("daemon connection missing after successful connect".into())
+                })?
+            }
+        };
+
+        serde_json::to_writer(&mut connection.writer, envelope)
+            .map_err(|error| AppError::Protocol(format!("failed to encode request: {error}")))?;
+        connection.writer.write_all(b"\n")?;
+        connection.writer.flush()?;
+
+        let mut line = String::new();
+        let read = connection.reader.read_line(&mut line)?;
+        if read == 0 {
+            return Err(AppError::Protocol(
+                "daemon closed connection without a response".into(),
+            ));
+        }
+        Ok(line)
     }
 
     fn connect(&self) -> Result<DaemonConnection> {
@@ -186,5 +240,56 @@ impl DaemonClient {
                 task_id: task_id.into(),
             },
         })
+    }
+}
+
+fn validate_response_id(line: &str, expected_id: u64) -> Result<()> {
+    let id = scan_top_level_response_id(line);
+    if id != Some(expected_id) {
+        return Err(AppError::Protocol(format!(
+            "daemon response id mismatch: expected {expected_id:?}, got {id:?}"
+        )));
+    }
+    Ok(())
+}
+
+fn scan_top_level_response_id(line: &str) -> Option<u64> {
+    let bytes = line.as_bytes();
+    let mut index = 0usize;
+    while index + 4 <= bytes.len() {
+        if &bytes[index..index + 4] == b"\"id\"" {
+            index += 4;
+            while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+                index += 1;
+            }
+            if bytes.get(index) != Some(&b':') {
+                continue;
+            }
+            index += 1;
+            while matches!(bytes.get(index), Some(b' ' | b'\t' | b'\r' | b'\n')) {
+                index += 1;
+            }
+            let start = index;
+            while bytes.get(index).is_some_and(u8::is_ascii_digit) {
+                index += 1;
+            }
+            return std::str::from_utf8(bytes.get(start..index)?)
+                .ok()?
+                .parse()
+                .ok();
+        }
+        index += 1;
+    }
+    None
+}
+
+#[cfg(test)]
+mod tests {
+    use super::scan_top_level_response_id;
+
+    #[test]
+    fn scan_top_level_response_id_reads_id_without_decoding_large_body() {
+        let line = r#"{"jsonrpc":"2.0","id":42,"result":{"r":{"f":[["path",[1,2,3]]]}}}"#;
+        assert_eq!(scan_top_level_response_id(line), Some(42));
     }
 }

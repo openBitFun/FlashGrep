@@ -48,8 +48,6 @@ impl RepoRuntime {
             normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
         let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
         let query_filters = build_query_filters(&self.build_config.repo_path, &scope);
-        self.schedule_workspace_probe(Duration::from_millis(0));
-
         let status = self.status_snapshot();
         let can_search_opening_snapshot =
             matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();

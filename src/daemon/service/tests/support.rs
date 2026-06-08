@@ -533,7 +533,10 @@ pub(super) fn wait_for_workspace_overlay_match_count(
             Ok(_) => {}
             Err(crate::error::AppError::InvalidIndex(_)) => {}
             Err(crate::error::AppError::Io(error))
-                if error.kind() == std::io::ErrorKind::NotFound => {}
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::InvalidInput
+                ) => {}
             Err(error) => panic!("workspace overlay engine should open: {error:?}"),
         }
         thread::sleep(Duration::from_millis(50));

@@ -288,7 +288,9 @@ impl WorkspaceOverlayIndex {
 
         let merge_result = self.engine.admin().maintain();
         if let Err(error) = &merge_result {
-            eprintln!("flashgrep[overlay][warn] workspace overlay background merge failed: {error}");
+            eprintln!(
+                "flashgrep[overlay][warn] workspace overlay background merge failed: {error}"
+            );
         }
 
         {

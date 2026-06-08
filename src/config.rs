@@ -4,6 +4,8 @@ use crate::error::Result;
 use crate::path_utils::{normalize_existing_path, normalize_path_from_cwd};
 use crate::search::SearchMode;
 
+pub const DEFAULT_LINE_MATCH_LIMIT: usize = 10_000;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TokenizerMode {
     Trigram,
@@ -128,7 +130,13 @@ pub struct QueryConfig {
 
 impl QueryConfig {
     pub fn effective_global_max_results(&self) -> Option<usize> {
-        self.global_max_results.filter(|limit| *limit > 0)
+        match self.global_max_results {
+            Some(limit) => (limit > 0).then_some(limit),
+            None if matches!(self.search_mode, SearchMode::LineMatches) => {
+                Some(DEFAULT_LINE_MATCH_LIMIT)
+            }
+            None => None,
+        }
     }
 }
 

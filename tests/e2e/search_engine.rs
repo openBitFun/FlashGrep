@@ -15,7 +15,10 @@ fn search_engine_uses_index_when_fresh() {
 
     assert_eq!(outcome.backend, SearchBackend::Index);
     assert_eq!(outcome.results.line_matches.len(), 1);
-    assert_eq!(outcome.results.line_matches[0].path, source.to_string_lossy());
+    assert_eq!(
+        outcome.results.line_matches[0].path,
+        source.to_string_lossy()
+    );
 }
 
 #[test]
@@ -90,7 +93,10 @@ fn search_engine_scans_when_index_is_missing() {
 
     assert_eq!(outcome.backend, SearchBackend::Scan);
     assert_eq!(outcome.results.line_matches.len(), 1);
-    assert_eq!(outcome.results.line_matches[0].path, source.to_string_lossy());
+    assert_eq!(
+        outcome.results.line_matches[0].path,
+        source.to_string_lossy()
+    );
 }
 
 #[test]
@@ -200,5 +206,8 @@ fn search_engine_keeps_relative_build_paths_fresh_after_reopen() {
         .expect("test should succeed");
     assert_eq!(outcome.backend, SearchBackend::Index);
     assert_eq!(outcome.results.line_matches.len(), 1);
-    assert_eq!(outcome.results.line_matches[0].path, source.to_string_lossy());
+    assert_eq!(
+        outcome.results.line_matches[0].path,
+        source.to_string_lossy()
+    );
 }

@@ -80,7 +80,11 @@ fn run_rg_files_with_matches(
 ) -> Result<SearchResults> {
     let counts = run_rg_count_search(build_config, query, scope, false)?;
     Ok(SearchResults {
-        matched_paths: counts.file_counts.iter().map(|count| count.path.clone()).collect(),
+        matched_paths: counts
+            .file_counts
+            .iter()
+            .map(|count| count.path.clone())
+            .collect(),
         file_counts: Vec::new(),
         ..counts
     })
@@ -119,6 +123,7 @@ fn run_rg_count_search(
         matched_occurrences,
         matched_paths: Vec::new(),
         line_matches: Vec::new(),
+        line_match_files: Vec::new(),
         file_counts,
         file_match_counts,
     })
@@ -169,16 +174,10 @@ fn run_rg_line_matches(
         let Some(line_number) = rg_line_number(data) else {
             continue;
         };
-        let snippet = rg_text_field(data.get("lines")).unwrap_or_default();
-        let snippet = trim_rg_newline(&snippet).to_string();
         let path = normalize_lexical_path(&build_config.repo_path.join(path))
             .to_string_lossy()
             .into_owned();
-        line_matches.push(LineMatch {
-            path,
-            line_number,
-            line_text: snippet,
-        });
+        line_matches.push(LineMatch { path, line_number });
         matched_occurrences += data
             .get("submatches")
             .and_then(Value::as_array)
@@ -201,6 +200,7 @@ fn run_rg_line_matches(
         matched_occurrences,
         matched_paths: Vec::new(),
         line_matches,
+        line_match_files: Vec::new(),
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
     })
@@ -434,8 +434,4 @@ fn rg_line_number(data: &Value) -> Option<usize> {
     data.get("line_number")
         .and_then(Value::as_u64)
         .and_then(|line| usize::try_from(line).ok())
-}
-
-fn trim_rg_newline(value: &str) -> &str {
-    value.trim_end_matches(['\r', '\n'])
 }

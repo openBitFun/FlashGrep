@@ -3,6 +3,7 @@ use super::*;
 pub(super) fn query_request_to_runtime_config(query: &QueryRequest) -> QueryConfig {
     QueryConfig {
         regex_pattern: query.pattern.clone(),
+        patterns: vec![query.pattern.clone()],
         case_insensitive: query.case_insensitive,
         max_count: query.max_count,
         global_max_results: query.top_k,
@@ -78,6 +79,7 @@ pub(super) fn empty_results() -> SearchResults {
         matched_occurrences: 0,
         matched_paths: Vec::new(),
         line_matches: Vec::new(),
+        line_match_files: Vec::new(),
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
     }

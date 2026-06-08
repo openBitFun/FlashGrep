@@ -779,8 +779,6 @@ fn count_only_query(pattern: impl Into<String>) -> QuerySpec {
         fixed_strings: true,
         word_regexp: false,
         line_regexp: false,
-        before_context: 0,
-        after_context: 0,
         top_k_tokens: 6,
         max_count: None,
         global_max_results: None,

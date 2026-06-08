@@ -760,14 +760,58 @@ function rejectPendingRequests(backend, error) {
   }
 }
 
+// Set of type names recognized by the ignore crate's TypesBuilder::add_defaults().
+// See: https://github.com/BurntSushi/ripgrep/blob/master/crates/ignore/src/default_types.rs
+const BUILTIN_TYPE_NAMES = new Set([
+  "ada", "agda", "aidl", "alire", "amake", "asciidoc", "asm", "asp", "ats",
+  "avro", "awk", "bat", "batch", "bazel", "bitbake", "boxlang", "brotli",
+  "buildstream", "bzip2", "c", "cabal", "candid", "carp", "cbor", "ceylon",
+  "cfml", "clojure", "cmake", "cmd", "cml", "coffeescript", "config", "coq",
+  "cpp", "creole", "crystal", "cs", "csharp", "cshtml", "csproj", "css",
+  "csv", "cuda", "cython", "d", "dart", "devicetree", "dhall", "diff",
+  "dita", "docker", "dockercompose", "dts", "dvc", "ebuild", "edn", "elisp",
+  "elixir", "elm", "erb", "erlang", "fennel", "fidl", "fish", "flatbuffers",
+  "fortran", "fsharp", "fut", "gap", "gdscript", "gleam", "gn", "go",
+  "gprbuild", "gradle", "graphql", "groovy", "gzip", "h", "haml", "hare",
+  "haskell", "hbs", "hs", "html", "hy", "idris", "janet", "java", "jinja",
+  "jl", "js", "json", "jsonl", "julia", "jupyter", "k", "kconfig", "kotlin",
+  "lean", "less", "license", "lilypond", "lisp", "llvm", "lock", "log",
+  "lua", "lz4", "lzma", "m4", "make", "mako", "man", "markdown", "md",
+  "matlab", "meson", "minified", "mint", "mk", "ml", "motoko", "msbuild",
+  "nim", "nix", "objc", "objcpp", "ocaml", "org", "pants", "pascal", "pdf",
+  "perl", "php", "po", "pod", "postscript", "prolog", "protobuf", "ps",
+  "puppet", "purs", "py", "python", "qmake", "qml", "qrc", "qui", "r",
+  "racket", "raku", "rdoc", "readme", "reasonml", "red", "rescript",
+  "robot", "rst", "ruby", "rust", "sass", "scala", "scdoc", "seed7", "sh",
+  "slim", "smarty", "sml", "solidity", "soy", "spark", "spec", "sql", "ssa",
+  "stylus", "sv", "svelte", "svg", "swift", "swig", "systemd", "taskpaper",
+  "tcl", "tex", "texinfo", "textile", "tf", "thrift", "toml", "ts",
+  "typescript", "twig", "txt", "typoscript", "typst", "usd", "v", "vala",
+  "vb", "vcl", "verilog", "vhdl", "vim", "vimscript", "vue", "webidl",
+  "wgsl", "wiki", "xml", "xz", "yacc", "yaml", "yang", "z", "zig", "zsh",
+  "zstd",
+]);
+
 function buildPathScope(args) {
+  const typeAdd = [...args.type_add];
+  const types = [];
+  for (const name of args.file_type) {
+    if (BUILTIN_TYPE_NAMES.has(name)) {
+      types.push(name);
+    } else {
+      // Unrecognized type name: treat as a glob extension and register it
+      // via type_add so that TypesBuilder can resolve it.
+      typeAdd.push(`${name}:*.${name}`);
+      types.push(name);
+    }
+  }
   return {
     roots: args.roots,
     globs: args.glob,
     iglobs: args.iglob,
-    type_add: args.type_add,
+    type_add: typeAdd,
     type_clear: args.type_clear,
-    types: args.file_type,
+    types,
     type_not: args.file_type_not,
   };
 }

@@ -42,6 +42,7 @@ impl RepoRuntime {
             };
             *slot = opened_base_snapshot;
         }
+        self.clear_cached_base_snapshot_reader();
         if base_snapshot_ready {
             let prewarm_result = {
                 let guard = match self.base_snapshot_engine.lock() {
@@ -50,7 +51,11 @@ impl RepoRuntime {
                 };
                 guard
                     .as_ref()
-                    .map(|index| index.open_committed().map(|_| ()))
+                    .map(|index| {
+                        let reader = index.open_committed()?;
+                        self.store_cached_base_snapshot_reader(reader);
+                        Ok::<(), AppError>(())
+                    })
                     .transpose()
             };
             if let Err(error) = prewarm_result {
@@ -91,14 +96,45 @@ impl RepoRuntime {
     pub(super) fn open_base_snapshot_reader(
         &self,
     ) -> Result<Option<crate::index_engine::IndexSnapshotReader>> {
+        if let Some(reader) = self.cached_base_snapshot_reader() {
+            return Ok(Some(reader));
+        }
         let base_engine = match self.base_snapshot_engine.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        base_engine
+        let reader = base_engine
             .as_ref()
             .map(WorkspaceBaseSnapshotIndex::open_committed)
-            .transpose()
+            .transpose()?;
+        if let Some(reader) = reader.as_ref() {
+            self.store_cached_base_snapshot_reader(reader.clone());
+        }
+        Ok(reader)
+    }
+
+    fn cached_base_snapshot_reader(&self) -> Option<crate::index_engine::IndexSnapshotReader> {
+        let cache = match self.cached_base_snapshot_reader.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        cache.clone()
+    }
+
+    fn store_cached_base_snapshot_reader(&self, reader: crate::index_engine::IndexSnapshotReader) {
+        let mut cache = match self.cached_base_snapshot_reader.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *cache = Some(reader);
+    }
+
+    fn clear_cached_base_snapshot_reader(&self) {
+        let mut cache = match self.cached_base_snapshot_reader.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *cache = None;
     }
 
     pub(super) fn is_storage_path(&self, path: &std::path::Path) -> bool {

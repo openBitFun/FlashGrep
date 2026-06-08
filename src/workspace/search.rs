@@ -113,6 +113,7 @@ pub(super) fn empty_search_results() -> SearchResults {
         matched_occurrences: 0,
         matched_paths: Vec::new(),
         line_matches: Vec::new(),
+        line_match_files: Vec::new(),
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
     }

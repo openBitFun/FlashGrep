@@ -11,9 +11,9 @@ use crate::{
     planner::plan,
     query_runtime::{
         build_matcher, requires_multiline_verification, verify_candidate_sources_with_resolver,
-        CountVerifyKind, CountVerifyPlan, LinePrefilter, VerifyCandidateSource,
+        CountVerifyKind, CountVerifyPlan, LinePrefilter, PureLiteralMatcher, VerifyCandidateSource,
     },
-    search::{FileCount, FileMatchCount, LineMatch, SearchMode, SearchResults},
+    search::{append_line_match_file, FileCount, FileMatchCount, SearchMode, SearchResults},
 };
 
 use super::document::{SearchDocument, SearchDocumentSource};
@@ -50,11 +50,13 @@ pub(crate) fn search_documents(
     let resolve_source = |doc_id| scan_doc_source(documents, doc_id);
     if matches!(config.search_mode, SearchMode::LineMatches) {
         let matcher = build_matcher(config, multiline_verifier)?;
+        let literal_matcher = PureLiteralMatcher::compile(config, multiline_verifier)?;
         let outcomes = verify_candidate_sources_with_resolver(
             &candidate_ids,
             docs.len(),
             &resolve_source,
             &matcher,
+            literal_matcher.as_ref(),
             line_prefilter.as_ref(),
             multiline_verifier,
             config.max_count,
@@ -68,6 +70,7 @@ pub(crate) fn search_documents(
             matched_occurrences: 0,
             matched_paths: Vec::new(),
             line_matches: Vec::new(),
+            line_match_files: Vec::new(),
             file_counts: Vec::new(),
             file_match_counts: Vec::new(),
         };
@@ -78,13 +81,11 @@ pub(crate) fn search_documents(
             results.matched_occurrences += task.outcome.matched_occurrences;
             if !task.outcome.line_matches.is_empty() {
                 results.searches_with_match += 1;
-                results.line_matches.extend(task.outcome.line_matches.into_iter().map(|matched| {
-                    LineMatch {
-                        path: path.clone(),
-                        line_number: matched.line_number,
-                        line_text: matched.line_text,
-                    }
-                }));
+                append_line_match_file(
+                    &mut results.line_match_files,
+                    path,
+                    task.outcome.line_matches,
+                );
             }
         }
         return Ok(results);
@@ -330,7 +331,10 @@ fn build_results_from_counts(
     counts: Vec<(String, usize, usize)>,
 ) -> Result<SearchResults> {
     let searches_with_match = counts.len();
-    let matched_lines = counts.iter().map(|(_, matched_lines, _)| *matched_lines).sum();
+    let matched_lines = counts
+        .iter()
+        .map(|(_, matched_lines, _)| *matched_lines)
+        .sum();
     let matched_occurrences = counts
         .iter()
         .map(|(_, _, matched_occurrences)| *matched_occurrences)
@@ -344,6 +348,7 @@ fn build_results_from_counts(
         matched_occurrences,
         matched_paths: Vec::new(),
         line_matches: Vec::new(),
+        line_match_files: Vec::new(),
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
     };
@@ -356,7 +361,10 @@ fn build_results_from_counts(
         SearchMode::CountOnly => {
             results.file_counts = counts
                 .into_iter()
-                .map(|(path, matched_lines, _)| FileCount { path, matched_lines })
+                .map(|(path, matched_lines, _)| FileCount {
+                    path,
+                    matched_lines,
+                })
                 .collect();
         }
         SearchMode::CountMatches => {

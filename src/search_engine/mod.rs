@@ -358,15 +358,26 @@ mod tests {
         }
     }
 
-    fn line_match_fixed_query_with_limit(
-        pattern: &str,
-        max_count: usize,
-    ) -> QueryConfig {
+    fn line_match_fixed_query_with_limit(pattern: &str, max_count: usize) -> QueryConfig {
         QueryConfig {
             regex_pattern: regex::escape(pattern),
             patterns: vec![pattern.to_string()],
             fixed_strings: true,
             max_count: Some(max_count),
+            search_mode: SearchMode::LineMatches,
+            ..QueryConfig::default()
+        }
+    }
+
+    fn line_match_fixed_query_with_global_limit(
+        pattern: &str,
+        global_max_results: Option<usize>,
+    ) -> QueryConfig {
+        QueryConfig {
+            regex_pattern: regex::escape(pattern),
+            patterns: vec![pattern.to_string()],
+            fixed_strings: true,
+            global_max_results,
             search_mode: SearchMode::LineMatches,
             ..QueryConfig::default()
         }
@@ -387,8 +398,9 @@ mod tests {
 
         assert_eq!(results.matched_lines, 1);
         assert_eq!(results.matched_occurrences, 1);
-        assert_eq!(results.line_matches.len(), 1);
-        assert_eq!(results.line_matches[0].line_text, format!("prefix {pattern} suffix"));
+        let line_matches = results.flattened_line_matches();
+        assert_eq!(line_matches.len(), 1);
+        assert_eq!(line_matches[0].line_number, 1);
     }
 
     #[test]
@@ -406,8 +418,9 @@ mod tests {
 
         assert_eq!(results.matched_lines, 1);
         assert_eq!(results.matched_occurrences, 1);
-        assert_eq!(results.line_matches.len(), 1);
-        assert!(results.line_matches[0].line_text.contains(pattern));
+        let line_matches = results.flattened_line_matches();
+        assert_eq!(line_matches.len(), 1);
+        assert_eq!(line_matches[0].line_number, 1);
     }
 
     #[test]
@@ -425,11 +438,34 @@ mod tests {
 
         assert_eq!(results.matched_lines, 2);
         assert_eq!(results.matched_occurrences, 2);
-        assert_eq!(results.line_matches.len(), 2);
-        assert_eq!(results.line_matches[0].line_number, 1);
-        assert_eq!(results.line_matches[0].line_text, "needle one");
-        assert_eq!(results.line_matches[1].line_number, 3);
-        assert_eq!(results.line_matches[1].line_text, "needle two");
+        let line_matches = results.flattened_line_matches();
+        assert_eq!(line_matches.len(), 2);
+        assert_eq!(line_matches[0].line_number, 1);
+        assert_eq!(line_matches[1].line_number, 3);
+    }
+
+    #[test]
+    fn search_documents_reuses_line_number_state_without_changing_line_matches() {
+        let pattern = "needle";
+        let documents = vec![SearchDocument::from_loaded_bytes(
+            "doc.txt".into(),
+            128,
+            0,
+            Arc::<[u8]>::from(
+                b"needle first\r\nneedle second needle again\r\nskip\r\nneedle fourth\r\n".to_vec(),
+            ),
+        )];
+
+        let results = search_documents(&line_match_fixed_query(pattern), &documents)
+            .expect("search should succeed");
+
+        assert_eq!(results.matched_lines, 3);
+        assert_eq!(results.matched_occurrences, 4);
+        let line_matches = results.flattened_line_matches();
+        assert_eq!(line_matches.len(), 3);
+        assert_eq!(line_matches[0].line_number, 1);
+        assert_eq!(line_matches[1].line_number, 2);
+        assert_eq!(line_matches[2].line_number, 4);
     }
 
     #[test]
@@ -454,7 +490,7 @@ mod tests {
 
         assert_eq!(results.matched_lines, 2);
         assert_eq!(results.searches_with_match, 1);
-        assert_eq!(results.line_matches.len(), 2);
+        assert_eq!(results.flattened_line_matches().len(), 2);
     }
 
     #[test]
@@ -551,10 +587,42 @@ mod tests {
         assert_eq!(response.results.searches_with_match, 130);
         assert_eq!(response.results.matched_lines, 130);
         assert_eq!(response.results.matched_occurrences, 130);
-        assert_eq!(response.results.line_matches.len(), 130);
+        let line_matches = response.results.flattened_line_matches();
+        assert_eq!(line_matches.len(), 130);
 
-        for matched in &response.results.line_matches {
-            assert_eq!(matched.line_text, "TARGET");
-        }
+        assert!(line_matches.iter().all(|matched| matched.line_number == 2));
+    }
+
+    #[test]
+    fn line_matches_apply_default_global_result_limit() {
+        let contents = (0..20_000)
+            .map(|_| "TARGET\n")
+            .collect::<String>()
+            .into_bytes();
+        let documents = vec![SearchDocument::from_loaded_bytes(
+            "doc.txt".into(),
+            contents.len() as u64,
+            0,
+            Arc::<[u8]>::from(contents),
+        )];
+
+        let results = search_documents(
+            &line_match_fixed_query_with_global_limit("TARGET", None),
+            &documents,
+        )
+        .expect("search should succeed");
+
+        assert_eq!(
+            results.flattened_line_matches().len(),
+            crate::config::DEFAULT_LINE_MATCH_LIMIT
+        );
+        assert_eq!(
+            results.matched_lines,
+            crate::config::DEFAULT_LINE_MATCH_LIMIT
+        );
+        assert_eq!(
+            results.matched_occurrences,
+            crate::config::DEFAULT_LINE_MATCH_LIMIT
+        );
     }
 }

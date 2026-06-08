@@ -61,11 +61,6 @@ pub(super) fn line_index_for_offset(offset: usize, line_starts: &[usize]) -> usi
     }
 }
 
-pub(super) fn trim_line_terminator_bytes(line: &[u8]) -> &[u8] {
-    let line = line.strip_suffix(b"\n").unwrap_or(line);
-    line.strip_suffix(b"\r").unwrap_or(line)
-}
-
 pub(super) fn with_verify_path_bytes<T, F>(path: &Path, op: F) -> Result<T>
 where
     F: FnOnce(&[u8]) -> Result<T>,

@@ -274,6 +274,114 @@ fn workspace_search_uses_transition_fallback_without_base_index() {
 }
 
 #[test]
+fn grouped_line_matches_response_groups_lines_by_path() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(repo_path.join("main.rs"), "NEEDLE\nskip\nNEEDLE\n")
+        .expect("main write should succeed");
+    fs::write(repo_path.join("other.rs"), "NEEDLE\n").expect("other write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path);
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyClean
+                | crate::daemon::protocol::RepoPhase::ReadyDirty
+        )
+    });
+
+    match service
+        .handle_request_only(Request::SearchGroupedLineMatches {
+            params: crate::daemon::protocol::SearchParams {
+                repo_id: repo_id.clone(),
+                query: query("NEEDLE"),
+                scope: PathScope::default(),
+                allow_scan_fallback: false,
+            },
+        })
+        .expect("grouped search should succeed")
+    {
+        Response::SearchGroupedLineMatchesCompleted { results, .. } => {
+            assert_eq!(results.matched_lines, 3);
+            assert!(!results.limit_reached);
+            assert_eq!(results.summary.files_with_matches, 2);
+            assert_eq!(results.summary.top_files.len(), 2);
+            assert_eq!(results.summary.top_files[0].matched_lines, 2);
+            assert!(results.summary.top_files[0].path.ends_with("main.rs"));
+            assert_eq!(results.files.len(), 2);
+            let main = results
+                .files
+                .iter()
+                .find(|(path, _)| path.ends_with("main.rs"))
+                .expect("main.rs group should be present");
+            assert_eq!(main.1, vec![1, 3]);
+            let other = results
+                .files
+                .iter()
+                .find(|(path, _)| path.ends_with("other.rs"))
+                .expect("other.rs group should be present");
+            assert_eq!(other.1, vec![1]);
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    match service
+        .handle_request_only(Request::SearchLineMatchesCompact {
+            params: crate::daemon::protocol::SearchParams {
+                repo_id: repo_id.clone(),
+                query: query("NEEDLE"),
+                scope: PathScope::default(),
+                allow_scan_fallback: false,
+            },
+        })
+        .expect("compact search should succeed")
+    {
+        Response::SearchLineMatchesCompactCompleted { results } => {
+            assert_eq!(results.matched_lines, 3);
+            assert!(!results.limit_reached);
+            assert_eq!(results.summary.files_with_matches, 2);
+            assert_eq!(results.summary.top_files.len(), 2);
+            assert_eq!(results.summary.top_files[0].matched_lines, 2);
+            assert!(results.summary.top_files[0].path.ends_with("main.rs"));
+            assert_eq!(results.files.len(), 2);
+            assert!(results
+                .files
+                .iter()
+                .any(|(path, lines)| path.ends_with("main.rs") && lines == &vec![1, 3]));
+            assert!(results
+                .files
+                .iter()
+                .any(|(path, lines)| path.ends_with("other.rs") && lines == &vec![1]));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    let mut limited_query = query("NEEDLE");
+    limited_query.global_max_results = Some(2);
+    match service
+        .handle_request_only(Request::SearchLineMatchesCompact {
+            params: crate::daemon::protocol::SearchParams {
+                repo_id,
+                query: limited_query,
+                scope: PathScope::default(),
+                allow_scan_fallback: false,
+            },
+        })
+        .expect("limited compact search should succeed")
+    {
+        Response::SearchLineMatchesCompactCompleted { results } => {
+            assert_eq!(results.matched_lines, 2);
+            assert!(results.limit_reached);
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
 fn reopening_repo_reuses_base_snapshot_shard_for_workspace_search() {
     let _serial = daemon_test_serial();
     let setup_service = DaemonService::new();

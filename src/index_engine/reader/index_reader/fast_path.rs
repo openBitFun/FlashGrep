@@ -256,6 +256,7 @@ impl IndexSnapshotReader {
                 matched_occurrences,
                 matched_paths,
                 line_matches: Vec::new(),
+                line_match_files: Vec::new(),
                 file_counts,
                 file_match_counts,
             });
@@ -268,19 +269,24 @@ impl IndexSnapshotReader {
             .flatten();
         let line_prefilter_ref = line_prefilter.as_ref();
         let verify_started = Instant::now();
-        if query.top_k.is_none()
-            && filtered_candidate_ids.len() >= SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD
+        let global_limit = config.effective_global_max_results();
+        if global_limit.is_some()
+            || (query.top_k.is_none()
+                && filtered_candidate_ids.len() >= SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD)
         {
             let matcher = crate::query_runtime::build_matcher(&config, multiline_verifier)?;
+            let literal_matcher =
+                crate::query_runtime::PureLiteralMatcher::compile(&config, multiline_verifier)?;
             let outcomes = verify_candidate_sources_with_resolver(
                 &filtered_candidate_ids,
                 reader.doc_count(),
                 &|doc_id| self.verify_source_for_query(&reader, query, doc_id),
                 &matcher,
+                literal_matcher.as_ref(),
                 line_prefilter_ref,
                 multiline_verifier,
                 config.max_count,
-                config.effective_global_max_results(),
+                global_limit,
             )?;
             let mut results = empty_results();
             results.candidate_docs = filtered_candidate_ids.len();
@@ -291,13 +297,11 @@ impl IndexSnapshotReader {
                 if !task.outcome.line_matches.is_empty() {
                     results.searches_with_match += 1;
                     let path = reader.doc_key(task.doc_id)?.logical_path.clone();
-                    results.line_matches.extend(task.outcome.line_matches.into_iter().map(
-                        |matched| crate::search::LineMatch {
-                            path: path.clone(),
-                            line_number: matched.line_number,
-                            line_text: matched.line_text,
-                        },
-                    ));
+                    crate::search::append_line_match_file(
+                        &mut results.line_match_files,
+                        path,
+                        task.outcome.line_matches,
+                    );
                 } else if task.outcome.matched_lines > 0 || task.outcome.matched_occurrences > 0 {
                     results.searches_with_match += 1;
                 }
@@ -320,20 +324,15 @@ impl IndexSnapshotReader {
             if !outcome.line_matches.is_empty() {
                 results.searches_with_match += 1;
                 let path = reader.doc_key(doc_id)?.logical_path.clone();
-                results.line_matches.extend(outcome.line_matches.into_iter().map(|matched| {
-                    crate::search::LineMatch {
-                        path: path.clone(),
-                        line_number: matched.line_number,
-                        line_text: matched.line_text,
-                    }
-                }));
+                crate::search::append_line_match_file(
+                    &mut results.line_match_files,
+                    path,
+                    outcome.line_matches,
+                );
             } else if outcome.matched_lines > 0 || outcome.matched_occurrences > 0 {
                 results.searches_with_match += 1;
             }
-            if query
-                .top_k
-                .is_some_and(|limit| results.line_matches.len() >= limit)
-            {
+            if global_limit.is_some_and(|limit| results.line_match_count() >= limit) {
                 phases.verify = verify_started.elapsed();
                 return Ok(results);
             }
@@ -365,6 +364,98 @@ impl IndexSnapshotReader {
             .then(|| LinePrefilter::compile(&config, &query_plan))
             .flatten();
         let line_prefilter_ref = line_prefilter.as_ref();
+
+        let global_limit = config.effective_global_max_results();
+        if matches!(query.mode, crate::search::SearchMode::LineMatches) && global_limit.is_some() {
+            const LIMITED_CANDIDATE_FILTER_CHUNK_SIZE: usize = 1024;
+            let matcher = crate::query_runtime::build_matcher(&config, multiline_verifier)?;
+            let literal_matcher =
+                crate::query_runtime::PureLiteralMatcher::compile(&config, multiline_verifier)?;
+            let mut results = empty_results();
+            let mut collect_elapsed = Duration::default();
+            let mut candidate_filter_elapsed = Duration::default();
+            let mut verify_elapsed = Duration::default();
+            for segment_ref in &active_segments {
+                if global_limit.is_some_and(|limit| results.line_match_count() >= limit) {
+                    break;
+                }
+                let reader = self.segment_store.open_segment(segment_ref.id.clone())?;
+                let collect_started = Instant::now();
+                let candidate_ids = reader.collect_candidates(plan, 0)?;
+                collect_elapsed += collect_started.elapsed();
+
+                for candidate_chunk in candidate_ids.chunks(LIMITED_CANDIDATE_FILTER_CHUNK_SIZE) {
+                    if global_limit.is_some_and(|limit| results.line_match_count() >= limit) {
+                        break;
+                    }
+                    let filter_started = Instant::now();
+                    let mut filtered_candidate_ids = Vec::with_capacity(candidate_chunk.len());
+                    let mut candidate_bytes = 0u64;
+                    for &doc_id in candidate_chunk {
+                        let key = reader.doc_key(doc_id)?;
+                        if !matches_key_filters(key, query) {
+                            continue;
+                        }
+                        if visibility
+                            .latest_live_segment_seq
+                            .get(key)
+                            .is_some_and(|seq_no| *seq_no != segment_ref.max_seq_no)
+                            || !visibility.latest_live_segment_seq.contains_key(key)
+                        {
+                            continue;
+                        }
+                        candidate_bytes += reader.doc_metadata(doc_id)?.size;
+                        filtered_candidate_ids.push(doc_id);
+                    }
+                    candidate_filter_elapsed += filter_started.elapsed();
+                    if filtered_candidate_ids.is_empty() {
+                        continue;
+                    }
+                    results.candidate_docs += filtered_candidate_ids.len();
+                    results.bytes_searched += candidate_bytes;
+
+                    let remaining_limit =
+                        global_limit.map(|limit| limit.saturating_sub(results.line_match_count()));
+                    let verify_started = Instant::now();
+                    let outcomes = verify_candidate_sources_with_resolver(
+                        &filtered_candidate_ids,
+                        reader.doc_count(),
+                        &|doc_id| self.verify_source_for_query(&reader, query, doc_id),
+                        &matcher,
+                        literal_matcher.as_ref(),
+                        line_prefilter_ref,
+                        multiline_verifier,
+                        config.max_count,
+                        remaining_limit,
+                    )?;
+                    verify_elapsed += verify_started.elapsed();
+                    for task in outcomes {
+                        results.matched_lines += task.outcome.matched_lines;
+                        results.matched_occurrences += task.outcome.matched_occurrences;
+                        if !task.outcome.line_matches.is_empty() {
+                            results.searches_with_match += 1;
+                            let path = reader.doc_key(task.doc_id)?.logical_path.clone();
+                            crate::search::append_line_match_file(
+                                &mut results.line_match_files,
+                                path,
+                                task.outcome.line_matches,
+                            );
+                        } else if task.outcome.matched_lines > 0
+                            || task.outcome.matched_occurrences > 0
+                        {
+                            results.searches_with_match += 1;
+                        }
+                    }
+                }
+            }
+            results
+                .line_match_files
+                .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+            phases.collect_candidates = collect_elapsed;
+            phases.filter_candidates = candidate_filter_elapsed;
+            phases.verify = verify_elapsed;
+            return Ok(results);
+        }
 
         let collect_started = Instant::now();
         let mut candidate_filter_elapsed = Duration::default();
@@ -500,7 +591,8 @@ impl IndexSnapshotReader {
                 results.file_match_counts.extend(segment.file_match_counts);
             }
             results.matched_paths.sort_unstable();
-            results.file_counts
+            results
+                .file_counts
                 .sort_unstable_by(|left, right| left.path.cmp(&right.path));
             results
                 .file_match_counts
@@ -510,23 +602,32 @@ impl IndexSnapshotReader {
         }
 
         let matcher = crate::query_runtime::build_matcher(&config, multiline_verifier)?;
+        let literal_matcher =
+            crate::query_runtime::PureLiteralMatcher::compile(&config, multiline_verifier)?;
         let verify_plan =
             SearchVerifyPlan::compile(&config, multiline_verifier, line_prefilter.clone())?;
         for (reader, filtered_candidate_ids, candidate_bytes) in collected_segments {
+            if global_limit.is_some_and(|limit| results.line_match_count() >= limit) {
+                break;
+            }
             results.candidate_docs += filtered_candidate_ids.len();
             results.bytes_searched += candidate_bytes;
-            if query.top_k.is_none()
-                && filtered_candidate_ids.len() >= SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD
+            let remaining_limit =
+                global_limit.map(|limit| limit.saturating_sub(results.line_match_count()));
+            if remaining_limit.is_some()
+                || (query.top_k.is_none()
+                    && filtered_candidate_ids.len() >= SINGLE_SEGMENT_PARALLEL_VERIFY_DOC_THRESHOLD)
             {
                 let outcomes = verify_candidate_sources_with_resolver(
                     &filtered_candidate_ids,
                     reader.doc_count(),
                     &|doc_id| self.verify_source_for_query(&reader, query, doc_id),
                     &matcher,
+                    literal_matcher.as_ref(),
                     line_prefilter_ref,
                     multiline_verifier,
                     config.max_count,
-                    config.effective_global_max_results(),
+                    remaining_limit,
                 )?;
                 for task in outcomes {
                     results.matched_lines += task.outcome.matched_lines;
@@ -534,13 +635,11 @@ impl IndexSnapshotReader {
                     if !task.outcome.line_matches.is_empty() {
                         results.searches_with_match += 1;
                         let path = reader.doc_key(task.doc_id)?.logical_path.clone();
-                        results.line_matches.extend(task.outcome.line_matches.into_iter().map(
-                            |matched| crate::search::LineMatch {
-                                path: path.clone(),
-                                line_number: matched.line_number,
-                                line_text: matched.line_text,
-                            },
-                        ));
+                        crate::search::append_line_match_file(
+                            &mut results.line_match_files,
+                            path,
+                            task.outcome.line_matches,
+                        );
                     } else if task.outcome.matched_lines > 0 || task.outcome.matched_occurrences > 0
                     {
                         results.searches_with_match += 1;
@@ -558,36 +657,27 @@ impl IndexSnapshotReader {
                 if !outcome.line_matches.is_empty() {
                     results.searches_with_match += 1;
                     let path = reader.doc_key(doc_id)?.logical_path.clone();
-                    results.line_matches.extend(outcome.line_matches.into_iter().map(
-                        |matched| crate::search::LineMatch {
-                            path: path.clone(),
-                            line_number: matched.line_number,
-                            line_text: matched.line_text,
-                        },
-                    ));
+                    crate::search::append_line_match_file(
+                        &mut results.line_match_files,
+                        path,
+                        outcome.line_matches,
+                    );
                 } else if outcome.matched_lines > 0 || outcome.matched_occurrences > 0 {
                     results.searches_with_match += 1;
                 }
-                if query
-                    .top_k
-                    .is_some_and(|limit| results.line_matches.len() >= limit)
-                {
-                    results.line_matches.sort_unstable_by(|left, right| {
-                        left.path
-                            .cmp(&right.path)
-                            .then(left.line_number.cmp(&right.line_number))
-                    });
+                if global_limit.is_some_and(|limit| results.line_match_count() >= limit) {
+                    results
+                        .line_match_files
+                        .sort_unstable_by(|left, right| left.path.cmp(&right.path));
                     phases.verify = verify_started.elapsed();
                     return Ok(results);
                 }
             }
         }
 
-        results.line_matches.sort_unstable_by(|left, right| {
-            left.path
-                .cmp(&right.path)
-                .then(left.line_number.cmp(&right.line_number))
-        });
+        results
+            .line_match_files
+            .sort_unstable_by(|left, right| left.path.cmp(&right.path));
         phases.verify = verify_started.elapsed();
         Ok(results)
     }

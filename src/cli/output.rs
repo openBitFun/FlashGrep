@@ -2,7 +2,7 @@ use std::fmt::Write as _;
 use std::io::Write;
 
 use crate::{
-    daemon::protocol::{RepoStatus, Response},
+    daemon::protocol::{CompactLineMatchResults, RepoStatus, Response},
     error::{AppError, Result},
     search::SearchResults,
 };
@@ -19,7 +19,7 @@ pub(super) fn print_engine_search_results(results: &SearchResults) {
         println!("file {path}");
     }
     for matched in &results.line_matches {
-        println!("file {}:{} {}", matched.path, matched.line_number, matched.line_text);
+        println!("file {}:{}", matched.path, matched.line_number);
     }
     for count in &results.file_counts {
         println!("file {} matched_lines={}", count.path, count.matched_lines);
@@ -39,6 +39,46 @@ pub(super) fn print_daemon_response(response: &Response) -> Result<()> {
         AppError::Protocol(format!("failed to encode daemon response: {error}"))
     })?;
     stdout.write_all(b"\n")?;
+    Ok(())
+}
+
+pub(super) fn print_daemon_compact_line_matches(raw_response: &str) -> Result<()> {
+    #[derive(serde::Deserialize)]
+    struct Envelope {
+        result: Option<CompactLineMatchResult>,
+        error: Option<CompactLineMatchError>,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CompactLineMatchResult {
+        #[serde(rename = "r")]
+        results: CompactLineMatchResults,
+    }
+
+    #[derive(serde::Deserialize)]
+    struct CompactLineMatchError {
+        message: String,
+    }
+
+    let envelope: Envelope = serde_json::from_str(raw_response).map_err(|error| {
+        AppError::Protocol(format!(
+            "failed to decode compact line-match response: {error}"
+        ))
+    })?;
+    if let Some(error) = envelope.error {
+        return Err(AppError::Protocol(error.message));
+    }
+    let result = envelope
+        .result
+        .ok_or_else(|| AppError::Protocol("compact line-match response missing result".into()))?;
+
+    let stdout = std::io::stdout();
+    let mut stdout = stdout.lock();
+    for (path, line_numbers) in result.results.files {
+        for line_number in line_numbers {
+            writeln!(stdout, "{path}:{line_number}")?;
+        }
+    }
     Ok(())
 }
 

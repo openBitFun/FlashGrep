@@ -379,6 +379,10 @@ pub(super) struct DaemonSearchArgs {
 }
 
 impl DaemonSearchArgs {
+    pub(super) fn uses_line_match_mode(&self) -> bool {
+        !self.count && !self.count_matches
+    }
+
     pub(super) fn into_search_params(self) -> SearchParams {
         let Self {
             repo,

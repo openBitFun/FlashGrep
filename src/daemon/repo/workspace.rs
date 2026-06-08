@@ -152,10 +152,21 @@ impl RepoRuntime {
         match self.current_base_snapshot_key() {
             Ok(Some(snapshot_key)) => {
                 let plan = match self.plan_overlay_update_from_incremental_probe()? {
-                    Some(plan) => plan,
-                    None => self.plan_overlay_full_rebuild_from_worktree()?,
+                    Some(plan) => Some(plan),
+                    None if self.build_config.repo_path.join(".git").exists()
+                        && self.workspace_watcher_active()
+                        && self.dirty_catalog_pending_paths().is_empty()
+                        && self.snapshot_published_overlay_paths()?.is_some() =>
+                    {
+                        None
+                    }
+                    None => Some(self.plan_overlay_full_rebuild_from_worktree()?),
                 };
-                self.apply_refreshed_overlay(snapshot_key, plan);
+                if let Some(plan) = plan {
+                    self.apply_refreshed_overlay(snapshot_key, plan);
+                } else {
+                    self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
+                }
                 Ok(true)
             }
             Ok(None) => {

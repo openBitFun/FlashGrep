@@ -7,6 +7,7 @@ use regex_syntax::{
 use crate::{
     config::QueryConfig,
     error::{AppError, Result},
+    search::LineMatch,
 };
 
 #[derive(Debug, Clone)]
@@ -66,6 +67,63 @@ impl PureLiteralMatcher {
             matched_occurrences,
         }
     }
+
+    pub(crate) fn line_matches(
+        &self,
+        bytes: &[u8],
+        max_count: Option<usize>,
+    ) -> LiteralLineScanStats {
+        let max_count = max_count.unwrap_or(usize::MAX);
+        if max_count == 0 {
+            return LiteralLineScanStats::default();
+        }
+
+        let mut matched_lines = 0usize;
+        let mut matched_occurrences = 0usize;
+        let mut current_line_number = 1usize;
+        let mut current_line_start = 0usize;
+        let mut current_line_end = next_line_end(bytes, current_line_start);
+        let mut current_line_has_match = false;
+        let mut line_matches = Vec::new();
+
+        for matched in self.matcher.find_iter(bytes) {
+            while matched.start() >= current_line_end && current_line_start < bytes.len() {
+                current_line_start = current_line_end;
+                current_line_end = next_line_end(bytes, current_line_start);
+                current_line_number += 1;
+                current_line_has_match = false;
+            }
+            if !current_line_has_match {
+                matched_lines += 1;
+                current_line_has_match = true;
+                if line_matches.len() < max_count {
+                    line_matches.push(LineMatch {
+                        path: String::new(),
+                        line_number: current_line_number,
+                    });
+                }
+            }
+            matched_occurrences += 1;
+            if line_matches.len() >= max_count {
+                break;
+            }
+        }
+
+        LiteralLineScanStats {
+            matched_lines,
+            matched_occurrences,
+            bytes_searched: bytes.len() as u64,
+            line_matches,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub(crate) struct LiteralLineScanStats {
+    pub(crate) matched_lines: usize,
+    pub(crate) matched_occurrences: usize,
+    pub(crate) bytes_searched: u64,
+    pub(crate) line_matches: Vec<LineMatch>,
 }
 
 fn collect_pure_literals(config: &QueryConfig) -> Result<Option<Vec<String>>> {
@@ -156,5 +214,21 @@ mod tests {
         let stats = matcher.count(b"ui ui ui\nalpha\nui beta ui\n");
         assert_eq!(stats.matched_lines, 2);
         assert_eq!(stats.matched_occurrences, 5);
+    }
+
+    #[test]
+    fn line_matches_return_unique_matching_lines_until_limit() {
+        let matcher = literal_matcher("ui");
+        let stats = matcher.line_matches(b"ui ui ui\nalpha\nui beta ui\nui gamma\n", Some(2));
+        assert_eq!(stats.matched_lines, 2);
+        assert_eq!(stats.matched_occurrences, 4);
+        assert_eq!(
+            stats
+                .line_matches
+                .iter()
+                .map(|matched| matched.line_number)
+                .collect::<Vec<_>>(),
+            vec![1, 3]
+        );
     }
 }

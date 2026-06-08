@@ -23,6 +23,30 @@ pub(super) fn system_time_to_unix_secs(time: Option<SystemTime>) -> Option<u64> 
 }
 
 pub(super) fn convert_search_results(results: SearchResults) -> proto::SearchResults {
+    let line_matches = if results.line_matches.is_empty() && !results.line_match_files.is_empty() {
+        results
+            .line_match_files
+            .iter()
+            .flat_map(|file| {
+                file.line_numbers
+                    .iter()
+                    .map(|line_number| proto::LineMatch {
+                        path: file.path.clone(),
+                        line_number: *line_number,
+                    })
+            })
+            .collect()
+    } else {
+        results
+            .line_matches
+            .into_iter()
+            .map(|matched| proto::LineMatch {
+                path: matched.path,
+                line_number: matched.line_number,
+            })
+            .collect()
+    };
+
     proto::SearchResults {
         candidate_docs: results.candidate_docs,
         searches_with_match: results.searches_with_match,
@@ -30,15 +54,7 @@ pub(super) fn convert_search_results(results: SearchResults) -> proto::SearchRes
         matched_lines: results.matched_lines,
         matched_occurrences: results.matched_occurrences,
         matched_paths: results.matched_paths,
-        line_matches: results
-            .line_matches
-            .into_iter()
-            .map(|matched| proto::LineMatch {
-                path: matched.path,
-                line_number: matched.line_number,
-                line_text: matched.line_text,
-            })
-            .collect(),
+        line_matches,
         file_counts: results
             .file_counts
             .into_iter()
@@ -55,6 +71,93 @@ pub(super) fn convert_search_results(results: SearchResults) -> proto::SearchRes
                 matched_occurrences: count.matched_occurrences,
             })
             .collect(),
+    }
+}
+
+pub(super) fn convert_grouped_line_match_results(
+    results: SearchResults,
+    global_limit: Option<usize>,
+) -> proto::GroupedLineMatchResults {
+    let limit_reached = line_match_limit_reached(&results, global_limit);
+    let files = collect_grouped_line_match_files(results.line_match_files, results.line_matches);
+    let summary = line_match_summary(&files);
+    proto::GroupedLineMatchResults {
+        candidate_docs: results.candidate_docs,
+        searches_with_match: results.searches_with_match,
+        bytes_searched: results.bytes_searched,
+        matched_lines: results.matched_lines,
+        matched_occurrences: results.matched_occurrences,
+        limit_reached,
+        summary,
+        files,
+    }
+}
+
+pub(super) fn convert_compact_line_match_results(
+    results: SearchResults,
+    global_limit: Option<usize>,
+) -> proto::CompactLineMatchResults {
+    let limit_reached = line_match_limit_reached(&results, global_limit);
+    let files = collect_grouped_line_match_files(results.line_match_files, results.line_matches);
+    let summary = line_match_summary(&files);
+    proto::CompactLineMatchResults {
+        candidate_docs: results.candidate_docs,
+        searches_with_match: results.searches_with_match,
+        bytes_searched: results.bytes_searched,
+        matched_lines: results.matched_lines,
+        matched_occurrences: results.matched_occurrences,
+        limit_reached,
+        summary,
+        files,
+    }
+}
+
+fn line_match_limit_reached(results: &SearchResults, global_limit: Option<usize>) -> bool {
+    global_limit.is_some_and(|limit| results.line_match_count() >= limit)
+}
+
+fn collect_grouped_line_match_files(
+    line_match_files: Vec<crate::search::LineMatchFile>,
+    line_matches: Vec<crate::search::LineMatch>,
+) -> Vec<(String, Vec<usize>)> {
+    let mut files = line_match_files
+        .into_iter()
+        .map(|file| (file.path, file.line_numbers))
+        .collect::<Vec<_>>();
+    if files.is_empty() {
+        for matched in line_matches {
+            match files.last_mut() {
+                Some((path, line_numbers)) if *path == matched.path => {
+                    line_numbers.push(matched.line_number);
+                }
+                _ => files.push((matched.path, vec![matched.line_number])),
+            }
+        }
+    }
+    files
+}
+
+fn line_match_summary(files: &[(String, Vec<usize>)]) -> proto::LineMatchSummary {
+    const TOP_FILE_LIMIT: usize = 10;
+
+    let mut top_files = files
+        .iter()
+        .map(|(path, line_numbers)| proto::LineMatchFileSummary {
+            path: path.clone(),
+            matched_lines: line_numbers.len(),
+        })
+        .collect::<Vec<_>>();
+    top_files.sort_unstable_by(|left, right| {
+        right
+            .matched_lines
+            .cmp(&left.matched_lines)
+            .then_with(|| left.path.cmp(&right.path))
+    });
+    top_files.truncate(TOP_FILE_LIMIT);
+
+    proto::LineMatchSummary {
+        files_with_matches: files.len(),
+        top_files,
     }
 }
 

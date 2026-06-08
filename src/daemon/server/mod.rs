@@ -139,7 +139,10 @@ pub(super) fn is_concurrent_request(request: &RequestEnvelope) -> bool {
     // Keep stateful protocol operations ordered; only read-only query requests run concurrently.
     matches!(
         request.request,
-        Request::Search { .. } | Request::Glob { .. }
+        Request::Search { .. }
+            | Request::SearchGroupedLineMatches { .. }
+            | Request::SearchLineMatchesCompact { .. }
+            | Request::Glob { .. }
     )
 }
 
