@@ -106,7 +106,7 @@ class McpServer {
       },
       serverInfo: {
         name: MCP_SERVER_NAME,
-        title: "Codgrep Search MCP",
+        title: "Flashgrep Search MCP",
         version: MCP_SERVER_VERSION,
       },
       instructions,
@@ -167,24 +167,18 @@ class McpServer {
     }
     const patterns = [args.pattern, ...args.regexp];
     const pattern = combinePatterns(patterns, args.fixed_strings);
-    const response = await sendDaemonRequest(repoContext.backend, "search", {
-      repo_id: repoContext.repoId,
+    const searchParams = buildSearchParams(repoContext.repoId, args, pattern, patterns);
+    const searchMethod =
+      args.search_mode === "line_matches" ? "search/grouped_line_matches" : "search";
+    const response = await sendDaemonRequest(repoContext.backend, searchMethod, {
+      ...searchParams,
       query: {
-        pattern,
-        patterns,
-        case_insensitive: args.case_insensitive,
-        multiline: args.multiline,
-        dot_matches_new_line: args.multiline_dotall,
-        fixed_strings: args.fixed_strings,
-        word_regexp: args.word_regexp,
-        line_regexp: args.line_regexp,
-        top_k_tokens: args.top_k_tokens,
-        max_count: args.max_count,
-        global_max_results: args.global_max_results,
-        search_mode: args.search_mode,
+        ...searchParams.query,
+        search_mode:
+          searchMethod === "search/grouped_line_matches"
+            ? "line_matches"
+            : args.search_mode,
       },
-      scope: buildPathScope(args),
-      allow_scan_fallback: args.allow_scan_fallback,
     });
 
     return {
@@ -816,6 +810,28 @@ function buildPathScope(args) {
   };
 }
 
+function buildSearchParams(repoId, args, pattern, patterns) {
+  return {
+    repo_id: repoId,
+    query: {
+      pattern,
+      patterns,
+      case_insensitive: args.case_insensitive,
+      multiline: args.multiline,
+      dot_matches_new_line: args.multiline_dotall,
+      fixed_strings: args.fixed_strings,
+      word_regexp: args.word_regexp,
+      line_regexp: args.line_regexp,
+      top_k_tokens: args.top_k_tokens,
+      max_count: args.max_count,
+      global_max_results: args.global_max_results,
+      search_mode: args.search_mode,
+    },
+    scope: buildPathScope(args),
+    allow_scan_fallback: args.allow_scan_fallback,
+  };
+}
+
 function resolveRepoPath(defaultRepoPath, overrideRepoPath) {
   const repoPath = overrideRepoPath ?? defaultRepoPath;
   if (!repoPath) {
@@ -855,7 +871,7 @@ function toolDefinitions() {
           top_k_tokens: schemaInteger("Planner token budget. Default is 6."),
           max_count: schemaNullableInteger("Per-pattern result cap."),
           global_max_results: schemaNullableInteger(
-            "Maximum number of matching files to return. Defaults to 100.",
+            "Global result cap for the selected search mode. Defaults to 100.",
           ),
           search_mode: {
             type: "string",
