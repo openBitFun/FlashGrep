@@ -14,9 +14,10 @@ fn search_engine_uses_index_when_fresh() {
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Index);
-    assert_eq!(outcome.results.line_matches.len(), 1);
+    let line_matches = outcome.results.flattened_line_matches();
+    assert_eq!(line_matches.len(), 1);
     assert_eq!(
-        outcome.results.line_matches[0].path,
+        line_matches[0].path,
         source.to_string_lossy()
     );
 }
@@ -34,10 +35,9 @@ fn search_engine_uses_workspace_snapshot_view_when_worktree_is_dirty() {
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Index);
-    assert_eq!(outcome.results.line_matches.len(), 2);
-    let mut paths = outcome
-        .results
-        .line_matches
+    let line_matches = outcome.results.flattened_line_matches();
+    assert_eq!(line_matches.len(), 2);
+    let mut paths = line_matches
         .iter()
         .map(|matched| matched.path.clone())
         .collect::<Vec<_>>();
@@ -64,10 +64,9 @@ fn search_engine_workspace_view_keeps_non_utf8_dirty_text_files() {
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Index);
-    assert_eq!(outcome.results.line_matches.len(), 2);
-    let mut paths = outcome
-        .results
-        .line_matches
+    let line_matches = outcome.results.flattened_line_matches();
+    assert_eq!(line_matches.len(), 2);
+    let mut paths = line_matches
         .iter()
         .map(|matched| matched.path.clone())
         .collect::<Vec<_>>();
@@ -92,9 +91,10 @@ fn search_engine_scans_when_index_is_missing() {
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Scan);
-    assert_eq!(outcome.results.line_matches.len(), 1);
+    let line_matches = outcome.results.flattened_line_matches();
+    assert_eq!(line_matches.len(), 1);
     assert_eq!(
-        outcome.results.line_matches[0].path,
+        line_matches[0].path,
         source.to_string_lossy()
     );
 }
@@ -115,7 +115,7 @@ fn search_engine_scans_count_matches_when_index_is_missing() {
     assert_eq!(outcome.backend, SearchBackend::Scan);
     assert_eq!(outcome.results.matched_lines, 2);
     assert_eq!(outcome.results.matched_occurrences, 3);
-    assert!(outcome.results.line_matches.is_empty());
+    assert!(outcome.results.flattened_line_matches().is_empty());
 }
 
 #[test]
@@ -134,7 +134,7 @@ fn search_engine_scan_count_matches_honors_max_count_by_matching_line() {
     assert_eq!(outcome.backend, SearchBackend::Scan);
     assert_eq!(outcome.results.matched_lines, 1);
     assert_eq!(outcome.results.matched_occurrences, 2);
-    assert!(outcome.results.line_matches.is_empty());
+    assert!(outcome.results.flattened_line_matches().is_empty());
 }
 
 #[test]
@@ -168,7 +168,7 @@ fn search_engine_uses_index_by_default_when_preflight_is_disabled() {
         .expect("test should succeed");
 
     assert_eq!(outcome.backend, SearchBackend::Index);
-    assert_eq!(outcome.results.line_matches.len(), 1);
+    assert_eq!(outcome.results.flattened_line_matches().len(), 1);
 }
 
 #[test]
@@ -205,9 +205,10 @@ fn search_engine_keeps_relative_build_paths_fresh_after_reopen() {
         .search(&query("PM_RESUME"), SearchPolicy::FallbackToScan)
         .expect("test should succeed");
     assert_eq!(outcome.backend, SearchBackend::Index);
-    assert_eq!(outcome.results.line_matches.len(), 1);
+    let line_matches = outcome.results.flattened_line_matches();
+    assert_eq!(line_matches.len(), 1);
     assert_eq!(
-        outcome.results.line_matches[0].path,
+        line_matches[0].path,
         source.to_string_lossy()
     );
 }

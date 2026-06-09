@@ -34,7 +34,7 @@ fn hit_paths(workspace: &WorkspaceIndex, pattern: &str) -> Vec<String> {
     let mut paths = workspace
         .search(&query(pattern))
         .expect("test should succeed")
-        .line_matches
+        .flattened_line_matches()
         .into_iter()
         .map(|matched| matched.path)
         .collect::<Vec<_>>();
@@ -47,7 +47,7 @@ fn hit_paths_current_view(workspace: &WorkspaceIndex, pattern: &str) -> Vec<Stri
     let mut paths = workspace
         .search(&query(pattern))
         .expect("test should succeed")
-        .line_matches
+        .flattened_line_matches()
         .into_iter()
         .map(|matched| matched.path)
         .collect::<Vec<_>>();
@@ -238,14 +238,14 @@ fn workspace_snapshot_freezes_materialized_overlay_snapshot() {
     let snapshot_paths = snapshot
         .search(&query("DIRTY_ONE"))
         .expect("test should succeed")
-        .line_matches
+        .flattened_line_matches()
         .into_iter()
         .map(|matched| matched.path)
         .collect::<Vec<_>>();
     let snapshot_new_paths = snapshot
         .search(&query("DIRTY_TWO"))
         .expect("test should succeed")
-        .line_matches
+        .flattened_line_matches()
         .into_iter()
         .map(|matched| matched.path)
         .collect::<Vec<_>>();
@@ -437,7 +437,7 @@ fn workspace_json_report_reflects_latest_worktree_view() {
     let mut paths = workspace
         .search(&query("DIRTY_NAME"))
         .expect("test should succeed")
-        .line_matches
+        .flattened_line_matches()
         .into_iter()
         .map(|matched| matched.path)
         .collect::<Vec<_>>();

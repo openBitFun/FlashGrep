@@ -191,8 +191,9 @@ fn search_can_be_restricted_to_selected_paths() {
             flashgrep::SearchPolicy::IndexOnly,
         )
         .expect("test should succeed");
-    assert_eq!(results.results.line_matches.len(), 1);
-    assert_eq!(results.results.line_matches[0].path, src.to_string_lossy());
+    let line_matches = results.results.flattened_line_matches();
+    assert_eq!(line_matches.len(), 1);
+    assert_eq!(line_matches[0].path, src.to_string_lossy());
 
     let tests_filter = PathFilter::new(
         PathFilterArgs {
@@ -256,9 +257,10 @@ fn search_can_be_restricted_to_exact_file_path() {
             flashgrep::SearchPolicy::IndexOnly,
         )
         .expect("test should succeed");
-    assert_eq!(literal.results.line_matches.len(), 1);
+    let line_matches = literal.results.flattened_line_matches();
+    assert_eq!(line_matches.len(), 1);
     assert_eq!(
-        literal.results.line_matches[0].path,
+        line_matches[0].path,
         source.to_string_lossy()
     );
 }
