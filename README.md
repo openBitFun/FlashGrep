@@ -1,6 +1,6 @@
 # flashgrep
 
-[![version](https://img.shields.io/badge/version-0.2.6-blue.svg)](https://github.com/flashgrep/flashgrep)
+[![version](https://img.shields.io/badge/version-0.2.8-blue.svg)](https://github.com/flashgrep/flashgrep)
 [![rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
