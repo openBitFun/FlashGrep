@@ -521,6 +521,64 @@ impl IndexSnapshotReader {
                     CountVerifyKind::Occurrences
                 },
             )?;
+            if let Some(limit) = config.effective_global_max_results() {
+                for (reader, filtered_candidate_ids, candidate_bytes) in collected_segments {
+                    if results.searches_with_match >= limit {
+                        break;
+                    }
+                    let remaining_limit = limit.saturating_sub(results.searches_with_match);
+                    let counts = verify_plan.verify_candidate_counts_by_doc_with_sources(
+                        &filtered_candidate_ids,
+                        reader.doc_count(),
+                        &|doc_id| self.verify_source_for_query(&reader, query, doc_id),
+                        Some(remaining_limit),
+                    )?;
+
+                    results.candidate_docs += filtered_candidate_ids.len();
+                    results.searches_with_match += counts.len();
+                    results.bytes_searched += candidate_bytes;
+                    results.matched_lines += counts
+                        .iter()
+                        .map(|count| count.matched_lines)
+                        .sum::<usize>();
+                    results.matched_occurrences += counts
+                        .iter()
+                        .map(|count| count.matched_occurrences)
+                        .sum::<usize>();
+
+                    for count in counts {
+                        let path = reader.doc_key(count.doc_id)?.logical_path.clone();
+                        match query.mode {
+                            crate::search::SearchMode::FilesWithMatches => {
+                                results.matched_paths.push(path);
+                            }
+                            crate::search::SearchMode::CountOnly => {
+                                results.file_counts.push(FileCount {
+                                    path,
+                                    matched_lines: count.matched_lines,
+                                });
+                            }
+                            crate::search::SearchMode::CountMatches => {
+                                results.file_match_counts.push(FileMatchCount {
+                                    path,
+                                    matched_occurrences: count.matched_occurrences,
+                                });
+                            }
+                            crate::search::SearchMode::LineMatches => unreachable!(),
+                        }
+                    }
+                }
+                results.matched_paths.sort_unstable();
+                results
+                    .file_counts
+                    .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+                results
+                    .file_match_counts
+                    .sort_unstable_by(|left, right| left.path.cmp(&right.path));
+                phases.verify = verify_started.elapsed();
+                return Ok(results);
+            }
+
             let segment_results = collected_segments
                 .into_par_iter()
                 .map(
@@ -529,7 +587,7 @@ impl IndexSnapshotReader {
                             &filtered_candidate_ids,
                             reader.doc_count(),
                             &|doc_id| self.verify_source_for_query(&reader, query, doc_id),
-                            config.effective_global_max_results(),
+                            None,
                         )?;
 
                         let mut segment = SegmentCountResults {

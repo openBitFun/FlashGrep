@@ -25,6 +25,7 @@ const MAX_LOOK_AHEAD: usize = 128;
 // Count queries over large monorepos often end up with a few hundred candidates. Waiting until
 // 512 docs to parallelize leaves too much verify work on a single thread.
 const VERIFY_PARALLEL_THRESHOLD: usize = 128;
+const LIMITED_VERIFY_CHUNK_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CountKind {
@@ -74,7 +75,23 @@ impl VerifyPlan {
         F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
     {
         validate_doc_ids(doc_count, candidate_ids)?;
-        if max_results.is_none() && should_parallel_verify(candidate_ids.len()) {
+        if let Some(limit) = max_results {
+            if should_parallel_verify(candidate_ids.len()) {
+                self.verify_candidate_counts_with_parallel_limit(
+                    candidate_ids,
+                    doc_count,
+                    resolve_source,
+                    limit,
+                )
+            } else {
+                self.verify_candidate_counts_serial(
+                    candidate_ids,
+                    doc_count,
+                    resolve_source,
+                    Some(limit),
+                )
+            }
+        } else if should_parallel_verify(candidate_ids.len()) {
             let results = candidate_ids
                 .par_iter()
                 .enumerate()
@@ -105,25 +122,92 @@ impl VerifyPlan {
             counts.sort_unstable_by_key(|count| count.ordinal);
             Ok(counts.into_iter().map(|count| count.count).collect())
         } else {
-            let mut runtime = self.create_runtime();
-            let mut counts = Vec::new();
-            for &doc_id in candidate_ids {
-                validate_doc_id(doc_count, doc_id)?;
-                let source = resolve_source(doc_id)?;
-                let stats = runtime.verify_source(&source)?;
-                if stats.has_match() {
-                    counts.push(DocMatchCount {
-                        doc_id,
-                        matched_lines: stats.matched_lines,
-                        matched_occurrences: stats.matched_occurrences,
-                    });
-                    if max_results.is_some_and(|limit| counts.len() >= limit) {
-                        break;
-                    }
+            self.verify_candidate_counts_serial(candidate_ids, doc_count, resolve_source, None)
+        }
+    }
+
+    fn verify_candidate_counts_serial<F>(
+        &self,
+        candidate_ids: &[u32],
+        doc_count: usize,
+        resolve_source: &F,
+        max_results: Option<usize>,
+    ) -> Result<Vec<DocMatchCount>>
+    where
+        F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
+    {
+        let mut runtime = self.create_runtime();
+        let mut counts = Vec::new();
+        for &doc_id in candidate_ids {
+            validate_doc_id(doc_count, doc_id)?;
+            let source = resolve_source(doc_id)?;
+            let stats = runtime.verify_source(&source)?;
+            if stats.has_match() {
+                counts.push(DocMatchCount {
+                    doc_id,
+                    matched_lines: stats.matched_lines,
+                    matched_occurrences: stats.matched_occurrences,
+                });
+                if max_results.is_some_and(|limit| counts.len() >= limit) {
+                    break;
                 }
             }
-            Ok(counts)
         }
+        Ok(counts)
+    }
+
+    fn verify_candidate_counts_with_parallel_limit<F>(
+        &self,
+        candidate_ids: &[u32],
+        doc_count: usize,
+        resolve_source: &F,
+        max_results: usize,
+    ) -> Result<Vec<DocMatchCount>>
+    where
+        F: Fn(u32) -> Result<VerifyCandidateSource> + Sync,
+    {
+        let mut counts = Vec::new();
+        for (chunk_index, chunk) in candidate_ids.chunks(LIMITED_VERIFY_CHUNK_SIZE).enumerate() {
+            if counts.len() >= max_results {
+                break;
+            }
+            let base_ordinal = chunk_index * LIMITED_VERIFY_CHUNK_SIZE;
+            let results = chunk
+                .par_iter()
+                .enumerate()
+                .map_init(
+                    || self.create_runtime(),
+                    |runtime, (offset, &doc_id)| {
+                        validate_doc_id(doc_count, doc_id)?;
+                        let source = resolve_source(doc_id)?;
+                        let stats = runtime.verify_source(&source)?;
+                        Ok(stats.has_match().then_some(OrdinalDocMatchCount {
+                            ordinal: base_ordinal + offset,
+                            count: DocMatchCount {
+                                doc_id,
+                                matched_lines: stats.matched_lines,
+                                matched_occurrences: stats.matched_occurrences,
+                            },
+                        }))
+                    },
+                )
+                .collect::<Vec<Result<Option<OrdinalDocMatchCount>>>>();
+
+            let mut chunk_counts = Vec::new();
+            for result in results {
+                if let Some(count) = result? {
+                    chunk_counts.push(count);
+                }
+            }
+            chunk_counts.sort_unstable_by_key(|count| count.ordinal);
+            for count in chunk_counts {
+                if counts.len() >= max_results {
+                    break;
+                }
+                counts.push(count.count);
+            }
+        }
+        Ok(counts)
     }
 
     fn create_runtime(&self) -> VerifyRuntime<'_> {

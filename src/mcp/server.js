@@ -6,7 +6,7 @@ const { spawn } = require("node:child_process");
 
 const JSONRPC_VERSION = "2.0";
 const MCP_SERVER_NAME = "flashgrep-mcp";
-const MCP_SERVER_VERSION = "0.1.0";
+const MCP_SERVER_VERSION = "0.2.9";
 const SUPPORTED_PROTOCOL_VERSIONS = [
   "2025-11-25",
   "2025-06-18",
@@ -869,9 +869,11 @@ function toolDefinitions() {
           word_regexp: schemaBool("Require word boundaries around matches."),
           line_regexp: schemaBool("Require the whole line to match."),
           top_k_tokens: schemaInteger("Planner token budget. Default is 6."),
-          max_count: schemaNullableInteger("Per-pattern result cap."),
+          max_count: schemaNullableInteger(
+            "Per-file match cap, mirroring ripgrep --max-count. In line_matches mode this limits matching lines returned per file; use global_max_results to cap total returned results.",
+          ),
           global_max_results: schemaNullableInteger(
-            "Global result cap for the selected search mode. Defaults to 100.",
+            "Global result cap for the selected search mode. Defaults to 100. Caps returned lines for line_matches, paths for files_with_matches, file_counts for count_only, and file_match_counts for count_matches.",
           ),
           search_mode: {
             type: "string",

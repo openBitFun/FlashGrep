@@ -512,12 +512,15 @@ impl IndexSnapshotReader {
 mod tests {
     use std::sync::Arc;
 
+    use tempfile::tempdir;
+
     use super::document_matches_literal_sequence_plan;
     use crate::{
         index_engine::{
             query::{QueryFilters, QueryPlan, QueryRequest},
-            types::{DocKey, RepoId},
+            types::{DocKey, RepoId, ShardId},
             writer::IndexDocument,
+            EngineConfig, IndexEngine,
         },
         search::SearchMode,
         TokenizerMode,
@@ -551,6 +554,14 @@ mod tests {
             top_k: None,
             filters: QueryFilters::default(),
             prefer_worktree_for_git_head_blob: false,
+        }
+    }
+
+    fn request_with_mode(pattern: &str, mode: SearchMode, top_k: Option<usize>) -> QueryRequest {
+        QueryRequest {
+            mode,
+            top_k,
+            ..request(pattern, false)
         }
     }
 
@@ -599,5 +610,84 @@ mod tests {
             &doc("xx bar yy foo zz"),
             &plan
         ));
+    }
+
+    #[test]
+    fn multi_segment_count_modes_honor_global_result_limit() {
+        let temp = tempdir().expect("temp dir should succeed");
+        let engine = IndexEngine::open(EngineConfig {
+            shard_id: ShardId("limit-test".into()),
+            index_root: temp.path().join("index"),
+            tokenizer: trigram_tokenizer(),
+            ..EngineConfig::default()
+        })
+        .expect("engine should open");
+        let repo_id = RepoId("repo".into());
+
+        for segment in 0..2 {
+            for index in 0..30 {
+                let logical_path = format!("seg{segment}/file_{index:02}.txt");
+                engine
+                    .writer()
+                    .add_document(IndexDocument {
+                        key: DocKey {
+                            repo_id: repo_id.clone(),
+                            logical_path: logical_path.clone(),
+                        },
+                        repo_id: repo_id.clone(),
+                        logical_path,
+                        file_name: format!("file_{index:02}.txt"),
+                        language: Some("txt".into()),
+                        size: 6,
+                        modified_at: 0,
+                        content_hash: [0; 32],
+                        source_bytes: Arc::<[u8]>::from(b"MATCH\n".to_vec()),
+                    })
+                    .expect("document should add");
+            }
+            engine.writer().commit().expect("segment should commit");
+        }
+
+        assert_eq!(
+            engine
+                .admin()
+                .manifest()
+                .expect("manifest should load")
+                .active_segments
+                .len(),
+            2
+        );
+        let reader = engine
+            .reader()
+            .open_committed()
+            .expect("reader should open");
+
+        let files = reader
+            .search(&request_with_mode(
+                "MATCH",
+                SearchMode::FilesWithMatches,
+                Some(20),
+            ))
+            .expect("files search should succeed");
+        assert_eq!(files.searches_with_match, 20);
+        assert_eq!(files.matched_paths.len(), 20);
+
+        let line_counts = reader
+            .search(&request_with_mode("MATCH", SearchMode::CountOnly, Some(20)))
+            .expect("count search should succeed");
+        assert_eq!(line_counts.searches_with_match, 20);
+        assert_eq!(line_counts.file_counts.len(), 20);
+        assert_eq!(line_counts.matched_lines, 20);
+
+        let occurrence_counts = reader
+            .search(&request_with_mode(
+                "MATCH",
+                SearchMode::CountMatches,
+                Some(20),
+            ))
+            .expect("count matches search should succeed");
+        assert_eq!(occurrence_counts.searches_with_match, 20);
+        assert_eq!(occurrence_counts.file_match_counts.len(), 20);
+        assert_eq!(occurrence_counts.matched_occurrences, 20);
     }
 }
