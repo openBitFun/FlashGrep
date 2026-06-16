@@ -153,8 +153,7 @@ impl RepoRuntime {
             Ok(Some(snapshot_key)) => {
                 let plan = match self.plan_overlay_update_from_incremental_probe()? {
                     Some(plan) => Some(plan),
-                    None if self.build_config.repo_path.join(".git").exists()
-                        && self.workspace_watcher_active()
+                    None if self.workspace_watcher_active()
                         && self.dirty_catalog_pending_paths().is_empty()
                         && self.snapshot_published_overlay_paths()?.is_some() =>
                     {
@@ -190,39 +189,8 @@ impl RepoRuntime {
     }
 
     pub(super) fn probe_workspace_overlay_from_events(&self) -> Result<bool> {
-        let observed = self.take_workspace_events();
-        if observed.force_full_rescan {
-            return self.probe_workspace_overlay();
-        }
-        match self.current_base_snapshot_key() {
-            Ok(Some(snapshot_key)) => {
-                if let Some(plan) = self.plan_overlay_update_from_observed_paths(
-                    &observed.paths.into_iter().collect::<Vec<_>>(),
-                )? {
-                    self.apply_refreshed_overlay(snapshot_key, plan);
-                } else {
-                    self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
-                }
-                Ok(true)
-            }
-            Ok(None) => {
-                self.apply_missing_base_overlay_state(None);
-                Ok(true)
-            }
-            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                self.apply_missing_base_overlay_state(None);
-                Ok(true)
-            }
-            Err(AppError::InvalidIndex(error)) => {
-                self.apply_missing_base_overlay_state(Some(error));
-                Ok(true)
-            }
-            Err(error) => {
-                self.set_probe_healthy(false);
-                self.set_phase(RepoPhase::Degraded, Some(error.to_string()));
-                Err(error)
-            }
-        }
+        let _ = self.take_workspace_events();
+        self.probe_workspace_overlay()
     }
 
     fn apply_refreshed_overlay(

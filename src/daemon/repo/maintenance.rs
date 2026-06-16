@@ -26,9 +26,7 @@ const MAINTENANCE_REASON_BASE_REBUILD: u32 = 1 << 3;
 const MAINTENANCE_REASON_BASE_PROMOTE: u32 = 1 << 4;
 const GIT_WORKSPACE_EVENT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
-const NON_GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(5);
 const GIT_WORKSPACE_POLL_FALLBACK_INTERVAL: Duration = Duration::from_millis(100);
-const NON_GIT_WORKSPACE_POLL_FALLBACK_INTERVAL: Duration = Duration::from_secs(2);
 const AUTO_BASE_REBUILD_MIN_DELAY: Duration = Duration::from_secs(2);
 const AUTO_BASE_REBUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
 
@@ -246,18 +244,10 @@ impl RepoRuntime {
     }
 
     pub(super) fn workspace_probe_interval(&self) -> Duration {
-        if self.build_config.repo_path.join(".git").exists() {
-            if self.workspace_watcher_active() {
-                GIT_WORKSPACE_RECONCILE_INTERVAL
-            } else {
-                GIT_WORKSPACE_POLL_FALLBACK_INTERVAL
-            }
+        if self.workspace_watcher_active() {
+            GIT_WORKSPACE_RECONCILE_INTERVAL
         } else {
-            if self.workspace_watcher_active() {
-                NON_GIT_WORKSPACE_RECONCILE_INTERVAL
-            } else {
-                NON_GIT_WORKSPACE_POLL_FALLBACK_INTERVAL
-            }
+            GIT_WORKSPACE_POLL_FALLBACK_INTERVAL
         }
     }
 

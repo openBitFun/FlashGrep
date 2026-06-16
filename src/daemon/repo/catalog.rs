@@ -1,5 +1,5 @@
 use std::{
-    collections::{BTreeSet, HashSet},
+    collections::HashSet,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -10,16 +10,15 @@ use crate::{
     config::CorpusMode,
     error::{AppError, Result},
     files::{
-        is_corpus_text_file, is_text_file, is_workspace_internal_path, repo_relative_path,
-        resolve_repo_path, scan_paths, ScanOptions,
+        is_corpus_text_file, is_workspace_internal_path, repo_relative_path, resolve_repo_path,
     },
     git_snapshot::{canonical_repo_root, resolve_git_head},
     index_engine::{
         reader::SnapshotPathCatalog, workspace::WorkspaceBaseSnapshotMetadata,
         WorkspaceBaseSnapshotIndex,
     },
-    path_filter::{PathFilter, PathFilterArgs},
     search_engine::SearchDocument,
+    worktree_diff::DirtyPathKind,
 };
 
 use super::{
@@ -67,37 +66,6 @@ impl RepoRuntime {
         //   Delta publish can add/update/delete overlay entries, but it cannot retract already
         //   published overlay-visible paths that should disappear entirely.
         // - Otherwise publish only the pending delta paths.
-        match decide_overlay_update_mode(
-            &dirty,
-            &published_overlay_paths,
-            &pending_dirty,
-            published_overlay_snapshot_available,
-        ) {
-            OverlayUpdateMode::NoChange => Ok(None),
-            OverlayUpdateMode::Rebuild => self.build_overlay_rebuild_plan(dirty).map(Some),
-            OverlayUpdateMode::ApplyDelta => self
-                .build_overlay_delta_plan(dirty, pending_dirty)
-                .map(Some),
-        }
-    }
-
-    pub(super) fn plan_overlay_update_from_observed_paths(
-        &self,
-        observed_paths: &[PathBuf],
-    ) -> Result<Option<WorkspaceOverlayWritePlan>> {
-        let Some(catalog) = self.base_snapshot_catalog()? else {
-            return Ok(None);
-        };
-        let Some(dirty) =
-            self.diff_against_base_snapshot_observed_paths(&catalog, observed_paths)?
-        else {
-            return Ok(None);
-        };
-        self.reconcile_dirty_catalog(&dirty)?;
-        let published_overlay_paths = self.published_overlay_paths()?;
-        let pending_dirty = self.dirty_catalog_pending_paths();
-        let published_overlay_snapshot_available =
-            self.snapshot_published_overlay_paths()?.is_some() || dirty.is_empty();
         match decide_overlay_update_mode(
             &dirty,
             &published_overlay_paths,
@@ -250,225 +218,49 @@ impl RepoRuntime {
     }
 
     fn diff_against_base_snapshot_worktree(&self) -> Result<DirtyPathSet> {
-        if let Some(dirty) = self.fast_empty_dirty_diff_from_git()? {
-            return Ok(dirty);
-        }
-
-        let Some(catalog) = self.base_snapshot_catalog()? else {
-            return Ok(DirtyPathSet::default());
-        };
-
-        if let Some(git_dirty) = self.diff_against_base_snapshot_git_worktree(&catalog)? {
-            return Ok(git_dirty);
-        }
-
-        let scanned = scan_paths(
-            std::slice::from_ref(&self.build_config.repo_path),
-            Some(&self.build_config.storage_root),
-            ScanOptions {
-                respect_ignore: matches!(self.build_config.corpus_mode, CorpusMode::RespectIgnore),
-                include_hidden: self.build_config.include_hidden,
-                max_file_size: self.build_config.max_file_size,
-                max_depth: None,
-                ignore_files: Vec::new(),
-            },
-            None,
-        )?;
-
-        let mut dirty = DirtyPathSet::default();
-        let mut seen = HashSet::new();
-
-        for file in scanned {
-            let logical_path = repo_relative_path(&file.path, &self.build_config.repo_path);
-            match catalog.get(&logical_path) {
-                Some(entry) => {
-                    if entry.size == file.size
-                        && (entry.modified_at == file.mtime_nanos
-                            || current_file_content_hash(&file.path)? == entry.content_hash)
-                    {
-                        seen.insert(logical_path);
-                        continue;
-                    }
-                    if !is_text_file(&file.path)? {
-                        continue;
-                    }
-                    seen.insert(logical_path);
-                    let absolute_path = file.path.to_string_lossy().into_owned();
-                    dirty.modified.insert(absolute_path);
-                }
-                None => {
-                    if !is_text_file(&file.path)? {
-                        continue;
-                    }
-                    seen.insert(logical_path);
-                    let absolute_path = file.path.to_string_lossy().into_owned();
-                    dirty.new.insert(absolute_path);
-                }
-            }
-        }
-
-        for (logical_path, _) in catalog.iter() {
-            if seen.contains(logical_path) {
-                continue;
-            }
-            dirty.deleted.insert(
-                resolve_repo_path(&self.build_config.repo_path, logical_path)
-                    .to_string_lossy()
-                    .into_owned(),
-            );
-        }
-
-        Ok(dirty)
+        self.diff_against_base_snapshot_git_worktree()
     }
 
     fn diff_against_base_snapshot_incremental(&self) -> Result<Option<DirtyPathSet>> {
-        if let Some(dirty) = self.fast_empty_dirty_diff_from_git()? {
-            return Ok(Some(dirty));
-        }
-
-        let Some(catalog) = self.base_snapshot_catalog()? else {
-            return Ok(None);
-        };
-
-        self.diff_against_base_snapshot_git_worktree(&catalog)
+        self.diff_against_base_snapshot_git_worktree().map(Some)
     }
 
-    fn diff_against_base_snapshot_observed_paths(
-        &self,
-        catalog: &SnapshotPathCatalog,
-        observed_paths: &[PathBuf],
-    ) -> Result<Option<DirtyPathSet>> {
-        let affected_paths = self.expand_observed_paths(catalog, observed_paths)?;
-        if affected_paths.is_empty() {
-            return Ok(None);
-        }
-
-        let mut dirty = self.dirty_catalog_visible_paths();
-        for path in affected_paths {
-            match self.classify_current_path_against_base_snapshot(&path, catalog)? {
-                Some(kind) => {
-                    dirty.upsert(path, kind);
-                }
-                None => {
-                    dirty.remove(&path);
-                }
-            }
-        }
-        Ok(Some(dirty))
-    }
-
-    fn fast_empty_dirty_diff_from_git(&self) -> Result<Option<DirtyPathSet>> {
-        if !matches!(self.build_config.corpus_mode, CorpusMode::RespectIgnore) {
-            return Ok(None);
-        }
+    fn diff_against_base_snapshot_git_worktree(&self) -> Result<DirtyPathSet> {
         let Some(base_metadata) =
             WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
         else {
-            return Ok(None);
-        };
-        let Some(base_head_commit) = base_metadata
-            .head_commit
-            .clone()
-            .or_else(|| base_metadata.revision.map(|revision| revision.0))
-        else {
-            return Ok(None);
-        };
-
-        let mut should_cancel = || false;
-        let current_head_commit =
-            resolve_git_head(&self.build_config.repo_path, &mut should_cancel)?;
-        if current_head_commit.as_deref() != Some(base_head_commit.as_str()) {
-            return Ok(None);
-        }
-
-        let tracked_paths = match self.git_visible_paths([
-            "diff",
-            "--name-only",
-            "-z",
-            base_head_commit.as_str(),
-            "--",
-            ".",
-        ]) {
-            Ok(paths) => paths,
-            Err(_) => return Ok(None),
-        };
-        if !tracked_paths.is_empty() {
-            return Ok(None);
-        }
-        let untracked_paths = match self.git_visible_paths([
-            "ls-files",
-            "-z",
-            "--others",
-            "--exclude-standard",
-            "--",
-            ".",
-        ]) {
-            Ok(paths) => paths,
-            Err(_) => return Ok(None),
-        };
-        if !untracked_paths.is_empty()
-            && !self
-                .classify_paths_against_base_snapshot(untracked_paths)?
-                .new
-                .is_empty()
-        {
-            return Ok(None);
-        }
-
-        Ok(Some(DirtyPathSet::default()))
-    }
-
-    fn diff_against_base_snapshot_git_worktree(
-        &self,
-        catalog: &SnapshotPathCatalog,
-    ) -> Result<Option<DirtyPathSet>> {
-        if !matches!(self.build_config.corpus_mode, CorpusMode::RespectIgnore) {
-            return Ok(None);
-        }
-        let Some(base_metadata) =
-            WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
-        else {
-            return Ok(None);
+            return Ok(DirtyPathSet::default());
         };
         let Some(head_commit) = base_metadata
             .head_commit
             .clone()
             .or_else(|| base_metadata.revision.map(|revision| revision.0))
         else {
-            return Ok(None);
+            return Err(AppError::InvalidIndex(format!(
+                "daemon dirty probe requires a Git HEAD base snapshot for {}",
+                self.build_config.repo_path.display()
+            )));
         };
 
-        let tracked_paths = match self.git_visible_paths([
-            "diff",
-            "--name-only",
-            "-z",
-            head_commit.as_str(),
-            "--",
-            ".",
-        ]) {
-            Ok(paths) => paths,
-            Err(_) => return Ok(None),
-        };
-        let untracked_visible_paths = match self.git_visible_paths([
-            "ls-files",
-            "-z",
-            "--others",
-            "--exclude-standard",
-            "--",
-            ".",
-        ]) {
-            Ok(paths) => paths,
-            Err(_) => return Ok(None),
-        };
+        let tracked_changes = self.git_tracked_dirty_paths(&head_commit)?;
+        let untracked_visible_paths = self.git_untracked_visible_paths()?;
 
-        let mut dirty = self.classify_paths_against_base_snapshot(tracked_paths)?;
-        let untracked_candidates = untracked_visible_paths
-            .into_iter()
-            .filter(|path| self.path_is_missing_from_base_catalog(path, catalog))
-            .collect::<Vec<_>>();
-        dirty.merge(self.classify_paths_against_base_snapshot(untracked_candidates)?);
+        let mut dirty = DirtyPathSet::default();
+        let mut tracked_current_paths = Vec::new();
+        for (path, kind) in tracked_changes {
+            match kind {
+                DirtyPathKind::Deleted => {
+                    dirty.upsert(path, DirtyPathKind::Deleted);
+                }
+                DirtyPathKind::Modified | DirtyPathKind::New => {
+                    tracked_current_paths.push(path);
+                }
+            }
+        }
+        dirty.merge(self.classify_paths_against_base_snapshot(tracked_current_paths)?);
+        dirty.merge(self.classify_paths_against_base_snapshot(untracked_visible_paths)?);
 
-        Ok(Some(dirty))
+        Ok(dirty)
     }
 
     fn classify_paths_against_base_snapshot<I>(&self, paths: I) -> Result<DirtyPathSet>
@@ -524,51 +316,6 @@ impl RepoRuntime {
         Ok(dirty)
     }
 
-    fn classify_current_path_against_base_snapshot(
-        &self,
-        path: &str,
-        catalog: &SnapshotPathCatalog,
-    ) -> Result<Option<crate::worktree_diff::DirtyPathKind>> {
-        let path_ref = Path::new(path);
-        let Some(logical_path) = self.logical_repo_path(path_ref) else {
-            return Ok(None);
-        };
-
-        match catalog.get(&logical_path) {
-            Some(entry) => match fs::metadata(path_ref) {
-                Ok(metadata) => {
-                    if !self.current_path_matches_corpus(path_ref)? {
-                        return Ok(Some(crate::worktree_diff::DirtyPathKind::Deleted));
-                    }
-                    let modified_at = file_mtime_nanos(&metadata);
-                    if metadata.len() != entry.size {
-                        return Ok(Some(crate::worktree_diff::DirtyPathKind::Modified));
-                    }
-                    if modified_at == entry.modified_at {
-                        return Ok(None);
-                    }
-                    let content_hash = current_file_content_hash(path_ref)?;
-                    if content_hash != entry.content_hash {
-                        Ok(Some(crate::worktree_diff::DirtyPathKind::Modified))
-                    } else {
-                        Ok(None)
-                    }
-                }
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    Ok(Some(crate::worktree_diff::DirtyPathKind::Deleted))
-                }
-                Err(error) => Err(error.into()),
-            },
-            None => {
-                if self.current_path_matches_corpus(path_ref)? {
-                    Ok(Some(crate::worktree_diff::DirtyPathKind::New))
-                } else {
-                    Ok(None)
-                }
-            }
-        }
-    }
-
     pub(super) fn load_known_corpus_search_document(
         &self,
         path: &str,
@@ -621,45 +368,12 @@ impl RepoRuntime {
             return Ok(false);
         }
 
-        if matches!(self.build_config.corpus_mode, CorpusMode::RespectIgnore) {
-            let Some(parent) = path.parent() else {
-                return Ok(false);
-            };
-            let filter = PathFilter::new(
-                PathFilterArgs {
-                    roots: vec![path.to_path_buf()],
-                    ..PathFilterArgs::default()
-                },
-                &self.build_config.repo_path,
-            )?;
-            let scanned = scan_paths(
-                &[parent.to_path_buf()],
-                Some(&self.build_config.storage_root),
-                ScanOptions {
-                    respect_ignore: true,
-                    include_hidden: self.build_config.include_hidden,
-                    max_file_size: self.build_config.max_file_size,
-                    max_depth: Some(1),
-                    ignore_files: Vec::new(),
-                },
-                Some(&filter),
-            )?;
-            if scanned.is_empty() {
-                return Ok(false);
-            }
-        }
-
         is_corpus_text_file(path)
     }
 
     fn logical_repo_path(&self, path: &Path) -> Option<String> {
         path.starts_with(&self.build_config.repo_path)
             .then(|| repo_relative_path(path, &self.build_config.repo_path))
-    }
-
-    fn path_is_missing_from_base_catalog(&self, path: &str, catalog: &SnapshotPathCatalog) -> bool {
-        self.logical_repo_path(Path::new(path))
-            .is_none_or(|logical_path| catalog.get(&logical_path).is_none())
     }
 
     fn path_is_hidden_for_build(&self, path: &Path) -> bool {
@@ -672,137 +386,7 @@ impl RepoRuntime {
         })
     }
 
-    fn expand_observed_paths(
-        &self,
-        catalog: &SnapshotPathCatalog,
-        observed_paths: &[PathBuf],
-    ) -> Result<BTreeSet<String>> {
-        let current_dirty = self.dirty_catalog_visible_paths();
-        let mut affected_paths = BTreeSet::new();
-        for observed_path in observed_paths {
-            if observed_path == &self.build_config.repo_path {
-                return Ok(BTreeSet::new());
-            }
-            let path = if observed_path.is_absolute() {
-                observed_path.clone()
-            } else {
-                self.build_config.repo_path.join(observed_path)
-            };
-            if !path.starts_with(&self.build_config.repo_path)
-                || is_workspace_internal_path(&path)
-                || self.is_storage_path(&path)
-            {
-                continue;
-            }
-            match fs::metadata(&path) {
-                Ok(metadata) if metadata.is_file() => {
-                    affected_paths.insert(path.to_string_lossy().into_owned());
-                }
-                Ok(metadata) if metadata.is_dir() => {
-                    self.collect_directory_paths(
-                        &path,
-                        catalog,
-                        &current_dirty,
-                        &mut affected_paths,
-                    )?;
-                }
-                Ok(_) => {}
-                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                    let logical_path = self
-                        .logical_repo_path(&path)
-                        .unwrap_or_else(|| repo_relative_path(&path, &self.build_config.repo_path));
-                    let absolute_path = path.to_string_lossy().into_owned();
-                    if catalog.get(&logical_path).is_some()
-                        || current_dirty.kind_for_path(&absolute_path).is_some()
-                    {
-                        affected_paths.insert(absolute_path);
-                    }
-                    if catalog.has_path_under(&logical_path) {
-                        self.collect_catalog_paths_under(
-                            &logical_path,
-                            catalog,
-                            &mut affected_paths,
-                        );
-                    }
-                    self.collect_current_dirty_paths_under(
-                        &path,
-                        &current_dirty,
-                        &mut affected_paths,
-                    );
-                }
-                Err(error) => return Err(error.into()),
-            }
-        }
-        Ok(affected_paths)
-    }
-
-    fn collect_directory_paths(
-        &self,
-        path: &Path,
-        catalog: &SnapshotPathCatalog,
-        current_dirty: &DirtyPathSet,
-        affected_paths: &mut BTreeSet<String>,
-    ) -> Result<()> {
-        if let Some(logical_path) = self.logical_repo_path(path) {
-            self.collect_catalog_paths_under(&logical_path, catalog, affected_paths);
-        }
-        self.collect_current_dirty_paths_under(path, current_dirty, affected_paths);
-        let scanned = scan_paths(
-            &[path.to_path_buf()],
-            Some(&self.build_config.storage_root),
-            ScanOptions {
-                respect_ignore: matches!(self.build_config.corpus_mode, CorpusMode::RespectIgnore),
-                include_hidden: self.build_config.include_hidden,
-                max_file_size: self.build_config.max_file_size,
-                max_depth: None,
-                ignore_files: Vec::new(),
-            },
-            None,
-        )?;
-        for file in scanned {
-            affected_paths.insert(file.path.to_string_lossy().into_owned());
-        }
-        Ok(())
-    }
-
-    fn collect_catalog_paths_under(
-        &self,
-        logical_directory: &str,
-        catalog: &SnapshotPathCatalog,
-        affected_paths: &mut BTreeSet<String>,
-    ) {
-        let prefix = logical_directory_prefix(logical_directory);
-        for (logical_path, _) in catalog.iter() {
-            if logical_path == logical_directory || logical_path.starts_with(&prefix) {
-                affected_paths.insert(
-                    resolve_repo_path(&self.build_config.repo_path, logical_path)
-                        .to_string_lossy()
-                        .into_owned(),
-                );
-            }
-        }
-    }
-
-    fn collect_current_dirty_paths_under(
-        &self,
-        path: &Path,
-        current_dirty: &DirtyPathSet,
-        affected_paths: &mut BTreeSet<String>,
-    ) {
-        let prefix = directory_prefix(path);
-        for dirty_path in current_dirty
-            .modified
-            .iter()
-            .chain(current_dirty.deleted.iter())
-            .chain(current_dirty.new.iter())
-        {
-            if dirty_path.starts_with(&prefix) {
-                affected_paths.insert(dirty_path.clone());
-            }
-        }
-    }
-
-    fn git_visible_paths<const N: usize>(&self, args: [&str; N]) -> Result<Vec<String>> {
+    fn git_output<const N: usize>(&self, args: [&str; N]) -> Result<Vec<u8>> {
         let mut command = Command::new("git");
         command
             .arg("-C")
@@ -819,8 +403,54 @@ impl RepoRuntime {
             )));
         }
 
+        Ok(output.stdout)
+    }
+
+    fn git_tracked_dirty_paths(&self, head_commit: &str) -> Result<Vec<(String, DirtyPathKind)>> {
+        let output = self.git_output([
+            "diff",
+            "--name-status",
+            "-z",
+            "--no-renames",
+            head_commit,
+            "--",
+            ".",
+        ])?;
+        Ok(parse_git_name_status_z(&output)
+            .into_iter()
+            .filter_map(|(status, logical_path)| {
+                let path = resolve_repo_path(&self.build_config.repo_path, &logical_path);
+                if is_workspace_internal_path(&path) || self.is_storage_path(&path) {
+                    return None;
+                }
+                if !self.build_config.include_hidden && self.path_is_hidden_for_build(&path) {
+                    return None;
+                }
+                let kind = if status.starts_with('D') {
+                    DirtyPathKind::Deleted
+                } else if status.starts_with('A') {
+                    DirtyPathKind::New
+                } else {
+                    DirtyPathKind::Modified
+                };
+                Some((path.to_string_lossy().into_owned(), kind))
+            })
+            .collect())
+    }
+
+    fn git_untracked_visible_paths(&self) -> Result<Vec<String>> {
+        let output = match self.build_config.corpus_mode {
+            CorpusMode::RespectIgnore => self.git_output([
+                "ls-files",
+                "-z",
+                "--others",
+                "--exclude-standard",
+                "--",
+                ".",
+            ])?,
+            CorpusMode::NoIgnore => self.git_output(["ls-files", "-z", "--others", "--", "."])?,
+        };
         Ok(output
-            .stdout
             .split(|byte| *byte == 0)
             .filter(|path| !path.is_empty())
             .map(|path| {
@@ -846,20 +476,28 @@ impl RepoRuntime {
     }
 }
 
-fn logical_directory_prefix(logical_directory: &str) -> String {
-    if logical_directory.is_empty() {
-        String::new()
-    } else {
-        format!("{logical_directory}{}", std::path::MAIN_SEPARATOR)
-    }
-}
+fn parse_git_name_status_z(output: &[u8]) -> Vec<(String, String)> {
+    let mut parsed = Vec::new();
+    let mut records = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
 
-fn directory_prefix(path: &Path) -> String {
-    let mut prefix = path.to_string_lossy().into_owned();
-    if !prefix.ends_with(std::path::MAIN_SEPARATOR) {
-        prefix.push(std::path::MAIN_SEPARATOR);
+    while let Some(record) = records.next() {
+        if let Some(tab_index) = record.iter().position(|byte| *byte == b'\t') {
+            let status = String::from_utf8_lossy(&record[..tab_index]).into_owned();
+            let path = String::from_utf8_lossy(&record[tab_index + 1..]).into_owned();
+            parsed.push((status, path));
+            continue;
+        }
+
+        let status = String::from_utf8_lossy(record).into_owned();
+        let Some(path) = records.next() else {
+            break;
+        };
+        parsed.push((status, String::from_utf8_lossy(path).into_owned()));
     }
-    prefix
+
+    parsed
 }
 
 fn file_mtime_nanos(metadata: &fs::Metadata) -> u64 {

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
     thread,
@@ -20,8 +19,7 @@ const LINUX_INOTIFY_WATCH_BUDGET_PERCENT: u64 = 75;
 
 #[derive(Debug, Default)]
 pub(super) struct WorkspaceEventBuffer {
-    pub(super) paths: HashSet<PathBuf>,
-    pub(super) force_full_rescan: bool,
+    pub(super) observed: bool,
 }
 
 impl RepoRuntime {
@@ -45,7 +43,7 @@ impl RepoRuntime {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        buffer.force_full_rescan || !buffer.paths.is_empty()
+        buffer.observed
     }
 
     pub(super) fn take_workspace_events(&self) -> WorkspaceEventBuffer {
@@ -109,7 +107,7 @@ impl RepoRuntime {
                         "flashgrep[watch][warn] workspace watcher error for {}: {error}",
                         self.build_config.repo_path.display()
                     );
-                    self.enqueue_workspace_events(Vec::new(), true);
+                    self.enqueue_workspace_events();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -129,44 +127,34 @@ impl RepoRuntime {
             return;
         }
 
-        let mut saw_repo_root = false;
+        let mut observed = false;
         let mut paths = Vec::new();
         for path in event.paths {
             if path == self.build_config.repo_path {
-                saw_repo_root = true;
+                observed = true;
                 continue;
             }
             if let Some(path) = self.normalize_workspace_watch_path(&path) {
                 paths.push(path);
             }
         }
-        let mut force_full_rescan = saw_repo_root && paths.is_empty();
         if paths.len() > 4_096 {
-            force_full_rescan = true;
             paths.clear();
         }
-        if !force_full_rescan && paths.is_empty() {
+        observed |= !paths.is_empty();
+        if !observed {
             return;
         }
-        self.enqueue_workspace_events(paths, force_full_rescan);
+        self.enqueue_workspace_events();
     }
 
-    fn enqueue_workspace_events(&self, paths: Vec<PathBuf>, force_full_rescan: bool) {
+    fn enqueue_workspace_events(&self) {
         let mut buffer = match self.workspace_event_buffer.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let mut changed = false;
-        if force_full_rescan && !buffer.force_full_rescan {
-            buffer.force_full_rescan = true;
-            buffer.paths.clear();
-            changed = true;
-        }
-        if !buffer.force_full_rescan {
-            for path in paths {
-                changed |= buffer.paths.insert(path);
-            }
-        }
+        let changed = !buffer.observed;
+        buffer.observed = true;
         drop(buffer);
         if !changed {
             return;

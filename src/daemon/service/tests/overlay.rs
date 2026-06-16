@@ -572,6 +572,97 @@ fn probe_tracks_new_text_files() {
 }
 
 #[test]
+fn probe_respect_ignore_skips_ignored_untracked_files() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(repo_path.join(".gitignore"), "ignored.rs\n").expect("write should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const NAME: &str = \"BASE\";\n",
+    )
+    .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let repo_id = match service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: None,
+                config: RepoConfig {
+                    corpus_mode: crate::daemon::protocol::CorpusModeConfig::RespectIgnore,
+                    ..RepoConfig::default()
+                },
+                refresh: Default::default(),
+            },
+        })
+        .expect("open repo should succeed")
+    {
+        Response::RepoOpened { repo_id, .. } => repo_id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    build_repo(&service, &repo_id);
+
+    fs::write(
+        repo_path.join("ignored.rs"),
+        "const NAME: &str = \"IGNORED_UNTRACKED\";\n",
+    )
+    .expect("write should succeed");
+
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let (backend, _) = wait_for_search_count(&service, &repo_id, "IGNORED_UNTRACKED", 0);
+    assert!(matches!(backend, SearchBackend::IndexedClean));
+}
+
+#[test]
+fn probe_no_ignore_tracks_ignored_untracked_files() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(repo_path.join(".gitignore"), "ignored.rs\n").expect("write should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const NAME: &str = \"BASE\";\n",
+    )
+    .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let repo_id = match service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: None,
+                config: RepoConfig {
+                    corpus_mode: crate::daemon::protocol::CorpusModeConfig::NoIgnore,
+                    ..RepoConfig::default()
+                },
+                refresh: Default::default(),
+            },
+        })
+        .expect("open repo should succeed")
+    {
+        Response::RepoOpened { repo_id, .. } => repo_id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    build_repo(&service, &repo_id);
+
+    fs::write(
+        repo_path.join("ignored.rs"),
+        "const NAME: &str = \"IGNORED_UNTRACKED\";\n",
+    )
+    .expect("write should succeed");
+
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "IGNORED_UNTRACKED", 1);
+    assert!(is_transition_or_indexed_workspace_backend(backend));
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+}
+
+#[test]
 fn probe_tracks_new_text_files_inside_new_directory_without_extra_probe() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
