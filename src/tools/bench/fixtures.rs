@@ -2,6 +2,7 @@ use std::{
     collections::BTreeSet,
     fs,
     path::{Path, PathBuf},
+    process::Command,
     thread,
 };
 
@@ -68,6 +69,9 @@ pub(super) fn prepare_dirty_worktree_fixture(
         copy_file(source_path, &target)?;
         (target.clone(), vec![target])
     };
+    if repo_path.is_dir() {
+        ensure_git_repo_with_head(&repo_path)?;
+    }
     let storage_root = fixture_root.join("index");
     let build_config = BuildConfig {
         repo_path: repo_path.clone(),
@@ -416,5 +420,50 @@ fn rewrite_with_fresh_mtime(path: &Path, contents: &str) -> Result<()> {
     Err(AppError::InvalidIndex(format!(
         "mtime did not advance while rewriting benchmark file {}",
         path.display()
+    )))
+}
+
+fn ensure_git_repo_with_head(repo_path: &Path) -> Result<()> {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(std::process::Stdio::null())
+        .output()?;
+    if !output.status.success() {
+        run_git(repo_path, &["init", "-q"])?;
+        run_git(repo_path, &["config", "user.email", "test@example.com"])?;
+        run_git(repo_path, &["config", "user.name", "Test User"])?;
+    }
+
+    let has_head = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()?
+        .success();
+    if !has_head {
+        run_git(repo_path, &["add", "."])?;
+        run_git(repo_path, &["commit", "--allow-empty", "-qm", "initial"])?;
+    }
+    Ok(())
+}
+
+fn run_git(repo_path: &Path, args: &[&str]) -> Result<()> {
+    let status = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .status()?;
+    if status.success() {
+        return Ok(());
+    }
+    Err(AppError::InvalidIndex(format!(
+        "git {} failed for {} with status {}",
+        args.join(" "),
+        repo_path.display(),
+        status
     )))
 }

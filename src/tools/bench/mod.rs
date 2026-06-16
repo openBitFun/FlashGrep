@@ -137,13 +137,16 @@ impl Corpus {
     fn repo_path(self, suite_dir: &Path) -> PathBuf {
         match self {
             Self::Linux => suite_dir.join("linux"),
-            Self::SubtitlesEn => suite_dir.join("subtitles").join("en.sample.txt"),
-            Self::SubtitlesRu => suite_dir.join("subtitles").join("ru.txt"),
+            Self::SubtitlesEn | Self::SubtitlesRu => suite_dir.join("subtitles"),
         }
     }
 
     fn search_target(self, suite_dir: &Path) -> PathBuf {
-        self.repo_path(suite_dir)
+        match self {
+            Self::Linux => self.repo_path(suite_dir),
+            Self::SubtitlesEn => self.repo_path(suite_dir).join("en.sample.txt"),
+            Self::SubtitlesRu => self.repo_path(suite_dir).join("ru.txt"),
+        }
     }
 }
 
@@ -918,7 +921,9 @@ pub(super) fn ensure_bench_base_snapshot(
     let result = WorkspaceBaseSnapshotIndex::build_with_options(
         build_config,
         &RepoId(build_config.repo_path.to_string_lossy().into_owned()),
-        BaseSnapshotBuildOptions::new().with_build_mode(build_mode),
+        BaseSnapshotBuildOptions::new()
+            .with_build_mode(build_mode)
+            .requiring_git_head(),
     )?;
     Ok(BenchBaseSnapshotBuild {
         indexed_docs: result.indexed_docs,

@@ -12,6 +12,7 @@ fn bench_runner_supports_custom_repo_patterns() {
     fs::create_dir_all(&suite_dir).expect("test should succeed");
     fs::create_dir_all(&repo_dir).expect("test should succeed");
     fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+    ensure_git_repo_with_head(&repo_dir);
 
     let report = run(&BenchConfig {
         suite_dir,
@@ -64,6 +65,7 @@ fn bench_daemon_shutdown_removes_state_file() {
     fs::create_dir_all(&suite_dir).expect("test should succeed");
     fs::create_dir_all(&repo_dir).expect("test should succeed");
     fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+    ensure_git_repo_with_head(&repo_dir);
 
     let config = BenchConfig {
         suite_dir,
@@ -112,6 +114,7 @@ fn bench_rg_runner_uses_snapshot_visible_scope_for_custom_repo() {
     fs::create_dir_all(&repo_dir).expect("test should succeed");
     fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
     fs::write(repo_dir.join("latin1.txt"), b"BitFun\xff\n").expect("test should succeed");
+    ensure_git_repo_with_head(&repo_dir);
 
     let report = run(&BenchConfig {
         suite_dir,
@@ -163,6 +166,7 @@ fn prepare_rg_search_scope_keeps_snapshot_visible_non_utf8_files() {
     fs::create_dir_all(&repo_dir).expect("test should succeed");
     fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
     fs::write(repo_dir.join("latin1.txt"), b"BitFun\xff\n").expect("test should succeed");
+    ensure_git_repo_with_head(&repo_dir);
 
     let config = BenchConfig {
         suite_dir,
@@ -210,6 +214,7 @@ fn bench_runner_uses_trace_mode_for_multiple_custom_patterns() {
         "const APP = 'BitFun';\nconst TOOL = 'Search';\n",
     )
     .expect("test should succeed");
+    ensure_git_repo_with_head(&repo_dir);
 
     let report = run(&BenchConfig {
         suite_dir,

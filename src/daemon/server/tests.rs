@@ -4,6 +4,7 @@ use std::{
     io::{BufRead, BufReader, BufWriter, Write},
     net::TcpListener,
     net::TcpStream,
+    process::Command,
     thread,
     time::Duration,
 };
@@ -90,6 +91,7 @@ fn initialized_connection_receives_task_notifications() {
         )
         .expect("write should succeed");
     }
+    ensure_git_repo_with_head(&repo_path);
 
     let handle = thread::spawn({
         let state_file = state_file.clone();
@@ -333,6 +335,39 @@ fn read_message(reader: &mut BufReader<TcpStream>) -> ServerMessage {
         });
         return ServerMessage::Response(envelope);
     }
+}
+
+fn ensure_git_repo_with_head(repo_path: &std::path::Path) {
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["init", "-q"])
+        .status()
+        .expect("git init should succeed");
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["config", "user.email", "test@example.com"])
+        .status()
+        .expect("git config should succeed");
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["config", "user.name", "Test User"])
+        .status()
+        .expect("git config should succeed");
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["add", "."])
+        .status()
+        .expect("git add should succeed");
+    Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["commit", "--allow-empty", "-qm", "initial"])
+        .status()
+        .expect("git commit should succeed");
 }
 
 #[test]

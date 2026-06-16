@@ -86,6 +86,7 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
     fs::write(repo_dir.join("drivers").join("apm.c"), "PM_RESUME\n").expect("test should succeed");
     fs::write(repo_dir.join("kernel").join("ata.c"), "ERR_SYS\n").expect("test should succeed");
     fs::write(repo_dir.join("misc.txt"), "unrelated\n").expect("test should succeed");
+    ensure_git_repo_with_head(&repo_dir);
 
     let fixture = prepare_dirty_worktree_fixture(
         &repo_dir,
@@ -139,6 +140,7 @@ fn sampled_dirty_worktree_fixture_limits_files_but_keeps_required_matches() {
                 .into_owned()
         })
         .filter(|path| !path.starts_with(".flashgrep-index-engine/"))
+        .filter(|path| path != ".git" && !path.starts_with(".git/"))
         .map(|path| path.replace('\\', "/"))
         .collect::<Vec<_>>();
 
@@ -159,6 +161,7 @@ fn bench_runner_supports_custom_worktree_build_runner() {
     fs::create_dir_all(&suite_dir).expect("test should succeed");
     fs::create_dir_all(&repo_dir).expect("test should succeed");
     fs::write(repo_dir.join("main.ts"), "const APP = 'BitFun';\n").expect("test should succeed");
+    ensure_git_repo_with_head(&repo_dir);
 
     let report = run(&BenchConfig {
         suite_dir,

@@ -1,4 +1,4 @@
-use std::{fs, io::ErrorKind, net::TcpListener, path::Path};
+use std::{fs, io::ErrorKind, net::TcpListener, path::Path, process::Command};
 
 use tempfile::tempdir;
 
@@ -47,4 +47,61 @@ fn write_standard_suite(suite_dir: &Path) {
         "Шерлок Холмс встретил Джон Уотсон.\n",
     )
     .expect("test should succeed");
+
+    ensure_git_repo_with_head(&suite_dir.join("linux"));
+    ensure_git_repo_with_head(&suite_dir.join("subtitles"));
+}
+
+fn ensure_git_repo_with_head(repo_path: &Path) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("git rev-parse should run");
+    if !output.status.success() {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should succeed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config should succeed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .expect("git config should succeed");
+    }
+
+    let has_head = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git rev-parse should run")
+        .success();
+    if !has_head {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["add", "."])
+            .status()
+            .expect("git add should succeed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["commit", "--allow-empty", "-qm", "initial"])
+            .status()
+            .expect("git commit should succeed");
+    }
 }
