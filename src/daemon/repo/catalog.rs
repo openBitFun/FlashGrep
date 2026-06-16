@@ -8,13 +8,16 @@ use std::{
 
 use crate::{
     config::CorpusMode,
-    error::Result,
+    error::{AppError, Result},
     files::{
         is_corpus_text_file, is_text_file, is_workspace_internal_path, repo_relative_path,
         resolve_repo_path, scan_paths, ScanOptions,
     },
-    git_snapshot::resolve_git_head,
-    index_engine::{reader::SnapshotPathCatalog, WorkspaceBaseSnapshotIndex},
+    git_snapshot::{canonical_repo_root, resolve_git_head},
+    index_engine::{
+        reader::SnapshotPathCatalog, workspace::WorkspaceBaseSnapshotMetadata,
+        WorkspaceBaseSnapshotIndex,
+    },
     path_filter::{PathFilter, PathFilterArgs},
     search_engine::SearchDocument,
 };
@@ -165,6 +168,51 @@ impl RepoRuntime {
             WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
                 .map(|metadata| metadata.snapshot_key),
         )
+    }
+
+    pub(super) fn current_base_snapshot_key_matching_git_identity(&self) -> Result<Option<String>> {
+        let Some(metadata) =
+            WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
+        else {
+            return Ok(None);
+        };
+        match self.base_snapshot_metadata_matches_current_git_identity(&metadata)? {
+            true => Ok(Some(metadata.snapshot_key)),
+            false => Ok(None),
+        }
+    }
+
+    pub(super) fn base_snapshot_metadata_matches_current_git_identity(
+        &self,
+        metadata: &WorkspaceBaseSnapshotMetadata,
+    ) -> Result<bool> {
+        let Some(head_commit) = metadata.head_commit.as_deref() else {
+            return Ok(false);
+        };
+        let Some(config_fingerprint) = metadata.config_fingerprint.as_deref() else {
+            return Ok(false);
+        };
+        let Some(repo_root) = metadata.repo_root.as_deref() else {
+            return Ok(false);
+        };
+        if config_fingerprint
+            != crate::index_engine::workspace::base_snapshot_config_fingerprint_for(
+                &self.build_config,
+            )
+        {
+            return Ok(false);
+        }
+        if repo_root != canonical_repo_root(&self.build_config.repo_path) {
+            return Ok(false);
+        }
+        let mut should_cancel = || false;
+        match resolve_git_head(&self.build_config.repo_path, &mut should_cancel)? {
+            Some(current_head) => Ok(current_head == head_commit),
+            None => Err(AppError::InvalidIndex(format!(
+                "daemon base snapshot identity requires a Git HEAD commit for {}",
+                self.build_config.repo_path.display()
+            ))),
+        }
     }
 
     pub(super) fn base_snapshot_catalog(&self) -> Result<Option<SnapshotPathCatalog>> {

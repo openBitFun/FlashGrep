@@ -305,7 +305,7 @@ impl RepoRuntime {
         Ok(documents)
     }
 
-    fn clear_overlay(&self) {
+    pub(super) fn clear_overlay(&self) {
         {
             let mut published_overlay_paths_cache = match self.published_overlay_paths_cache.lock()
             {

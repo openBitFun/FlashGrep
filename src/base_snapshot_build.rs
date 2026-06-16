@@ -8,6 +8,7 @@ pub struct BaseSnapshotBuildOptions<'a> {
     pub progress: Option<&'a mut dyn FnMut(IndexProgress)>,
     pub should_cancel: Option<&'a mut dyn FnMut() -> bool>,
     pub build_mode: BaseSnapshotBuildMode,
+    pub require_git_head: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -22,6 +23,7 @@ impl<'a> Default for BaseSnapshotBuildOptions<'a> {
             progress: None,
             should_cancel: None,
             build_mode: BaseSnapshotBuildMode::ReuseExistingSnapshot,
+            require_git_head: false,
         }
     }
 }
@@ -43,6 +45,11 @@ impl<'a> BaseSnapshotBuildOptions<'a> {
 
     pub fn with_build_mode(mut self, build_mode: BaseSnapshotBuildMode) -> Self {
         self.build_mode = build_mode;
+        self
+    }
+
+    pub fn requiring_git_head(mut self) -> Self {
+        self.require_git_head = true;
         self
     }
 }

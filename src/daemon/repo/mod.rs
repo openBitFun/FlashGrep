@@ -217,7 +217,7 @@ impl RepoManager {
         let build_config = request.build_config.normalized()?;
         crate::gitignore::ensure_storage_root_ignored(&build_config)?;
         let repo_id = build_config.repo_path.to_string_lossy().into_owned();
-        let stale_runtime = {
+        let (existing_runtime, stale_runtime) = {
             let mut repos = match self.repos.lock() {
                 Ok(guard) => guard,
                 Err(poisoned) => poisoned.into_inner(),
@@ -226,12 +226,16 @@ impl RepoManager {
                 Some(existing)
                     if existing.matches_open_request(&build_config, &request.refresh_policy) =>
                 {
-                    return Ok(existing.status_snapshot());
+                    (Some(Arc::clone(existing)), None)
                 }
-                Some(_) => repos.remove(&repo_id),
-                None => None,
+                Some(_) => (None, repos.remove(&repo_id)),
+                None => (None, None),
             }
         };
+        if let Some(runtime) = existing_runtime {
+            runtime.refresh_base_snapshot_identity_state()?;
+            return Ok(runtime.status_snapshot());
+        }
         if let Some(runtime) = stale_runtime {
             runtime.shutdown();
         }

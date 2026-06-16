@@ -85,6 +85,96 @@ fn ensure_repo_replaces_runtime_when_storage_root_changes() {
 }
 
 #[test]
+fn ensure_repo_rebuilds_when_existing_snapshot_head_is_stale() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    let storage_root = temp.path().join("storage");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const NAME: &str = \"BASE\";\n",
+    )
+    .expect("tracked write should succeed");
+    init_git_repo(&repo_path);
+    git_commit_all(&repo_path, "base");
+    let base_head = git_head_commit(&repo_path);
+
+    let repo_id = match service
+        .handle_request_only(Request::EnsureRepo {
+            params: EnsureRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: Some(storage_root.clone()),
+                config: RepoConfig::default(),
+                refresh: Default::default(),
+            },
+        })
+        .expect("initial ensure should succeed")
+    {
+        Response::RepoEnsured {
+            repo_id,
+            status,
+            indexed_docs,
+        } => {
+            assert!(indexed_docs.is_some());
+            assert!(status
+                .snapshot_key
+                .as_deref()
+                .is_some_and(|key| key.contains(&base_head)));
+            repo_id
+        }
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    service
+        .handle_request_only(Request::CloseRepo {
+            params: crate::daemon::protocol::RepoRef {
+                repo_id: repo_id.clone(),
+            },
+        })
+        .expect("close repo should succeed");
+
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const NAME: &str = \"UPDATED\";\n",
+    )
+    .expect("tracked rewrite should succeed");
+    git_commit_all(&repo_path, "updated");
+    let updated_head = git_head_commit(&repo_path);
+    assert_ne!(updated_head, base_head);
+
+    match service
+        .handle_request_only(Request::EnsureRepo {
+            params: EnsureRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: Some(storage_root),
+                config: RepoConfig::default(),
+                refresh: Default::default(),
+            },
+        })
+        .expect("ensure with stale base snapshot should succeed")
+    {
+        Response::RepoEnsured {
+            status,
+            indexed_docs,
+            ..
+        } => {
+            assert!(
+                indexed_docs.is_some(),
+                "ensure should rebuild when the existing base snapshot HEAD is stale"
+            );
+            let snapshot_key = status
+                .snapshot_key
+                .expect("rebuilt status should include a snapshot key");
+            assert!(snapshot_key.contains(&updated_head));
+            assert!(!snapshot_key.contains(&base_head));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
 fn git_branch_checkout_reconciles_large_worktree_switches() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();

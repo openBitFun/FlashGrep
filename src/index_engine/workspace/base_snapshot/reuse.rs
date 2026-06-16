@@ -128,6 +128,7 @@ pub(super) fn base_snapshot_segment_id(shard_id: u32, fingerprint: &str) -> Segm
 
 pub(super) fn resolve_base_snapshot_build(
     build_config: &BuildConfig,
+    require_git_head: bool,
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<ResolvedBaseSnapshotBuild> {
     let config_fingerprint = base_snapshot_config_fingerprint(build_config);
@@ -141,6 +142,12 @@ pub(super) fn resolve_base_snapshot_build(
             })
         }
         None => {
+            if require_git_head {
+                return Err(AppError::InvalidIndex(format!(
+                    "base snapshot build requires a Git HEAD commit for {}",
+                    build_config.repo_path.display()
+                )));
+            }
             let snapshot_key = format!(
                 "base-repo-{}-{}",
                 repo_snapshot_fingerprint(build_config)?,

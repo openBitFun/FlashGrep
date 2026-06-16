@@ -12,7 +12,7 @@ impl RepoRuntime {
     pub(super) fn bootstrap_from_existing_snapshot(&self) -> Result<()> {
         self.recover_dirty_catalog_for_startup()?;
         let now = SystemTime::now();
-        let snapshot_key = match self.current_base_snapshot_key() {
+        let snapshot_key = match self.current_base_snapshot_key_matching_git_identity() {
             Ok(snapshot_key) => snapshot_key,
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(AppError::InvalidIndex(_)) => None,
@@ -89,6 +89,33 @@ impl RepoRuntime {
             super::DirtyStats::default(),
         );
         drop(state);
+        self.emit_workspace_status_changed();
+        Ok(())
+    }
+
+    pub(super) fn refresh_base_snapshot_identity_state(&self) -> Result<()> {
+        let current_snapshot_key = self.current_base_snapshot_key_matching_git_identity()?;
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if state.snapshot_key == current_snapshot_key {
+            return Ok(());
+        }
+
+        state.snapshot_key = current_snapshot_key.clone();
+        if current_snapshot_key.is_none() {
+            state.dirty_files = super::DirtyStats::default();
+            state.rebuild_recommended = false;
+            state.phase = super::RepoPhase::MissingBaseSnapshot;
+        }
+        drop(state);
+
+        if current_snapshot_key.is_none() {
+            self.clear_cached_base_snapshot_reader();
+            self.clear_base_snapshot_catalog();
+            self.clear_overlay();
+        }
         self.emit_workspace_status_changed();
         Ok(())
     }

@@ -270,6 +270,10 @@ pub(super) fn base_snapshot_memory_pressure_should_spill() -> bool {
         .unwrap_or(false)
 }
 
+pub(crate) fn base_snapshot_config_fingerprint_for(build_config: &BuildConfig) -> String {
+    base_snapshot_config_fingerprint(build_config)
+}
+
 fn available_memory_bytes() -> Option<u64> {
     let system_available = system_available_memory_bytes();
     let cgroup_available = linux_cgroup_available_bytes();
@@ -425,6 +429,7 @@ impl WorkspaceBaseSnapshotIndex {
             build_config,
             repo_id,
             options.build_mode,
+            options.require_git_head,
             on_progress,
             should_cancel,
         )
@@ -630,6 +635,7 @@ impl WorkspaceBaseSnapshotIndex {
         build_config: &BuildConfig,
         repo_id: &RepoId,
         build_mode: BaseSnapshotBuildMode,
+        require_git_head: bool,
         mut on_progress: F,
         mut should_cancel: C,
     ) -> Result<WorkspaceBaseSnapshotBuildResult>
@@ -646,7 +652,8 @@ impl WorkspaceBaseSnapshotIndex {
             0,
             None,
         );
-        let resolved = resolve_base_snapshot_build(&build_config, &mut should_cancel)?;
+        let resolved =
+            resolve_base_snapshot_build(&build_config, require_git_head, &mut should_cancel)?;
 
         if build_mode == BaseSnapshotBuildMode::ReuseExistingSnapshot {
             if let Some(metadata) = reusable_snapshot_metadata(&build_config, &resolved)? {

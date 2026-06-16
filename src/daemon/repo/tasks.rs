@@ -212,7 +212,7 @@ impl RepoRuntime {
         let indexed_docs = WorkspaceBaseSnapshotIndex::build_with_options(
             &self.build_config,
             &self.overlay_repo_id,
-            BaseSnapshotBuildOptions::default(),
+            BaseSnapshotBuildOptions::new().requiring_git_head(),
         )?
         .indexed_docs;
         self.bootstrap_from_existing_snapshot()?;
@@ -234,7 +234,7 @@ impl RepoRuntime {
         let indexed_docs = WorkspaceBaseSnapshotIndex::rebuild_with_options(
             &self.build_config,
             &self.overlay_repo_id,
-            BaseSnapshotBuildOptions::default(),
+            BaseSnapshotBuildOptions::new().requiring_git_head(),
         )?
         .indexed_docs;
         self.bootstrap_from_existing_snapshot()?;
@@ -269,7 +269,8 @@ impl RepoRuntime {
                 &self.overlay_repo_id,
                 BaseSnapshotBuildOptions::new()
                     .with_progress(&mut progress)
-                    .with_cancel(&mut should_cancel),
+                    .with_cancel(&mut should_cancel)
+                    .requiring_git_head(),
             )
             .map(|result| result.indexed_docs),
             RepoTaskKind::RebuildBaseSnapshot => WorkspaceBaseSnapshotIndex::rebuild_with_options(
@@ -277,7 +278,8 @@ impl RepoRuntime {
                 &self.overlay_repo_id,
                 BaseSnapshotBuildOptions::new()
                     .with_progress(&mut progress)
-                    .with_cancel(&mut should_cancel),
+                    .with_cancel(&mut should_cancel)
+                    .requiring_git_head(),
             )
             .map(|result| result.indexed_docs),
             RepoTaskKind::RefreshWorkspace => self

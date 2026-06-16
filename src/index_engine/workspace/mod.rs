@@ -3,6 +3,7 @@ mod git_snapshot;
 mod overlay;
 mod search_view;
 
+pub(crate) use base_snapshot::base_snapshot_config_fingerprint_for;
 pub use base_snapshot::{WorkspaceBaseSnapshotIndex, WorkspaceBaseSnapshotMetadata};
 pub use git_snapshot::GitSnapshotIndex;
 pub use overlay::WorkspaceOverlayIndex;

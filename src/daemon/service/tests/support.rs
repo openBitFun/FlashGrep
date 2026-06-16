@@ -190,6 +190,20 @@ pub(super) fn git_commit_all(repo_path: &std::path::Path, message: &str) {
         .expect("git commit should succeed");
 }
 
+pub(super) fn git_head_commit(repo_path: &std::path::Path) -> String {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .output()
+        .expect("git rev-parse HEAD should succeed");
+    assert!(output.status.success());
+    String::from_utf8(output.stdout)
+        .expect("git HEAD output should decode")
+        .trim()
+        .to_string()
+}
+
 pub(super) fn git_current_branch(repo_path: &std::path::Path) -> String {
     let output = Command::new("git")
         .arg("-C")
