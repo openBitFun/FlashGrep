@@ -5,7 +5,7 @@
 `flashgrep` 当前 daemon/runtime 主线已经不是“base snapshot + query-time dirty repair”，也不是把 workspace 增量直接暴露给查询线程的可变写路径。查询真相源只剩两层只读 snapshot：
 
 1. `base snapshot`
-   对应某个 Git `HEAD` 或 repo fingerprint 的稳定基线快照。
+   daemon runtime 中对应某个 Git `HEAD + config fingerprint` 的稳定基线快照。
 2. `published overlay snapshot`
    只表达已经构建完成并原子发布、对查询可见的 workspace 增量层。
 
@@ -33,7 +33,8 @@ daemon runtime 仍然还维护一份 `dirty catalog`，
 
 base snapshot 由 `WorkspaceBaseSnapshotIndex` 负责：
 
-- snapshot key 由 `HEAD commit + config fingerprint` 或 repo fallback 指定。
+- daemon build / rebuild 要求 Git `HEAD`，snapshot key 由 `HEAD commit + config fingerprint` 指定。
+- 库层仍保留 repo fingerprint fallback 作为 daemon 外的低层能力。
 - 数据落在 `index_engine` 的 base shard 路径，而不是旧 `src/index/*` generation layout。
 - build / rebuild 直接产出新的 base snapshot shard。
 
@@ -41,7 +42,7 @@ base snapshot 由 `WorkspaceBaseSnapshotIndex` 负责：
 
 dirty catalog 由 daemon runtime 负责维护：
 
-- background probe / reconcile 从当前 worktree 归纳 modified / deleted / new paths。
+- background probe / reconcile 只使用 Git dirty probe 从当前 worktree 归纳 modified / deleted / new paths。
 - 对每个 path 记录 `dirty / building / ready / failed` 和 observed file version。
 - catalog 只负责表达“哪些路径需要重建或已经发布”，不直接参与查询合并，也不是查询真相源。
 
@@ -105,7 +106,7 @@ src/worktree_diff.rs
 - `search_view.rs`
   合并 base / overlay snapshot 并执行 workspace 查询。
 - `daemon/repo/catalog.rs`
-  计算 base 相对当前工作区的 dirty 集，并构造 rebuild / delta publish 计划。
+  通过 Git dirty probe 计算 base 相对当前工作区的 dirty 集，并构造 rebuild / delta publish 计划。
 - `daemon/repo/dirty_catalog.rs`
   维护持久化 dirty catalog 和最小状态机。
 - `daemon/repo/maintenance.rs`
@@ -127,10 +128,11 @@ src/worktree_diff.rs
 
 当前主线搜索架构完全建立在 `index_engine` 的 snapshot / overlay 目录和 manifest 之上。
 
-计划中的 daemon workspace runtime 兼容边界进一步收敛为 Git-only：
+daemon workspace runtime 兼容边界已经收敛为 Git-only：
 
 - daemon indexed workspace 只支持非 bare Git worktree。
 - base snapshot 只锚定 Git `HEAD + config fingerprint`。
+- dirty detection 只使用 Git diff / ls-files；watcher 只负责唤醒 probe，不决定变化范围。
 - 非 Git 目录不再进入 daemon 的 base / dirty catalog / overlay 增量索引路径。
 
 详细方案见 [Git-Only Workspace Runtime Plan](git_only_workspace_runtime.md)。

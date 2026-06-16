@@ -187,7 +187,7 @@ merge 是后台维护行为，不改变“只有 published manifest 可见”这
 - `base_snapshot.rs`
   构建和打开 commit-addressed base snapshot
 - `git_snapshot.rs`
-  Git `HEAD` / fallback snapshot key 辅助
+  Git `HEAD` snapshot 辅助；repo fingerprint fallback 仅保留为 daemon 外低层能力
 - `overlay.rs`
   workspace overlay shard、发布策略、运行时统计
 - `search_view.rs`

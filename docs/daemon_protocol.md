@@ -1,4 +1,4 @@
-# Codgrep Daemon Protocol v1
+# Flashgrep Daemon Protocol v1
 
 ## 目标
 
@@ -94,7 +94,23 @@ Rust 侧当前提供的是围绕本地 daemon 的基础客户端封装；其中 
 
 ### `repo_id`
 
-v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
+daemon indexed workspace runtime 只支持非 bare Git worktree。`open_repo` / `ensure_repo`
+会先执行 Git discovery，并把输入路径归一化到 canonical Git top-level。
+
+`repo_id` 使用 canonical Git top-level 路径字符串。调用方传入 repo 子目录时，runtime
+仍以 Git top-level 作为 repo identity；子目录搜索应通过 query `scope.roots` 表达。
+
+如果调用方没有显式传入 `storage_root`，默认值基于 canonical Git top-level 派生：
+
+```text
+<canonical-git-top-level>/.flashgrep-index-engine
+```
+
+非 Git 目录、bare repository、没有 `HEAD` commit 的 Git repo 都会返回协议错误：
+
+```text
+indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
+```
 
 ### 内部路径保留
 
@@ -147,8 +163,10 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 - `phase` 表示 repo 当前对外可见状态
 - 长任务是否仍在运行，由 `active_task_id` 和 `task/status` 表达
-- `ready_dirty` 表示 daemon 已经或即将通过 overlay snapshot 表达当前 worktree 增量视图
+- `ready_dirty` 表示 daemon 已经通过 published overlay snapshot 表达当前 Git worktree
+  相对 base snapshot 的增量视图
 - `overlay` 存在时表示 daemon 已打开 workspace overlay engine，并暴露其当前已发布 overlay 与后台维护状态
+- `probe_healthy=false` 表示最近一次 Git dirty probe 失败；daemon 会保留上一份成功发布的查询视图，并由 maintenance worker 重试
 
 `overlay` 字段：
 
@@ -374,11 +392,14 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 - 注册 repo runtime
 - 启动后台 maintenance / workspace probe 循环
 - 不自动构建 base snapshot
+- 要求 `repo_path` 位于非 bare Git worktree 内，且该 repo 已有 `HEAD` commit
 
 补充约定：
 
 - 如果调用方通过 managed client 打开 repo，daemon 发现/复用默认按 `storage_root` 派生的 state file 路径进行。
 - `open_repo` 本身不要求接入方自己先拉起 daemon；这部分可以由 managed client 负责。
+- `repo_path` 可以是 repo 子目录；响应中的 `repo_id`、`status.repo_path` 和默认
+  `storage_root` 都会归一化到 Git top-level。
 
 请求：
 
@@ -416,7 +437,7 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 用途：
 
 - 确保 repo 已打开
-- 若缺少 base snapshot，同步执行一次 build
+- 若缺少当前 `HEAD + config fingerprint` 对应的 base snapshot，同步执行一次 build
 
 请求参数与 `open_repo` 相同。
 
@@ -434,7 +455,10 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 说明：
 
 - `indexed_docs = null` 表示 repo 已打开，且无需新建 base snapshot
-- 重启后会重新扫描 worktree 并恢复当前状态，这会增加启动阶段耗时，但不会改变对外语义
+- `indexed_docs = null` 表示已有 base snapshot 的 `HEAD`、config fingerprint、repo root 均匹配当前 Git discovery
+- 如果 repo 已提交/checkout 到新的 `HEAD`，`ensure_repo` 会同步构建当前 `HEAD + config`
+  的 base snapshot，而不是复用任意旧 snapshot
+- 重启后会通过 Git dirty probe 恢复当前状态，这会增加启动阶段耗时，但不会改变对外语义
 
 ### `get_repo_status`
 
@@ -509,6 +533,14 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 ### `build_base_snapshot`
 
 同步构建缺失的 base snapshot。
+
+daemon base snapshot build 只使用 Git identity；snapshot key 形如：
+
+```text
+base-git-<head_commit>-<config_fingerprint>
+```
+
+repo fingerprint fallback 只属于库层/低层能力，不属于 daemon indexed workspace runtime。
 
 请求：
 
@@ -623,6 +655,8 @@ v1 沿用当前实现语义：默认使用 normalized `repo_path` 字符串。
 
 - `scope.roots` 必须为空，或解析后仍位于 `repo_id` 对应 repo 根目录之内
 - daemon 不接受借助 `roots` 越出 repo 边界的搜索请求
+- `allow_scan_fallback` 只用于 indexed repo 未 ready 时的一次性过渡搜索；它不会绕过
+  `open_repo` / `ensure_repo` 的 Git worktree discovery 要求
 
 调用方应至少读取：
 
