@@ -127,6 +127,14 @@ src/worktree_diff.rs
 
 当前主线搜索架构完全建立在 `index_engine` 的 snapshot / overlay 目录和 manifest 之上。
 
+计划中的 daemon workspace runtime 兼容边界进一步收敛为 Git-only：
+
+- daemon indexed workspace 只支持非 bare Git worktree。
+- base snapshot 只锚定 Git `HEAD + config fingerprint`。
+- 非 Git 目录不再进入 daemon 的 base / dirty catalog / overlay 增量索引路径。
+
+详细方案见 [Git-Only Workspace Runtime Plan](git_only_workspace_runtime.md)。
+
 ## Public Library API
 
 ```rust
