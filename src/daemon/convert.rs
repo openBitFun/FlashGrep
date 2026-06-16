@@ -1,13 +1,6 @@
-use std::{
-    path::PathBuf,
-    time::{SystemTime, UNIX_EPOCH},
-};
+use std::time::{SystemTime, UNIX_EPOCH};
 
-use crate::{
-    config::{BuildConfig, CorpusMode, TokenizerMode},
-    progress::IndexProgressPhase,
-    search::SearchResults,
-};
+use crate::{progress::IndexProgressPhase, search::SearchResults};
 
 use super::{
     protocol as proto,
@@ -233,34 +226,6 @@ pub(super) fn convert_repo_phase(phase: RepoPhase) -> proto::RepoPhase {
         RepoPhase::ReadyDirty => proto::RepoPhase::ReadyDirty,
         RepoPhase::RebuildingBaseSnapshot => proto::RepoPhase::RebuildingBaseSnapshot,
         RepoPhase::Degraded => proto::RepoPhase::Degraded,
-    }
-}
-
-pub(super) fn build_config_from_open(
-    repo_path: PathBuf,
-    storage_root: Option<PathBuf>,
-    tokenizer: proto::TokenizerModeConfig,
-    corpus_mode: proto::CorpusModeConfig,
-    include_hidden: bool,
-    max_file_size: u64,
-    min_sparse_len: usize,
-    max_sparse_len: usize,
-) -> BuildConfig {
-    BuildConfig {
-        storage_root: storage_root.unwrap_or_else(|| repo_path.join(".flashgrep-index-engine")),
-        repo_path,
-        tokenizer: match tokenizer {
-            proto::TokenizerModeConfig::Trigram => TokenizerMode::Trigram,
-            proto::TokenizerModeConfig::SparseNgram => TokenizerMode::SparseNgram,
-        },
-        corpus_mode: match corpus_mode {
-            proto::CorpusModeConfig::RespectIgnore => CorpusMode::RespectIgnore,
-            proto::CorpusModeConfig::NoIgnore => CorpusMode::NoIgnore,
-        },
-        include_hidden,
-        max_file_size,
-        min_sparse_len,
-        max_sparse_len,
     }
 }
 

@@ -14,10 +14,10 @@ use crate::{
 use super::DaemonService;
 use crate::daemon::{
     convert::{
-        build_config_from_open, convert_compact_line_match_results,
-        convert_grouped_line_match_results, convert_query_backend, convert_repo_status,
-        convert_search_results, convert_task_status,
+        convert_compact_line_match_results, convert_grouped_line_match_results,
+        convert_query_backend, convert_repo_status, convert_search_results, convert_task_status,
     },
+    git_workspace::resolve_repo_config,
     protocol::{
         ClientCapabilities, EnsureRepoParams, ErrorResponse, QuerySpec, Request, RequestEnvelope,
         Response, SearchProtocolCapabilities, ServerCapabilities, ServerInfo,
@@ -118,10 +118,10 @@ impl DaemonService {
                 false,
             )),
             Request::OpenRepo { params } => {
-                let build_config =
-                    build_config_from_request(params.repo_path, params.storage_root, params.config);
+                let resolved =
+                    resolve_repo_config(params.repo_path, params.storage_root, params.config)?;
                 let status = self.repos.open_repo(OpenRepoRequest {
-                    build_config,
+                    build_config: resolved.build_config,
                     refresh_policy: RepoRefreshPolicy {
                         rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
                         overlay_auto_checkpoint_max_uncommitted_ops: params
@@ -276,15 +276,10 @@ impl DaemonService {
         &self,
         params: EnsureRepoParams,
     ) -> Result<(Response, Option<ClientCapabilities>, bool)> {
-        let build_config =
-            build_config_from_request(params.repo_path, params.storage_root, params.config);
-        let repo_id = build_config
-            .normalized()?
-            .repo_path
-            .to_string_lossy()
-            .into_owned();
+        let resolved = resolve_repo_config(params.repo_path, params.storage_root, params.config)?;
+        let repo_id = resolved.repo_id();
         let mut status = self.repos.open_repo(OpenRepoRequest {
-            build_config,
+            build_config: resolved.build_config,
             refresh_policy: RepoRefreshPolicy {
                 rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
                 overlay_auto_checkpoint_max_uncommitted_ops: params
@@ -332,23 +327,6 @@ fn wait_for_repo_open(
     Err(AppError::Protocol(format!(
         "timed out waiting for repo {repo_id} to finish opening"
     )))
-}
-
-fn build_config_from_request(
-    repo_path: PathBuf,
-    storage_root: Option<PathBuf>,
-    config: super::super::protocol::RepoConfig,
-) -> crate::config::BuildConfig {
-    build_config_from_open(
-        repo_path,
-        storage_root,
-        config.tokenizer,
-        config.corpus_mode,
-        config.include_hidden,
-        config.max_file_size,
-        config.min_sparse_len,
-        config.max_sparse_len,
-    )
 }
 
 fn convert_query_spec(query: QuerySpec) -> Result<QueryConfig> {

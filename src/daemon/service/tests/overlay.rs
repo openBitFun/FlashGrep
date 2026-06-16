@@ -9,6 +9,7 @@ fn refresh_workspace_rebuilds_workspace_overlay_engine() {
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     let tracked = repo_path.join("tracked.rs");
     fs::write(&tracked, "const NAME: &str = \"BASE\";\n").expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let (repo_id, _) = open_repo(&service, repo_path.clone());
     build_repo(&service, &repo_id);
@@ -42,6 +43,7 @@ fn probe_marks_dirty_paths_for_eventual_workspace_search() {
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     let tracked = repo_path.join("tracked.rs");
     fs::write(&tracked, "const NAME: &str = \"BASE\";\n").expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let (repo_id, _) = open_repo(&service, repo_path.clone());
     build_repo(&service, &repo_id);
@@ -76,6 +78,7 @@ fn eventual_search_stays_indexed_while_overlay_engine_recovers() {
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     let tracked = repo_path.join("tracked.rs");
     fs::write(&tracked, "const NAME: &str = \"BASE\";\n").expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let (repo_id, _) = open_repo(&service, repo_path.clone());
     build_repo(&service, &repo_id);
@@ -145,6 +148,7 @@ fn eventual_search_rebuilds_full_overlay_after_overlay_engine_reset() {
     let second = repo_path.join("second.rs");
     fs::write(&first, "const NAME: &str = \"BASE_FIRST\";\n").expect("write should succeed");
     fs::write(&second, "const NAME: &str = \"BASE_SECOND\";\n").expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let (repo_id, _) = open_repo(&service, repo_path.clone());
     build_repo(&service, &repo_id);
@@ -188,6 +192,7 @@ fn eventual_search_honors_configured_overlay_auto_checkpoint_threshold() {
     let temp = tempdir().expect("temp dir should succeed");
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let (repo_id, _) = match service
         .handle_request_only(Request::OpenRepo {
@@ -233,6 +238,7 @@ fn repo_status_reports_overlay_runtime_stats() {
     let temp = tempdir().expect("temp dir should succeed");
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let repo_id = match service
         .handle_request_only(Request::OpenRepo {
@@ -279,6 +285,7 @@ fn overlay_merge_is_deferred_and_runs_in_background() {
     let temp = tempdir().expect("temp dir should succeed");
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let repo_id = match service
         .handle_request_only(Request::OpenRepo {
@@ -348,6 +355,7 @@ fn workspace_search_stays_stable_while_overlay_merge_is_pending() {
     let tracked = repo_path.join("tracked.rs");
     fs::write(&tracked, "const NAME: &str = \"MERGE_STABLE_OLD\";\n")
         .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let repo_id = match service
         .handle_request_only(Request::OpenRepo {
@@ -791,6 +799,7 @@ fn repeated_incremental_edits_converge_to_expected_overlay_state() {
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     let tracked = repo_path.join("tracked.rs");
     fs::write(&tracked, "const VALUE: &str = \"REPEAT_BASE\";\n").expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let repo_id = match service
         .handle_request_only(Request::OpenRepo {

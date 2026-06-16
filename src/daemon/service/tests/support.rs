@@ -64,6 +64,7 @@ pub(super) fn open_repo(
     service: &DaemonService,
     repo_path: PathBuf,
 ) -> (String, RepoStatusPayload) {
+    ensure_git_repo_with_head(&repo_path);
     let (repo_id, status) = match service
         .handle_request_only(Request::OpenRepo {
             params: OpenRepoParams {
@@ -89,6 +90,7 @@ pub(super) fn open_repo(
 }
 
 pub(super) fn ensure_repo(service: &DaemonService, repo_path: PathBuf) -> Response {
+    ensure_git_repo_with_head(&repo_path);
     service
         .handle_request_only(Request::EnsureRepo {
             params: EnsureRepoParams {
@@ -130,6 +132,47 @@ pub(super) fn init_git_repo(repo_path: &std::path::Path) {
         .args(["config", "user.name", "Test User"])
         .status()
         .expect("git config should succeed");
+}
+
+pub(super) fn ensure_git_repo_with_head(repo_path: &std::path::Path) {
+    let git_root = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("git rev-parse should run");
+    let git_root = if git_root.status.success() {
+        let path = String::from_utf8(git_root.stdout).expect("git root should decode");
+        PathBuf::from(path.trim())
+    } else {
+        init_git_repo(repo_path);
+        repo_path.to_path_buf()
+    };
+    let has_head = Command::new("git")
+        .arg("-C")
+        .arg(&git_root)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git rev-parse should run")
+        .success();
+    if !has_head {
+        Command::new("git")
+            .arg("-C")
+            .arg(&git_root)
+            .args(["add", "."])
+            .status()
+            .expect("git add should succeed");
+        Command::new("git")
+            .arg("-C")
+            .arg(&git_root)
+            .args(["commit", "--allow-empty", "-qm", "initial"])
+            .status()
+            .expect("git commit should succeed");
+    }
 }
 
 pub(super) fn git_commit_all(repo_path: &std::path::Path, message: &str) {

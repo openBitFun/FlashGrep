@@ -45,7 +45,7 @@ fn opening_git_repo_ignores_custom_repo_local_storage_root_in_gitignore() {
     let temp = tempdir().expect("temp dir should succeed");
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("custom")).expect("custom dir should succeed");
-    init_git_repo(&repo_path);
+    ensure_git_repo_with_head(&repo_path);
 
     let response = service
         .handle_request_only(Request::OpenRepo {
@@ -74,16 +74,57 @@ fn opening_git_repo_ignores_custom_repo_local_storage_root_in_gitignore() {
 }
 
 #[test]
-fn opening_non_git_repo_does_not_create_gitignore() {
+fn opening_non_git_repo_fails_without_creating_gitignore() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
 
-    let _ = open_repo(&service, repo_path.clone());
+    let error = service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: None,
+                config: RepoConfig::default(),
+                refresh: Default::default(),
+            },
+        })
+        .expect_err("non-git open should fail");
+
+    assert!(error
+        .to_string()
+        .contains("indexed daemon workspace requires a Git worktree with a HEAD commit"));
 
     assert!(!repo_path.join(".gitignore").exists());
+}
+
+#[test]
+fn opening_repo_subdirectory_uses_git_root_identity_and_default_storage() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    let src_path = repo_path.join("src");
+    fs::create_dir_all(&src_path).expect("repo dir should succeed");
+    fs::write(
+        src_path.join("lib.rs"),
+        "pub const NAME: &str = \"SUBDIR\";\n",
+    )
+    .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let (repo_id, status) = open_repo(&service, src_path);
+    let canonical_repo = fs::canonicalize(&repo_path).expect("repo should canonicalize");
+
+    assert_eq!(repo_id, canonical_repo.to_string_lossy());
+    assert_eq!(status.repo_path, canonical_repo.to_string_lossy());
+    assert_eq!(
+        status.storage_root,
+        canonical_repo
+            .join(".flashgrep-index-engine")
+            .to_string_lossy()
+    );
 }
 
 #[test]
@@ -565,7 +606,6 @@ fn glob_lists_paths_without_requiring_index_and_respects_scope_filters() {
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).expect("repo dir should succeed");
     fs::create_dir_all(repo_path.join("tests")).expect("repo dir should succeed");
-    fs::create_dir_all(repo_path.join(".git")).expect("git dir should succeed");
     fs::write(repo_path.join(".gitignore"), "ignored.rs\n").expect("write should succeed");
     let src = repo_path.join("src/lib.rs");
     let test = repo_path.join("tests/lib.rs");
@@ -576,6 +616,8 @@ fn glob_lists_paths_without_requiring_index_and_respects_scope_filters() {
         "pub const NAME: &str = \"IGNORED\";\n",
     )
     .expect("write should succeed");
+    init_git_repo(&repo_path);
+    git_commit_all(&repo_path, "initial");
 
     let (repo_id, _) = open_repo(&service, repo_path.clone());
 
@@ -737,6 +779,8 @@ fn eventual_search_uses_fallback_while_repo_is_still_opening_or_missing_index() 
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
         .expect("write should succeed");
+    init_git_repo(&repo_path);
+    git_commit_all(&repo_path, "initial");
 
     let repo_id = match service
         .handle_request_only(Request::OpenRepo {

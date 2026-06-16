@@ -1,5 +1,6 @@
 mod client;
 mod convert;
+mod git_workspace;
 mod managed;
 pub mod protocol;
 mod repo;

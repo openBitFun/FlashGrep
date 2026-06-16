@@ -7,14 +7,11 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
-    config::BuildConfig,
-    error::{AppError, Result},
-};
+use crate::error::{AppError, Result};
 
 use super::{
     client::DaemonClient,
-    convert::build_config_from_open,
+    git_workspace::resolve_repo_config,
     protocol::{
         EnsureRepoParams, GlobParams, OpenRepoParams, RepoStatus, Request, Response, SearchParams,
     },
@@ -78,6 +75,7 @@ impl ManagedDaemonClient {
     }
 
     pub fn ensure_repo(&self, params: EnsureRepoParams) -> Result<EnsuredRepo> {
+        let params = normalize_ensure_params(params)?;
         let state_file = daemon_state_file_path(&params)?;
         let lock_file = daemon_start_lock_file_path(&state_file);
         if let Ok(repo) = self.try_ensure_repo(&state_file, &params) {
@@ -121,6 +119,7 @@ impl ManagedDaemonClient {
     }
 
     pub fn open_repo(&self, params: OpenRepoParams) -> Result<OpenedRepo> {
+        let params = normalize_open_params(params)?;
         let state_file = daemon_state_file_path_from_open(&params)?;
         let lock_file = daemon_start_lock_file_path(&state_file);
         if let Ok(repo) = self.try_open_repo(&state_file, &params) {
@@ -311,11 +310,19 @@ impl Drop for StartupLockGuard {
 }
 
 pub fn daemon_state_file_path(params: &EnsureRepoParams) -> Result<PathBuf> {
-    daemon_state_file_path_from_build_config(build_config_from_ensure(params))
+    let params = normalize_ensure_params(params.clone())?;
+    Ok(params
+        .storage_root
+        .expect("normalized ensure params should have storage root")
+        .join(DEFAULT_DAEMON_STATE_FILE))
 }
 
 pub fn daemon_state_file_path_from_open(params: &OpenRepoParams) -> Result<PathBuf> {
-    daemon_state_file_path_from_build_config(build_config_from_open_params(params))
+    let params = normalize_open_params(params.clone())?;
+    Ok(params
+        .storage_root
+        .expect("normalized open params should have storage root")
+        .join(DEFAULT_DAEMON_STATE_FILE))
 }
 
 fn daemon_start_lock_file_path(state_file: &Path) -> PathBuf {
@@ -333,35 +340,26 @@ fn startup_lock_is_stale(path: &Path, stale_after: Duration) -> bool {
         .is_some_and(|age| age >= stale_after)
 }
 
-fn build_config_from_ensure(params: &EnsureRepoParams) -> BuildConfig {
-    build_config_from_open(
-        params.repo_path.clone(),
-        params.storage_root.clone(),
-        params.config.tokenizer,
-        params.config.corpus_mode,
-        params.config.include_hidden,
-        params.config.max_file_size,
-        params.config.min_sparse_len,
-        params.config.max_sparse_len,
-    )
+fn normalize_ensure_params(params: EnsureRepoParams) -> Result<EnsureRepoParams> {
+    let resolved =
+        resolve_repo_config(params.repo_path, params.storage_root, params.config.clone())?;
+    Ok(EnsureRepoParams {
+        repo_path: resolved.build_config.repo_path,
+        storage_root: Some(resolved.build_config.storage_root),
+        config: params.config,
+        refresh: params.refresh,
+    })
 }
 
-fn build_config_from_open_params(params: &OpenRepoParams) -> BuildConfig {
-    build_config_from_open(
-        params.repo_path.clone(),
-        params.storage_root.clone(),
-        params.config.tokenizer,
-        params.config.corpus_mode,
-        params.config.include_hidden,
-        params.config.max_file_size,
-        params.config.min_sparse_len,
-        params.config.max_sparse_len,
-    )
-}
-
-fn daemon_state_file_path_from_build_config(build_config: BuildConfig) -> Result<PathBuf> {
-    let build_config = build_config.normalized()?;
-    Ok(build_config.storage_root.join(DEFAULT_DAEMON_STATE_FILE))
+fn normalize_open_params(params: OpenRepoParams) -> Result<OpenRepoParams> {
+    let resolved =
+        resolve_repo_config(params.repo_path, params.storage_root, params.config.clone())?;
+    Ok(OpenRepoParams {
+        repo_path: resolved.build_config.repo_path,
+        storage_root: Some(resolved.build_config.storage_root),
+        config: params.config,
+        refresh: params.refresh,
+    })
 }
 
 #[cfg(test)]

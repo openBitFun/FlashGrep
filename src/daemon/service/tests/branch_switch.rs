@@ -12,6 +12,7 @@ fn ensure_repo_replaces_runtime_when_storage_root_changes() {
         "const NAME: &str = \"STORAGE_SWITCH_TOKEN\";\n",
     )
     .expect("tracked write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let storage_a = temp.path().join("storage-a");
     let storage_b = temp.path().join("storage-b");

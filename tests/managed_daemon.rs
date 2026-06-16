@@ -4,6 +4,7 @@ use std::{
     io::ErrorKind,
     net::TcpListener,
     path::PathBuf,
+    process::Command,
     sync::{Arc, Barrier},
     thread,
 };
@@ -63,6 +64,64 @@ fn flashgrep_test_binary() -> PathBuf {
     PathBuf::from("flashgrep")
 }
 
+fn ensure_git_repo_with_head(repo_path: &std::path::Path) {
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(["rev-parse", "--show-toplevel"])
+        .stderr(std::process::Stdio::null())
+        .output()
+        .expect("git rev-parse should run");
+    let git_root = if output.status.success() {
+        let path = String::from_utf8(output.stdout).expect("git root should decode");
+        PathBuf::from(path.trim())
+    } else {
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["init", "-q"])
+            .status()
+            .expect("git init should succeed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["config", "user.email", "test@example.com"])
+            .status()
+            .expect("git config should succeed");
+        Command::new("git")
+            .arg("-C")
+            .arg(repo_path)
+            .args(["config", "user.name", "Test User"])
+            .status()
+            .expect("git config should succeed");
+        repo_path.to_path_buf()
+    };
+
+    let has_head = Command::new("git")
+        .arg("-C")
+        .arg(&git_root)
+        .args(["rev-parse", "--verify", "HEAD^{commit}"])
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null())
+        .status()
+        .expect("git rev-parse should run")
+        .success();
+    if !has_head {
+        Command::new("git")
+            .arg("-C")
+            .arg(&git_root)
+            .args(["add", "."])
+            .status()
+            .expect("git add should succeed");
+        Command::new("git")
+            .arg("-C")
+            .arg(&git_root)
+            .args(["commit", "--allow-empty", "-qm", "initial"])
+            .status()
+            .expect("git commit should succeed");
+    }
+}
+
 #[test]
 fn managed_client_spawns_ensures_and_searches() {
     if !supports_managed_daemon_tests() {
@@ -73,6 +132,7 @@ fn managed_client_spawns_ensures_and_searches() {
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
         .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let managed = ManagedDaemonClient::new().with_daemon_program(flashgrep_test_binary());
     let ensure = managed
@@ -157,6 +217,7 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
         .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let ensure_params = EnsureRepoParams {
         repo_path: repo_path.clone(),
@@ -201,6 +262,44 @@ fn managed_client_reuses_single_daemon_under_concurrent_ensure() {
 }
 
 #[test]
+fn managed_state_file_uses_git_root_for_repo_subdirectory() {
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    let src_path = repo_path.join("src");
+    fs::create_dir_all(&src_path).expect("repo dir should succeed");
+    fs::write(
+        src_path.join("lib.rs"),
+        "pub const NAME: &str = \"SUBDIR\";\n",
+    )
+    .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let root_state_file = daemon_state_file_path(&EnsureRepoParams {
+        repo_path: repo_path.clone(),
+        storage_root: None,
+        config: RepoConfig::default(),
+        refresh: Default::default(),
+    })
+    .expect("root state file should resolve");
+    let subdir_state_file = daemon_state_file_path(&EnsureRepoParams {
+        repo_path: src_path,
+        storage_root: None,
+        config: RepoConfig::default(),
+        refresh: Default::default(),
+    })
+    .expect("subdir state file should resolve");
+
+    assert_eq!(subdir_state_file, root_state_file);
+    assert_eq!(
+        root_state_file,
+        fs::canonicalize(repo_path)
+            .expect("repo should canonicalize")
+            .join(".flashgrep-index-engine")
+            .join("daemon-state.json")
+    );
+}
+
+#[test]
 fn managed_client_glob_uses_daemon_protocol_scope() {
     if !supports_managed_daemon_tests() {
         return;
@@ -209,7 +308,6 @@ fn managed_client_glob_uses_daemon_protocol_scope() {
     let repo_path = temp.path().join("repo");
     fs::create_dir_all(repo_path.join("src")).expect("repo dir should succeed");
     fs::create_dir_all(repo_path.join("tests")).expect("repo dir should succeed");
-    fs::create_dir_all(repo_path.join(".git")).expect("git dir should succeed");
     fs::write(repo_path.join(".gitignore"), "ignored.rs\n").expect("write should succeed");
     let src = repo_path.join("src/lib.rs");
     fs::write(&src, "const NAME: &str = \"HELLO\";\n").expect("write should succeed");
@@ -223,6 +321,7 @@ fn managed_client_glob_uses_daemon_protocol_scope() {
         "const NAME: &str = \"IGNORED\";\n",
     )
     .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let managed = ManagedDaemonClient::new().with_daemon_program(flashgrep_test_binary());
     let response = managed
@@ -273,6 +372,7 @@ fn managed_client_can_open_without_ensuring_index() {
     fs::create_dir_all(&repo_path).expect("repo dir should succeed");
     fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
         .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
 
     let managed = ManagedDaemonClient::new().with_daemon_program(flashgrep_test_binary());
     let opened = managed
