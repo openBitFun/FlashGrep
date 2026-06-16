@@ -100,6 +100,32 @@ fn opening_non_git_repo_fails_without_creating_gitignore() {
 }
 
 #[test]
+fn opening_empty_git_repo_fails_without_creating_gitignore() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    init_git_repo(&repo_path);
+
+    let error = service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: None,
+                config: RepoConfig::default(),
+                refresh: Default::default(),
+            },
+        })
+        .expect_err("empty git repo open should fail");
+
+    assert!(error
+        .to_string()
+        .contains("indexed daemon workspace requires a Git worktree with a HEAD commit"));
+    assert!(!repo_path.join(".gitignore").exists());
+}
+
+#[test]
 fn opening_repo_subdirectory_uses_git_root_identity_and_default_storage() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
@@ -122,6 +148,45 @@ fn opening_repo_subdirectory_uses_git_root_identity_and_default_storage() {
     assert_eq!(
         status.storage_root,
         canonical_repo
+            .join(".flashgrep-index-engine")
+            .to_string_lossy()
+    );
+}
+
+#[test]
+fn opening_linked_worktree_uses_git_discovery_and_linked_root_identity() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(repo_path.join("main.rs"), "const NAME: &str = \"MAIN\";\n")
+        .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let linked_path = temp.path().join("linked");
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(&repo_path)
+        .args(["worktree", "add", "-q", "-b", "linked"])
+        .arg(&linked_path)
+        .arg("HEAD")
+        .status()
+        .expect("git worktree add should run");
+    assert!(status.success(), "git worktree add should succeed");
+    assert!(
+        linked_path.join(".git").is_file(),
+        "linked worktrees use a .git file, not a .git directory"
+    );
+
+    let (repo_id, status) = open_repo(&service, linked_path.clone());
+    let canonical_linked = fs::canonicalize(&linked_path).expect("linked worktree should exist");
+
+    assert_eq!(repo_id, canonical_linked.to_string_lossy());
+    assert_eq!(status.repo_path, canonical_linked.to_string_lossy());
+    assert_eq!(
+        status.storage_root,
+        canonical_linked
             .join(".flashgrep-index-engine")
             .to_string_lossy()
     );
