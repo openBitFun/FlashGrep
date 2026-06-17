@@ -261,16 +261,28 @@ watcher 继续使用 `notify` 递归监听 worktree，但它只做两件事：
 1. 过滤 internal storage path。
 2. 调度一次尽快执行的 Git dirty probe。
 
-watcher 不再维护非 Git observed-path diff 分支。即使 watcher 丢事件，周期性 Git reconcile 也会恢复正确性。
+正常文件/目录事件会记录一个 bounded candidate path set，用这些 path 作为 Git pathspec 缩小 dirty probe 范围。这个 fast path 仍然只相信 Git 输出；watcher path 只是 Git probe 的 scope，不直接决定 dirty 集合。
+
+以下事件会升级到 full Git probe：
+
+- `.git` / Git metadata 变化。
+- `.gitignore` / `.gitmodules` / `.gitattributes` 变化。
+- repo root only event。
+- candidate path 数量超过上限。
+- watcher backend error。
+
+即使 watcher 丢事件，低频 full Git reconcile 也会恢复正确性。
 
 ### Polling / Reconcile
 
 只保留 Git worktree 的 reconcile 策略：
 
-- watcher active：低延迟事件触发 + 周期性 Git reconcile。
+- watcher active：低延迟事件触发 + 低频周期性 full Git reconcile。
 - watcher inactive：较短周期 Git poll fallback。
 
 删除 non-Git poll interval。
+
+带明确非 repo-root scope roots 的 search 会先执行一次 scoped Git pathspec probe，再读取 published view。这用于避免 macOS FSEvents 聚合延迟影响“搜索刚编辑的单个文件”这类交互路径。
 
 ## Overlay Construction
 
@@ -340,19 +352,17 @@ daemon build / rebuild 只允许 Git snapshot mode：
 - Git command error 后的 scan fallback
 - classifier 内用于重新解释 ignore 规则的 per-path scanner
 
-### Phase 4: Watcher 简化
+### Phase 4: Watcher Fast Path
 
-watcher 保留路径过滤和 debounce / schedule 行为。
+watcher 保留路径过滤和 debounce / schedule 行为，并记录 bounded candidate paths。
 
-但 workspace probe 不再消费 event buffer 里的具体路径做 correctness 判断；event buffer 可以退化成一个 dirty bit：
+`probe_workspace_overlay_from_events` 消费 event buffer 后：
 
-```text
-workspace_event_observed: bool
-```
+- 如果事件需要 full probe，执行 full Git dirty probe。
+- 如果有 candidate paths，执行 Git pathspec scoped dirty probe。
+- 如果没有可用 candidate，退回 full Git dirty probe。
 
-这样 watcher 的职责是“唤醒”，不是“决定变化范围”。
-
-`probe_workspace_overlay_from_events` 也应改成消费这个 dirty bit 后执行 Git dirty probe，而不是继续调用 observed-path classifier。旧的 `expand_observed_paths` / directory scan expansion 只有在以后引入 Git-aware fast path 时才允许回来，并且必须有周期性 full Git reconcile 兜底。
+这个 pathspec fast path 只缩小 Git 命令范围，不重新引入 non-Git observed-path classifier。周期性 full Git reconcile 继续作为 watcher 丢事件后的兜底。
 
 ### Phase 5: Protocol And Docs
 
@@ -385,7 +395,7 @@ workspace_event_observed: bool
 - 单文件修改后的 overlay publish 延迟需要保持在交互可接受范围。
 - watcher active 时不能因为连续保存触发无限并发 Git probe；maintenance worker 仍需串行合并事件。
 
-如果 Git dirty probe 在超大仓库上不可接受，允许增加一个 Git-aware fast path，但它必须仍以 Git 为正确性边界。例如：
+如果 Git dirty probe 在超大仓库上不可接受，允许继续扩展 Git-aware fast path，但它必须仍以 Git 为正确性边界。例如：
 
 - watcher 只收集候选路径。
 - 候选路径用 `git check-ignore` / `git ls-files --error-unmatch` / base catalog 分类。

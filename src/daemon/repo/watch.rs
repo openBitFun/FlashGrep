@@ -1,5 +1,6 @@
 use std::{
-    path::{Path, PathBuf},
+    collections::HashSet,
+    path::{Component, Path, PathBuf},
     sync::{mpsc, Arc},
     thread,
     time::Duration,
@@ -16,10 +17,19 @@ use super::RepoRuntime;
 
 #[cfg(target_os = "linux")]
 const LINUX_INOTIFY_WATCH_BUDGET_PERCENT: u64 = 75;
+const WATCH_EVENT_CANDIDATE_LIMIT: usize = 512;
 
 #[derive(Debug, Default)]
 pub(super) struct WorkspaceEventBuffer {
     pub(super) observed: bool,
+    pub(super) full_probe_required: bool,
+    pub(super) candidate_paths: HashSet<PathBuf>,
+}
+
+impl WorkspaceEventBuffer {
+    pub(super) fn use_fast_path(&self) -> bool {
+        self.observed && !self.full_probe_required && !self.candidate_paths.is_empty()
+    }
 }
 
 impl RepoRuntime {
@@ -107,7 +117,7 @@ impl RepoRuntime {
                         "flashgrep[watch][warn] workspace watcher error for {}: {error}",
                         self.build_config.repo_path.display()
                     );
-                    self.enqueue_workspace_events();
+                    self.enqueue_full_workspace_probe();
                 }
                 Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
@@ -127,34 +137,59 @@ impl RepoRuntime {
             return;
         }
 
-        let mut observed = false;
+        let mut root_event_seen = false;
+        let mut full_probe_required = false;
         let mut paths = Vec::new();
         for path in event.paths {
             if path == self.build_config.repo_path {
-                observed = true;
+                root_event_seen = true;
                 continue;
             }
             if let Some(path) = self.normalize_workspace_watch_path(&path) {
-                paths.push(path);
+                if self.watch_path_requires_full_probe(&path) {
+                    full_probe_required = true;
+                } else {
+                    paths.push(path);
+                }
             }
         }
-        if paths.len() > 4_096 {
-            paths.clear();
+        if root_event_seen && paths.is_empty() {
+            full_probe_required = true;
         }
-        observed |= !paths.is_empty();
-        if !observed {
+        if paths.len() > WATCH_EVENT_CANDIDATE_LIMIT {
+            paths.clear();
+            full_probe_required = true;
+        }
+        if !full_probe_required && paths.is_empty() {
             return;
         }
-        self.enqueue_workspace_events();
+        self.enqueue_workspace_events(paths, full_probe_required);
     }
 
-    fn enqueue_workspace_events(&self) {
+    fn enqueue_full_workspace_probe(&self) {
+        self.enqueue_workspace_events(Vec::new(), true);
+    }
+
+    fn enqueue_workspace_events(&self, paths: Vec<PathBuf>, full_probe_required: bool) {
         let mut buffer = match self.workspace_event_buffer.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         let changed = !buffer.observed;
         buffer.observed = true;
+        if full_probe_required {
+            buffer.full_probe_required = true;
+            buffer.candidate_paths.clear();
+        } else if !buffer.full_probe_required {
+            for path in paths {
+                buffer.candidate_paths.insert(path);
+                if buffer.candidate_paths.len() > WATCH_EVENT_CANDIDATE_LIMIT {
+                    buffer.full_probe_required = true;
+                    buffer.candidate_paths.clear();
+                    break;
+                }
+            }
+        }
         drop(buffer);
         if !changed {
             return;
@@ -179,6 +214,26 @@ impl RepoRuntime {
             return None;
         }
         Some(path)
+    }
+
+    fn watch_path_requires_full_probe(&self, path: &Path) -> bool {
+        if path
+            .strip_prefix(&self.build_config.repo_path)
+            .ok()
+            .and_then(|relative| relative.components().next())
+            .is_some_and(|component| matches!(component, Component::Normal(name) if name == ".git"))
+        {
+            return true;
+        }
+        if path.file_name().is_some_and(|name| {
+            matches!(
+                name.to_string_lossy().as_ref(),
+                ".gitignore" | ".gitmodules" | ".gitattributes" | "HEAD" | "config" | "packed-refs"
+            )
+        }) {
+            return true;
+        }
+        false
     }
 }
 

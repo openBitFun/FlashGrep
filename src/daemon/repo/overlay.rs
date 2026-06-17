@@ -154,11 +154,7 @@ impl RepoRuntime {
 
         WorkspaceOverlayIndex::clear_storage(&self.build_config)?;
 
-        let overlay_index = Arc::new(WorkspaceOverlayIndex::open_with_policy_and_hook(
-            &self.build_config,
-            self.workspace_overlay_publish_policy(),
-            self.workspace_overlay_merge_state_hook(),
-        )?);
+        let overlay_index = Arc::new(self.open_workspace_overlay_index()?);
         overlay_index.rebuild_snapshot(&snapshot)?;
         overlay_index.checkpoint()?;
         let mut slot = match self.workspace_overlay_engine.lock() {
@@ -198,6 +194,17 @@ impl RepoRuntime {
             if dirty.is_empty() {
                 return self.try_reset_workspace_overlay_engine();
             }
+            if self.dirty_catalog_pending_paths() == *dirty {
+                WorkspaceOverlayIndex::clear_storage(&self.build_config)?;
+                let overlay_index = Arc::new(self.open_workspace_overlay_index()?);
+                overlay_index.ingest_batch(&batch)?;
+                let mut slot = match self.workspace_overlay_engine.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                *slot = Some(overlay_index);
+                return Ok(());
+            }
             eprintln!(
                 "flashgrep[overlay][info] workspace overlay engine missing for {}; rebuilding from dirty paths: modified={} deleted={} new={}",
                 self.build_config.repo_path.display(),
@@ -215,6 +222,14 @@ impl RepoRuntime {
         };
         overlay_index.ingest_batch(&batch)?;
         Ok(())
+    }
+
+    fn open_workspace_overlay_index(&self) -> Result<WorkspaceOverlayIndex> {
+        WorkspaceOverlayIndex::open_with_policy_and_hook(
+            &self.build_config,
+            self.workspace_overlay_publish_policy(),
+            self.workspace_overlay_merge_state_hook(),
+        )
     }
 
     fn handle_workspace_overlay_engine_error(&self, operation: &str, error: &AppError) {

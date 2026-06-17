@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    ffi::OsString,
     fs,
     path::{Path, PathBuf},
     process::Command,
@@ -53,6 +54,33 @@ impl RepoRuntime {
         let Some(dirty) = self.diff_against_base_snapshot_incremental()? else {
             return Ok(None);
         };
+        self.plan_overlay_update_from_dirty_probe(dirty)
+    }
+
+    pub(super) fn plan_overlay_update_from_event_probe(
+        &self,
+        candidate_paths: impl IntoIterator<Item = PathBuf>,
+    ) -> Result<Option<WorkspaceOverlayWritePlan>> {
+        let candidate_paths = candidate_paths
+            .into_iter()
+            .filter(|path| !self.is_storage_path(path) && !is_workspace_internal_path(path))
+            .collect::<Vec<_>>();
+        if candidate_paths.is_empty() {
+            return Ok(None);
+        }
+        let delta = self.diff_against_base_snapshot_git_worktree_paths(&candidate_paths)?;
+        let mut dirty = self.dirty_catalog_visible_paths();
+        for path in candidate_paths {
+            dirty.remove_path_scope(&path);
+        }
+        dirty.merge(delta);
+        self.plan_overlay_update_from_dirty_probe(dirty)
+    }
+
+    fn plan_overlay_update_from_dirty_probe(
+        &self,
+        dirty: DirtyPathSet,
+    ) -> Result<Option<WorkspaceOverlayWritePlan>> {
         self.reconcile_dirty_catalog(&dirty)?;
         let published_overlay_paths = self.published_overlay_paths()?;
         let pending_dirty = self.dirty_catalog_pending_paths();
@@ -226,6 +254,20 @@ impl RepoRuntime {
     }
 
     fn diff_against_base_snapshot_git_worktree(&self) -> Result<DirtyPathSet> {
+        self.diff_against_base_snapshot_git_worktree_with_scope(None)
+    }
+
+    fn diff_against_base_snapshot_git_worktree_paths(
+        &self,
+        paths: &[PathBuf],
+    ) -> Result<DirtyPathSet> {
+        self.diff_against_base_snapshot_git_worktree_with_scope(Some(paths))
+    }
+
+    fn diff_against_base_snapshot_git_worktree_with_scope(
+        &self,
+        paths: Option<&[PathBuf]>,
+    ) -> Result<DirtyPathSet> {
         let Some(base_metadata) =
             WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
         else {
@@ -242,8 +284,8 @@ impl RepoRuntime {
             )));
         };
 
-        let tracked_changes = self.git_tracked_dirty_paths(&head_commit)?;
-        let untracked_visible_paths = self.git_untracked_visible_paths()?;
+        let tracked_changes = self.git_tracked_dirty_paths(&head_commit, paths)?;
+        let untracked_visible_paths = self.git_untracked_visible_paths(paths)?;
 
         let mut dirty = DirtyPathSet::default();
         let mut tracked_current_paths = Vec::new();
@@ -387,13 +429,27 @@ impl RepoRuntime {
     }
 
     fn git_output<const N: usize>(&self, args: [&str; N]) -> Result<Vec<u8>> {
+        self.git_output_with_pathspec(args, None)
+    }
+
+    fn git_output_with_pathspec<const N: usize>(
+        &self,
+        args: [&str; N],
+        paths: Option<&[PathBuf]>,
+    ) -> Result<Vec<u8>> {
         let mut command = Command::new("git");
         command
             .arg("-C")
             .arg(&self.build_config.repo_path)
+            .env("GIT_OPTIONAL_LOCKS", "0")
             .args(args);
         if let Some(pathspec) = self.git_exclude_pathspec() {
             command.arg(pathspec);
+        }
+        if let Some(paths) = paths {
+            for pathspec in self.git_candidate_pathspecs(paths) {
+                command.arg(pathspec);
+            }
         }
         let output = command.output()?;
         if !output.status.success() {
@@ -406,16 +462,33 @@ impl RepoRuntime {
         Ok(output.stdout)
     }
 
-    fn git_tracked_dirty_paths(&self, head_commit: &str) -> Result<Vec<(String, DirtyPathKind)>> {
-        let output = self.git_output([
-            "diff",
-            "--name-status",
-            "-z",
-            "--no-renames",
-            head_commit,
-            "--",
-            ".",
-        ])?;
+    fn git_tracked_dirty_paths(
+        &self,
+        head_commit: &str,
+        paths: Option<&[PathBuf]>,
+    ) -> Result<Vec<(String, DirtyPathKind)>> {
+        let output = match paths {
+            Some(paths) => self.git_output_with_pathspec(
+                [
+                    "diff",
+                    "--name-status",
+                    "-z",
+                    "--no-renames",
+                    head_commit,
+                    "--",
+                ],
+                Some(paths),
+            )?,
+            None => self.git_output([
+                "diff",
+                "--name-status",
+                "-z",
+                "--no-renames",
+                head_commit,
+                "--",
+                ".",
+            ])?,
+        };
         Ok(parse_git_name_status_z(&output)
             .into_iter()
             .filter_map(|(status, logical_path)| {
@@ -438,9 +511,13 @@ impl RepoRuntime {
             .collect())
     }
 
-    fn git_untracked_visible_paths(&self) -> Result<Vec<String>> {
-        let output = match self.build_config.corpus_mode {
-            CorpusMode::RespectIgnore => self.git_output([
+    fn git_untracked_visible_paths(&self, paths: Option<&[PathBuf]>) -> Result<Vec<String>> {
+        let output = match (self.build_config.corpus_mode, paths) {
+            (CorpusMode::RespectIgnore, Some(paths)) => self.git_output_with_pathspec(
+                ["ls-files", "-z", "--others", "--exclude-standard", "--"],
+                Some(paths),
+            )?,
+            (CorpusMode::RespectIgnore, None) => self.git_output([
                 "ls-files",
                 "-z",
                 "--others",
@@ -448,7 +525,12 @@ impl RepoRuntime {
                 "--",
                 ".",
             ])?,
-            CorpusMode::NoIgnore => self.git_output(["ls-files", "-z", "--others", "--", "."])?,
+            (CorpusMode::NoIgnore, Some(paths)) => {
+                self.git_output_with_pathspec(["ls-files", "-z", "--others", "--"], Some(paths))?
+            }
+            (CorpusMode::NoIgnore, None) => {
+                self.git_output(["ls-files", "-z", "--others", "--", "."])?
+            }
         };
         Ok(output
             .split(|byte| *byte == 0)
@@ -473,6 +555,17 @@ impl RepoRuntime {
         }
         let path = relative.to_string_lossy().replace('\\', "/");
         Some(format!(":(exclude){path}"))
+    }
+
+    fn git_candidate_pathspecs(&self, paths: &[PathBuf]) -> Vec<OsString> {
+        let mut pathspecs = paths
+            .iter()
+            .filter_map(|path| self.logical_repo_path(path))
+            .filter(|path| !path.is_empty())
+            .collect::<Vec<_>>();
+        pathspecs.sort_unstable();
+        pathspecs.dedup();
+        pathspecs.into_iter().map(OsString::from).collect()
     }
 }
 
@@ -526,6 +619,14 @@ fn decide_overlay_update_mode(
     pending_dirty: &DirtyPathSet,
     published_overlay_snapshot_available: bool,
 ) -> OverlayUpdateMode {
+    if dirty.is_empty() {
+        return if published_overlay_paths.is_empty() {
+            OverlayUpdateMode::NoChange
+        } else {
+            OverlayUpdateMode::Rebuild
+        };
+    }
+
     if dirty == published_overlay_paths {
         if pending_dirty.is_empty() {
             return if published_overlay_snapshot_available {
@@ -582,6 +683,18 @@ mod tests {
         let pending_dirty = dirty_paths(&[], &[], &[]);
 
         let mode = decide_overlay_update_mode(&dirty, &dirty, &pending_dirty, true);
+
+        assert_eq!(mode, OverlayUpdateMode::NoChange);
+    }
+
+    #[test]
+    fn clean_repo_without_overlay_snapshot_stays_no_change() {
+        let dirty = dirty_paths(&[], &[], &[]);
+        let published_overlay_paths = dirty_paths(&[], &[], &[]);
+        let pending_dirty = dirty_paths(&[], &[], &[]);
+
+        let mode =
+            decide_overlay_update_mode(&dirty, &published_overlay_paths, &pending_dirty, false);
 
         assert_eq!(mode, OverlayUpdateMode::NoChange);
     }

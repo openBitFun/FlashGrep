@@ -1,4 +1,9 @@
-use std::{collections::HashMap, path::PathBuf, sync::atomic::Ordering, time::SystemTime};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+    sync::atomic::Ordering,
+    time::SystemTime,
+};
 
 use crate::{
     error::{AppError, Result},
@@ -37,6 +42,25 @@ impl DirtyPathSet {
         let removed_deleted = self.deleted.remove(path);
         let removed_new = self.new.remove(path);
         removed_modified || removed_deleted || removed_new
+    }
+
+    pub(super) fn remove_path_scope(&mut self, path: &Path) -> bool {
+        self.remove_matching(|dirty_path| {
+            let dirty_path = Path::new(dirty_path);
+            dirty_path == path || dirty_path.starts_with(path)
+        })
+    }
+
+    fn remove_matching(&mut self, mut matches: impl FnMut(&str) -> bool) -> bool {
+        let modified_before = self.modified.len();
+        self.modified.retain(|path| !matches(path));
+        let deleted_before = self.deleted.len();
+        self.deleted.retain(|path| !matches(path));
+        let new_before = self.new.len();
+        self.new.retain(|path| !matches(path));
+        modified_before != self.modified.len()
+            || deleted_before != self.deleted.len()
+            || new_before != self.new.len()
     }
 
     pub(super) fn merge(&mut self, other: DirtyPathSet) -> bool {
@@ -149,6 +173,7 @@ impl RepoRuntime {
     }
 
     pub(super) fn probe_workspace_overlay(&self) -> Result<bool> {
+        record_probe_mode_for_test("full");
         match self.current_base_snapshot_key() {
             Ok(Some(snapshot_key)) => {
                 let plan = match self.plan_overlay_update_from_incremental_probe()? {
@@ -189,11 +214,52 @@ impl RepoRuntime {
     }
 
     pub(super) fn probe_workspace_overlay_from_events(&self) -> Result<bool> {
-        let _ = self.take_workspace_events();
-        self.probe_workspace_overlay()
+        let events = self.take_workspace_events();
+        if !events.use_fast_path() {
+            return self.probe_workspace_overlay();
+        }
+        record_probe_mode_for_test("fast");
+        match self.current_base_snapshot_key() {
+            Ok(Some(snapshot_key)) => {
+                let plan = match self
+                    .plan_overlay_update_from_event_probe(events.candidate_paths.into_iter())?
+                {
+                    Some(plan) => Some(plan),
+                    None if self.dirty_catalog_pending_paths().is_empty()
+                        && self.snapshot_published_overlay_paths()?.is_some() =>
+                    {
+                        None
+                    }
+                    None => Some(self.plan_overlay_full_rebuild_from_worktree()?),
+                };
+                if let Some(plan) = plan {
+                    self.apply_refreshed_overlay(snapshot_key, plan);
+                } else {
+                    self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
+                }
+                Ok(true)
+            }
+            Ok(None) => {
+                self.apply_missing_base_overlay_state(None);
+                Ok(true)
+            }
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                self.apply_missing_base_overlay_state(None);
+                Ok(true)
+            }
+            Err(AppError::InvalidIndex(error)) => {
+                self.apply_missing_base_overlay_state(Some(error));
+                Ok(true)
+            }
+            Err(error) => {
+                self.set_probe_healthy(false);
+                self.set_phase(RepoPhase::Degraded, Some(error.to_string()));
+                Err(error)
+            }
+        }
     }
 
-    fn apply_refreshed_overlay(
+    pub(super) fn apply_refreshed_overlay(
         &self,
         snapshot_key: String,
         plan: super::overlay::WorkspaceOverlayWritePlan,
@@ -211,7 +277,10 @@ impl RepoRuntime {
         self.apply_overlay_write_plan(plan);
     }
 
-    fn finish_workspace_probe_without_overlay_change(&self, snapshot_key: Option<String>) {
+    pub(super) fn finish_workspace_probe_without_overlay_change(
+        &self,
+        snapshot_key: Option<String>,
+    ) {
         self.workspace_probe_pending.store(false, Ordering::Relaxed);
         self.set_probe_healthy(true);
         let dirty_stats = self.dirty_catalog_stats();
@@ -303,5 +372,43 @@ impl RepoRuntime {
         adjusted
             .starts_with(&self.build_config.repo_path)
             .then_some(adjusted)
+    }
+}
+
+#[cfg(test)]
+fn record_probe_mode_for_test(mode: &'static str) {
+    use std::io::Write;
+
+    let Some(path) = std::env::var_os("FLASHGREP_TEST_PROBE_MODE_FILE") else {
+        return;
+    };
+    if let Ok(mut file) = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+    {
+        let _ = writeln!(file, "{mode}");
+    }
+}
+
+#[cfg(not(test))]
+fn record_probe_mode_for_test(_mode: &'static str) {}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn dirty_path_set_removes_directory_scope_without_prefix_bleed() {
+        let mut dirty = DirtyPathSet::default();
+        dirty.modified.insert("/repo/src/lib.rs".into());
+        dirty.deleted.insert("/repo/src/nested/old.rs".into());
+        dirty.new.insert("/repo/src2/kept.rs".into());
+
+        assert!(dirty.remove_path_scope(Path::new("/repo/src")));
+
+        assert!(dirty.modified.is_empty());
+        assert!(dirty.deleted.is_empty());
+        assert!(dirty.new.contains("/repo/src2/kept.rs"));
     }
 }

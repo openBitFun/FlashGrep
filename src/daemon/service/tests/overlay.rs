@@ -699,6 +699,117 @@ fn probe_tracks_new_text_files_inside_new_directory_without_extra_probe() {
 }
 
 #[test]
+fn watcher_file_events_use_git_pathspec_fast_probe() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    fs::write(&tracked, "const VALUE: &str = \"BASE\";\n").expect("write should succeed");
+
+    let probe_mode_path = temp.path().join("probe-mode.log");
+    unsafe {
+        std::env::set_var("FLASHGREP_TEST_PROBE_MODE_FILE", &probe_mode_path);
+    }
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+    wait_for_workspace_watcher_active(&service, &repo_id);
+    let _ = fs::remove_file(&probe_mode_path);
+
+    fs::write(&tracked, "const VALUE: &str = \"FAST_PATH_TOKEN\";\n")
+        .expect("rewrite should succeed");
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "FAST_PATH_TOKEN", 1);
+    assert!(is_transition_or_indexed_workspace_backend(backend));
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    let probe_modes =
+        fs::read_to_string(&probe_mode_path).expect("probe mode log should be written");
+    unsafe {
+        std::env::remove_var("FLASHGREP_TEST_PROBE_MODE_FILE");
+    }
+    assert!(
+        probe_modes.lines().any(|line| line == "fast"),
+        "expected fast probe in {probe_modes:?}"
+    );
+}
+
+#[test]
+fn watcher_gitignore_events_fall_back_to_full_git_probe() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const VALUE: &str = \"BASE\";\n",
+    )
+    .expect("write should succeed");
+
+    let probe_mode_path = temp.path().join("probe-mode.log");
+    unsafe {
+        std::env::set_var("FLASHGREP_TEST_PROBE_MODE_FILE", &probe_mode_path);
+    }
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    let _ = fs::remove_file(&probe_mode_path);
+
+    fs::write(repo_path.join(".gitignore"), "*.tmp\n").expect("gitignore write should succeed");
+    fs::write(
+        repo_path.join("added.rs"),
+        "const VALUE: &str = \"FULL_PROBE_TOKEN\";\n",
+    )
+    .expect("added write should succeed");
+
+    let (backend, status) = wait_for_search_count(&service, &repo_id, "FULL_PROBE_TOKEN", 1);
+    assert!(is_transition_or_indexed_workspace_backend(backend));
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    let probe_modes =
+        fs::read_to_string(&probe_mode_path).expect("probe mode log should be written");
+    unsafe {
+        std::env::remove_var("FLASHGREP_TEST_PROBE_MODE_FILE");
+    }
+    assert!(
+        probe_modes.lines().any(|line| line == "full"),
+        "expected full probe in {probe_modes:?}"
+    );
+}
+
+#[test]
+fn scoped_search_probes_requested_roots_without_waiting_for_watcher() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    fs::write(&tracked, "const VALUE: &str = \"BASE\";\n").expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    fs::write(&tracked, "const VALUE: &str = \"SCOPED_SEARCH_TOKEN\";\n")
+        .expect("rewrite should succeed");
+
+    let query = query("SCOPED_SEARCH_TOKEN");
+    let (backend, results, status) =
+        wait_for_search_with_params_count(&service, &repo_id, query, vec![tracked], 1);
+    assert!(is_transition_or_indexed_workspace_backend(backend));
+    assert_eq!(results.matched_lines, 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+}
+
+#[test]
 fn probe_tracks_deleted_files() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();

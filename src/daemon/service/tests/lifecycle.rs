@@ -983,6 +983,57 @@ fn eventual_search_keeps_indexed_reads_while_clean_repo_has_pending_reconcile() 
 }
 
 #[test]
+fn clean_indexed_search_does_not_schedule_workspace_probe_for_missing_overlay() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const NAME: &str = \"BASE_NO_OVERLAY_PROBE\";\n",
+    )
+    .expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path);
+    build_repo(&service, &repo_id);
+
+    let status = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+            && status.dirty_files.modified == 0
+            && status.dirty_files.deleted == 0
+            && status.dirty_files.new == 0
+            && status.overlay.is_none()
+    });
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    match search_repo(&service, &repo_id, "BASE_NO_OVERLAY_PROBE") {
+        Response::SearchCompleted {
+            backend,
+            results,
+            status,
+            ..
+        } => {
+            assert!(matches!(backend, SearchBackend::IndexedClean));
+            assert_eq!(results.matched_lines, 1);
+            assert!(matches!(
+                status.phase,
+                crate::daemon::protocol::RepoPhase::ReadyClean
+            ));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+
+    assert!(
+        !service
+            .repos
+            .workspace_probe_pending_for_tests(&repo_id)
+            .expect("workspace probe pending check should succeed"),
+        "clean indexed search should not schedule a probe solely because overlay is absent"
+    );
+}
+
+#[test]
 fn background_reconcile_uses_git_incremental_recovery() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
@@ -1002,7 +1053,6 @@ fn background_reconcile_uses_git_incremental_recovery() {
     let ready = wait_for_status(&service, &repo_id, |status| {
         matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
     });
-    let baseline_probe = ready.last_probe_unix_secs;
     assert_eq!(ready.dirty_files.modified, 0);
     assert_eq!(ready.dirty_files.deleted, 0);
     assert_eq!(ready.dirty_files.new, 0);
@@ -1011,7 +1061,10 @@ fn background_reconcile_uses_git_incremental_recovery() {
 
     let settled = wait_for_status(&service, &repo_id, |status| {
         matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
-            && status.last_probe_unix_secs != baseline_probe
+            && !service
+                .repos
+                .workspace_probe_pending_for_tests(&repo_id)
+                .expect("workspace probe pending check should succeed")
     });
     assert_eq!(settled.dirty_files.modified, 0);
     assert_eq!(settled.dirty_files.deleted, 0);

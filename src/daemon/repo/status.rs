@@ -112,7 +112,7 @@ impl RepoRuntime {
     #[cfg(test)]
     pub(super) fn mark_workspace_probe_pending(&self) {
         self.workspace_probe_pending.store(true, Ordering::Relaxed);
-        self.schedule_workspace_probe(self.workspace_probe_interval());
+        self.schedule_workspace_probe(super::maintenance::GIT_WORKSPACE_EVENT_RETRY_DELAY);
         self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
     }
@@ -126,7 +126,7 @@ impl RepoRuntime {
         state.last_error = Some(error);
         state.probe_healthy = false;
         drop(state);
-        self.schedule_workspace_probe(self.workspace_probe_interval());
+        self.schedule_workspace_probe(super::maintenance::GIT_WORKSPACE_EVENT_RETRY_DELAY);
         self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
     }

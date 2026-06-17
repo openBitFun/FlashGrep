@@ -24,8 +24,8 @@ const MAINTENANCE_REASON_OVERLAY_REBUILD: u32 = 1 << 2;
 const MAINTENANCE_REASON_BASE_REBUILD: u32 = 1 << 3;
 #[allow(dead_code)]
 const MAINTENANCE_REASON_BASE_PROMOTE: u32 = 1 << 4;
-const GIT_WORKSPACE_EVENT_RETRY_DELAY: Duration = Duration::from_millis(50);
-const GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(10);
+pub(super) const GIT_WORKSPACE_EVENT_RETRY_DELAY: Duration = Duration::from_millis(50);
+const GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const GIT_WORKSPACE_POLL_FALLBACK_INTERVAL: Duration = Duration::from_millis(100);
 const AUTO_BASE_REBUILD_MIN_DELAY: Duration = Duration::from_secs(2);
 const AUTO_BASE_REBUILD_RETRY_DELAY: Duration = Duration::from_secs(2);

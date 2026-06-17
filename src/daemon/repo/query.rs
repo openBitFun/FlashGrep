@@ -46,6 +46,7 @@ impl RepoRuntime {
         let _search_activity = self.begin_search_activity();
         let scope =
             normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
+        self.probe_workspace_overlay_for_search_scope(&scope)?;
         let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
         let query_filters = build_query_filters(&self.build_config.repo_path, &scope);
         let status = self.status_snapshot();
@@ -109,7 +110,6 @@ impl RepoRuntime {
                 } else {
                     QueryBackend::IndexedWorkspaceView
                 };
-                let overlay_snapshot_missing = !workspace_snapshot.has_overlay_snapshot();
                 let overlay_snapshot_unavailable_for_dirty =
                     !tracked_dirty.is_empty() && !workspace_snapshot.has_overlay_snapshot();
                 if overlay_snapshot_unavailable_for_dirty {
@@ -123,9 +123,6 @@ impl RepoRuntime {
                         filter.as_ref(),
                         response_status,
                     );
-                }
-                if overlay_snapshot_missing {
-                    self.schedule_workspace_probe(Duration::from_millis(0));
                 }
                 let results = match workspace_snapshot.search(
                     &self.workspace_search_view,
@@ -212,6 +209,42 @@ impl RepoRuntime {
                     .unwrap_or_else(|| "repo runtime is degraded".into()),
             )),
         }
+    }
+
+    fn probe_workspace_overlay_for_search_scope(&self, scope: &PathFilterArgs) -> Result<()> {
+        if scope.roots.is_empty() || self.shutting_down.load(Ordering::Relaxed) {
+            return Ok(());
+        }
+        let roots = scope
+            .roots
+            .iter()
+            .filter(|root| {
+                root.strip_prefix(&self.build_config.repo_path)
+                    .is_ok_and(|relative| !relative.as_os_str().is_empty())
+            })
+            .cloned()
+            .collect::<Vec<_>>();
+        if roots.is_empty() {
+            return Ok(());
+        }
+
+        let status = self.status_snapshot();
+        if !matches!(status.phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
+            || status.snapshot_key.is_none()
+            || self.has_active_task()
+        {
+            return Ok(());
+        }
+
+        let Some(snapshot_key) = self.current_base_snapshot_key()? else {
+            return Ok(());
+        };
+        let Some(plan) = self.plan_overlay_update_from_event_probe(roots)? else {
+            self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
+            return Ok(());
+        };
+        self.apply_refreshed_overlay(snapshot_key, plan);
+        Ok(())
     }
 
     pub(super) fn glob(&self, request: super::GlobRequest) -> Result<super::GlobResponse> {

@@ -324,6 +324,20 @@ pub(super) fn mark_workspace_probe_pending(service: &DaemonService, repo_id: &st
         .expect("mark workspace probe pending should succeed");
 }
 
+pub(super) fn wait_for_workspace_watcher_active(service: &DaemonService, repo_id: &str) {
+    for _ in 0..STATUS_WAIT_ATTEMPTS {
+        if service
+            .repos
+            .workspace_watcher_active_for_tests(repo_id)
+            .expect("watcher active check should succeed")
+        {
+            return;
+        }
+        thread::sleep(Duration::from_millis(50));
+    }
+    panic!("timed out waiting for workspace watcher to become active");
+}
+
 pub(super) fn clear_published_overlay_paths_cache(service: &DaemonService, repo_id: &str) {
     service
         .repos

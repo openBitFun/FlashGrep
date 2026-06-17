@@ -410,6 +410,16 @@ impl RepoManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn workspace_probe_pending_for_tests(&self, repo_id: &str) -> Result<bool> {
+        Ok(self.repo(repo_id)?.workspace_probe_pending())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn workspace_watcher_active_for_tests(&self, repo_id: &str) -> Result<bool> {
+        Ok(self.repo(repo_id)?.workspace_watcher_active())
+    }
+
+    #[cfg(test)]
     pub(crate) fn clear_published_overlay_paths_cache_for_tests(
         &self,
         repo_id: &str,
