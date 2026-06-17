@@ -809,6 +809,1176 @@ fn scoped_search_probes_requested_roots_without_waiting_for_watcher() {
     assert_exact_dirty_stats(&status, 1, 0, 0);
 }
 
+fn write_sequence_token(path: &std::path::Path, token: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("sequence parent dir should be created");
+    }
+    fs::write(path, format!("const VALUE: &str = \"{token}\";\n"))
+        .expect("sequence file write should succeed");
+}
+
+fn remove_sequence_file(path: &std::path::Path) {
+    match fs::remove_file(path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => panic!("sequence file remove should succeed: {error:?}"),
+    }
+}
+
+fn git_sequence(repo_path: &std::path::Path, args: &[&str]) {
+    let status = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo_path)
+        .args(args)
+        .status()
+        .expect("git sequence command should run");
+    assert!(
+        status.success(),
+        "git sequence command should succeed: git -C {} {}",
+        repo_path.display(),
+        args.join(" ")
+    );
+}
+
+fn wait_for_scoped_token_count(
+    service: &DaemonService,
+    repo_id: &str,
+    path: &std::path::Path,
+    token: &str,
+    expected: usize,
+) -> crate::daemon::protocol::RepoStatus {
+    wait_for_scoped_token_count_for_roots(service, repo_id, &[path.to_path_buf()], token, expected)
+}
+
+fn wait_for_scoped_token_count_for_roots(
+    service: &DaemonService,
+    repo_id: &str,
+    roots: &[PathBuf],
+    token: &str,
+    expected: usize,
+) -> crate::daemon::protocol::RepoStatus {
+    let roots = roots
+        .iter()
+        .map(|path| canonical_sequence_scope_path(path))
+        .collect::<Vec<_>>();
+    let (_, _, status) =
+        wait_for_search_with_params_count(service, repo_id, query(token), roots, expected);
+    status
+}
+
+fn canonical_sequence_scope_path(path: &std::path::Path) -> PathBuf {
+    if let Ok(canonical) = fs::canonicalize(path) {
+        return canonical;
+    }
+    let Some(parent) = path.parent() else {
+        return path.to_path_buf();
+    };
+    match fs::canonicalize(parent) {
+        Ok(parent) => match path.file_name() {
+            Some(file_name) => parent.join(file_name),
+            None => parent,
+        },
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum CommonSequenceAction {
+    Write(&'static str),
+    Remove,
+    RestoreBase,
+}
+
+#[derive(Clone, Copy)]
+struct CommonSequenceStep {
+    action: CommonSequenceAction,
+    expected_token: Option<&'static str>,
+    absent_token: Option<&'static str>,
+    expected_dirty_stats: (usize, usize, usize),
+}
+
+fn write_common_sequence_state(
+    path: &std::path::Path,
+    action: CommonSequenceAction,
+    base_token: &'static str,
+) {
+    match action {
+        CommonSequenceAction::Write(token) => write_sequence_token(path, token),
+        CommonSequenceAction::Remove => remove_sequence_file(path),
+        CommonSequenceAction::RestoreBase => write_sequence_token(path, base_token),
+    }
+}
+
+fn run_common_sequence_steps(
+    service: &DaemonService,
+    repo_id: &str,
+    path: &std::path::Path,
+    base_token: &'static str,
+    steps: &[CommonSequenceStep],
+) {
+    for step in steps {
+        write_common_sequence_state(path, step.action, base_token);
+        let probe_token = step
+            .expected_token
+            .or(step.absent_token)
+            .unwrap_or(base_token);
+        let mut status = wait_for_scoped_token_count(
+            service,
+            repo_id,
+            path,
+            probe_token,
+            usize::from(step.expected_token == Some(probe_token)),
+        );
+        assert_exact_dirty_stats(
+            &status,
+            step.expected_dirty_stats.0,
+            step.expected_dirty_stats.1,
+            step.expected_dirty_stats.2,
+        );
+        if let Some(absent_token) = step.absent_token {
+            status = wait_for_scoped_token_count(service, repo_id, path, absent_token, 0);
+            assert_exact_dirty_stats(
+                &status,
+                step.expected_dirty_stats.0,
+                step.expected_dirty_stats.1,
+                step.expected_dirty_stats.2,
+            );
+        }
+    }
+}
+
+#[test]
+fn scoped_probe_reconciles_common_tracked_operation_permutations() {
+    let _serial = daemon_test_serial();
+    let cases: &[(&str, &[CommonSequenceStep])] = &[
+        (
+            "modify_modify_delete_restore_modify",
+            &[
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_T_MMDRM_A"),
+                    expected_token: Some("SEQ_PERM_T_MMDRM_A"),
+                    absent_token: Some("SEQ_PERM_TRACKED_BASE_modify_modify_delete_restore_modify"),
+                    expected_dirty_stats: (1, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_T_MMDRM_B"),
+                    expected_token: Some("SEQ_PERM_T_MMDRM_B"),
+                    absent_token: Some("SEQ_PERM_T_MMDRM_A"),
+                    expected_dirty_stats: (1, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_T_MMDRM_B"),
+                    expected_dirty_stats: (0, 1, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::RestoreBase,
+                    expected_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_modify_modify_delete_restore_modify",
+                    ),
+                    absent_token: Some("SEQ_PERM_T_MMDRM_B"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_T_MMDRM_C"),
+                    expected_token: Some("SEQ_PERM_T_MMDRM_C"),
+                    absent_token: Some("SEQ_PERM_TRACKED_BASE_modify_modify_delete_restore_modify"),
+                    expected_dirty_stats: (1, 0, 0),
+                },
+            ],
+        ),
+        (
+            "delete_restore_modify_restore_delete",
+            &[
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_restore_modify_restore_delete",
+                    ),
+                    expected_dirty_stats: (0, 1, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::RestoreBase,
+                    expected_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_restore_modify_restore_delete",
+                    ),
+                    absent_token: None,
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_T_DRMRA_A"),
+                    expected_token: Some("SEQ_PERM_T_DRMRA_A"),
+                    absent_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_restore_modify_restore_delete",
+                    ),
+                    expected_dirty_stats: (1, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::RestoreBase,
+                    expected_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_restore_modify_restore_delete",
+                    ),
+                    absent_token: Some("SEQ_PERM_T_DRMRA_A"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_restore_modify_restore_delete",
+                    ),
+                    expected_dirty_stats: (0, 1, 0),
+                },
+            ],
+        ),
+        (
+            "delete_write_write_restore_write_delete",
+            &[
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_write_write_restore_write_delete",
+                    ),
+                    expected_dirty_stats: (0, 1, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_T_DWWRWD_A"),
+                    expected_token: Some("SEQ_PERM_T_DWWRWD_A"),
+                    absent_token: None,
+                    expected_dirty_stats: (1, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_T_DWWRWD_B"),
+                    expected_token: Some("SEQ_PERM_T_DWWRWD_B"),
+                    absent_token: Some("SEQ_PERM_T_DWWRWD_A"),
+                    expected_dirty_stats: (1, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::RestoreBase,
+                    expected_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_write_write_restore_write_delete",
+                    ),
+                    absent_token: Some("SEQ_PERM_T_DWWRWD_B"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_T_DWWRWD_C"),
+                    expected_token: Some("SEQ_PERM_T_DWWRWD_C"),
+                    absent_token: Some(
+                        "SEQ_PERM_TRACKED_BASE_delete_write_write_restore_write_delete",
+                    ),
+                    expected_dirty_stats: (1, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_T_DWWRWD_C"),
+                    expected_dirty_stats: (0, 1, 0),
+                },
+            ],
+        ),
+    ];
+
+    for (name, steps) in cases {
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = fs::canonicalize(temp.path())
+            .expect("temp dir should canonicalize")
+            .join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        let path = repo_path.join(format!("tracked_{name}.rs"));
+        let base_token = Box::leak(format!("SEQ_PERM_TRACKED_BASE_{name}").into_boxed_str());
+        write_sequence_token(&path, base_token);
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+        wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+        });
+
+        run_common_sequence_steps(&service, &repo_id, &path, base_token, steps);
+    }
+}
+
+#[test]
+fn scoped_probe_reconciles_common_untracked_operation_permutations() {
+    let _serial = daemon_test_serial();
+    let cases: &[(&str, &[CommonSequenceStep])] = &[
+        (
+            "add_modify_delete_add_modify",
+            &[
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_AMDAM_A"),
+                    expected_token: Some("SEQ_PERM_U_AMDAM_A"),
+                    absent_token: None,
+                    expected_dirty_stats: (0, 0, 1),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_AMDAM_B"),
+                    expected_token: Some("SEQ_PERM_U_AMDAM_B"),
+                    absent_token: Some("SEQ_PERM_U_AMDAM_A"),
+                    expected_dirty_stats: (0, 0, 1),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_U_AMDAM_B"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_AMDAM_C"),
+                    expected_token: Some("SEQ_PERM_U_AMDAM_C"),
+                    absent_token: Some("SEQ_PERM_U_AMDAM_B"),
+                    expected_dirty_stats: (0, 0, 1),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_AMDAM_D"),
+                    expected_token: Some("SEQ_PERM_U_AMDAM_D"),
+                    absent_token: Some("SEQ_PERM_U_AMDAM_C"),
+                    expected_dirty_stats: (0, 0, 1),
+                },
+            ],
+        ),
+        (
+            "delete_add_delete_add",
+            &[
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_U_DADA_A"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_DADA_A"),
+                    expected_token: Some("SEQ_PERM_U_DADA_A"),
+                    absent_token: None,
+                    expected_dirty_stats: (0, 0, 1),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_U_DADA_A"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_DADA_B"),
+                    expected_token: Some("SEQ_PERM_U_DADA_B"),
+                    absent_token: Some("SEQ_PERM_U_DADA_A"),
+                    expected_dirty_stats: (0, 0, 1),
+                },
+            ],
+        ),
+        (
+            "add_delete_delete_add_delete",
+            &[
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_ADDAD_A"),
+                    expected_token: Some("SEQ_PERM_U_ADDAD_A"),
+                    absent_token: None,
+                    expected_dirty_stats: (0, 0, 1),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_U_ADDAD_A"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_U_ADDAD_A"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Write("SEQ_PERM_U_ADDAD_B"),
+                    expected_token: Some("SEQ_PERM_U_ADDAD_B"),
+                    absent_token: Some("SEQ_PERM_U_ADDAD_A"),
+                    expected_dirty_stats: (0, 0, 1),
+                },
+                CommonSequenceStep {
+                    action: CommonSequenceAction::Remove,
+                    expected_token: None,
+                    absent_token: Some("SEQ_PERM_U_ADDAD_B"),
+                    expected_dirty_stats: (0, 0, 0),
+                },
+            ],
+        ),
+    ];
+
+    for (name, steps) in cases {
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = fs::canonicalize(temp.path())
+            .expect("temp dir should canonicalize")
+            .join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        fs::write(
+            repo_path.join("tracked.rs"),
+            "const VALUE: &str = \"SEQ_PERM_UNTRACKED_REPO_BASE\";\n",
+        )
+        .expect("tracked write should succeed");
+
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+        wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+        });
+
+        let path = repo_path.join("scratch").join(format!("{name}.rs"));
+        run_common_sequence_steps(
+            &service,
+            &repo_id,
+            &path,
+            "SEQ_PERM_UNTRACKED_UNUSED_BASE",
+            steps,
+        );
+    }
+}
+
+#[test]
+fn scoped_probe_reconciles_repeated_tracked_file_operation_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    write_sequence_token(&tracked, "SEQ_TRACKED_BASE");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+    let status = wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_BASE", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    remove_sequence_file(&tracked);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_BASE", 0);
+    assert_exact_dirty_stats(&status, 0, 1, 0);
+
+    write_sequence_token(&tracked, "SEQ_TRACKED_DELETE_ADD_1");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_DELETE_ADD_1", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_BASE", 0);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    write_sequence_token(&tracked, "SEQ_TRACKED_DELETE_ADD_2");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_DELETE_ADD_1", 0);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_DELETE_ADD_2", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    remove_sequence_file(&tracked);
+    remove_sequence_file(&tracked);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_DELETE_ADD_2", 0);
+    assert_exact_dirty_stats(&status, 0, 1, 0);
+
+    write_sequence_token(&tracked, "SEQ_TRACKED_DELETE_DELETE_WRITE_1");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &tracked,
+        "SEQ_TRACKED_DELETE_DELETE_WRITE_1",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    write_sequence_token(&tracked, "SEQ_TRACKED_DELETE_DELETE_WRITE_2");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &tracked,
+        "SEQ_TRACKED_DELETE_DELETE_WRITE_1",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &tracked,
+        "SEQ_TRACKED_DELETE_DELETE_WRITE_2",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    write_sequence_token(&tracked, "SEQ_TRACKED_BASE");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &tracked,
+        "SEQ_TRACKED_DELETE_DELETE_WRITE_2",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_BASE", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    write_sequence_token(&tracked, "SEQ_TRACKED_AFTER_CLEAN_1");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_AFTER_CLEAN_1", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    write_sequence_token(&tracked, "SEQ_TRACKED_AFTER_CLEAN_2");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_AFTER_CLEAN_1", 0);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_AFTER_CLEAN_2", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+}
+
+#[test]
+fn scoped_probe_reconciles_repeated_untracked_file_operation_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const VALUE: &str = \"SEQ_UNTRACKED_BASE\";\n",
+    )
+    .expect("tracked write should succeed");
+    let untracked = repo_path.join("nested").join("scratch.rs");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    remove_sequence_file(&untracked);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &untracked, "SEQ_UNTRACKED_ADD_1", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    write_sequence_token(&untracked, "SEQ_UNTRACKED_ADD_1");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &untracked, "SEQ_UNTRACKED_ADD_1", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    write_sequence_token(&untracked, "SEQ_UNTRACKED_ADD_2");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &untracked, "SEQ_UNTRACKED_ADD_1", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &untracked, "SEQ_UNTRACKED_ADD_2", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    remove_sequence_file(&untracked);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &untracked, "SEQ_UNTRACKED_ADD_2", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    remove_sequence_file(&untracked);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &untracked, "SEQ_UNTRACKED_ADD_2", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    write_sequence_token(&untracked, "SEQ_UNTRACKED_DELETE_ADD_1");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_UNTRACKED_DELETE_ADD_1",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    write_sequence_token(&untracked, "SEQ_UNTRACKED_DELETE_ADD_2");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_UNTRACKED_DELETE_ADD_1",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_UNTRACKED_DELETE_ADD_2",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    remove_sequence_file(&untracked);
+    write_sequence_token(&untracked, "SEQ_UNTRACKED_DELETE_WRITE_WRITE_1");
+    write_sequence_token(&untracked, "SEQ_UNTRACKED_DELETE_WRITE_WRITE_2");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_UNTRACKED_DELETE_ADD_2",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_UNTRACKED_DELETE_WRITE_WRITE_1",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_UNTRACKED_DELETE_WRITE_WRITE_2",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+}
+
+#[test]
+fn scoped_probe_reconciles_mixed_directory_operation_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    let src = repo_path.join("src");
+    fs::create_dir_all(&src).expect("src dir should succeed");
+    let first = src.join("first.rs");
+    let second = src.join("second.rs");
+    let third = src.join("third.rs");
+    let fourth = src.join("fourth.rs");
+    write_sequence_token(&first, "SEQ_DIR_FIRST_BASE");
+    write_sequence_token(&second, "SEQ_DIR_SECOND_BASE");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    remove_sequence_file(&first);
+    write_sequence_token(&second, "SEQ_DIR_SECOND_MOD_1");
+    write_sequence_token(&third, "SEQ_DIR_THIRD_NEW_1");
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_FIRST_BASE", 0);
+    assert_exact_dirty_stats(&status, 1, 1, 1);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_SECOND_MOD_1", 1);
+    assert_exact_dirty_stats(&status, 1, 1, 1);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_THIRD_NEW_1", 1);
+    assert_exact_dirty_stats(&status, 1, 1, 1);
+
+    write_sequence_token(&first, "SEQ_DIR_FIRST_BASE");
+    write_sequence_token(&second, "SEQ_DIR_SECOND_MOD_2");
+    remove_sequence_file(&third);
+    write_sequence_token(&fourth, "SEQ_DIR_FOURTH_NEW_1");
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_FIRST_BASE", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 1);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_SECOND_MOD_1", 0);
+    assert_exact_dirty_stats(&status, 1, 0, 1);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_SECOND_MOD_2", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 1);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_THIRD_NEW_1", 0);
+    assert_exact_dirty_stats(&status, 1, 0, 1);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_FOURTH_NEW_1", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 1);
+
+    write_sequence_token(&second, "SEQ_DIR_SECOND_BASE");
+    remove_sequence_file(&fourth);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_SECOND_MOD_2", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_SECOND_BASE", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_FOURTH_NEW_1", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+}
+
+#[test]
+fn scoped_probe_reconciles_tracked_move_and_recreate_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let original = repo_path.join("original.rs");
+    let moved = repo_path.join("moved.rs");
+    let moved_again = repo_path.join("moved_again.rs");
+    write_sequence_token(&original, "SEQ_MOVE_ORIGINAL_BASE");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    fs::rename(&original, &moved).expect("rename should succeed");
+    write_sequence_token(&moved, "SEQ_MOVE_NEW_1");
+    let move_roots = vec![original.clone(), moved.clone()];
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &move_roots,
+        "SEQ_MOVE_ORIGINAL_BASE",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+    let status =
+        wait_for_scoped_token_count_for_roots(&service, &repo_id, &move_roots, "SEQ_MOVE_NEW_1", 1);
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+
+    write_sequence_token(&moved, "SEQ_MOVE_NEW_2");
+    let status =
+        wait_for_scoped_token_count_for_roots(&service, &repo_id, &move_roots, "SEQ_MOVE_NEW_1", 0);
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+    let status =
+        wait_for_scoped_token_count_for_roots(&service, &repo_id, &move_roots, "SEQ_MOVE_NEW_2", 1);
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+
+    remove_sequence_file(&moved);
+    write_sequence_token(&moved_again, "SEQ_MOVE_NEW_3");
+    let move_again_roots = vec![original.clone(), moved.clone(), moved_again.clone()];
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &move_again_roots,
+        "SEQ_MOVE_NEW_2",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &move_again_roots,
+        "SEQ_MOVE_NEW_3",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+
+    remove_sequence_file(&moved_again);
+    write_sequence_token(&original, "SEQ_MOVE_ORIGINAL_BASE");
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &move_again_roots,
+        "SEQ_MOVE_NEW_3",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &move_again_roots,
+        "SEQ_MOVE_ORIGINAL_BASE",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+}
+
+#[test]
+fn scoped_probe_reconciles_untracked_directory_delete_and_recreate_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const VALUE: &str = \"SEQ_UNTRACKED_DIR_BASE\";\n",
+    )
+    .expect("tracked write should succeed");
+    let generated = repo_path.join("generated");
+    let first = generated.join("first.rs");
+    let second = generated.join("second.rs");
+    let third = generated.join("third.rs");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    write_sequence_token(&first, "SEQ_UNTRACKED_DIR_FIRST");
+    write_sequence_token(&second, "SEQ_UNTRACKED_DIR_SECOND");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &generated, "SEQ_UNTRACKED_DIR_FIRST", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 2);
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &generated,
+        "SEQ_UNTRACKED_DIR_SECOND",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 2);
+
+    fs::remove_dir_all(&generated).expect("generated dir delete should succeed");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &generated, "SEQ_UNTRACKED_DIR_FIRST", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &generated,
+        "SEQ_UNTRACKED_DIR_SECOND",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    write_sequence_token(&third, "SEQ_UNTRACKED_DIR_THIRD");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &generated, "SEQ_UNTRACKED_DIR_THIRD", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+}
+
+#[test]
+fn refresh_reconciles_ignore_rule_flip_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let gitignore = repo_path.join(".gitignore");
+    let ignored = repo_path.join("scratch.tmp");
+    fs::write(&gitignore, "*.tmp\n").expect("gitignore write should succeed");
+    fs::write(
+        repo_path.join("tracked.rs"),
+        "const VALUE: &str = \"SEQ_IGNORE_BASE\";\n",
+    )
+    .expect("tracked write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    write_sequence_token(&ignored, "SEQ_IGNORE_VISIBLE_ALPHA");
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_IGNORE_VISIBLE_ALPHA", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    fs::write(&gitignore, "").expect("gitignore rewrite should succeed");
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_IGNORE_VISIBLE_ALPHA", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    write_sequence_token(&ignored, "SEQ_IGNORE_VISIBLE_BETA");
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_IGNORE_VISIBLE_ALPHA", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_IGNORE_VISIBLE_BETA", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    fs::write(&gitignore, "*.tmp\n").expect("gitignore restore should succeed");
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_IGNORE_VISIBLE_BETA", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+}
+
+#[test]
+fn scoped_probe_preserves_unrelated_dirty_paths_with_prefix_like_names() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let src = repo_path.join("src");
+    let src2 = repo_path.join("src2");
+    fs::create_dir_all(&src).expect("src dir should succeed");
+    fs::create_dir_all(&src2).expect("src2 dir should succeed");
+    let scoped = src.join("file.rs");
+    let unrelated = src2.join("file.rs");
+    write_sequence_token(&scoped, "SEQ_PREFIX_SCOPED_BASE");
+    write_sequence_token(&unrelated, "SEQ_PREFIX_UNRELATED_BASE");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    write_sequence_token(&scoped, "SEQ_PREFIX_SCOPED_DIRTY");
+    write_sequence_token(&unrelated, "SEQ_PREFIX_UNRELATED_DIRTY");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &scoped, "SEQ_PREFIX_SCOPED_DIRTY", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &unrelated,
+        "SEQ_PREFIX_UNRELATED_DIRTY",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 2, 0, 0);
+
+    write_sequence_token(&scoped, "SEQ_PREFIX_SCOPED_BASE");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_PREFIX_SCOPED_DIRTY", 0);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &src2, "SEQ_PREFIX_UNRELATED_DIRTY", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+}
+
+#[test]
+fn scoped_probe_reconciles_file_directory_type_flip_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let flip = repo_path.join("flip.rs");
+    write_sequence_token(&flip, "SEQ_TYPE_FLIP_BASE");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    remove_sequence_file(&flip);
+    fs::create_dir_all(&flip).expect("directory replacement should succeed");
+    write_sequence_token(&flip.join("child.rs"), "SEQ_TYPE_FLIP_CHILD");
+    let status = wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_BASE", 0);
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_CHILD", 1);
+    assert_exact_dirty_stats(&status, 0, 1, 1);
+
+    fs::remove_dir_all(&flip).expect("directory replacement remove should succeed");
+    write_sequence_token(&flip, "SEQ_TYPE_FLIP_MODIFIED_FILE");
+    let status = wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_CHILD", 0);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_MODIFIED_FILE", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    write_sequence_token(&flip, "SEQ_TYPE_FLIP_BASE");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_MODIFIED_FILE", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let status = wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_BASE", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+}
+
+#[test]
+fn scoped_probe_reconciles_text_binary_text_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    let untracked = repo_path.join("scratch.rs");
+    write_sequence_token(&tracked, "SEQ_BINARY_TRACKED_BASE");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    fs::write(&tracked, b"\0SEQ_BINARY_TRACKED_HIDDEN\n").expect("binary write should succeed");
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_BINARY_TRACKED_BASE", 0);
+    assert_exact_dirty_stats(&status, 0, 1, 0);
+    let status =
+        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_BINARY_TRACKED_HIDDEN", 0);
+    assert_exact_dirty_stats(&status, 0, 1, 0);
+
+    write_sequence_token(&tracked, "SEQ_BINARY_TRACKED_TEXT_AGAIN");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &tracked,
+        "SEQ_BINARY_TRACKED_TEXT_AGAIN",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    fs::write(&untracked, b"\0SEQ_BINARY_UNTRACKED_HIDDEN\n").expect("binary write should succeed");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_BINARY_UNTRACKED_HIDDEN",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    write_sequence_token(&untracked, "SEQ_BINARY_UNTRACKED_TEXT");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_BINARY_UNTRACKED_TEXT",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 1, 0, 1);
+
+    fs::write(&untracked, b"\0SEQ_BINARY_UNTRACKED_HIDDEN_AGAIN\n")
+        .expect("binary write should succeed");
+    let status = wait_for_scoped_token_count(
+        &service,
+        &repo_id,
+        &untracked,
+        "SEQ_BINARY_UNTRACKED_TEXT",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+}
+
+#[test]
+fn refresh_reconciles_index_staged_operation_sequences() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    let staged_new = repo_path.join("staged_new.rs");
+    write_sequence_token(&tracked, "SEQ_STAGE_BASE");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    write_sequence_token(&tracked, "SEQ_STAGE_STAGED_MOD");
+    git_sequence(&repo_path, &["add", "tracked.rs"]);
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_STAGE_STAGED_MOD", 1);
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    git_sequence(&repo_path, &["reset", "-q", "--", "tracked.rs"]);
+    write_sequence_token(&tracked, "SEQ_STAGE_BASE");
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_STAGE_STAGED_MOD", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+
+    write_sequence_token(&staged_new, "SEQ_STAGE_NEW_FILE");
+    git_sequence(&repo_path, &["add", "staged_new.rs"]);
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_STAGE_NEW_FILE", 1);
+    assert_exact_dirty_stats(&status, 0, 0, 1);
+
+    git_sequence(&repo_path, &["rm", "-q", "--cached", "staged_new.rs"]);
+    remove_sequence_file(&staged_new);
+    let status = refresh_repo(&service, &repo_id, true);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let (_, status) = wait_for_search_count(&service, &repo_id, "SEQ_STAGE_NEW_FILE", 0);
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+}
+
+#[test]
+fn scoped_probe_handles_many_paths_across_directories() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = fs::canonicalize(temp.path())
+        .expect("temp dir should canonicalize")
+        .join("repo");
+    let src = repo_path.join("src");
+    let generated = repo_path.join("generated");
+    fs::create_dir_all(&src).expect("src dir should succeed");
+    fs::create_dir_all(&generated).expect("generated dir should succeed");
+    let tracked_paths = (0..6)
+        .map(|index| src.join(format!("tracked_{index}.rs")))
+        .collect::<Vec<_>>();
+    for (index, path) in tracked_paths.iter().enumerate() {
+        write_sequence_token(path, &format!("SEQ_MANY_TRACKED_BASE_{index}"));
+    }
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    for (index, path) in tracked_paths.iter().enumerate().take(3) {
+        write_sequence_token(path, &format!("SEQ_MANY_TRACKED_MOD_{index}"));
+    }
+    for (index, path) in tracked_paths.iter().enumerate().skip(3) {
+        remove_sequence_file(path);
+        let replacement = generated.join(format!("new_{index}.rs"));
+        write_sequence_token(&replacement, &format!("SEQ_MANY_UNTRACKED_NEW_{index}"));
+    }
+
+    let roots = vec![src.clone(), generated.clone()];
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &roots,
+        "SEQ_MANY_TRACKED_MOD_0",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 3, 3, 3);
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &roots,
+        "SEQ_MANY_UNTRACKED_NEW_5",
+        1,
+    );
+    assert_exact_dirty_stats(&status, 3, 3, 3);
+
+    for (index, path) in tracked_paths.iter().enumerate().take(3) {
+        write_sequence_token(path, &format!("SEQ_MANY_TRACKED_BASE_{index}"));
+    }
+    for (index, path) in tracked_paths.iter().enumerate().skip(3) {
+        write_sequence_token(path, &format!("SEQ_MANY_TRACKED_BASE_{index}"));
+        remove_sequence_file(&generated.join(format!("new_{index}.rs")));
+    }
+
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &roots,
+        "SEQ_MANY_TRACKED_MOD_0",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+    let status = wait_for_scoped_token_count_for_roots(
+        &service,
+        &repo_id,
+        &roots,
+        "SEQ_MANY_UNTRACKED_NEW_5",
+        0,
+    );
+    assert_exact_dirty_stats(&status, 0, 0, 0);
+}
+
 #[test]
 fn probe_tracks_deleted_files() {
     let _serial = daemon_test_serial();
