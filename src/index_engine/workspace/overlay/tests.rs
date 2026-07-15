@@ -39,15 +39,15 @@ fn build_config(repo: &Path) -> BuildConfig {
 }
 
 fn query(pattern: &str) -> QueryRequest {
-    QueryRequest {
-        pattern: pattern.into(),
-        mode: SearchMode::CountOnly,
-        case_insensitive: false,
-        max_count: None,
-        top_k: None,
-        filters: QueryFilters::default(),
-        prefer_worktree_for_git_head_blob: false,
-    }
+    QueryRequest::from_config(
+        &crate::QueryConfig {
+            regex_pattern: pattern.into(),
+            search_mode: SearchMode::CountOnly,
+            ..crate::QueryConfig::default()
+        },
+        QueryFilters::default(),
+        false,
+    )
 }
 
 fn wait_for_delete_compaction(overlay: &WorkspaceOverlayIndex) {

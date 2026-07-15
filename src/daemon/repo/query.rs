@@ -46,9 +46,8 @@ impl RepoRuntime {
         let _search_activity = self.begin_search_activity();
         let scope =
             normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
-        self.probe_workspace_overlay_for_search_scope(&scope)?;
         let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
-        let query_filters = build_query_filters(&self.build_config.repo_path, &scope);
+        let query_filters = QueryFilters::default();
         let status = self.status_snapshot();
         let can_search_opening_snapshot =
             matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
@@ -209,42 +208,6 @@ impl RepoRuntime {
                     .unwrap_or_else(|| "repo runtime is degraded".into()),
             )),
         }
-    }
-
-    fn probe_workspace_overlay_for_search_scope(&self, scope: &PathFilterArgs) -> Result<()> {
-        if scope.roots.is_empty() || self.shutting_down.load(Ordering::Relaxed) {
-            return Ok(());
-        }
-        let roots = scope
-            .roots
-            .iter()
-            .filter(|root| {
-                root.strip_prefix(&self.build_config.repo_path)
-                    .is_ok_and(|relative| !relative.as_os_str().is_empty())
-            })
-            .cloned()
-            .collect::<Vec<_>>();
-        if roots.is_empty() {
-            return Ok(());
-        }
-
-        let status = self.status_snapshot();
-        if !matches!(status.phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
-            || status.snapshot_key.is_none()
-            || self.has_active_task()
-        {
-            return Ok(());
-        }
-
-        let Some(snapshot_key) = self.current_base_snapshot_key()? else {
-            return Ok(());
-        };
-        let Some(plan) = self.plan_overlay_update_from_event_probe(roots)? else {
-            self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
-            return Ok(());
-        };
-        self.apply_refreshed_overlay(snapshot_key, plan);
-        Ok(())
     }
 
     pub(super) fn glob(&self, request: super::GlobRequest) -> Result<super::GlobResponse> {
@@ -528,26 +491,4 @@ fn scan_roots(repo_root: &Path, args: &PathFilterArgs) -> Vec<PathBuf> {
         .iter()
         .map(|root| normalize_path(root, repo_root))
         .collect()
-}
-
-fn build_query_filters(repo_root: &Path, args: &PathFilterArgs) -> QueryFilters {
-    let mut path_prefixes = args
-        .roots
-        .iter()
-        .filter_map(|root| {
-            let normalized = normalize_path(root, repo_root);
-            let relative = normalized.strip_prefix(repo_root).ok()?;
-            if relative.as_os_str().is_empty() {
-                return None;
-            }
-            Some(relative.to_string_lossy().into_owned())
-        })
-        .collect::<Vec<_>>();
-    path_prefixes.sort_unstable();
-    path_prefixes.dedup();
-
-    QueryFilters {
-        path_prefixes,
-        ..QueryFilters::default()
-    }
 }

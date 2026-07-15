@@ -263,6 +263,49 @@ fn search_can_be_restricted_to_exact_file_path() {
 }
 
 #[test]
+fn path_filter_is_applied_before_global_result_limit() {
+    let repo = TestRepo::new();
+    for index in 0..300 {
+        repo.write(
+            format!("excluded/file_{index:03}.txt"),
+            "FILTER_LIMIT_TOKEN\n",
+        );
+    }
+    let included = repo.write("included/result.rs", "FILTER_LIMIT_TOKEN\n");
+
+    repo.build();
+    repo.engine()
+        .build_base_snapshot()
+        .expect("test should succeed");
+    let cwd = std::env::current_dir().expect("test should succeed");
+    let filter = PathFilter::new(
+        PathFilterArgs {
+            globs: vec!["*.rs".into()],
+            ..PathFilterArgs::default()
+        },
+        &cwd,
+    )
+    .expect("test should succeed");
+
+    let results = repo
+        .engine()
+        .search_with_filter(
+            &QueryConfig {
+                global_max_results: Some(1),
+                ..query("FILTER_LIMIT_TOKEN")
+            },
+            Some(&filter),
+            flashgrep::SearchPolicy::IndexOnly,
+        )
+        .expect("test should succeed")
+        .results;
+    let line_matches = results.flattened_line_matches();
+
+    assert_eq!(line_matches.len(), 1);
+    assert_eq!(line_matches[0].path, included.to_string_lossy());
+}
+
+#[test]
 fn files_without_matches_are_exposed_via_search_engine_api() {
     let repo = TestRepo::new();
     repo.write("matched.rs", "const NAME: &str = \"PM_RESUME\";\n");

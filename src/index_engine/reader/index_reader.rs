@@ -523,7 +523,7 @@ mod tests {
             EngineConfig, IndexEngine,
         },
         search::SearchMode,
-        TokenizerMode,
+        QueryConfig, TokenizerMode,
     };
 
     fn doc(body: &str) -> IndexDocument {
@@ -546,15 +546,16 @@ mod tests {
     }
 
     fn request(pattern: &str, case_insensitive: bool) -> QueryRequest {
-        QueryRequest {
-            pattern: pattern.into(),
-            mode: SearchMode::CountOnly,
-            case_insensitive,
-            max_count: None,
-            top_k: None,
-            filters: QueryFilters::default(),
-            prefer_worktree_for_git_head_blob: false,
-        }
+        QueryRequest::from_config(
+            &QueryConfig {
+                regex_pattern: pattern.into(),
+                case_insensitive,
+                search_mode: SearchMode::CountOnly,
+                ..QueryConfig::default()
+            },
+            QueryFilters::default(),
+            false,
+        )
     }
 
     fn request_with_mode(pattern: &str, mode: SearchMode, top_k: Option<usize>) -> QueryRequest {

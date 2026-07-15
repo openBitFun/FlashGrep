@@ -1,15 +1,7 @@
 use super::*;
 
 pub(super) fn query_request_to_runtime_config(query: &QueryRequest) -> QueryConfig {
-    QueryConfig {
-        regex_pattern: query.pattern.clone(),
-        patterns: vec![query.pattern.clone()],
-        case_insensitive: query.case_insensitive,
-        max_count: query.max_count,
-        global_max_results: query.top_k,
-        search_mode: query.mode,
-        ..QueryConfig::default()
-    }
+    query.to_config()
 }
 
 pub(super) fn matches_filters(doc: &IndexDocument, query: &QueryRequest) -> bool {
@@ -67,7 +59,7 @@ pub(super) fn matches_key_filters(key: &DocKey, query: &QueryRequest) -> bool {
     {
         return false;
     }
-    true
+    query.filters.matches_logical_path(&key.logical_path)
 }
 
 pub(super) fn empty_results() -> SearchResults {

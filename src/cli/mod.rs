@@ -121,15 +121,16 @@ fn run_engine(args: EngineArgs) -> Result<bool> {
 
 fn run_engine_search(args: EngineSearchArgs) -> Result<bool> {
     let engine = open_index_engine(&args.repo)?;
-    let query = crate::index_engine::query::QueryRequest {
-        pattern: args.pattern,
-        mode: SearchMode::LineMatches,
-        case_insensitive: args.ignore_case,
-        max_count: None,
-        top_k: None,
-        filters: crate::index_engine::query::QueryFilters::default(),
-        prefer_worktree_for_git_head_blob: false,
-    };
+    let query = crate::index_engine::query::QueryRequest::from_config(
+        &crate::QueryConfig {
+            regex_pattern: args.pattern,
+            case_insensitive: args.ignore_case,
+            search_mode: SearchMode::LineMatches,
+            ..crate::QueryConfig::default()
+        },
+        crate::index_engine::query::QueryFilters::default(),
+        false,
+    );
     let reader = if args.committed {
         engine.reader().open_committed()?
     } else {

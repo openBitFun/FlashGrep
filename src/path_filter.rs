@@ -19,7 +19,7 @@ pub struct PathFilterArgs {
     pub type_not: Vec<String>,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct PathFilter {
     roots: Vec<PathRoot>,
     overrides: Override,

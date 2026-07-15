@@ -76,15 +76,7 @@ pub(super) fn workspace_candidate_paths(
 }
 
 pub(crate) fn workspace_query_request(query: &crate::QueryConfig) -> QueryRequest {
-    QueryRequest {
-        pattern: query.regex_pattern.clone(),
-        mode: query.search_mode,
-        case_insensitive: query.case_insensitive,
-        max_count: query.max_count,
-        top_k: query.global_max_results,
-        filters: QueryFilters::default(),
-        prefer_worktree_for_git_head_blob: false,
-    }
+    QueryRequest::from_config(query, QueryFilters::default(), false)
 }
 
 pub(super) fn query_with_remaining_global_limit(

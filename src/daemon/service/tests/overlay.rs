@@ -783,7 +783,7 @@ fn watcher_gitignore_events_fall_back_to_full_git_probe() {
 }
 
 #[test]
-fn scoped_search_probes_requested_roots_without_waiting_for_watcher() {
+fn scoped_search_observes_watcher_updates_without_query_time_probe() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -807,6 +807,104 @@ fn scoped_search_probes_requested_roots_without_waiting_for_watcher() {
     assert!(is_transition_or_indexed_workspace_backend(backend));
     assert_eq!(results.matched_lines, 1);
     assert_exact_dirty_stats(&status, 1, 0, 0);
+}
+
+#[test]
+fn scoped_search_does_not_advance_workspace_probe_state() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    fs::write(&tracked, "const VALUE: &str = \"SCOPED_BASE_TOKEN\";\n")
+        .expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path);
+    build_repo(&service, &repo_id);
+    let before = wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    let (_, results, after) = wait_for_search_with_params_count(
+        &service,
+        &repo_id,
+        query("SCOPED_BASE_TOKEN"),
+        vec![tracked],
+        1,
+    );
+
+    assert_eq!(results.matched_lines, 1);
+    assert_eq!(after.last_probe_unix_secs, before.last_probe_unix_secs);
+}
+
+#[test]
+fn indexed_base_and_overlay_preserve_word_and_line_match_semantics() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.cc");
+    fs::write(
+        &tracked,
+        "NOTREACHED();\nDUMP_WILL_BE_NOTREACHED();\n  NOTREACHED();\n  NOTREACHED(); // base\n",
+    )
+    .expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path);
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    let mut word_query = query("NOTREACHED");
+    word_query.patterns = vec!["NOTREACHED".into()];
+    word_query.fixed_strings = true;
+    word_query.word_regexp = true;
+    word_query.search_mode = SearchModeConfig::LineMatches;
+
+    let raw_line = "  NOTREACHED();";
+    let mut line_query = query(&regex::escape(raw_line));
+    line_query.patterns = vec![raw_line.into()];
+    line_query.fixed_strings = true;
+    line_query.line_regexp = true;
+    line_query.search_mode = SearchModeConfig::LineMatches;
+
+    let (_, word_results, _) =
+        wait_for_search_with_params_count(&service, &repo_id, word_query.clone(), Vec::new(), 3);
+    assert_eq!(
+        word_results
+            .line_matches
+            .iter()
+            .map(|matched| matched.line_number)
+            .collect::<Vec<_>>(),
+        vec![1, 3, 4]
+    );
+    let (_, line_results, _) =
+        wait_for_search_with_params_count(&service, &repo_id, line_query.clone(), Vec::new(), 1);
+    assert_eq!(line_results.line_matches[0].line_number, 3);
+
+    fs::write(
+        &tracked,
+        "DUMP_WILL_BE_NOTREACHED();\nNOTREACHED();\n  NOTREACHED();\n  NOTREACHED(); // overlay\n",
+    )
+    .expect("rewrite should succeed");
+    wait_for_dirty_stats(&service, &repo_id, 1, 0, 0);
+
+    let (_, word_results, _) =
+        wait_for_search_with_params_count(&service, &repo_id, word_query, Vec::new(), 3);
+    assert_eq!(
+        word_results
+            .line_matches
+            .iter()
+            .map(|matched| matched.line_number)
+            .collect::<Vec<_>>(),
+        vec![2, 3, 4]
+    );
+    let (_, line_results, _) =
+        wait_for_search_with_params_count(&service, &repo_id, line_query, Vec::new(), 1);
+    assert_eq!(line_results.line_matches[0].line_number, 3);
 }
 
 fn write_sequence_token(path: &std::path::Path, token: &str) {
@@ -948,7 +1046,7 @@ fn run_common_sequence_steps(
 }
 
 #[test]
-fn scoped_probe_reconciles_common_tracked_operation_permutations() {
+fn watcher_reconciles_common_tracked_operation_permutations() {
     let _serial = daemon_test_serial();
     let cases: &[(&str, &[CommonSequenceStep])] = &[
         (
@@ -1104,7 +1202,7 @@ fn scoped_probe_reconciles_common_tracked_operation_permutations() {
 }
 
 #[test]
-fn scoped_probe_reconciles_common_untracked_operation_permutations() {
+fn watcher_reconciles_common_untracked_operation_permutations() {
     let _serial = daemon_test_serial();
     let cases: &[(&str, &[CommonSequenceStep])] = &[
         (
@@ -1239,7 +1337,7 @@ fn scoped_probe_reconciles_common_untracked_operation_permutations() {
 }
 
 #[test]
-fn scoped_probe_reconciles_repeated_tracked_file_operation_sequences() {
+fn watcher_reconciles_repeated_tracked_file_operation_sequences() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1338,7 +1436,7 @@ fn scoped_probe_reconciles_repeated_tracked_file_operation_sequences() {
 }
 
 #[test]
-fn scoped_probe_reconciles_repeated_untracked_file_operation_sequences() {
+fn watcher_reconciles_repeated_untracked_file_operation_sequences() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1445,7 +1543,7 @@ fn scoped_probe_reconciles_repeated_untracked_file_operation_sequences() {
 }
 
 #[test]
-fn scoped_probe_reconciles_mixed_directory_operation_sequences() {
+fn watcher_reconciles_mixed_directory_operation_sequences() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1503,7 +1601,7 @@ fn scoped_probe_reconciles_mixed_directory_operation_sequences() {
 }
 
 #[test]
-fn scoped_probe_reconciles_tracked_move_and_recreate_sequences() {
+fn watcher_reconciles_tracked_move_and_recreate_sequences() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1586,7 +1684,7 @@ fn scoped_probe_reconciles_tracked_move_and_recreate_sequences() {
 }
 
 #[test]
-fn scoped_probe_reconciles_untracked_directory_delete_and_recreate_sequences() {
+fn watcher_reconciles_untracked_directory_delete_and_recreate_sequences() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1612,6 +1710,7 @@ fn scoped_probe_reconciles_untracked_directory_delete_and_recreate_sequences() {
 
     write_sequence_token(&first, "SEQ_UNTRACKED_DIR_FIRST");
     write_sequence_token(&second, "SEQ_UNTRACKED_DIR_SECOND");
+    wait_for_dirty_stats(&service, &repo_id, 0, 0, 2);
     let status =
         wait_for_scoped_token_count(&service, &repo_id, &generated, "SEQ_UNTRACKED_DIR_FIRST", 1);
     assert_exact_dirty_stats(&status, 0, 0, 2);
@@ -1625,6 +1724,7 @@ fn scoped_probe_reconciles_untracked_directory_delete_and_recreate_sequences() {
     assert_exact_dirty_stats(&status, 0, 0, 2);
 
     fs::remove_dir_all(&generated).expect("generated dir delete should succeed");
+    wait_for_dirty_stats(&service, &repo_id, 0, 0, 0);
     let status =
         wait_for_scoped_token_count(&service, &repo_id, &generated, "SEQ_UNTRACKED_DIR_FIRST", 0);
     assert_exact_dirty_stats(&status, 0, 0, 0);
@@ -1638,6 +1738,7 @@ fn scoped_probe_reconciles_untracked_directory_delete_and_recreate_sequences() {
     assert_exact_dirty_stats(&status, 0, 0, 0);
 
     write_sequence_token(&third, "SEQ_UNTRACKED_DIR_THIRD");
+    wait_for_dirty_stats(&service, &repo_id, 0, 0, 1);
     let status =
         wait_for_scoped_token_count(&service, &repo_id, &generated, "SEQ_UNTRACKED_DIR_THIRD", 1);
     assert_exact_dirty_stats(&status, 0, 0, 1);
@@ -1695,7 +1796,7 @@ fn refresh_reconciles_ignore_rule_flip_sequences() {
 }
 
 #[test]
-fn scoped_probe_preserves_unrelated_dirty_paths_with_prefix_like_names() {
+fn watcher_keeps_prefix_like_dirty_paths_distinct() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1720,9 +1821,10 @@ fn scoped_probe_preserves_unrelated_dirty_paths_with_prefix_like_names() {
 
     write_sequence_token(&scoped, "SEQ_PREFIX_SCOPED_DIRTY");
     write_sequence_token(&unrelated, "SEQ_PREFIX_UNRELATED_DIRTY");
+    wait_for_dirty_stats(&service, &repo_id, 2, 0, 0);
     let status =
         wait_for_scoped_token_count(&service, &repo_id, &scoped, "SEQ_PREFIX_SCOPED_DIRTY", 1);
-    assert_exact_dirty_stats(&status, 1, 0, 0);
+    assert_exact_dirty_stats(&status, 2, 0, 0);
 
     let status = wait_for_scoped_token_count(
         &service,
@@ -1734,6 +1836,7 @@ fn scoped_probe_preserves_unrelated_dirty_paths_with_prefix_like_names() {
     assert_exact_dirty_stats(&status, 2, 0, 0);
 
     write_sequence_token(&scoped, "SEQ_PREFIX_SCOPED_BASE");
+    wait_for_dirty_stats(&service, &repo_id, 1, 0, 0);
     let status =
         wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_PREFIX_SCOPED_DIRTY", 0);
     assert_exact_dirty_stats(&status, 1, 0, 0);
@@ -1743,7 +1846,7 @@ fn scoped_probe_preserves_unrelated_dirty_paths_with_prefix_like_names() {
 }
 
 #[test]
-fn scoped_probe_reconciles_file_directory_type_flip_sequences() {
+fn watcher_reconciles_file_directory_type_flip_sequences() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1763,6 +1866,7 @@ fn scoped_probe_reconciles_file_directory_type_flip_sequences() {
     remove_sequence_file(&flip);
     fs::create_dir_all(&flip).expect("directory replacement should succeed");
     write_sequence_token(&flip.join("child.rs"), "SEQ_TYPE_FLIP_CHILD");
+    wait_for_dirty_stats(&service, &repo_id, 0, 1, 1);
     let status = wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_BASE", 0);
     assert_exact_dirty_stats(&status, 0, 1, 1);
     let status = wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_CHILD", 1);
@@ -1770,6 +1874,7 @@ fn scoped_probe_reconciles_file_directory_type_flip_sequences() {
 
     fs::remove_dir_all(&flip).expect("directory replacement remove should succeed");
     write_sequence_token(&flip, "SEQ_TYPE_FLIP_MODIFIED_FILE");
+    wait_for_dirty_stats(&service, &repo_id, 1, 0, 0);
     let status = wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_CHILD", 0);
     assert_exact_dirty_stats(&status, 1, 0, 0);
     let status =
@@ -1777,6 +1882,7 @@ fn scoped_probe_reconciles_file_directory_type_flip_sequences() {
     assert_exact_dirty_stats(&status, 1, 0, 0);
 
     write_sequence_token(&flip, "SEQ_TYPE_FLIP_BASE");
+    wait_for_dirty_stats(&service, &repo_id, 0, 0, 0);
     let status =
         wait_for_scoped_token_count(&service, &repo_id, &flip, "SEQ_TYPE_FLIP_MODIFIED_FILE", 0);
     assert_exact_dirty_stats(&status, 0, 0, 0);
@@ -1785,7 +1891,7 @@ fn scoped_probe_reconciles_file_directory_type_flip_sequences() {
 }
 
 #[test]
-fn scoped_probe_reconciles_text_binary_text_sequences() {
+fn watcher_reconciles_text_binary_text_sequences() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1902,7 +2008,7 @@ fn refresh_reconciles_index_staged_operation_sequences() {
 }
 
 #[test]
-fn scoped_probe_handles_many_paths_across_directories() {
+fn watcher_handles_many_paths_across_directories() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");

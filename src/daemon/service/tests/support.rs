@@ -18,7 +18,7 @@ use crate::index_engine::{
     query::{QueryFilters, QueryRequest},
     EngineConfig, IndexEngine, ShardId,
 };
-use crate::SearchMode;
+use crate::{QueryConfig, SearchMode};
 
 thread_local! {
     static DAEMON_TEST_LOCK_DEPTH: Cell<usize> = const { Cell::new(0) };
@@ -388,6 +388,20 @@ where
     panic!("timed out waiting for repo status");
 }
 
+pub(super) fn wait_for_dirty_stats(
+    service: &DaemonService,
+    repo_id: &str,
+    modified: usize,
+    deleted: usize,
+    new: usize,
+) -> RepoStatusPayload {
+    wait_for_status(service, repo_id, |status| {
+        status.dirty_files.modified == modified
+            && status.dirty_files.deleted == deleted
+            && status.dirty_files.new == new
+    })
+}
+
 pub(super) fn wait_for_search_count(
     service: &DaemonService,
     repo_id: &str,
@@ -559,15 +573,18 @@ pub(super) fn workspace_overlay_match_count(
         index_root: workspace_overlay_index_root(&repo_root),
         ..EngineConfig::default()
     })?;
-    let results = engine.reader().open_snapshot()?.search(&QueryRequest {
-        pattern: pattern.into(),
-        mode: SearchMode::LineMatches,
-        case_insensitive: false,
-        max_count: None,
-        top_k: None,
-        filters: QueryFilters::default(),
-        prefer_worktree_for_git_head_blob: false,
-    })?;
+    let results = engine
+        .reader()
+        .open_snapshot()?
+        .search(&QueryRequest::from_config(
+            &QueryConfig {
+                regex_pattern: pattern.into(),
+                search_mode: SearchMode::LineMatches,
+                ..QueryConfig::default()
+            },
+            QueryFilters::default(),
+            false,
+        ))?;
     Ok(results.matched_lines)
 }
 
@@ -581,15 +598,18 @@ pub(super) fn workspace_overlay_committed_match_count(
         index_root: workspace_overlay_index_root(&repo_root),
         ..EngineConfig::default()
     })?;
-    let results = engine.reader().open_committed()?.search(&QueryRequest {
-        pattern: pattern.into(),
-        mode: SearchMode::LineMatches,
-        case_insensitive: false,
-        max_count: None,
-        top_k: None,
-        filters: QueryFilters::default(),
-        prefer_worktree_for_git_head_blob: false,
-    })?;
+    let results = engine
+        .reader()
+        .open_committed()?
+        .search(&QueryRequest::from_config(
+            &QueryConfig {
+                regex_pattern: pattern.into(),
+                search_mode: SearchMode::LineMatches,
+                ..QueryConfig::default()
+            },
+            QueryFilters::default(),
+            false,
+        ))?;
     Ok(results.matched_lines)
 }
 

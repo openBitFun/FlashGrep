@@ -1,6 +1,6 @@
 use std::{collections::HashSet, path::Path};
 
-use crate::{path_filter::PathFilter, search::SearchResults, QueryConfig};
+use crate::{search::SearchResults, QueryConfig};
 
 pub(super) fn query_with_remaining_global_limit(
     query: &QueryConfig,
@@ -79,28 +79,6 @@ pub(super) fn empty_search_results() -> SearchResults {
         file_counts: Vec::new(),
         file_match_counts: Vec::new(),
     }
-}
-
-pub(super) fn filter_search_results(results: &mut SearchResults, filter: &PathFilter) {
-    results
-        .matched_paths
-        .retain(|path| filter.matches_file(Path::new(path)));
-    results
-        .line_matches
-        .retain(|matched| filter.matches_file(Path::new(&matched.path)));
-    results
-        .line_match_files
-        .retain(|file| filter.matches_file(Path::new(&file.path)));
-    results
-        .file_counts
-        .retain(|count| filter.matches_file(Path::new(&count.path)));
-    results
-        .file_match_counts
-        .retain(|count| filter.matches_file(Path::new(&count.path)));
-
-    results.candidate_docs = unique_result_paths(results).len();
-    results.bytes_searched = 0;
-    recompute_result_totals(results);
 }
 
 pub(super) fn exclude_search_results(

@@ -17,7 +17,7 @@ use crate::{
 
 use self::results::{
     absolutize_path, absolutize_search_results, empty_search_results, exclude_search_results,
-    filter_search_results, merge_search_results, query_with_remaining_global_limit,
+    merge_search_results, query_with_remaining_global_limit,
 };
 use super::git_snapshot::GitSnapshotIndex;
 
@@ -201,24 +201,17 @@ impl WorkspaceSearchView {
         filter: Option<&PathFilter>,
         overlay_snapshot: Option<&IndexSnapshotReader>,
     ) -> Result<SearchResults> {
+        let mut effective_filters = query_filters.clone();
+        if let Some(filter) = filter {
+            effective_filters.set_path_filter(self.build_config.repo_path.clone(), filter.clone());
+        }
         let mut results = if let Some(snapshot) = overlay_snapshot {
-            snapshot.search(&QueryRequest {
-                pattern: query.regex_pattern.clone(),
-                mode: query.search_mode,
-                case_insensitive: query.case_insensitive,
-                max_count: query.max_count,
-                top_k: query.global_max_results,
-                filters: query_filters.clone(),
-                prefer_worktree_for_git_head_blob: false,
-            })?
+            snapshot.search(&QueryRequest::from_config(query, effective_filters, false))?
         } else {
             return Ok(empty_search_results());
         };
 
         absolutize_search_results(&mut results, &self.build_config.repo_path);
-        if let Some(filter) = filter {
-            filter_search_results(&mut results, filter);
-        }
         Ok(results)
     }
 
@@ -233,21 +226,18 @@ impl WorkspaceSearchView {
     ) -> Result<SearchResults> {
         let snapshot = base_snapshot
             .ok_or_else(|| AppError::InvalidIndex("base snapshot reader is unavailable".into()))?;
-        let mut results = snapshot.search(&QueryRequest {
-            pattern: query.regex_pattern.clone(),
-            mode: query.search_mode,
-            case_insensitive: query.case_insensitive,
-            max_count: query.max_count,
-            top_k: query.global_max_results,
-            filters: query_filters.clone(),
+        let mut effective_filters = query_filters.clone();
+        if let Some(filter) = filter {
+            effective_filters.set_path_filter(self.build_config.repo_path.clone(), filter.clone());
+        }
+        let mut results = snapshot.search(&QueryRequest::from_config(
+            query,
+            effective_filters,
             prefer_worktree_for_git_head_blob,
-        })?;
+        ))?;
         absolutize_search_results(&mut results, &self.build_config.repo_path);
         if let Some(excluded_paths) = excluded_paths {
             exclude_search_results(&mut results, excluded_paths);
-        }
-        if let Some(filter) = filter {
-            filter_search_results(&mut results, filter);
         }
         Ok(results)
     }
