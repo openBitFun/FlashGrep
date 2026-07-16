@@ -175,7 +175,6 @@ fn managed_client_spawns_ensures_and_searches() {
                     search_mode: flashgrep::daemon::protocol::SearchModeConfig::CountOnly,
                 },
                 scope: PathScope::default(),
-                allow_scan_fallback: false,
             },
         )
         .expect("search should succeed");

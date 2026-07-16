@@ -1,0 +1,4 @@
+interface:
+  display_name: "Flashgrep Search"
+  short_description: "Replace built-in grep and glob with flashgrep MCP."
+  default_prompt: "Use $flashgrep-search instead of the built-in grep and glob tools."

@@ -3,10 +3,10 @@
 const fs = require("node:fs");
 const path = require("node:path");
 const { spawn } = require("node:child_process");
+const { version: MCP_SERVER_VERSION } = require("./package.json");
 
 const JSONRPC_VERSION = "2.0";
 const MCP_SERVER_NAME = "flashgrep-mcp";
-const MCP_SERVER_VERSION = "0.2.9";
 const SUPPORTED_PROTOCOL_VERSIONS = [
   "2025-11-25",
   "2025-06-18",
@@ -28,6 +28,7 @@ const DEFAULTS = {
 const START_TIMEOUT_MS = 10_000;
 const RETRY_INTERVAL_MS = 100;
 const SHUTDOWN_TIMEOUT_MS = 2_000;
+const MCP_TEXT_FILE_PREVIEW_LIMIT = 20;
 
 async function main() {
   const options = parseServerArgs(process.argv.slice(2));
@@ -155,21 +156,18 @@ class McpServer {
   }
 
   async searchCode(arguments_) {
+    const startedAt = monotonicNowMs();
     const args = parseSearchArguments(arguments_);
+    const openStartedAt = monotonicNowMs();
     const repoContext = await openRepoForCall(this, args);
-    if (
-      !isIndexedSearchReady(repoContext.status.phase) &&
-      !args.allow_scan_fallback
-    ) {
-      throw new Error(
-        `repo is not ready for indexed search (phase=${repoContext.status.phase}); call build_index first or retry with allow_scan_fallback=true`,
-      );
-    }
+    const openElapsedMs = elapsedMsSince(openStartedAt);
+    const indexTask = await startIndexBuildIfMissing(repoContext);
     const patterns = [args.pattern, ...args.regexp];
     const pattern = combinePatterns(patterns, args.fixed_strings);
-    const searchParams = buildSearchParams(repoContext.repoId, args, pattern, patterns);
+    const searchParams = buildSearchParams(repoContext, args, pattern, patterns);
     const searchMethod =
       args.search_mode === "line_matches" ? "search/grouped_line_matches" : "search";
+    const daemonStartedAt = monotonicNowMs();
     const response = await sendDaemonRequest(repoContext.backend, searchMethod, {
       ...searchParams,
       query: {
@@ -180,11 +178,21 @@ class McpServer {
             : args.search_mode,
       },
     });
+    const daemonElapsedMs = elapsedMsSince(daemonStartedAt);
+    const totalElapsedMs = elapsedMsSince(startedAt);
+    const timings = {
+      total_ms: totalElapsedMs,
+      open_repo_ms: openElapsedMs,
+      daemon_search_ms: daemonElapsedMs,
+    };
 
     return {
       daemon_addr: repoContext.addr,
       repo_id: repoContext.repoId,
-      status: repoContext.status,
+      requested_root: repoContext.requestedPath,
+      index_task: indexTask,
+      status: response.status ?? repoContext.status,
+      timings,
       response,
     };
   }
@@ -194,11 +202,12 @@ class McpServer {
     const repoContext = await openRepoForCall(this, args);
     const response = await sendDaemonRequest(repoContext.backend, "glob", {
       repo_id: repoContext.repoId,
-      scope: buildPathScope(args),
+      scope: buildPathScope(args, repoContext),
     });
     return {
       daemon_addr: repoContext.addr,
       repo_id: repoContext.repoId,
+      requested_root: repoContext.requestedPath,
       response,
     };
   }
@@ -212,6 +221,7 @@ class McpServer {
     return {
       daemon_addr: repoContext.addr,
       repo_id: repoContext.repoId,
+      requested_root: repoContext.requestedPath,
       response,
     };
   }
@@ -226,17 +236,20 @@ class McpServer {
     return {
       daemon_addr: repoContext.addr,
       repo_id: repoContext.repoId,
+      requested_root: repoContext.requestedPath,
       response,
     };
   }
 
   async buildIndex(arguments_) {
     const args = parseRepoArguments(arguments_);
-    const repoContext = await ensureRepoForCall(this, args);
+    const repoContext = await openRepoForCall(this, args);
+    const task = await startIndexBuildIfMissing(repoContext);
     return {
       daemon_addr: repoContext.addr,
       repo_id: repoContext.repoId,
-      indexed_docs: repoContext.indexedDocs,
+      requested_root: repoContext.requestedPath,
+      task,
       status: repoContext.status,
     };
   }
@@ -523,37 +536,13 @@ function parseSearchArguments(value) {
       ["files_with_matches", "line_matches", "count_only", "count_matches"],
       "line_matches",
     ),
-    allow_scan_fallback: Boolean(value.allow_scan_fallback),
-  };
-}
-
-async function ensureRepoForCall(server, args) {
-  const { options } = server;
-  const repoPath = resolveRepoPath(options.repoPath, args.repo_path);
-  const storageRoot = resolveStorageRoot(options.storageRoot, args.storage_root, repoPath);
-  const daemon = await server.ensureBackend();
-  const result = await sendDaemonRequest(daemon, "ensure_repo", {
-    repo_path: repoPath,
-    storage_root: storageRoot,
-    config: options.config,
-    refresh: options.refresh,
-  });
-  if (result.kind !== "repo_ensured") {
-    throw new Error(`unexpected ensure_repo response: ${JSON.stringify(result)}`);
-  }
-  return {
-    backend: daemon,
-    addr: daemon.addr,
-    repoId: result.repo_id,
-    indexedDocs: result.indexed_docs ?? null,
-    status: result.status,
   };
 }
 
 async function openRepoForCall(server, args) {
   const { options } = server;
   const repoPath = resolveRepoPath(options.repoPath, args.repo_path);
-  const storageRoot = resolveStorageRoot(options.storageRoot, args.storage_root, repoPath);
+  const storageRoot = resolveStorageRoot(options.storageRoot, args.storage_root);
   const daemon = await server.ensureBackend();
   const result = await sendDaemonRequest(daemon, "open_repo", {
     repo_path: repoPath,
@@ -568,12 +557,24 @@ async function openRepoForCall(server, args) {
     backend: daemon,
     addr: daemon.addr,
     repoId: result.repo_id,
+    requestedPath: repoPath,
     status: result.status,
   };
 }
 
-function isIndexedSearchReady(phase) {
-  return phase === "ready_clean" || phase === "ready_dirty";
+async function startIndexBuildIfMissing(repoContext) {
+  if (repoContext.status.phase !== "missing_base_snapshot") {
+    return repoContext.status.active_task_id
+      ? { task_id: repoContext.status.active_task_id, already_running: true }
+      : null;
+  }
+  const result = await sendDaemonRequest(repoContext.backend, "base_snapshot/build", {
+    repo_id: repoContext.repoId,
+  });
+  if (result.kind !== "task_started") {
+    throw new Error(`unexpected base_snapshot/build response: ${JSON.stringify(result)}`);
+  }
+  return result.task;
 }
 
 async function spawnBackend(options) {
@@ -644,16 +645,33 @@ function selectDaemonProgram(explicitProgram) {
     return process.env.FLASHGREP_DAEMON_BIN;
   }
 
+  const bundledBinary = bundledDaemonProgram();
+  if (bundledBinary && fs.existsSync(bundledBinary)) {
+    return bundledBinary;
+  }
+
   const binaryFileName = process.platform === "win32" ? "flashgrep.exe" : "flashgrep";
-  const releaseBinary = path.resolve(__dirname, "../../target/release", binaryFileName);
+  const releaseBinary = path.resolve(__dirname, "../target/release", binaryFileName);
   if (fs.existsSync(releaseBinary)) {
     return releaseBinary;
   }
-  const debugBinary = path.resolve(__dirname, "../../target/debug", binaryFileName);
+  const debugBinary = path.resolve(__dirname, "../target/debug", binaryFileName);
   if (fs.existsSync(debugBinary)) {
     return debugBinary;
   }
   return "flashgrep";
+}
+
+function bundledDaemonProgram() {
+  const binaryName = {
+    "darwin:arm64": "flashgrep-aarch64-apple-darwin",
+    "darwin:x64": "flashgrep-x86_64-apple-darwin",
+    "linux:arm64": "flashgrep-aarch64-unknown-linux-musl",
+    "linux:x64": "flashgrep-x86_64-unknown-linux-musl",
+    "win32:arm64": "flashgrep-aarch64-pc-windows-msvc.exe",
+    "win32:x64": "flashgrep-x86_64-pc-windows-msvc.exe",
+  }[`${process.platform}:${process.arch}`];
+  return binaryName ? path.resolve(__dirname, "bin", binaryName) : null;
 }
 
 async function initializeBackend(backend) {
@@ -786,7 +804,7 @@ const BUILTIN_TYPE_NAMES = new Set([
   "zstd",
 ]);
 
-function buildPathScope(args) {
+function buildPathScope(args, repoContext) {
   const typeAdd = [...args.type_add];
   const types = [];
   for (const name of args.file_type) {
@@ -799,8 +817,13 @@ function buildPathScope(args) {
       types.push(name);
     }
   }
+  const roots = args.roots.length > 0
+    ? args.roots.map((root) =>
+        path.isAbsolute(root) ? root : path.resolve(repoContext.requestedPath, root),
+      )
+    : defaultScopeRoots(repoContext);
   return {
-    roots: args.roots,
+    roots,
     globs: args.glob,
     iglobs: args.iglob,
     type_add: typeAdd,
@@ -810,9 +833,20 @@ function buildPathScope(args) {
   };
 }
 
-function buildSearchParams(repoId, args, pattern, patterns) {
+function defaultScopeRoots(repoContext) {
+  const repoRoot = normalizePathForComparison(repoContext.status.repo_path);
+  const requestedRoot = normalizePathForComparison(repoContext.requestedPath);
+  return requestedRoot === repoRoot ? [] : [repoContext.requestedPath];
+}
+
+function normalizePathForComparison(value) {
+  const normalized = path.resolve(value);
+  return process.platform === "win32" ? normalized.toLowerCase() : normalized;
+}
+
+function buildSearchParams(repoContext, args, pattern, patterns) {
   return {
-    repo_id: repoId,
+    repo_id: repoContext.repoId,
     query: {
       pattern,
       patterns,
@@ -827,8 +861,7 @@ function buildSearchParams(repoId, args, pattern, patterns) {
       global_max_results: args.global_max_results,
       search_mode: args.search_mode,
     },
-    scope: buildPathScope(args),
-    allow_scan_fallback: args.allow_scan_fallback,
+    scope: buildPathScope(args, repoContext),
   };
 }
 
@@ -842,8 +875,8 @@ function resolveRepoPath(defaultRepoPath, overrideRepoPath) {
   return repoPath;
 }
 
-function resolveStorageRoot(defaultStorageRoot, overrideStorageRoot, repoPath) {
-  return overrideStorageRoot ?? defaultStorageRoot ?? path.join(repoPath, ".flashgrep-index-engine");
+function resolveStorageRoot(defaultStorageRoot, overrideStorageRoot) {
+  return overrideStorageRoot ?? defaultStorageRoot;
 }
 
 function toolDefinitions() {
@@ -857,7 +890,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
+            "Workspace path. A subdirectory reuses its Git worktree root index and becomes the default search scope.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
           pattern: schemaString("Primary regex or literal pattern."),
@@ -879,13 +912,10 @@ function toolDefinitions() {
             type: "string",
             enum: ["files_with_matches", "line_matches", "count_only", "count_matches"],
           },
-          allow_scan_fallback: schemaBool(
-            "Allow scan fallback if indexed execution cannot serve the query.",
-          ),
           glob: schemaStringArray("Include glob filters."),
           iglob: schemaStringArray("Case-insensitive include glob filters."),
           roots: schemaStringArray(
-            "Restrict search to repo-relative or absolute subpaths.",
+            "Restrict search to workspace-relative or absolute subpaths.",
           ),
           file_type: schemaStringArray("Only search the given file types."),
           file_type_not: schemaStringArray("Exclude the given file types."),
@@ -907,13 +937,13 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
+            "Workspace path. A subdirectory reuses its Git worktree root index and becomes the default glob scope.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
           glob: schemaStringArray("Include glob filters."),
           iglob: schemaStringArray("Case-insensitive include glob filters."),
           roots: schemaStringArray(
-            "Restrict globbing to repo-relative or absolute subpaths.",
+            "Restrict globbing to workspace-relative or absolute subpaths.",
           ),
           file_type: schemaStringArray("Only include the given file types."),
           file_type_not: schemaStringArray("Exclude the given file types."),
@@ -934,7 +964,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
+            "Workspace path. Subdirectories are resolved to their Git worktree root index.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
         },
@@ -949,7 +979,7 @@ function toolDefinitions() {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
+            "Workspace path. Subdirectories are resolved to their Git worktree root index.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
           force: schemaBool(
@@ -963,12 +993,12 @@ function toolDefinitions() {
       name: "build_index",
       title: "Build Index",
       description:
-        "Ensure the repository has a searchable base snapshot, starting the backend process as needed.",
+        "Start building the repository base snapshot if it is missing and return immediately.",
       inputSchema: {
         type: "object",
         properties: {
           repo_path: schemaString(
-            "Repository root path. Optional when the server was started with --repo or from the target repo root.",
+            "Workspace path. Subdirectories build and reuse their Git worktree root index.",
           ),
           storage_root: schemaString("Override index storage root for this call."),
         },
@@ -983,13 +1013,94 @@ function toolResult(structuredContent, isError) {
     content: [
       {
         type: "text",
-        text: JSON.stringify(structuredContent, null, 2),
+        text: formatToolText(structuredContent, isError),
       },
     ],
     structuredContent,
     isError,
   };
 }
+
+function formatToolText(structuredContent, isError) {
+  if (isError) {
+    return structuredContent?.error ?? JSON.stringify(structuredContent);
+  }
+  if (structuredContent?.response?.kind?.startsWith?.("search_")) {
+    return formatSearchToolText(structuredContent);
+  }
+  return JSON.stringify(structuredContent, null, 2);
+}
+
+function formatSearchToolText(result) {
+  const response = result.response ?? {};
+  const results = response.results ?? {};
+  const summary = results.summary ?? {};
+  const lines = [
+    `repo_id: ${result.repo_id}`,
+    `backend: ${response.backend ?? "-"}`,
+    `search_kind: ${response.kind ?? "-"}`,
+    `timings_ms: total=${result.timings?.total_ms ?? "-"} open_repo=${result.timings?.open_repo_ms ?? "-"} daemon_search=${result.timings?.daemon_search_ms ?? "-"}`,
+    `matches: lines=${results.matched_lines ?? 0} occurrences=${results.matched_occurrences ?? 0} files=${summary.files_with_matches ?? resultFileCount(results)} limit_reached=${Boolean(results.limit_reached)}`,
+  ];
+  const files = Array.isArray(results.files) ? results.files : [];
+  if (files.length > 0) {
+    lines.push(`files_preview: first ${Math.min(files.length, MCP_TEXT_FILE_PREVIEW_LIMIT)} of ${files.length}`);
+    for (const entry of files.slice(0, MCP_TEXT_FILE_PREVIEW_LIMIT)) {
+      const [filePath, lineNumbers] = entry;
+      lines.push(`- ${filePath}: ${Array.isArray(lineNumbers) ? lineNumbers.join(",") : ""}`);
+    }
+  }
+  const matchedPaths = Array.isArray(results.matched_paths) ? results.matched_paths : [];
+  if (matchedPaths.length > 0) {
+    lines.push(`paths_preview: first ${Math.min(matchedPaths.length, MCP_TEXT_FILE_PREVIEW_LIMIT)} of ${matchedPaths.length}`);
+    for (const filePath of matchedPaths.slice(0, MCP_TEXT_FILE_PREVIEW_LIMIT)) {
+      lines.push(`- ${filePath}`);
+    }
+  }
+  const fileCounts = Array.isArray(results.file_counts) ? results.file_counts : [];
+  if (fileCounts.length > 0) {
+    lines.push(`file_counts_preview: first ${Math.min(fileCounts.length, MCP_TEXT_FILE_PREVIEW_LIMIT)} of ${fileCounts.length}`);
+    for (const item of fileCounts.slice(0, MCP_TEXT_FILE_PREVIEW_LIMIT)) {
+      lines.push(`- ${item.path}: ${item.matched_lines}`);
+    }
+  }
+  const fileMatchCounts = Array.isArray(results.file_match_counts)
+    ? results.file_match_counts
+    : [];
+  if (fileMatchCounts.length > 0) {
+    lines.push(`file_match_counts_preview: first ${Math.min(fileMatchCounts.length, MCP_TEXT_FILE_PREVIEW_LIMIT)} of ${fileMatchCounts.length}`);
+    for (const item of fileMatchCounts.slice(0, MCP_TEXT_FILE_PREVIEW_LIMIT)) {
+      lines.push(`- ${item.path}: ${item.matched_occurrences}`);
+    }
+  }
+  lines.push("Full machine-readable results are available in structuredContent.");
+  return lines.join("\n");
+}
+
+function resultFileCount(results) {
+  if (Array.isArray(results.files)) {
+    return results.files.length;
+  }
+  if (Array.isArray(results.matched_paths)) {
+    return results.matched_paths.length;
+  }
+  if (Array.isArray(results.file_counts)) {
+    return results.file_counts.length;
+  }
+  if (Array.isArray(results.file_match_counts)) {
+    return results.file_match_counts.length;
+  }
+  return 0;
+}
+
+function monotonicNowMs() {
+  return Number(process.hrtime.bigint() / 1_000_000n);
+}
+
+function elapsedMsSince(startedAt) {
+  return Math.max(0, monotonicNowMs() - startedAt);
+}
+
 
 function successResponse(id, result) {
   return {
@@ -1183,7 +1294,7 @@ function requireValue(flag, value) {
 }
 
 function printHelp() {
-  process.stdout.write(`Usage: node src/mcp/server.js [OPTIONS]
+  process.stdout.write(`Usage: node mcp/server.js [OPTIONS]
 
 Options:
   --repo <REPO>  (defaults to the server process cwd)

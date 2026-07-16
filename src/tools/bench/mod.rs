@@ -887,7 +887,6 @@ pub(super) fn run_daemon_search_count(
             types: Vec::new(),
             type_not: Vec::new(),
         },
-        allow_scan_fallback: false,
     })?;
 
     match response {

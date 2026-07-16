@@ -360,8 +360,6 @@ pub(super) struct DaemonSearchArgs {
     pub(super) count: bool,
     #[arg(long = "count-matches", default_value_t = false)]
     pub(super) count_matches: bool,
-    #[arg(long, default_value_t = false)]
-    pub(super) allow_scan_fallback: bool,
     #[arg(short = 'g', long = "glob", value_name = "GLOB")]
     pub(super) glob: Vec<String>,
     #[arg(long = "iglob", value_name = "GLOB")]
@@ -397,7 +395,6 @@ impl DaemonSearchArgs {
             max_count,
             count,
             count_matches,
-            allow_scan_fallback,
             glob,
             iglob,
             file_type,
@@ -433,7 +430,6 @@ impl DaemonSearchArgs {
                 file_type,
                 file_type_not,
             ),
-            allow_scan_fallback,
         }
     }
 }

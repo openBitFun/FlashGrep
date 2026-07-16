@@ -1,6 +1,6 @@
 # flashgrep
 
-[![version](https://img.shields.io/badge/version-0.2.9-blue.svg)](https://github.com/flashgrep/flashgrep)
+[![version](https://img.shields.io/badge/version-0.2.10-blue.svg)](https://github.com/flashgrep/flashgrep)
 [![rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
@@ -40,6 +40,8 @@
   regex 查询规划，先做保守提取，不覆盖完整语义。
 - `src/search.rs`
   搜索结果类型定义。
+- `mcp/`
+  对外 MCP server、使用文档和 agent skill 的唯一源码；发布时与各平台二进制一起打包。
 
 ## 存储布局
 
@@ -98,17 +100,17 @@ cargo run --bin flashgrep -- daemon shutdown
 
 ```bash
 # Node MCP server，固定 repo
-node src/mcp/server.js --repo /path/to/repo
+node mcp/server.js --repo /path/to/repo
 
 # 也可以显式指定索引目录或 flashgrep daemon 二进制
-node src/mcp/server.js --repo /path/to/repo --storage-root /tmp/flashgrep-index
-node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
+node mcp/server.js --repo /path/to/repo --storage-root /tmp/flashgrep-index
+node mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
 ```
 
 这个 MCP server 当前暴露 5 个 tools：
 
 - `search_code`
-  对 repo 执行 flashgrep 搜索；不会隐式建索引。如果 repo 还没有 base snapshot，会直接报错，要求先调用 `build_index`，或者显式允许 `allow_scan_fallback`。
+  对 repo 执行 flashgrep 搜索。缺少 base snapshot 时会启动后台构建，并立即使用过渡搜索返回结果，不等待索引完成。
 - `glob_files`
   按 ignore/glob/type 规则返回当前可见文件。
 - `repo_status`
@@ -116,7 +118,7 @@ node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
 - `refresh_repo`
   触发 workspace refresh。
 - `build_index`
-  显式确保 repo 已完成基础索引构建。
+  显式启动缺失的基础索引构建并立即返回，不等待构建完成。
 
 典型 MCP 配置示例：
 
@@ -126,7 +128,7 @@ node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
     "flashgrep": {
       "command": "node",
       "args": [
-        "/absolute/path/to/flashgrep/src/mcp/server.js",
+        "/absolute/path/to/flashgrep/mcp/server.js",
         "--repo",
         "/path/to/repo"
       ]
@@ -137,11 +139,13 @@ node src/mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
 
 说明：
 
-- 如果启动时已经传了 `--repo`，tool 调用里可以省略 `repo_path`。
-- 如果没有传 `--repo`，server 会默认把启动进程的当前工作目录（`cwd`）当作 repo；如果那不是目标仓库，再在 tool 调用里显式传 `repo_path`。
+- 如果启动时已经传了 `--repo`，tool 调用里可以省略 `repo_path`。该路径可以是 Git worktree 根目录或其中的子目录。
+- 如果没有传 `--repo`，server 会默认使用启动进程的当前工作目录（`cwd`）。子目录会复用 Git worktree 根索引，并作为默认搜索范围。
 - MCP transport 走 stdio，framing 使用 `Content-Length`。
 - MCP server 自身是 Node 进程；它会在本次 MCP session 内拉起并持有一个 `flashgrep serve --stdio` 后端子进程。
-- 如果没显式传 `--daemon-bin`，server 会优先尝试 `target/release/flashgrep`、`target/debug/flashgrep`，最后回退到环境里的 `flashgrep`。
+- 如果没显式传 `--daemon-bin`，server 会依次尝试分发包 `mcp/bin/` 中与当前平台匹配的二进制、源码仓库的 `target/release/flashgrep`、`target/debug/flashgrep`，最后使用环境里的 `flashgrep`。
+
+完整的 MCP 分发包由 CI 从 `mcp/` 源码和六个平台的 release 二进制自动生成，主仓库不提交 `mcp/bin/` 构建产物。
 
 如果只是离线准备索引或做 bench，也保留这两个入口：
 
@@ -225,7 +229,6 @@ let response = client.send(Request::Search {
             search_mode: SearchModeConfig::LineMatches,
         },
         scope: PathScope::default(),
-        allow_scan_fallback: false,
     },
 })?;
 ```

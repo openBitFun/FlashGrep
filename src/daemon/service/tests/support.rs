@@ -262,7 +262,6 @@ pub(super) fn search_repo(service: &DaemonService, repo_id: &str, pattern: &str)
                 repo_id: repo_id.to_string(),
                 query: query(pattern),
                 scope: PathScope::default(),
-                allow_scan_fallback: false,
             },
         })
         .expect("search should succeed")
@@ -415,7 +414,6 @@ pub(super) fn wait_for_search_count(
                 repo_id: repo_id.to_string(),
                 query: query(pattern),
                 scope: PathScope::default(),
-                allow_scan_fallback: false,
             },
         }) {
             Ok(Response::SearchCompleted {
@@ -488,7 +486,6 @@ pub(super) fn wait_for_search_with_params_count(
                     roots: roots.clone(),
                     ..PathScope::default()
                 },
-                allow_scan_fallback: false,
             },
         }) {
             Ok(Response::SearchCompleted {

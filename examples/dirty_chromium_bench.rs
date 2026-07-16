@@ -664,7 +664,6 @@ fn run_flashgrep_query(repo: &DaemonRepo, query: &str) -> Result<SearchMeasureme
             repo_id: repo.repo_id.clone(),
             query: count_only_query(query),
             scope: PathScope::default(),
-            allow_scan_fallback: false,
         },
     })?;
     let elapsed_ms = elapsed_ms(started.elapsed().as_secs_f64());

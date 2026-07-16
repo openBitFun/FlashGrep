@@ -361,7 +361,6 @@ fn workspace_search_uses_transition_fallback_without_base_index() {
                 repo_id,
                 query: query("SCAN_ONLY"),
                 scope: PathScope::default(),
-                allow_scan_fallback: true,
             },
         })
         .expect("search should succeed")
@@ -406,7 +405,6 @@ fn grouped_line_matches_response_groups_lines_by_path() {
                 repo_id: repo_id.clone(),
                 query: query("NEEDLE"),
                 scope: PathScope::default(),
-                allow_scan_fallback: false,
             },
         })
         .expect("grouped search should succeed")
@@ -441,7 +439,6 @@ fn grouped_line_matches_response_groups_lines_by_path() {
                 repo_id: repo_id.clone(),
                 query: query("NEEDLE"),
                 scope: PathScope::default(),
-                allow_scan_fallback: false,
             },
         })
         .expect("compact search should succeed")
@@ -474,7 +471,6 @@ fn grouped_line_matches_response_groups_lines_by_path() {
                 repo_id,
                 query: limited_query,
                 scope: PathScope::default(),
-                allow_scan_fallback: false,
             },
         })
         .expect("limited compact search should succeed")
@@ -754,7 +750,6 @@ fn scope_roots_must_stay_within_repo_boundary() {
                     roots: vec![outside_root.clone()],
                     ..PathScope::default()
                 },
-                allow_scan_fallback: false,
             },
         })
         .expect_err("search should reject roots outside repo");
