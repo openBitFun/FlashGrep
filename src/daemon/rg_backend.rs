@@ -139,6 +139,7 @@ fn run_rg_line_matches(
     if let Some(max_count) = query.max_count {
         command.arg("-m").arg(max_count.to_string());
     }
+    append_rg_scope_roots(&mut command, build_config, scope);
     let command_debug = format!("{command:?}");
 
     let output = command.output()?;
@@ -221,6 +222,7 @@ fn run_rg_count_command(
     if let Some(max_count) = query.max_count {
         command.arg("-m").arg(max_count.to_string());
     }
+    append_rg_scope_roots(&mut command, build_config, scope);
     let command_debug = format!("{command:?}");
 
     let output = command.output()?;
@@ -294,7 +296,6 @@ fn build_rg_base_command(
         command.arg("-e").arg(&query.regex_pattern);
     }
 
-    append_rg_scope_roots(&mut command, build_config, scope);
     command
 }
 
