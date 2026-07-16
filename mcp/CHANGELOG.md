@@ -7,6 +7,12 @@
 - Made `build_index` asynchronous and removed the obsolete `allow_scan_fallback` option from the MCP and daemon search interfaces.
 - Updated the bundled Agent Skill so index construction is no longer a prerequisite for search.
 
+## v0.2.11 - 2026-07-16
+
+- Reused the canonical root index for monorepo subdirectory MCP sessions while preserving the requested directory scope.
+- Returned transition searches immediately through `rg` while a missing base index builds asynchronously.
+- Fixed `rg` transition fallback argument ordering and strengthened the Agent Skill to replace built-in repository search.
+
 ## v0.2.10 - 2026-06-17
 
 - Updated all bundled `flashgrep` binaries to `0.2.10`.

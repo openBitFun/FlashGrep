@@ -1,11 +1,11 @@
 # flashgrep MCP 变更说明
 
-发布时间：2026-07-06 17:19:44 +0800
+发布时间：2026-07-16 12:00:00 +0800
 
 ## 本次包内容
 
-- MCP Server 版本：`0.2.10`
-- 内置 `flashgrep` 后端版本：`0.2.10`
+- MCP Server 版本：`0.2.11`
+- 内置 `flashgrep` 后端版本：`0.2.11`
 - 已替换全部平台二进制：
   - `flashgrep-aarch64-apple-darwin`
   - `flashgrep-x86_64-apple-darwin`
