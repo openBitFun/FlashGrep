@@ -110,8 +110,11 @@ MCP 会自动发现当前目录所属的 Git worktree 根目录并复用根索�
 ```toml
 [mcp_servers.flashgrep]
 command = "node"
-args = ["<FLASHGREP_MCP_DIR>/server.js", "--repo", "<REPO>"]
+args = ["<FLASHGREP_MCP_DIR>/server.js"]
 ```
+
+不配置 `--repo` 时，MCP 默认使用 Codex 当前工作区目录。跨目录调用时，可通过工具的
+`repo_path` 参数显式指定目标目录。
 
 ## 可选参数
 
