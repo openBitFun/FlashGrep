@@ -444,7 +444,7 @@ mod tests {
             .filter(|token| doc_tokens.contains(token))
             .count();
 
-        assert!(doc_tokens.len() >= 1);
+        assert!(!doc_tokens.is_empty());
         assert!(query_tokens.is_empty());
         assert_eq!(shared, 0);
     }

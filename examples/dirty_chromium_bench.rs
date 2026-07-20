@@ -187,7 +187,7 @@ impl BenchWorkspace {
 
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
-            .expect("clock should be after unix epoch")
+            .unwrap_or_default()
             .as_secs();
         let root = env::temp_dir().join(format!(
             "flashgrep-dirty-bench-{timestamp}-{}",
@@ -238,16 +238,14 @@ impl BenchWorkspace {
 impl Drop for BenchWorkspace {
     fn drop(&mut self) {
         if self.cleanup_detached_worktree {
-            let _ = Command::new("git")
-                .arg("-C")
-                .arg(
-                    self.source_repo
-                        .as_ref()
-                        .expect("cleanup_detached_worktree requires source_repo"),
-                )
-                .args(["worktree", "remove", "--force"])
-                .arg(&self.worktree_path)
-                .status();
+            if let Some(source_repo) = self.source_repo.as_ref() {
+                let _ = Command::new("git")
+                    .arg("-C")
+                    .arg(source_repo)
+                    .args(["worktree", "remove", "--force"])
+                    .arg(&self.worktree_path)
+                    .status();
+            }
         }
         if self.cleanup_root {
             if let Some(root) = self.root.as_ref() {
@@ -259,10 +257,10 @@ impl Drop for BenchWorkspace {
 
 fn main() -> Result<()> {
     let mut args = env::args().skip(1);
-    let source_repo = args
-        .next()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("/Users/user/workspace/chromium-src"));
+    let source_repo = args.next().map_or_else(
+        || PathBuf::from("/Users/user/workspace/chromium-src"),
+        PathBuf::from,
+    );
     let query = args
         .next()
         .or_else(|| env::var("FLASHGREP_DIRTY_BENCH_QUERY").ok())
@@ -404,7 +402,11 @@ fn main() -> Result<()> {
                 rg_count.get_or_insert(count);
             }
 
-            let rg_count = rg_count.expect("rg should run at least once");
+            let rg_count = rg_count.ok_or_else(|| {
+                flashgrep::AppError::ValueOutOfRange(
+                    "benchmark iterations must be greater than zero".into(),
+                )
+            })?;
             let rg_median = median_ms(rg_times);
             let detection_ms =
                 wait_for_dirty_paths(&repo, expected_dirty_paths, Duration::from_secs(180))?;
@@ -971,15 +973,14 @@ fn flashgrep_executable() -> Result<PathBuf> {
 
     let current = env::current_exe()?;
     let candidates = [
-        current
-            .parent()
-            .map(|parent| parent.join("flashgrep"))
-            .unwrap_or_else(|| PathBuf::from("target/release/flashgrep")),
-        current
-            .parent()
-            .and_then(Path::parent)
-            .map(|parent| parent.join("flashgrep"))
-            .unwrap_or_else(|| PathBuf::from("target/release/flashgrep")),
+        current.parent().map_or_else(
+            || PathBuf::from("target/release/flashgrep"),
+            |parent| parent.join("flashgrep"),
+        ),
+        current.parent().and_then(Path::parent).map_or_else(
+            || PathBuf::from("target/release/flashgrep"),
+            |parent| parent.join("flashgrep"),
+        ),
         PathBuf::from("/Users/user/workspace/flashgrep/target/release/flashgrep"),
     ];
     for candidate in candidates {
@@ -991,9 +992,12 @@ fn flashgrep_executable() -> Result<PathBuf> {
 }
 
 fn median_ms(mut values: Vec<f64>) -> f64 {
-    values.sort_by(|left, right| left.partial_cmp(right).expect("times should be finite"));
+    if values.is_empty() {
+        return 0.0;
+    }
+    values.sort_by(f64::total_cmp);
     let middle = values.len() / 2;
-    if values.len() % 2 == 0 {
+    if values.len().is_multiple_of(2) {
         (values[middle - 1] + values[middle]) / 2.0
     } else {
         values[middle]

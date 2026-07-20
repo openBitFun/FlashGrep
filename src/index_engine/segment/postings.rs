@@ -21,7 +21,7 @@ pub struct PostingLists {
 #[derive(Debug)]
 enum PostingListStorage {
     Eager(HashMap<u64, Arc<[u32]>>),
-    Lazy(FileBackedPostingLists),
+    Lazy(Box<FileBackedPostingLists>),
 }
 
 #[derive(Debug)]
@@ -71,12 +71,12 @@ impl PostingLists {
         let postings_mmap = unsafe { Mmap::map(&postings_file)? };
         advise_mmap_random(&postings_mmap);
         Ok(Self {
-            storage: PostingListStorage::Lazy(FileBackedPostingLists {
+            storage: PostingListStorage::Lazy(Box::new(FileBackedPostingLists {
                 postings_mmap,
                 term_dict,
                 version,
                 cache: RwLock::new(HashMap::new()),
-            }),
+            })),
         })
     }
 

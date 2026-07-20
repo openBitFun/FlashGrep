@@ -117,7 +117,6 @@ impl RepoRuntime {
                 dirty_path_count,
                 build_path_count
             ),
-            "delta" => {}
             _ => {}
         }
     }

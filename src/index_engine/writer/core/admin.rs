@@ -40,6 +40,7 @@ pub struct IndexAdmin {
 }
 
 impl IndexAdmin {
+    #[allow(clippy::too_many_arguments)]
     pub(super) fn new(
         index_root: PathBuf,
         manifest_store: Arc<dyn ManifestStore>,

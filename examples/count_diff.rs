@@ -124,7 +124,7 @@ fn run_rg_count_by_file(
     let chunks: Vec<Vec<String>> = if let Some(visible_paths) = visible_paths {
         visible_paths
             .chunks(RG_CHUNK_SIZE)
-            .map(|chunk| chunk.to_vec())
+            .map(<[String]>::to_vec)
             .collect()
     } else {
         vec![Vec::new()]

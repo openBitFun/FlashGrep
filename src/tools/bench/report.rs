@@ -88,11 +88,7 @@ pub(super) fn build_summary(
 }
 
 pub(super) fn mean_usize(total: usize, count: usize) -> usize {
-    if count == 0 {
-        0
-    } else {
-        total / count
-    }
+    total.checked_div(count).unwrap_or_default()
 }
 
 fn mean(values: &[f64]) -> f64 {

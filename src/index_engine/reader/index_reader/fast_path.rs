@@ -242,7 +242,7 @@ impl IndexSnapshotReader {
                         file_match_counts.push(FileMatchCount {
                             path,
                             matched_occurrences: count.matched_occurrences,
-                        })
+                        });
                     }
                     crate::search::SearchMode::LineMatches => unreachable!(),
                 }
@@ -605,13 +605,8 @@ impl IndexSnapshotReader {
                         for count in counts {
                             let path = reader.doc_key(count.doc_id)?.logical_path.clone();
                             match query.mode {
-                                crate::search::SearchMode::FilesWithMatches => {
-                                    segment.file_counts.push(FileCount {
-                                        path,
-                                        matched_lines: count.matched_lines,
-                                    });
-                                }
-                                crate::search::SearchMode::CountOnly => {
+                                crate::search::SearchMode::FilesWithMatches
+                                | crate::search::SearchMode::CountOnly => {
                                     segment.file_counts.push(FileCount {
                                         path,
                                         matched_lines: count.matched_lines,

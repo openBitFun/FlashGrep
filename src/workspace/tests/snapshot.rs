@@ -65,7 +65,7 @@ fn ensure_base_snapshot_publishes_compact_base_manifest() {
         WorkspaceBaseSnapshotIndex::index_root(&repo.build_config()).join("manifests"),
     )
     .expect("manifests dir should exist")
-    .filter_map(|entry| entry.ok())
+    .filter_map(std::result::Result::ok)
     .count();
     assert_eq!(manifest_count, 1);
 }

@@ -516,6 +516,7 @@ fn run_worktree_custom_trace_benchmark(
     )
 }
 
+#[allow(clippy::too_many_arguments)]
 fn run_workspace_benchmark(
     repo_path: &Path,
     storage_root: &Path,

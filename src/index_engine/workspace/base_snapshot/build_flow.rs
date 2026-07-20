@@ -45,7 +45,7 @@ pub(super) fn build_sharded_base_snapshot(
                 scope.spawn(move || loop {
                     let Some(shard) = pending_shards
                         .lock()
-                        .expect("base snapshot shard queue lock poisoned")
+                        .unwrap_or_else(std::sync::PoisonError::into_inner)
                         .pop_front()
                     else {
                         break;
@@ -316,7 +316,7 @@ fn build_base_snapshot_segment(
                     let processed = processed_files
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         .saturating_add(1);
-                    if processed % BASE_SNAPSHOT_PROGRESS_REPORT_DOCS == 0
+                    if processed.is_multiple_of(BASE_SNAPSHOT_PROGRESS_REPORT_DOCS)
                         || processed == files.len()
                     {
                         on_progress(processed);
@@ -334,7 +334,7 @@ fn build_base_snapshot_segment(
                     let processed = processed_files
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         .saturating_add(1);
-                    if processed % BASE_SNAPSHOT_PROGRESS_REPORT_DOCS == 0
+                    if processed.is_multiple_of(BASE_SNAPSHOT_PROGRESS_REPORT_DOCS)
                         || processed == files.len()
                     {
                         on_progress(processed);

@@ -454,9 +454,12 @@ fn checkpoint_publish_policy_compacts_overlay_delete_segments() {
     .expect("build add batch");
     overlay.ingest_batch(&add_batch).expect("ingest add batch");
 
-    let delete_batch =
-        WorkspaceOverlayIngestBatch::from_deleted_paths(&repo_id, &repo, &[tracked.clone()])
-            .expect("build delete batch");
+    let delete_batch = WorkspaceOverlayIngestBatch::from_deleted_paths(
+        &repo_id,
+        &repo,
+        std::slice::from_ref(&tracked),
+    )
+    .expect("build delete batch");
     overlay
         .ingest_batch(&delete_batch)
         .expect("ingest delete batch");

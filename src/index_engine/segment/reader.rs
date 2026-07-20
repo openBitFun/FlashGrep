@@ -411,7 +411,7 @@ impl FileSegmentReader {
                     Vec::<u8>::new(),
                 )))
             }
-            Err(error) => return Err(error.into()),
+            Err(error) => Err(error.into()),
         }
     }
 }

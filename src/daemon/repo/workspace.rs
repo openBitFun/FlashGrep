@@ -221,17 +221,16 @@ impl RepoRuntime {
         record_probe_mode_for_test("fast");
         match self.current_base_snapshot_key() {
             Ok(Some(snapshot_key)) => {
-                let plan = match self
-                    .plan_overlay_update_from_event_probe(events.candidate_paths.into_iter())?
-                {
-                    Some(plan) => Some(plan),
-                    None if self.dirty_catalog_pending_paths().is_empty()
-                        && self.snapshot_published_overlay_paths()?.is_some() =>
-                    {
-                        None
-                    }
-                    None => Some(self.plan_overlay_full_rebuild_from_worktree()?),
-                };
+                let plan =
+                    match self.plan_overlay_update_from_event_probe(events.candidate_paths)? {
+                        Some(plan) => Some(plan),
+                        None if self.dirty_catalog_pending_paths().is_empty()
+                            && self.snapshot_published_overlay_paths()?.is_some() =>
+                        {
+                            None
+                        }
+                        None => Some(self.plan_overlay_full_rebuild_from_worktree()?),
+                    };
                 if let Some(plan) = plan {
                     self.apply_refreshed_overlay(snapshot_key, plan);
                 } else {

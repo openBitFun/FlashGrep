@@ -93,10 +93,7 @@ pub fn serve_stdio() -> Result<()> {
     let stdin = std::io::stdin();
     let mut reader = BufReader::new(stdin.lock());
     let mut explicit_shutdown = false;
-    loop {
-        let Some(request) = read_content_length_request(&mut reader)? else {
-            break;
-        };
+    while let Some(request) = read_content_length_request(&mut reader)? {
         let is_shutdown = matches!(request.request, Request::Shutdown | Request::Exit);
         if is_concurrent_request(&request) {
             spawn_request_worker(

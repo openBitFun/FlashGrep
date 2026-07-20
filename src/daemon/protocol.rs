@@ -338,6 +338,8 @@ impl NotificationEnvelope {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(untagged)]
+// These public wire models stay inline so the Rust API mirrors the JSON protocol schema.
+#[allow(clippy::large_enum_variant)]
 pub enum ServerMessage {
     Response(ResponseEnvelope),
     Notification(NotificationEnvelope),
@@ -451,6 +453,7 @@ pub struct SearchProtocolCapabilities {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(tag = "method")]
+#[allow(clippy::large_enum_variant)]
 pub enum Notification {
     #[serde(rename = "$/progress")]
     Progress { params: ProgressNotificationParams },

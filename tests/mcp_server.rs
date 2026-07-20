@@ -1,3 +1,5 @@
+#![allow(clippy::expect_used, clippy::unwrap_used)]
+
 use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
@@ -676,9 +678,8 @@ fn wait_or_kill(child: &mut Child) {
     let deadline = Instant::now() + Duration::from_secs(2);
     while Instant::now() < deadline {
         match child.try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) | Err(_) => return,
             Ok(None) => thread::sleep(Duration::from_millis(25)),
-            Err(_) => return,
         }
     }
     let _ = child.kill();

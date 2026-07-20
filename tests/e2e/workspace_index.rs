@@ -92,8 +92,7 @@ fn build_base_snapshot_with_progress_emits_build_phases() {
     assert!(events.iter().all(|event| {
         event
             .total
-            .map(|total| total > 0 && event.processed <= total)
-            .unwrap_or(true)
+            .is_none_or(|total| total > 0 && event.processed <= total)
     }));
     assert!(events.iter().any(|event| {
         event.phase == IndexProgressPhase::Writing && event.processed == 3 && event.total == Some(3)

@@ -494,8 +494,8 @@ pub(super) fn wait_for_search_with_params_count(
                 status,
                 ..
             }) if results.matched_lines == expected => return (backend, results, status),
-            Ok(Response::SearchCompleted { .. }) => {}
-            Err(crate::error::AppError::InvalidIndex(_)) => {}
+            Ok(Response::SearchCompleted { .. }) | Err(crate::error::AppError::InvalidIndex(_)) => {
+            }
             Err(crate::error::AppError::Io(error))
                 if error.kind() == std::io::ErrorKind::NotFound => {}
             Ok(other) => panic!("unexpected response: {other:?}"),
@@ -618,8 +618,7 @@ pub(super) fn wait_for_workspace_overlay_match_count(
     for _ in 0..SEARCH_WAIT_ATTEMPTS {
         match workspace_overlay_match_count(repo_path, pattern) {
             Ok(count) if count == expected => return,
-            Ok(_) => {}
-            Err(crate::error::AppError::InvalidIndex(_)) => {}
+            Ok(_) | Err(crate::error::AppError::InvalidIndex(_)) => {}
             Err(crate::error::AppError::Io(error))
                 if matches!(
                     error.kind(),
@@ -640,8 +639,7 @@ pub(super) fn wait_for_workspace_overlay_committed_match_count(
     for _ in 0..SEARCH_WAIT_ATTEMPTS {
         match workspace_overlay_committed_match_count(repo_path, pattern) {
             Ok(count) if count == expected => return,
-            Ok(_) => {}
-            Err(crate::error::AppError::InvalidIndex(_)) => {}
+            Ok(_) | Err(crate::error::AppError::InvalidIndex(_)) => {}
             Err(crate::error::AppError::Io(error))
                 if error.kind() == std::io::ErrorKind::NotFound => {}
             Err(error) => panic!("workspace overlay engine should open: {error:?}"),

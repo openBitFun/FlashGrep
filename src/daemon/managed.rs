@@ -311,18 +311,18 @@ impl Drop for StartupLockGuard {
 
 pub fn daemon_state_file_path(params: &EnsureRepoParams) -> Result<PathBuf> {
     let params = normalize_ensure_params(params.clone())?;
-    Ok(params
-        .storage_root
-        .expect("normalized ensure params should have storage root")
-        .join(DEFAULT_DAEMON_STATE_FILE))
+    let storage_root = params.storage_root.ok_or_else(|| {
+        AppError::Protocol("normalized ensure params are missing a storage root".into())
+    })?;
+    Ok(storage_root.join(DEFAULT_DAEMON_STATE_FILE))
 }
 
 pub fn daemon_state_file_path_from_open(params: &OpenRepoParams) -> Result<PathBuf> {
     let params = normalize_open_params(params.clone())?;
-    Ok(params
-        .storage_root
-        .expect("normalized open params should have storage root")
-        .join(DEFAULT_DAEMON_STATE_FILE))
+    let storage_root = params.storage_root.ok_or_else(|| {
+        AppError::Protocol("normalized open params are missing a storage root".into())
+    })?;
+    Ok(storage_root.join(DEFAULT_DAEMON_STATE_FILE))
 }
 
 fn daemon_start_lock_file_path(state_file: &Path) -> PathBuf {

@@ -22,8 +22,7 @@ fn main() -> Result<()> {
     };
 
     let bench_root = env::var("FLASHGREP_BUILD_BENCH_ROOT")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| PathBuf::from("tmp/build-rebuild-bench"));
+        .map_or_else(|_| PathBuf::from("tmp/build-rebuild-bench"), PathBuf::from);
     fs::create_dir_all(&bench_root)?;
 
     println!(

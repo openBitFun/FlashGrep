@@ -161,10 +161,7 @@ fn search_document_from_path(logical_path: String, path: PathBuf) -> Result<Sear
         .modified()
         .ok()
         .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-        .map(|duration| match u64::try_from(duration.as_nanos()) {
-            Ok(value) => value,
-            Err(_) => u64::MAX,
-        })
+        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
         .unwrap_or_default();
 
     Ok(SearchDocument {

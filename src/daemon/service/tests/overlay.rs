@@ -2477,17 +2477,15 @@ fn path_scoped_search_limits_published_overlay_results() {
         search_mode: SearchModeConfig::LineMatches,
         ..query("SCOPED_TOKEN")
     };
-    match wait_for_search_with_params_count(&service, &repo_id, query, vec![left.clone()], 1) {
-        (backend, results, _) => {
-            assert!(matches!(
-                backend,
-                SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
-            ));
-            assert_eq!(results.line_matches.len(), 1);
-            assert!(results.line_matches[0].path.ends_with("left.rs"));
-            assert_eq!(results.line_matches[0].line_number, 1);
-        }
-    }
+    let (backend, results, _) =
+        wait_for_search_with_params_count(&service, &repo_id, query, vec![left.clone()], 1);
+    assert!(matches!(
+        backend,
+        SearchBackend::IndexedWorkspaceView | SearchBackend::IndexedClean
+    ));
+    assert_eq!(results.line_matches.len(), 1);
+    assert!(results.line_matches[0].path.ends_with("left.rs"));
+    assert_eq!(results.line_matches[0].line_number, 1);
 }
 
 #[test]
@@ -2802,7 +2800,7 @@ fn probe_updates_invalidate_glob_cache() {
     ));
 
     fs::remove_file(repo_path.join("src/fresh.rs")).expect("delete should succeed");
-    let status = wait_for_glob_paths(&service, &repo_id, scope, &[stable.clone()]);
+    let status = wait_for_glob_paths(&service, &repo_id, scope, std::slice::from_ref(&stable));
     assert!(matches!(
         status.phase,
         crate::daemon::protocol::RepoPhase::Opening

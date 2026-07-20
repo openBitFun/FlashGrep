@@ -317,10 +317,7 @@ fn collect_repository_files_for_paths(
             .modified()
             .ok()
             .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| match u64::try_from(duration.as_nanos()) {
-                Ok(value) => value,
-                Err(_) => u64::MAX,
-            })
+            .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
             .unwrap_or_default();
         files.push(RepositoryFile {
             ordinal: files.len(),

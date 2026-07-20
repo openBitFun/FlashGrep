@@ -300,14 +300,12 @@ fn parse_bool_env_value(value: &str) -> Option<bool> {
 
 pub(super) fn base_snapshot_detect_low_memory_mode() -> bool {
     available_memory_bytes()
-        .map(|available| available <= BASE_SNAPSHOT_LOW_MEMORY_AVAILABLE_BYTES)
-        .unwrap_or(false)
+        .is_some_and(|available| available <= BASE_SNAPSHOT_LOW_MEMORY_AVAILABLE_BYTES)
 }
 
 pub(super) fn base_snapshot_memory_pressure_should_spill() -> bool {
     available_memory_bytes()
-        .map(|available| available <= BASE_SNAPSHOT_FORCE_SPILL_AVAILABLE_BYTES)
-        .unwrap_or(false)
+        .is_some_and(|available| available <= BASE_SNAPSHOT_FORCE_SPILL_AVAILABLE_BYTES)
 }
 
 pub(crate) fn base_snapshot_config_fingerprint_for(build_config: &BuildConfig) -> String {

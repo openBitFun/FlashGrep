@@ -84,6 +84,7 @@ pub(crate) fn requires_multiline_verification(config: &QueryConfig) -> Result<bo
     Ok(hir_can_match_line_terminator(&hir))
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(crate) fn verify_candidate_sources_with_resolver<F>(
     candidate_ids: &[u32],
     doc_count: usize,
@@ -166,6 +167,7 @@ where
     Ok(outcomes)
 }
 
+#[allow(clippy::too_many_arguments)]
 fn verify_candidate_sources_with_global_limit<F>(
     candidate_ids: &[u32],
     doc_count: usize,
@@ -560,8 +562,8 @@ impl Sink for VerifySink {
         let buffer = mat.buffer();
         let range = mat.bytes_range_in_buffer();
         let line_starts = self.line_starts_for_buffer(buffer);
-        let base_line = buffer_base_line_number(mat, &line_starts);
-        let line_number = build_line_number(range.start, &line_starts, base_line);
+        let base_line = buffer_base_line_number(mat, line_starts);
+        let line_number = build_line_number(range.start, line_starts, base_line);
         let matched_lines = mat.lines().count().max(1);
         self.matched_lines += matched_lines;
         self.matched_occurrences += matched_lines;

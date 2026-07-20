@@ -233,7 +233,5 @@ fn delete_segment_path(index_root: &Path, delete_segment_id: &DeleteSegmentId) -
 }
 
 fn file_size(path: &Path) -> u64 {
-    fs::metadata(path)
-        .map(|metadata| metadata.len())
-        .unwrap_or(0)
+    fs::metadata(path).map_or(0, |metadata| metadata.len())
 }

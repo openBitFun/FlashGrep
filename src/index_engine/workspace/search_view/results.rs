@@ -205,9 +205,7 @@ fn recompute_result_totals(results: &mut SearchResults) {
             .iter()
             .map(|count| count.matched_occurrences)
             .sum()
-    } else if !results.line_matches.is_empty() {
-        results.matched_occurrences
-    } else if !results.line_match_files.is_empty() {
+    } else if !results.line_matches.is_empty() || !results.line_match_files.is_empty() {
         results.matched_occurrences
     } else {
         0

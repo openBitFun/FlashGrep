@@ -1,4 +1,5 @@
 use super::*;
+use std::path::Path;
 
 #[test]
 fn ensure_repo_replaces_runtime_when_storage_root_changes() {
@@ -74,7 +75,7 @@ fn ensure_repo_replaces_runtime_when_storage_root_changes() {
 
     let settled = wait_for_status(&service, &repo_id, |status| {
         matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
-            && PathBuf::from(&status.storage_root) == storage_b
+            && Path::new(&status.storage_root) == storage_b
     });
     assert!(settled.probe_healthy);
     assert_eq!(settled.last_error, None);

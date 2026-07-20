@@ -467,7 +467,7 @@ fn maintain_drains_multi_step_merges_and_vacuums_stale_files() {
 
     let manifest_count = fs::read_dir(config.index_root.join("manifests"))
         .expect("manifests dir should exist")
-        .filter_map(|entry| entry.ok())
+        .filter_map(std::result::Result::ok)
         .count();
     assert_eq!(manifest_count, 2);
 

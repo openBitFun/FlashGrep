@@ -314,58 +314,6 @@ fn extract_trigram_terms_from_bytes(bytes: &[u8]) -> Vec<u64> {
         .collect()
 }
 
-#[cfg(test)]
-mod tests {
-    use super::{
-        collect_document_posting_terms, collect_query_posting_terms, write_term_dict_file,
-        TermDictionary,
-    };
-    use crate::{index_engine::config::PostingTokenizerConfig, TokenizerMode};
-    use std::collections::HashMap;
-    use tempfile::TempDir;
-
-    fn sparse_tokenizer() -> PostingTokenizerConfig {
-        PostingTokenizerConfig {
-            mode: TokenizerMode::SparseNgram,
-            min_sparse_len: 3,
-            max_sparse_len: 8,
-        }
-    }
-
-    #[test]
-    fn sparse_documents_emit_build_all_tokens_while_queries_use_covering_tokens() {
-        let tokenizer = sparse_tokenizer();
-        let document_terms = collect_document_posting_terms(b"getUserById", &tokenizer);
-        let query_terms = collect_query_posting_terms("getUserById", &tokenizer);
-
-        assert!(!document_terms.is_empty());
-        assert!(!query_terms.is_empty());
-        assert!(document_terms.len() > query_terms.len());
-        for term in &query_terms {
-            assert!(document_terms.contains(term));
-        }
-    }
-
-    #[test]
-    fn mmap_term_dictionary_binary_searches_offsets() {
-        let temp = TempDir::new().expect("temp dir");
-        let path = temp.path().join("term_dict.bin");
-        let posting_lists = HashMap::from([
-            (11u64, vec![1u32, 3u32]),
-            (22u64, vec![2u32]),
-            (33u64, vec![4u32, 5u32, 6u32]),
-        ]);
-        write_term_dict_file(&path, &posting_lists).expect("write term dict");
-
-        let dict = TermDictionary::open(&path).expect("open term dict");
-        assert_eq!(dict.len(), 3);
-        assert_eq!(dict.postings_offset(11), Some(16));
-        assert_eq!(dict.postings_offset(22), Some(23));
-        assert_eq!(dict.postings_offset(33), Some(29));
-        assert_eq!(dict.postings_offset(44), None);
-    }
-}
-
 fn write_u32(buffer: &mut Vec<u8>, value: u32) -> Result<()> {
     buffer.write_all(&value.to_le_bytes())?;
     Ok(())
@@ -467,4 +415,56 @@ fn hash_trigram_window(window: &[u8]) -> u64 {
     let mut bytes = [0u8; 8];
     bytes[..POSTING_GRAM_LEN].copy_from_slice(window);
     u64::from_le_bytes(bytes)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        collect_document_posting_terms, collect_query_posting_terms, write_term_dict_file,
+        TermDictionary,
+    };
+    use crate::{index_engine::config::PostingTokenizerConfig, TokenizerMode};
+    use std::collections::HashMap;
+    use tempfile::TempDir;
+
+    fn sparse_tokenizer() -> PostingTokenizerConfig {
+        PostingTokenizerConfig {
+            mode: TokenizerMode::SparseNgram,
+            min_sparse_len: 3,
+            max_sparse_len: 8,
+        }
+    }
+
+    #[test]
+    fn sparse_documents_emit_build_all_tokens_while_queries_use_covering_tokens() {
+        let tokenizer = sparse_tokenizer();
+        let document_terms = collect_document_posting_terms(b"getUserById", &tokenizer);
+        let query_terms = collect_query_posting_terms("getUserById", &tokenizer);
+
+        assert!(!document_terms.is_empty());
+        assert!(!query_terms.is_empty());
+        assert!(document_terms.len() > query_terms.len());
+        for term in &query_terms {
+            assert!(document_terms.contains(term));
+        }
+    }
+
+    #[test]
+    fn mmap_term_dictionary_binary_searches_offsets() {
+        let temp = TempDir::new().expect("temp dir");
+        let path = temp.path().join("term_dict.bin");
+        let posting_lists = HashMap::from([
+            (11u64, vec![1u32, 3u32]),
+            (22u64, vec![2u32]),
+            (33u64, vec![4u32, 5u32, 6u32]),
+        ]);
+        write_term_dict_file(&path, &posting_lists).expect("write term dict");
+
+        let dict = TermDictionary::open(&path).expect("open term dict");
+        assert_eq!(dict.len(), 3);
+        assert_eq!(dict.postings_offset(11), Some(16));
+        assert_eq!(dict.postings_offset(22), Some(23));
+        assert_eq!(dict.postings_offset(33), Some(29));
+        assert_eq!(dict.postings_offset(44), None);
+    }
 }
