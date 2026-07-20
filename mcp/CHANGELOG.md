@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+## v0.2.12 - 2026-07-20
+
 - Reused one managed daemon, index reader, and workspace watcher across MCP processes for the same Git worktree.
 - Dispatched MCP JSON-RPC requests concurrently so a slow search no longer blocks unrelated requests.
 - Streamed transition `rg` results and terminated the process once the global result limit was reached.

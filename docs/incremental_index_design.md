@@ -279,3 +279,4 @@ Clean@Base
 
 - 当前运行时整体视图：[workspace_index_architecture.md](./workspace_index_architecture.md)
 - 模块和目录蓝图：[index_engine_blueprint.md](./index_engine_blueprint.md)
+- 分支切换增量 base promotion 改造方案：[branch_switch_incremental_index_plan.md](./branch_switch_incremental_index_plan.md)

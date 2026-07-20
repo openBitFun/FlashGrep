@@ -1,12 +1,12 @@
 # flashgrep MCP 变更说明
 
-发布时间：2026-07-16 12:00:00 +0800
+发布时间：2026-07-20 +0800
 
 ## 本次包内容
 
-- MCP Server 版本：`0.2.11`
-- 内置 `flashgrep` 后端版本：`0.2.11`
-- 已替换全部平台二进制：
+- MCP Server 版本：`0.2.12`
+- 内置 `flashgrep` 后端版本：`0.2.12`
+- 打包平台：
   - `flashgrep-aarch64-apple-darwin`
   - `flashgrep-x86_64-apple-darwin`
   - `flashgrep-aarch64-unknown-linux-musl`
@@ -16,117 +16,62 @@
 
 ## 关键修复
 
-### 子目录启动复用仓库根索引
+### 缺失索引时立即返回搜索结果
 
-修复了从仓库子目录启动 MCP 时重复创建子目录索引的问题。
+首次打开尚未建立索引的仓库时，`search_code` 会在后台启动 base snapshot 构建，并立即
+通过 transition backend 返回结果，不再等待完整索引构建完成。
 
-现在 `flashgrep` 会先通过 Git discovery 找到 canonical Git worktree root，再打开 repo。比如从仓库子目录：
+transition `rg` 改为流式读取。达到 `global_max_results` 后会主动终止子进程，避免高频
+匹配在大型仓库中继续消耗 CPU 和内存。
 
-```text
-<repo-root>/base
-```
+### 同一仓库的 MCP 进程共享 daemon
 
-启动 MCP 时，会归一化为：
+同一 Git worktree 的多个 MCP session 现在通过轻量 `mcp-bridge` 连接同一个 managed
+daemon，共享：
 
-```text
-repo_id=<repo-root>
-storage_root=<repo-root>/.flashgrep-index-engine
-```
+- base index reader
+- workspace overlay reader
+- workspace watcher
+- 后台构建任务
 
-不会再创建：
+大量 subagent 并发搜索时不会再为每个 MCP 进程各自启动一套重型 daemon 和索引 reader。
+MCP JSON-RPC 请求也改为并发分发，慢搜索不会阻塞无关请求。
 
-```text
-<repo-root>/base/.flashgrep-index-engine
-```
+### 跨进程索引构建串行化
 
-### Git-only indexed workspace runtime
+base snapshot 构建和发布增加了 OS 文件锁。多个 MCP/subagent 同时请求建立同一仓库索引
+时，只会有一个实际构建者；重复请求复用已有活动任务，避免 staging 清理和发布竞争。
 
-daemon 的 indexed workspace runtime 改为只支持非 bare Git worktree，且要求仓库已有 `HEAD` commit。
+### 子目录继续复用 Git worktree 根索引
 
-非 Git 目录不会在 MCP 初始化阶段直接失败；`initialize` 和 `tools/list` 仍可用。真正打开或确保 repo 的工具调用会返回明确错误。
+从仓库子目录启动 MCP 时，会使用 canonical Git worktree root 作为 repo identity 和索引
+存储根，同时把搜索结果限制在用户打开的子目录范围内。
 
-### base snapshot 身份校验
+## 工程质量
 
-base snapshot 会校验：
+- `cargo clippy --all-targets --all-features -- -D warnings` 已通过。
+- 完整测试：`246 passed, 0 failed, 1 ignored`。
+- MCP 集成测试覆盖多个 MCP 进程共享 managed daemon、并发请求和子目录索引复用。
 
-- 当前 Git `HEAD`
-- canonical repo root
-- index 配置 fingerprint
+## Chromium 大仓库验证
 
-这样可以避免切换分支、切换 checkout 或配置变化后误用旧 snapshot。
+在 Chromium 大型 Git worktree 上完成了冷索引和多进程验证：
 
-### dirty workspace 检测收敛到 Git
+- 冷索引搜索约 `442 ms` 返回 10 条 transition 结果，索引继续在后台构建。
+- 4 个并发 MCP session 只启动 1 个重型 managed daemon。
+- managed daemon RSS 约 `383 MB`，轻量 bridge 进程内存占用接近 0。
+- 热态 daemon 搜索耗时约 `7-13 ms`。
+- 从 `chromium-src/base` 打开时复用 `chromium-src` 根索引，结果保持在 `base` scope。
 
-dirty workspace 检测改为以 Git tracked / untracked visible paths 为准，减少 daemon runtime 里的文件系统扫描兜底分支。
+具体耗时受机器、仓库状态、缓存和查询模式影响，上述数字用于说明本次验证环境中的行为。
 
-### scoped workspace probe 快路径
+## 后续设计
 
-当搜索限制在某个子树时，daemon 可以只刷新相关路径范围的 overlay 状态，不必每次做完整 worktree probe。
-
-## MCP 响应调整
-
-### 搜索响应文本瘦身
-
-`search_code` 的 `content[0].text` 不再返回完整 pretty JSON，而是返回紧凑的人类可读摘要和最多 20 条预览。
-
-完整机器可读结果仍保留在：
+本仓库新增了 branch switch 增量 base promotion 的详细改造方案：
 
 ```text
-structuredContent
+docs/branch_switch_incremental_index_plan.md
 ```
 
-这减少了 MCP 客户端传给模型的大段重复文本，但如果调用方显式设置很大的 `global_max_results`，`structuredContent` 本身仍会随结果数量增长。
-
-### 搜索耗时上报
-
-`search_code` 返回新增：
-
-```json
-{
-  "timings": {
-    "total_ms": 353,
-    "open_repo_ms": 92,
-    "daemon_search_ms": 260
-  }
-}
-```
-
-说明：
-
-- `total_ms`：MCP `search_code` 总耗时
-- `open_repo_ms`：打开/确认 repo runtime 的耗时
-- `daemon_search_ms`：daemon 执行搜索请求的耗时
-
-不会向 stdout 或 stderr 额外打印耗时日志，避免影响 MCP 协议和客户端日志。
-
-## 已验证
-
-已在 Chromium 大型 Git worktree 上完成验证：
-
-- 从仓库子目录启动 MCP
-- `repo_status` 正确归一到 Git worktree root
-- `storage_root` 正确使用根目录 `.flashgrep-index-engine`
-- `search_code` 走 `indexed_clean`
-- `search_code` 返回包含 `timings`
-- `content[0].text` 为摘要，完整结果保留在 `structuredContent`
-
-示例验证结果：
-
-```text
-server_info.version=0.2.10
-repo_id=<repo-root>
-storage_root=<repo-root>/.flashgrep-index-engine
-phase=ready_clean
-search_backend=indexed_clean
-matched_lines=1
-```
-
-## 相关上游变更
-
-本次主要基于 `flashgrep v0.2.10`，其中修复子目录索引复用的关键提交为：
-
-```text
-74766fbc08a5f28502f102dc7afc5e36f76a3e3f
-daemon: require git discovery for repo open
-时间：2026-06-16 20:37:06 +0800
-```
+该方案用于后续替换切分支时的粗粒度 base rebuild；它是设计文档，不属于 `0.2.12` 已实现
+功能。
