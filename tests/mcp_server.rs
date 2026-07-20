@@ -9,6 +9,8 @@ use std::{
 use serde_json::{json, Value};
 use tempfile::tempdir;
 
+use flashgrep::daemon::{protocol::Request, DaemonClient};
+
 #[test]
 fn mcp_initialize_and_tools_list_do_not_open_invalid_default_repo() {
     if !node_is_available() {
@@ -362,6 +364,146 @@ fn mcp_default_repo_from_subdirectory_reuses_git_root_storage() {
 
     drop(stdin);
     server.wait_or_kill();
+    shutdown_managed_daemon(&repo_path);
+}
+
+#[test]
+fn mcp_processes_share_the_repo_managed_daemon() {
+    if !node_is_available() {
+        return;
+    }
+
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    std::fs::write(
+        repo_path.join("main.rs"),
+        "const TOKEN: &str = \"SHARED\";\n",
+    )
+    .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let mut first_server = McpServerProcess::spawn(&repo_path);
+    let mut first_stdin = first_server
+        .child
+        .stdin
+        .take()
+        .expect("stdin should be piped");
+    let first_stdout = first_server
+        .child
+        .stdout
+        .take()
+        .expect("stdout should be piped");
+    let mut first_stdout = BufReader::new(first_stdout);
+    let first_search = send_mcp_request(
+        &mut first_stdin,
+        &mut first_stdout,
+        search_request(1, "SHARED"),
+    );
+    assert_ne!(first_search["result"]["isError"], Value::Bool(true));
+    let first_state = managed_daemon_state(&repo_path);
+
+    let mut second_server = McpServerProcess::spawn(&repo_path);
+    let mut second_stdin = second_server
+        .child
+        .stdin
+        .take()
+        .expect("stdin should be piped");
+    let second_stdout = second_server
+        .child
+        .stdout
+        .take()
+        .expect("stdout should be piped");
+    let mut second_stdout = BufReader::new(second_stdout);
+    let second_search = send_mcp_request(
+        &mut second_stdin,
+        &mut second_stdout,
+        search_request(2, "SHARED"),
+    );
+    assert_ne!(second_search["result"]["isError"], Value::Bool(true));
+    let second_state = managed_daemon_state(&repo_path);
+    assert_eq!(first_state["pid"], second_state["pid"]);
+    assert_eq!(first_state["addr"], second_state["addr"]);
+
+    drop(first_stdin);
+    drop(second_stdin);
+    first_server.wait_or_kill();
+    second_server.wait_or_kill();
+
+    let addr = second_state["addr"]
+        .as_str()
+        .expect("managed daemon addr should be a string");
+    let response = DaemonClient::new(addr)
+        .send(Request::Ping)
+        .expect("managed daemon should outlive MCP bridges");
+    assert!(matches!(
+        response,
+        flashgrep::daemon::protocol::Response::Pong { .. }
+    ));
+    shutdown_managed_daemon(&repo_path);
+}
+
+#[test]
+fn mcp_dispatches_ping_without_waiting_for_search() {
+    if !node_is_available() {
+        return;
+    }
+
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    std::fs::write(
+        repo_path.join("main.rs"),
+        "const TOKEN: &str = \"HELLO\";\n",
+    )
+    .expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let mut server = McpServerProcess::spawn(&repo_path);
+    let mut stdin = server.child.stdin.take().expect("stdin should be piped");
+    let stdout = server.child.stdout.take().expect("stdout should be piped");
+    let mut stdout = BufReader::new(stdout);
+
+    write_mcp_request(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 1,
+            "method": "tools/call",
+            "params": {
+                "name": "search_code",
+                "arguments": { "pattern": "HELLO", "fixed_strings": true }
+            }
+        }),
+    );
+    write_mcp_request(
+        &mut stdin,
+        json!({
+            "jsonrpc": "2.0",
+            "id": 2,
+            "method": "ping",
+            "params": {}
+        }),
+    );
+    stdin.flush().expect("requests should flush");
+
+    let first = read_mcp_response(&mut stdout);
+    assert_eq!(
+        first["id"],
+        Value::from(2),
+        "ping should bypass search: {first}"
+    );
+    let second = read_mcp_response(&mut stdout);
+    assert_eq!(
+        second["id"],
+        Value::from(1),
+        "search response should follow: {second}"
+    );
+    assert_ne!(second["result"]["isError"], Value::Bool(true), "{second}");
+
+    drop(stdin);
+    server.wait_or_kill();
+    shutdown_managed_daemon(&repo_path);
 }
 
 fn node_is_available() -> bool {
@@ -462,11 +604,42 @@ fn send_mcp_request(
     stdout: &mut BufReader<ChildStdout>,
     request: Value,
 ) -> Value {
+    write_mcp_request(stdin, request);
+    stdin.flush().expect("request should flush");
+    read_mcp_response(stdout)
+}
+
+fn write_mcp_request(stdin: &mut ChildStdin, request: Value) {
     let body = serde_json::to_vec(&request).expect("request should encode");
     write!(stdin, "Content-Length: {}\r\n\r\n", body.len()).expect("header write should succeed");
     stdin.write_all(&body).expect("body write should succeed");
-    stdin.flush().expect("flush should succeed");
-    read_mcp_response(stdout)
+}
+
+fn search_request(id: u64, pattern: &str) -> Value {
+    json!({
+        "jsonrpc": "2.0",
+        "id": id,
+        "method": "tools/call",
+        "params": {
+            "name": "search_code",
+            "arguments": { "pattern": pattern, "fixed_strings": true }
+        }
+    })
+}
+
+fn managed_daemon_state(repo_path: &Path) -> Value {
+    let root = std::fs::canonicalize(repo_path).expect("repo should canonicalize");
+    let state_path = root.join(".flashgrep-index-engine/daemon-state.json");
+    let bytes = std::fs::read(state_path).expect("managed daemon state should exist");
+    serde_json::from_slice(&bytes).expect("managed daemon state should decode")
+}
+
+fn shutdown_managed_daemon(repo_path: &Path) {
+    let state = managed_daemon_state(repo_path);
+    let addr = state["addr"]
+        .as_str()
+        .expect("managed daemon addr should be a string");
+    let _ = DaemonClient::new(addr).send(Request::Shutdown);
 }
 
 fn read_mcp_response(stdout: &mut BufReader<ChildStdout>) -> Value {

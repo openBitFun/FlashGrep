@@ -1,3 +1,4 @@
+mod bridge;
 mod client;
 mod convert;
 mod git_workspace;
@@ -8,6 +9,7 @@ mod rg_backend;
 mod server;
 mod service;
 
+pub use bridge::serve_managed_stdio_bridge;
 pub use client::DaemonClient;
 pub use managed::{
     daemon_state_file_path, daemon_state_file_path_from_open, EnsuredRepo, ManagedDaemonClient,

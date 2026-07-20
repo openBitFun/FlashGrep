@@ -3,11 +3,12 @@ use std::{
     cmp::Reverse,
     collections::BinaryHeap,
     collections::{BTreeMap, HashMap},
-    fs::{self, File},
+    fs::{self, File, OpenOptions, TryLockError},
     io::{BufReader, BufWriter, Read, Seek, SeekFrom, Write},
     path::{Path, PathBuf},
     sync::{mpsc, Arc},
-    time::{SystemTime, UNIX_EPOCH},
+    thread,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 
 use rayon::prelude::*;
@@ -78,6 +79,45 @@ use self::writer::{
 
 const BASE_SNAPSHOT_BUILD_STAGING_PREFIX: &str = "base-snapshot.build-";
 const BASE_SNAPSHOT_BUILD_STALE_PREFIX: &str = "base-snapshot.stale-";
+const BASE_SNAPSHOT_BUILD_LOCK_FILE: &str = "base-snapshot.build.lock";
+const BASE_SNAPSHOT_BUILD_LOCK_RETRY: Duration = Duration::from_millis(50);
+
+struct BaseSnapshotBuildLock {
+    file: File,
+}
+
+impl BaseSnapshotBuildLock {
+    fn acquire(
+        build_config: &BuildConfig,
+        should_cancel: &mut impl FnMut() -> bool,
+    ) -> Result<Self> {
+        fs::create_dir_all(WorkspaceBaseSnapshotIndex::storage_root(build_config))?;
+        let path = WorkspaceBaseSnapshotIndex::storage_root(build_config)
+            .join(BASE_SNAPSHOT_BUILD_LOCK_FILE);
+        let file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(path)?;
+        loop {
+            check_cancel(should_cancel)?;
+            match file.try_lock() {
+                Ok(()) => return Ok(Self { file }),
+                Err(TryLockError::WouldBlock) => {
+                    thread::sleep(BASE_SNAPSHOT_BUILD_LOCK_RETRY);
+                }
+                Err(TryLockError::Error(error)) => return Err(error.into()),
+            }
+        }
+    }
+}
+
+impl Drop for BaseSnapshotBuildLock {
+    fn drop(&mut self) {
+        let _ = self.file.unlock();
+    }
+}
 const BASE_SNAPSHOT_PREPARE_CHUNK_DOCS: usize = 1024;
 const BASE_SNAPSHOT_PREPARE_PARALLEL_DOC_THRESHOLD: usize = 64;
 const BASE_SNAPSHOT_PREPARE_PARALLEL_BYTE_THRESHOLD: u64 = 8 * 1024 * 1024;
@@ -458,6 +498,26 @@ impl WorkspaceBaseSnapshotIndex {
         on_progress: &mut impl FnMut(IndexProgress),
         should_cancel: &mut impl FnMut() -> bool,
     ) -> Result<Self> {
+        let build_config = build_config.normalized()?;
+        let _build_lock = BaseSnapshotBuildLock::acquire(&build_config, should_cancel)?;
+        Self::rebuild_for_snapshot_identity_locked(
+            &build_config,
+            repo_id,
+            snapshot_key,
+            head_commit,
+            on_progress,
+            should_cancel,
+        )
+    }
+
+    fn rebuild_for_snapshot_identity_locked(
+        build_config: &BuildConfig,
+        repo_id: &RepoId,
+        snapshot_key: &str,
+        head_commit: Option<&str>,
+        on_progress: &mut impl FnMut(IndexProgress),
+        should_cancel: &mut impl FnMut() -> bool,
+    ) -> Result<Self> {
         cleanup_unpublished_base_snapshot_builds(build_config)?;
         let staging_root = next_staging_root(build_config);
         fs::create_dir_all(&staging_root)?;
@@ -645,6 +705,7 @@ impl WorkspaceBaseSnapshotIndex {
     {
         let build_config = build_config.normalized()?;
         check_cancel(&mut should_cancel)?;
+        let _build_lock = BaseSnapshotBuildLock::acquire(&build_config, &mut should_cancel)?;
         report_progress(
             &mut on_progress,
             IndexProgressPhase::Scanning,
@@ -685,7 +746,7 @@ impl WorkspaceBaseSnapshotIndex {
             0,
             None,
         );
-        Self::rebuild_for_snapshot_identity(
+        Self::rebuild_for_snapshot_identity_locked(
             &build_config,
             repo_id,
             &resolved.snapshot_key,

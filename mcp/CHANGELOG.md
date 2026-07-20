@@ -2,6 +2,10 @@
 
 ## Unreleased
 
+- Reused one managed daemon, index reader, and workspace watcher across MCP processes for the same Git worktree.
+- Dispatched MCP JSON-RPC requests concurrently so a slow search no longer blocks unrelated requests.
+- Streamed transition `rg` results and terminated the process once the global result limit was reached.
+- Serialized base snapshot publication across processes with an OS file lock and made duplicate build requests reuse the active task.
 - Reused the canonical Git worktree root index for subdirectory workspaces while keeping search and glob results scoped to the opened subdirectory.
 - Made `search_code` start a missing index build in the background and immediately return results through the transition backend.
 - Made `build_index` asynchronous and removed the obsolete `allow_scan_fallback` option from the MCP and daemon search interfaces.

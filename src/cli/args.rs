@@ -27,6 +27,7 @@ pub(super) enum Commands {
     Bench(BenchArgs),
     Engine(EngineArgs),
     Serve(ServeArgs),
+    McpBridge(DaemonOpenArgs),
     Daemon(DaemonArgs),
 }
 

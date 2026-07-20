@@ -142,7 +142,7 @@ node mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
 - 如果启动时已经传了 `--repo`，tool 调用里可以省略 `repo_path`。该路径可以是 Git worktree 根目录或其中的子目录。
 - 如果没有传 `--repo`，server 会默认使用启动进程的当前工作目录（`cwd`）。子目录会复用 Git worktree 根索引，并作为默认搜索范围。
 - MCP transport 走 stdio，framing 使用 `Content-Length`。
-- MCP server 自身是 Node 进程；它会在本次 MCP session 内拉起并持有一个 `flashgrep serve --stdio` 后端子进程。
+- MCP server 自身是 Node 进程；它通过轻量 `mcp-bridge` 子进程连接仓库级 managed daemon。同一 Git worktree 的多个 MCP session 复用一个 daemon、索引 reader 和 workspace watcher。
 - 如果没显式传 `--daemon-bin`，server 会依次尝试分发包 `mcp/bin/` 中与当前平台匹配的二进制、源码仓库的 `target/release/flashgrep`、`target/debug/flashgrep`，最后使用环境里的 `flashgrep`。
 
 完整的 MCP 分发包由 CI 从 `mcp/` 源码和六个平台的 release 二进制自动生成，主仓库不提交 `mcp/bin/` 构建产物。

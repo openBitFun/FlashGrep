@@ -24,7 +24,7 @@ use crate::{
 mod codec;
 mod connection;
 
-use codec::{read_content_length_request, write_content_length_message};
+pub(crate) use codec::{read_content_length_request, write_content_length_message};
 use connection::handle_connection;
 
 #[derive(Debug, Clone)]

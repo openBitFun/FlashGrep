@@ -7,7 +7,7 @@ use std::time::UNIX_EPOCH;
 use clap::Parser;
 
 use crate::{
-    daemon::{serve, DaemonClient, ManagedDaemonClient, ServerOptions},
+    daemon::{serve, serve_managed_stdio_bridge, DaemonClient, ManagedDaemonClient, ServerOptions},
     error::{AppError, Result},
     index_engine::{EngineConfig, IndexDocument, IndexEngine, RepoId, ShardId},
     search::SearchMode,
@@ -30,6 +30,10 @@ pub(crate) fn run() -> Result<bool> {
         Commands::Bench(args) => run_bench(args.into_config()),
         Commands::Engine(args) => run_engine(args),
         Commands::Serve(args) => run_serve(args),
+        Commands::McpBridge(args) => {
+            serve_managed_stdio_bridge(args.into_open_repo_params())?;
+            Ok(true)
+        }
         Commands::Daemon(args) => run_daemon(args),
     }
 }

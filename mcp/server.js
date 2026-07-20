@@ -34,17 +34,26 @@ async function main() {
   const options = parseServerArgs(process.argv.slice(2));
   const server = new McpServer(options);
   const transport = new ContentLengthTransport(process.stdin, process.stdout);
+  const inFlight = new Set();
   installSignalHandlers(server);
 
   try {
     for await (const { message, framing } of transport.readMessages()) {
-      const response = await server.handleRequest(message);
-      if (response) {
-        transport.writeMessage(response, framing);
-      }
+      const requestId = message && typeof message === "object" ? message.id ?? null : null;
+      const task = Promise.resolve()
+        .then(() => server.handleRequest(message))
+        .catch((error) => errorResponse(requestId, -32603, error.message))
+        .then((response) => {
+          if (response) {
+            transport.writeMessage(response, framing);
+          }
+        })
+        .finally(() => inFlight.delete(task));
+      inFlight.add(task);
     }
   } finally {
     await server.close();
+    await Promise.allSettled(inFlight);
   }
 }
 
@@ -579,7 +588,7 @@ async function startIndexBuildIfMissing(repoContext) {
 
 async function spawnBackend(options) {
   const program = selectDaemonProgram(options.daemonBin);
-  const child = spawn(program, ["serve", "--stdio"], {
+  const child = spawn(program, managedBridgeArgs(options), {
     stdio: ["pipe", "pipe", "pipe"],
   });
   if (child.stderr) {
@@ -615,6 +624,9 @@ async function spawnBackend(options) {
   });
   backend.readLoop = readBackendMessages(backend);
 
+  child.stdin.on("error", (error) => {
+    rejectPendingRequests(backend, error);
+  });
   child.once("error", (error) => {
     backend.spawnError = error;
     rejectPendingRequests(backend, error);
@@ -635,6 +647,31 @@ async function spawnBackend(options) {
     await shutdownBackend(backend);
     throw error;
   }
+}
+
+function managedBridgeArgs(options) {
+  const args = [
+    "mcp-bridge",
+    "--repo", options.repoPath,
+    "--tokenizer", options.config.tokenizer.replaceAll("_", "-"),
+    "--corpus-mode",
+    options.config.corpus_mode === "respect_ignore" ? "ignore" : "no-ignore",
+    "--max-file-size", String(options.config.max_file_size),
+    "--min-sparse-len", String(options.config.min_sparse_len),
+    "--max-sparse-len", String(options.config.max_sparse_len),
+    "--rebuild-dirty-threshold", String(options.refresh.rebuild_dirty_threshold),
+    "--overlay-auto-checkpoint-max-uncommitted-ops",
+    String(options.refresh.overlay_auto_checkpoint_max_uncommitted_ops),
+    "--overlay-merge-min-delay-ms", String(options.refresh.overlay_merge_min_delay_ms),
+    "--overlay-merge-retry-delay-ms", String(options.refresh.overlay_merge_retry_delay_ms),
+  ];
+  if (options.storageRoot) {
+    args.push("--storage-root", options.storageRoot);
+  }
+  if (options.config.include_hidden) {
+    args.push("--hidden");
+  }
+  return args;
 }
 
 function selectDaemonProgram(explicitProgram) {

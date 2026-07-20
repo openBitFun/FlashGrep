@@ -1,8 +1,9 @@
 use std::{
     env,
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Read},
     path::{Path, PathBuf},
-    process::Command,
+    process::{Child, ChildStdout, Command, Stdio},
+    thread::JoinHandle,
 };
 
 use serde_json::Value;
@@ -20,6 +21,9 @@ pub(super) fn run_rg_search(
     query: &QueryConfig,
     scope: &PathFilterArgs,
 ) -> Result<SearchResults> {
+    if query.effective_global_max_results() == Some(0) {
+        return Ok(empty_search_results());
+    }
     match query.search_mode {
         SearchMode::FilesWithMatches => run_rg_files_with_matches(build_config, query, scope),
         SearchMode::LineMatches => run_rg_line_matches(build_config, query, scope),
@@ -141,23 +145,13 @@ fn run_rg_line_matches(
     }
     append_rg_scope_roots(&mut command, build_config, scope);
     let command_debug = format!("{command:?}");
-
-    let output = command.output()?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(AppError::Protocol(format!(
-            "rg fallback failed with status {} (command: {}): {}",
-            output.status,
-            command_debug,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
-    let reader = BufReader::new(output.stdout.as_slice());
+    let mut process = StreamingRgProcess::spawn(&mut command)?;
     let max_results = query.effective_global_max_results().unwrap_or(usize::MAX);
     let mut line_matches = Vec::<LineMatch>::new();
     let mut matched_occurrences = 0usize;
+    let mut stopped_early = false;
 
-    for line in reader.lines() {
+    for line in process.stdout_mut().lines() {
         let line = line?;
         if line.trim().is_empty() {
             continue;
@@ -184,9 +178,11 @@ fn run_rg_line_matches(
             .and_then(Value::as_array)
             .map_or(1, Vec::len);
         if line_matches.len() >= max_results {
+            stopped_early = true;
             break;
         }
     }
+    process.finish(stopped_early, &command_debug)?;
 
     let searches_with_match = line_matches
         .iter()
@@ -224,22 +220,14 @@ fn run_rg_count_command(
     }
     append_rg_scope_roots(&mut command, build_config, scope);
     let command_debug = format!("{command:?}");
-
-    let output = command.output()?;
-    if !output.status.success() && output.status.code() != Some(1) {
-        return Err(AppError::Protocol(format!(
-            "rg fallback failed with status {} (command: {}): {}",
-            output.status,
-            command_debug,
-            String::from_utf8_lossy(&output.stderr).trim()
-        )));
-    }
-
+    let mut process = StreamingRgProcess::spawn(&mut command)?;
     let max_results = query.effective_global_max_results().unwrap_or(usize::MAX);
     let mut matched_total = 0usize;
     let mut searches_with_match = 0usize;
     let mut file_counts = Vec::new();
-    for line in String::from_utf8_lossy(&output.stdout).lines() {
+    let mut stopped_early = false;
+    for line in process.stdout_mut().lines() {
+        let line = line?;
         let Some((path, count)) = line.rsplit_once(':') else {
             continue;
         };
@@ -260,8 +248,103 @@ fn run_rg_count_command(
                 .into_owned(),
             matched_lines: count,
         });
+        if file_counts.len() >= max_results {
+            stopped_early = true;
+            break;
+        }
     }
+    process.finish(stopped_early, &command_debug)?;
     Ok((matched_total, searches_with_match, file_counts))
+}
+
+struct StreamingRgProcess {
+    child: Option<Child>,
+    stdout: BufReader<ChildStdout>,
+    stderr_handle: Option<JoinHandle<std::io::Result<Vec<u8>>>>,
+}
+
+impl StreamingRgProcess {
+    fn spawn(command: &mut Command) -> Result<Self> {
+        command.stdout(Stdio::piped()).stderr(Stdio::piped());
+        let mut child = command.spawn()?;
+        let stdout = child
+            .stdout
+            .take()
+            .ok_or_else(|| AppError::Protocol("rg fallback stdout pipe is missing".into()))?;
+        let mut stderr = child
+            .stderr
+            .take()
+            .ok_or_else(|| AppError::Protocol("rg fallback stderr pipe is missing".into()))?;
+        let stderr_handle = std::thread::spawn(move || {
+            let mut bytes = Vec::new();
+            stderr.read_to_end(&mut bytes)?;
+            Ok(bytes)
+        });
+        Ok(Self {
+            child: Some(child),
+            stdout: BufReader::new(stdout),
+            stderr_handle: Some(stderr_handle),
+        })
+    }
+
+    fn stdout_mut(&mut self) -> &mut BufReader<ChildStdout> {
+        &mut self.stdout
+    }
+
+    fn finish(&mut self, stopped_early: bool, command_debug: &str) -> Result<()> {
+        let mut child = self
+            .child
+            .take()
+            .ok_or_else(|| AppError::Protocol("rg fallback process already finished".into()))?;
+        if stopped_early {
+            let _ = child.kill();
+        }
+        let status = child.wait()?;
+        let stderr = self.join_stderr()?;
+        if !stopped_early && !status.success() && status.code() != Some(1) {
+            return Err(AppError::Protocol(format!(
+                "rg fallback failed with status {status} (command: {command_debug}): {}",
+                String::from_utf8_lossy(&stderr).trim()
+            )));
+        }
+        Ok(())
+    }
+
+    fn join_stderr(&mut self) -> Result<Vec<u8>> {
+        self.stderr_handle
+            .take()
+            .ok_or_else(|| AppError::Protocol("rg fallback stderr reader is missing".into()))?
+            .join()
+            .map_err(|_| AppError::Protocol("rg fallback stderr reader panicked".into()))?
+            .map_err(AppError::from)
+    }
+}
+
+impl Drop for StreamingRgProcess {
+    fn drop(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if let Some(handle) = self.stderr_handle.take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn empty_search_results() -> SearchResults {
+    SearchResults {
+        candidate_docs: 0,
+        searches_with_match: 0,
+        bytes_searched: 0,
+        matched_lines: 0,
+        matched_occurrences: 0,
+        matched_paths: Vec::new(),
+        line_matches: Vec::new(),
+        line_match_files: Vec::new(),
+        file_counts: Vec::new(),
+        file_match_counts: Vec::new(),
+    }
 }
 
 fn build_rg_base_command(
@@ -435,4 +518,28 @@ fn rg_line_number(data: &Value) -> Option<usize> {
     data.get("line_number")
         .and_then(Value::as_u64)
         .and_then(|line| usize::try_from(line).ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::StreamingRgProcess;
+    use std::io::BufRead;
+    use std::process::Command;
+
+    #[cfg(unix)]
+    #[test]
+    fn streaming_rg_process_can_stop_after_reaching_a_result_limit() {
+        let mut command = Command::new("sh");
+        command.args(["-c", "while :; do printf 'match\\n'; done"]);
+        let mut process = StreamingRgProcess::spawn(&mut command).expect("process should spawn");
+        let mut line = String::new();
+        process
+            .stdout_mut()
+            .read_line(&mut line)
+            .expect("line should read");
+        assert_eq!(line, "match\n");
+        process
+            .finish(true, "test streaming command")
+            .expect("early stop should succeed");
+    }
 }

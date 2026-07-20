@@ -808,6 +808,18 @@ fn async_base_snapshot_build_returns_task_and_completes() {
         other => panic!("unexpected response: {other:?}"),
     };
 
+    let repeated = service
+        .handle_request_only(Request::BaseSnapshotBuild {
+            params: crate::daemon::protocol::RepoRef {
+                repo_id: repo_id.clone(),
+            },
+        })
+        .expect("repeated async build should reuse the active task");
+    match repeated {
+        Response::TaskStarted { task } => assert_eq!(task.task_id, task_id),
+        other => panic!("unexpected response: {other:?}"),
+    }
+
     let task = wait_for_task_status(&service, &task_id, |task| {
         matches!(task.state, TaskState::Completed)
     });

@@ -157,6 +157,8 @@ args = ["<FLASHGREP_MCP_DIR>/server.js"]
 
 索引尚未建立或正在构建时，搜索会立即使用过渡后端返回结果，不会等待索引完成。响应中的 `backend` 字段会说明本次使用的是索引还是过渡搜索。
 
+同一 Git worktree 中启动的多个 MCP session 会连接同一个 managed daemon，共享索引 reader、后台构建任务和 workspace watcher。搜索请求可以并发执行；过渡 `rg` 搜索达到 `global_max_results` 后会主动结束子进程，避免高频匹配在大型仓库中持续占用 CPU 和内存。
+
 常用限制参数：
 
 - `global_max_results`: 限制本次搜索整体返回的结果数量；`search_code` 默认是 `100`。不同 `search_mode` 下限制的单位不同：`line_matches` 限制匹配行数，`files_with_matches` 限制路径数，`count_only` 限制 `file_counts` 条目数，`count_matches` 限制 `file_match_counts` 条目数。

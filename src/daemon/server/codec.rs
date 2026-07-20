@@ -5,7 +5,7 @@ use crate::{
     error::{AppError, Result},
 };
 
-pub(super) fn read_content_length_request(
+pub(crate) fn read_content_length_request(
     reader: &mut impl BufRead,
 ) -> Result<Option<RequestEnvelope>> {
     let mut content_length = None;
@@ -35,7 +35,7 @@ pub(super) fn read_content_length_request(
         .map_err(|error| AppError::Protocol(format!("invalid daemon request: {error}")))
 }
 
-pub(super) fn write_content_length_message(
+pub(crate) fn write_content_length_message(
     writer: &mut impl Write,
     message: &ServerMessage,
 ) -> Result<()> {

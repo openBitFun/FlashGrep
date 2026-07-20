@@ -499,3 +499,33 @@ fn git_base_snapshot_writes_per_doc_source_kind() {
         Some(&SegmentDocSourceKind::GitHeadBlob)
     );
 }
+
+#[test]
+fn base_snapshot_build_lock_serializes_independent_callers() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo = temp.path().join("repo");
+    let storage = temp.path().join("index");
+    std::fs::create_dir_all(&repo).expect("repo dir should succeed");
+    let config = build_config(&repo, &storage);
+    let mut never_cancel = || false;
+    let first = super::BaseSnapshotBuildLock::acquire(&config, &mut never_cancel)
+        .expect("first build lock should succeed");
+
+    let acquired = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let thread_acquired = std::sync::Arc::clone(&acquired);
+    let (started_tx, started_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        started_tx.send(()).expect("started signal should send");
+        let mut never_cancel = || false;
+        let _second = super::BaseSnapshotBuildLock::acquire(&config, &mut never_cancel)
+            .expect("second build lock should succeed");
+        thread_acquired.store(true, std::sync::atomic::Ordering::Release);
+    });
+
+    started_rx.recv().expect("started signal should arrive");
+    std::thread::sleep(std::time::Duration::from_millis(100));
+    assert!(!acquired.load(std::sync::atomic::Ordering::Acquire));
+    drop(first);
+    handle.join().expect("lock waiter should join");
+    assert!(acquired.load(std::sync::atomic::Ordering::Acquire));
+}

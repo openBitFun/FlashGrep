@@ -145,6 +145,13 @@ impl RepoRuntime {
         update_repo_phase: bool,
     ) -> Result<RepoTaskStatus> {
         self.cleanup_finished_task_handle();
+        if let Some(active) = self.active_task_status() {
+            if active.kind == kind
+                && matches!(active.state, RepoTaskState::Queued | RepoTaskState::Running)
+            {
+                return Ok(active);
+            }
+        }
         self.ensure_no_active_task()?;
 
         let task = Arc::new(RepoTaskRecord::new(
@@ -352,21 +359,23 @@ impl RepoRuntime {
 
     pub(super) fn ensure_no_active_task(&self) -> Result<()> {
         self.cleanup_finished_task_handle();
-        let active_task_id = match self.state.lock() {
-            Ok(guard) => guard.active_task_id.clone(),
-            Err(poisoned) => poisoned.into_inner().active_task_id.clone(),
-        };
-        if let Some(task_id) = active_task_id {
-            if let Some(task) = self.task_status(&task_id) {
-                if matches!(task.state, RepoTaskState::Queued | RepoTaskState::Running) {
-                    return Err(AppError::Protocol(format!(
-                        "repo {} already has a running task: {task_id}",
-                        self.repo_id
-                    )));
-                }
+        if let Some(task) = self.active_task_status() {
+            if matches!(task.state, RepoTaskState::Queued | RepoTaskState::Running) {
+                return Err(AppError::Protocol(format!(
+                    "repo {} already has a running task: {}",
+                    self.repo_id, task.task_id
+                )));
             }
         }
         Ok(())
+    }
+
+    fn active_task_status(&self) -> Option<RepoTaskStatus> {
+        let active_task_id = match self.state.lock() {
+            Ok(guard) => guard.active_task_id.clone(),
+            Err(poisoned) => poisoned.into_inner().active_task_id.clone(),
+        }?;
+        self.task_status(&active_task_id)
     }
 
     pub(super) fn cleanup_finished_task_handle(&self) {
