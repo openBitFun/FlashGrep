@@ -1,20 +1,21 @@
 use std::{
     collections::HashSet,
-    fs,
     io::{BufRead, BufReader, BufWriter, Read, Write},
     path::Path,
     process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio},
     sync::Mutex,
     thread,
-    time::{Duration, UNIX_EPOCH},
+    time::Duration,
 };
+
+#[cfg(test)]
+use std::fs;
 
 use crc32fast::Hasher;
 
 use crate::{
     config::BuildConfig,
     error::{AppError, Result},
-    files::{is_workspace_internal_path, resolve_repo_path, RepositoryFile},
 };
 
 const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -56,6 +57,7 @@ pub(crate) fn resolve_git_head(
 }
 
 pub(crate) struct GitHeadPathEntry {
+    pub mode: String,
     pub logical_path: String,
     pub object_id: String,
     pub size: u64,
@@ -126,45 +128,6 @@ pub(crate) fn commit_diff_paths(
     Ok(diff)
 }
 
-pub(crate) fn tracked_worktree_matches_head(
-    repo_root: &Path,
-    should_cancel: &mut impl FnMut() -> bool,
-) -> Result<bool> {
-    let output = run_git_command(
-        repo_root,
-        [
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=no",
-            "--",
-            ".",
-        ],
-        should_cancel,
-    )?;
-    if !output.status.success() {
-        return Err(AppError::InvalidIndex(format!(
-            "failed to inspect tracked git worktree state for {}",
-            repo_root.display()
-        )));
-    }
-
-    Ok(output.stdout.is_empty())
-}
-
-pub(crate) fn tracked_worktree_files(
-    repo_root: &Path,
-    include_hidden: bool,
-    max_file_size: u64,
-    should_cancel: &mut impl FnMut() -> bool,
-) -> Result<Vec<RepositoryFile>> {
-    let paths = git_path_list(
-        repo_root,
-        ["ls-files", "-z", "--cached", "--full-name", "--", "."],
-        should_cancel,
-    )?;
-    collect_repository_files_for_paths(repo_root, paths, include_hidden, max_file_size)
-}
-
 pub(crate) fn head_tracked_entries(
     repo_root: &Path,
     head_commit: &str,
@@ -195,7 +158,7 @@ pub(crate) fn head_tracked_entries(
         let path = &record[tab_index + 1..];
         let meta = String::from_utf8_lossy(meta);
         let mut fields = meta.split_whitespace();
-        let _mode = fields.next();
+        let mode = fields.next();
         let object_type = fields.next();
         let object_id = fields.next();
         let size = fields.next();
@@ -209,6 +172,7 @@ pub(crate) fn head_tracked_entries(
             continue;
         };
         entries.push(GitHeadPathEntry {
+            mode: mode.unwrap_or_default().to_string(),
             logical_path: String::from_utf8_lossy(path).into_owned(),
             object_id: object_id.to_string(),
             size,
@@ -354,74 +318,6 @@ pub(crate) fn canonical_repo_root(repo_root: &Path) -> String {
         .unwrap_or_else(|_| repo_root.to_path_buf())
         .to_string_lossy()
         .into_owned()
-}
-
-fn collect_repository_files_for_paths(
-    root: &Path,
-    paths: Vec<String>,
-    include_hidden: bool,
-    max_file_size: u64,
-) -> Result<Vec<RepositoryFile>> {
-    let mut files = Vec::with_capacity(paths.len());
-    for logical_path in paths {
-        let path = resolve_repo_path(root, &logical_path);
-        if is_workspace_internal_path(&path)
-            || (!include_hidden && path_has_hidden_components(&path, root))
-        {
-            continue;
-        }
-        let metadata = match fs::metadata(&path) {
-            Ok(metadata) => metadata,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
-            Err(error) => return Err(error.into()),
-        };
-        if !metadata.is_file() || metadata.len() > max_file_size {
-            continue;
-        }
-        let mtime_nanos = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-            .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
-            .unwrap_or_default();
-        files.push(RepositoryFile {
-            ordinal: files.len(),
-            path,
-            size: metadata.len(),
-            mtime_nanos,
-        });
-    }
-    Ok(files)
-}
-
-fn git_path_list<const N: usize>(
-    repo_root: &Path,
-    args: [&str; N],
-    _should_cancel: &mut impl FnMut() -> bool,
-) -> Result<Vec<String>> {
-    let mut command = Command::new("git");
-    command.arg("-C").arg(repo_root).args(args);
-    let output = command.output()?;
-    if !output.status.success() {
-        return Err(AppError::InvalidIndex(format!(
-            "failed to enumerate git files for {}",
-            repo_root.display()
-        )));
-    }
-    Ok(output
-        .stdout
-        .split(|byte| *byte == 0)
-        .filter(|path| !path.is_empty())
-        .map(|path| String::from_utf8_lossy(path).into_owned())
-        .collect())
-}
-
-fn path_has_hidden_components(path: &Path, root: &Path) -> bool {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    relative.components().any(|component| match component {
-        std::path::Component::Normal(value) => value.to_string_lossy().starts_with('.'),
-        _ => false,
-    })
 }
 
 fn run_git_command<const N: usize>(

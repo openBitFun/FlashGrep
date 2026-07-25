@@ -107,7 +107,25 @@ and the no-match case 0, with all intermediate regex, glob, case, and word cases
 
 ## Remaining Work
 
-Base construction still has independent costs in Git tree materialization, per-file metadata calls,
-document preparation, and posting spill/merge I/O. Those should be instrumented before changing the
-base builder. The remaining Phase 3 transaction-boundary matrix and a branch-aware large-delta
-planner remain the next overlay-specific phases from the optimization plan.
+## Base Builder First Slice
+
+The base builder now reports input enumeration and per-shard prepare/append/finish metrics. An
+instrumented prior-path empty-storage H0 build indexed 445,491 documents in 84.38 s. Per-shard
+preparation took 21-32 s, append took 2-4 s, and posting finish took 4-10 s while shards ran in
+parallel. Removing a duplicate binary-content probe produced a 72.81 s run. Restricting shard
+workers to four regressed to 83.22 s, so the default available-parallelism setting was retained.
+
+Clean HEAD builds now use the same Git-object input model as dirty HEAD builds. Regular base files
+are referenced as `GitHeadBlob`; symlinks keep the worktree-following behavior, preserving the prior
+445,491-document corpus. A representative run completed in 76.26 s and the index shrank from
+5,253,040 KiB to 2,522,784 KiB (52.0%). All 14 query cases remained exact against `rg --no-ignore`,
+including 895,521 common-word lines and 416,998 path-scoped include lines. The macOS page cache was
+not purged, so the wall-time samples show direction and stage attribution rather than a strict cold
+cache comparison.
+
+## Remaining Work
+
+Base construction still spends material time in Git input classification, document preparation,
+and posting spill/merge I/O. Posting-bucket parallelism and a global memory budget remain open. The
+remaining Phase 3 transaction-boundary matrix and a branch-aware large-delta planner remain the next
+overlay-specific phases from the optimization plan.

@@ -311,15 +311,22 @@ fn build_base_snapshot_segment(
     segment_id: SegmentId,
     on_progress: &(impl Fn(usize) + Sync),
 ) -> Result<Option<SegmentRef>> {
+    let started = std::time::Instant::now();
     let mut builder = BulkBaseSegmentWriter::new(
         index_root,
         segment_id,
         PostingTokenizerConfig::from(build_config),
     )?;
     let processed_files = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let mut prepare_ms = 0u128;
+    let mut append_ms = 0u128;
+    let mut prepared_documents = 0usize;
+    let mut posting_terms = 0usize;
+    let mut source_bytes = 0u64;
 
     let prepare_chunk_docs = base_snapshot_prepare_chunk_docs();
     for chunk in files.chunks(prepare_chunk_docs) {
+        let prepare_started = std::time::Instant::now();
         let prepared = if base_snapshot_prepare_parallel_enabled()
             && should_parallel_prepare_base_documents(chunk)
         {
@@ -359,16 +366,37 @@ fn build_base_snapshot_segment(
                 })
                 .collect::<Vec<_>>()
         };
+        prepare_ms = prepare_ms.saturating_add(prepare_started.elapsed().as_millis());
 
+        let append_started = std::time::Instant::now();
         for prepared_document in prepared {
             let Some(prepared_document) = prepared_document? else {
                 continue;
             };
+            prepared_documents = prepared_documents.saturating_add(1);
+            posting_terms = posting_terms.saturating_add(prepared_document.posting_terms.len());
+            source_bytes =
+                source_bytes.saturating_add(prepared_document.document.source_bytes.len() as u64);
             builder.add_document(prepared_document)?;
         }
+        append_ms = append_ms.saturating_add(append_started.elapsed().as_millis());
     }
 
-    builder.finish()
+    let finish_started = std::time::Instant::now();
+    let result = builder.finish();
+    let finish_ms = finish_started.elapsed().as_millis();
+    eprintln!(
+        "[flashgrep][base-metrics] stage=build_segment elapsed_ms={} prepare_ms={} append_ms={} finish_ms={} input_files={} documents={} source_bytes={} posting_terms={}",
+        started.elapsed().as_millis(),
+        prepare_ms,
+        append_ms,
+        finish_ms,
+        files.len(),
+        prepared_documents,
+        source_bytes,
+        posting_terms,
+    );
+    result
 }
 
 pub(super) fn cleanup_unpublished_base_snapshot_builds(build_config: &BuildConfig) -> Result<()> {

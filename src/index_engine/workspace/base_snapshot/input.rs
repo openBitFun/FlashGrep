@@ -54,10 +54,18 @@ pub(super) fn build_head_snapshot_input_files(
     max_file_size: u64,
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<Vec<BaseSnapshotInputFile>> {
+    let started = std::time::Instant::now();
+    let dirty_started = std::time::Instant::now();
     let dirty_paths = dirty_tracked_paths(repo_root, should_cancel)?;
+    let dirty_ms = dirty_started.elapsed().as_millis();
+    let tree_started = std::time::Instant::now();
+    let entries = head_tracked_entries(repo_root, head_commit, should_cancel)?;
+    let tracked_entries = entries.len();
+    let tree_ms = tree_started.elapsed().as_millis();
     let mut files = Vec::new();
+    let classify_started = std::time::Instant::now();
 
-    for entry in head_tracked_entries(repo_root, head_commit, should_cancel)? {
+    for entry in entries {
         let path = crate::files::resolve_repo_path(repo_root, &entry.logical_path);
         if crate::files::is_workspace_internal_path(&path)
             || (!include_hidden && path_has_hidden_components(&path, repo_root))
@@ -67,6 +75,32 @@ pub(super) fn build_head_snapshot_input_files(
         }
 
         let worktree_metadata = fs::metadata(&path).ok();
+        if entry.mode == "120000" {
+            let Some(metadata) = worktree_metadata.filter(|metadata| metadata.is_file()) else {
+                continue;
+            };
+            files.push(BaseSnapshotInputFile {
+                path,
+                logical_path: entry.logical_path,
+                size: metadata.len(),
+                mtime_nanos: metadata
+                    .modified()
+                    .ok()
+                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                    .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+                    .unwrap_or_default(),
+                source: BaseSnapshotFileSource::Worktree,
+                fingerprint: BaseSnapshotFileFingerprint::Worktree {
+                    mtime_nanos: metadata
+                        .modified()
+                        .ok()
+                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
+                        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
+                        .unwrap_or_default(),
+                },
+            });
+            continue;
+        }
         let use_worktree = !dirty_paths.contains(&entry.logical_path)
             && worktree_metadata
                 .as_ref()
@@ -105,6 +139,18 @@ pub(super) fn build_head_snapshot_input_files(
         }
     }
 
+    eprintln!(
+        "[flashgrep][base-metrics] stage=enumerate_inputs elapsed_ms={} dirty_ms={} git_tree_ms={} classify_ms={} dirty_paths={} tracked_entries={} selected_files={} source_bytes={}",
+        started.elapsed().as_millis(),
+        dirty_ms,
+        tree_ms,
+        classify_started.elapsed().as_millis(),
+        dirty_paths.len(),
+        tracked_entries,
+        files.len(),
+        files.iter().map(|file| file.size).sum::<u64>(),
+    );
+
     Ok(files)
 }
 
@@ -117,9 +163,7 @@ pub(super) fn prepare_base_document(
     let Some(document) = repository_file_to_index_document(repo_id, repo_root, file)? else {
         return Ok(None);
     };
-    let Some(text) = indexable_source_text(&document.source_bytes) else {
-        return Ok(None);
-    };
+    let text = String::from_utf8_lossy(&document.source_bytes);
     let mut posting_terms = collect_document_posting_terms_from_text(text.as_ref(), tokenizer);
     posting_terms.sort_unstable();
     posting_terms.dedup();
@@ -226,8 +270,4 @@ fn segment_doc_source_kind(file: &BaseSnapshotInputFile) -> SegmentDocSourceKind
 fn has_binary_source_bytes(bytes: &[u8]) -> bool {
     let probe_len = bytes.len().min(8 * 1024);
     bytes[..probe_len].contains(&0)
-}
-
-fn indexable_source_text(bytes: &[u8]) -> Option<Cow<'_, str>> {
-    (!has_binary_source_bytes(bytes)).then(|| String::from_utf8_lossy(bytes))
 }

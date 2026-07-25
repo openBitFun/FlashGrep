@@ -2,9 +2,9 @@
 
 ## Status
 
-Proposed on 2026-07-25. Phases 1 and 2, the first Phase 3 persistence changes, and the first bounded
-overlay preparation slice are implemented and validated on Chromium. Full Phase 4 bulk writing and
-the base-builder phases remain open.
+Proposed on 2026-07-25. Phases 1 and 2, the first Phase 3 persistence changes, the bounded overlay
+preparation slice, and the first base-builder optimization are implemented and validated on
+Chromium. Full Phase 4 bulk writing and the remaining base-builder phases remain open.
 
 This document is the execution and acceptance contract for improving full base construction,
 workspace overlay refresh, daemon restart recovery, and branch-delta construction. Every
@@ -357,6 +357,22 @@ Candidate changes, applied only when supported by the profile:
 
 The stable shard/fingerprint model remains. Changing shard count or assignment is deferred because it
 would invalidate reuse and change index compatibility.
+
+### Phase 5 Result (2026-07-25, first slice)
+
+Base construction now uses the Git tree input path whenever a HEAD exists, including a clean
+worktree. Regular files are stored as `GitHeadBlob` sources rather than duplicating their bytes as
+inline segment sources; symlinks retain the prior worktree-following behavior. This removes the
+old clean-worktree-only input branch and makes shard fingerprints object-identity based.
+
+The new instrumentation reports Git status/tree/classification and per-shard preparation, append,
+and finish timings. On Chromium H0 the new path indexed the same 445,491 documents with all 14 query
+counts exact. The optimized index was 2,522,784 KiB versus 5,253,040 KiB for the prior inline-source
+build, a 52.0% reduction. A comparable optimized run measured 76.26 s wall time; earlier isolated
+runs were 84.38 s before the duplicate binary scan removal and 72.81 s after it. A four-shard-worker
+run took 83.22 s, so the default available-parallelism setting remains preferable. The resource
+sample reached 3,945,185 KiB RSS during a run with concurrent benchmark interference and is not used
+as a clean peak comparison. Posting spill/merge and scheduler tuning remain open.
 
 ### Chromium Gate
 

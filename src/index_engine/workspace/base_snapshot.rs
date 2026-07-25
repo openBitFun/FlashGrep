@@ -1,5 +1,4 @@
 use std::{
-    borrow::Cow,
     cmp::Reverse,
     collections::BinaryHeap,
     collections::{BTreeMap, HashMap},
@@ -29,7 +28,7 @@ use crate::{
     files::{repo_relative_path, scan_paths, RepositoryFile, ScanOptions},
     git_snapshot::{
         build_config_fingerprint, canonical_repo_root, dirty_tracked_paths, head_tracked_entries,
-        read_git_blob, resolve_git_head, tracked_worktree_files, tracked_worktree_matches_head,
+        read_git_blob, resolve_git_head,
     },
     index_engine::{
         config::{EngineConfig, PostingTokenizerConfig},
@@ -624,45 +623,23 @@ impl WorkspaceBaseSnapshotIndex {
 
         let (doc_count, shards) = if let Some(head_commit) = head_commit {
             check_cancel(should_cancel)?;
-            if tracked_worktree_matches_head(&build_config.repo_path, should_cancel)? {
-                let files = tracked_worktree_files(
-                    &build_config.repo_path,
-                    build_config.include_hidden,
-                    build_config.max_file_size,
-                    should_cancel,
-                )?;
-                build_sharded_base_snapshot(
-                    &staging_root,
-                    build_config,
-                    repo_id,
-                    &build_config.repo_path,
-                    base_snapshot_input_files_from_repository_files(
-                        &files,
-                        &build_config.repo_path,
-                    ),
-                    previous_snapshot.as_ref(),
-                    Some(head_commit),
-                    on_progress,
-                )?
-            } else {
-                let files = build_head_snapshot_input_files(
-                    &build_config.repo_path,
-                    head_commit,
-                    build_config.include_hidden,
-                    build_config.max_file_size,
-                    should_cancel,
-                )?;
-                build_sharded_base_snapshot(
-                    &staging_root,
-                    build_config,
-                    repo_id,
-                    &build_config.repo_path,
-                    files,
-                    previous_snapshot.as_ref(),
-                    Some(head_commit),
-                    on_progress,
-                )?
-            }
+            let files = build_head_snapshot_input_files(
+                &build_config.repo_path,
+                head_commit,
+                build_config.include_hidden,
+                build_config.max_file_size,
+                should_cancel,
+            )?;
+            build_sharded_base_snapshot(
+                &staging_root,
+                build_config,
+                repo_id,
+                &build_config.repo_path,
+                files,
+                previous_snapshot.as_ref(),
+                Some(head_commit),
+                on_progress,
+            )?
         } else {
             let files = scan_paths(
                 std::slice::from_ref(&build_config.repo_path),
