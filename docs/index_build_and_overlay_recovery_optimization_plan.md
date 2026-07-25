@@ -368,8 +368,9 @@ old clean-worktree-only input branch and makes shard fingerprints object-identit
 The new instrumentation reports Git status/tree/classification and per-shard preparation, append,
 and finish timings. On Chromium H0 the new path indexed the same 445,491 documents with all 14 query
 counts exact. The optimized index was 2,522,784 KiB versus 5,253,040 KiB for the prior inline-source
-build, a 52.0% reduction. A comparable optimized run measured 76.26 s wall time; earlier isolated
-runs were 84.38 s before the duplicate binary scan removal and 72.81 s after it. A four-shard-worker
+build, a 52.0% reduction. A pre-symlink-correction optimized run measured 76.26 s wall time; the
+final semantics-preserving run overlapped another benchmark daemon and is not a timing sample.
+Earlier isolated runs were 84.38 s before the duplicate binary scan removal and 72.81 s after it. A four-shard-worker
 run took 83.22 s, so the default available-parallelism setting remains preferable. The resource
 sample reached 3,945,185 KiB RSS during a run with concurrent benchmark interference and is not used
 as a clean peak comparison. Posting spill/merge and scheduler tuning remain open.

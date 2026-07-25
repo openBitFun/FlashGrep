@@ -118,12 +118,19 @@ workers to four regressed to 83.22 s, so the default available-parallelism setti
 Clean HEAD builds now use the same Git-object input model as dirty HEAD builds. Regular base files
 are referenced as `GitHeadBlob`; symlinks keep the worktree-following behavior, preserving the prior
 445,491-document corpus. A representative run completed in 76.26 s and the index shrank from
-5,253,040 KiB to 2,522,784 KiB (52.0%). All 14 query cases remained exact against `rg --no-ignore`,
+5,253,040 KiB to 2,522,784 KiB (52.0%). The 76.26 s wall sample was captured before the final
+symlink semantic correction; the final correction run overlapped another daemon and is excluded
+from timing comparison. All 14 query cases remained exact against `rg --no-ignore`,
 including 895,521 common-word lines and 416,998 path-scoped include lines. The macOS page cache was
 not purged, so the wall-time samples show direction and stage attribution rather than a strict cold
 cache comparison.
 
 ## Remaining Work
+
+The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
+run had five watcher timing failures under concurrent daemon load; the base-focused tests and
+individual rebuild test passed, so these are retained as a watcher-race follow-up rather than
+claimed as a clean gate.
 
 Base construction still spends material time in Git input classification, document preparation,
 and posting spill/merge I/O. Posting-bucket parallelism and a global memory budget remain open. The
