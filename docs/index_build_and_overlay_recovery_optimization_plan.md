@@ -389,6 +389,11 @@ with the same 2M run setting. Ten shards is now the selected default because it 
 worker count; old manifests remain readable and naturally rebuild into the new assignment when
 explicitly rebuilt.
 
+A 192 MiB per-shard posting threshold was rejected: the ten-shard H0 build regressed to 71.32 s
+from 63.84 s at 128 MiB, with finish stages increasing to roughly 9-11 s. The global-budget work
+therefore retains 128 MiB as the performance point and should focus on bounding aggregate memory,
+not increasing per-shard residency.
+
 ### Chromium Gate
 
 Run empty-storage H0 build and same-H0 explicit rebuild. Acceptance:

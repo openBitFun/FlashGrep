@@ -149,6 +149,10 @@ Ten shards matches the measured ten-worker scheduling point. The segment format 
 previous 16-shard manifest remains readable, while an explicit rebuild recalculates shard
 fingerprints and produces the ten-shard assignment.
 
+Raising the in-memory posting threshold from 128 MiB to 192 MiB was rejected. With ten shards the
+same H0 build regressed from 63.84 s to 71.32 s, and per-shard finish times rose to 9-11 s. The
+existing 128 MiB threshold remains the measured performance point.
+
 ## Remaining Work
 
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
