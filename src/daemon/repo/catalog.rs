@@ -77,7 +77,7 @@ impl RepoRuntime {
         self.plan_overlay_update_from_dirty_probe(dirty)
     }
 
-    fn plan_overlay_update_from_dirty_probe(
+    pub(super) fn plan_overlay_update_from_dirty_probe(
         &self,
         dirty: DirtyPathSet,
     ) -> Result<Option<WorkspaceOverlayWritePlan>> {
@@ -260,7 +260,38 @@ impl RepoRuntime {
         self.diff_against_base_snapshot_git_worktree_with_scope(None)
     }
 
-    fn diff_against_base_snapshot_git_worktree_paths(
+    pub(super) fn startup_worktree_candidates(&self) -> Result<(DirtyPathSet, Vec<PathBuf>)> {
+        let Some(base_metadata) =
+            WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
+        else {
+            return Ok((DirtyPathSet::default(), Vec::new()));
+        };
+        let Some(head_commit) = base_metadata
+            .head_commit
+            .or(base_metadata.revision.map(|revision| revision.0))
+        else {
+            return Ok((DirtyPathSet::default(), Vec::new()));
+        };
+        let mut dirty = DirtyPathSet::default();
+        for (path, kind) in self.git_tracked_dirty_paths(&head_commit, None)? {
+            dirty.upsert(path, kind);
+        }
+        for path in self.git_untracked_visible_paths(None)? {
+            dirty.upsert(path, DirtyPathKind::New);
+        }
+        let mut paths = dirty
+            .modified
+            .iter()
+            .chain(dirty.deleted.iter())
+            .chain(dirty.new.iter())
+            .map(PathBuf::from)
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths.dedup();
+        Ok((dirty, paths))
+    }
+
+    pub(super) fn diff_against_base_snapshot_git_worktree_paths(
         &self,
         paths: &[PathBuf],
     ) -> Result<DirtyPathSet> {

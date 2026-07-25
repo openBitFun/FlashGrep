@@ -273,6 +273,16 @@ impl RepoRuntime {
         )
     }
 
+    pub(super) fn open_workspace_overlay_index_manifest_only(
+        &self,
+    ) -> Result<WorkspaceOverlayIndex> {
+        WorkspaceOverlayIndex::open_with_policy_and_hook_manifest_only(
+            &self.build_config,
+            self.workspace_overlay_publish_policy(),
+            self.workspace_overlay_merge_state_hook(),
+        )
+    }
+
     fn handle_workspace_overlay_engine_error(&self, operation: &str, error: &AppError) {
         {
             let mut slot = match self.workspace_overlay_engine.lock() {

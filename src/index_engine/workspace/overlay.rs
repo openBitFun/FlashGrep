@@ -201,17 +201,40 @@ impl WorkspaceOverlayIndex {
         publish_policy: WorkspaceOverlayPublishPolicy,
         merge_state_hook: MergeStateHook,
     ) -> Result<Self> {
+        Self::open_with_restore_mode(build_config, publish_policy, merge_state_hook, true)
+    }
+
+    pub(crate) fn open_with_policy_and_hook_manifest_only(
+        build_config: &BuildConfig,
+        publish_policy: WorkspaceOverlayPublishPolicy,
+        merge_state_hook: MergeStateHook,
+    ) -> Result<Self> {
+        Self::open_with_restore_mode(build_config, publish_policy, merge_state_hook, false)
+    }
+
+    fn open_with_restore_mode(
+        build_config: &BuildConfig,
+        publish_policy: WorkspaceOverlayPublishPolicy,
+        merge_state_hook: MergeStateHook,
+        full_restore: bool,
+    ) -> Result<Self> {
         migrate_legacy_overlay_storage(build_config)?;
+        let engine_config = EngineConfig {
+            shard_id: ShardId(format!(
+                "{}#workspace-overlay",
+                build_config.repo_path.to_string_lossy()
+            )),
+            index_root: workspace_overlay_index_root(build_config),
+            tokenizer: PostingTokenizerConfig::from(build_config),
+            ..EngineConfig::default()
+        };
+        let engine = if full_restore {
+            IndexEngine::open(engine_config)?
+        } else {
+            IndexEngine::open_manifest_only(engine_config)?
+        };
         Ok(Self::new_with_policy_and_hook(
-            IndexEngine::open(EngineConfig {
-                shard_id: ShardId(format!(
-                    "{}#workspace-overlay",
-                    build_config.repo_path.to_string_lossy()
-                )),
-                index_root: workspace_overlay_index_root(build_config),
-                tokenizer: PostingTokenizerConfig::from(build_config),
-                ..EngineConfig::default()
-            })?,
+            engine,
             publish_policy,
             merge_state_hook,
         ))
@@ -254,6 +277,12 @@ impl WorkspaceOverlayIndex {
         source: crate::index_engine::manifest::ManifestSource,
     ) {
         self.engine.writer().set_manifest_source(Some(source));
+    }
+
+    pub(crate) fn manifest_source(
+        &self,
+    ) -> Result<Option<crate::index_engine::manifest::ManifestSource>> {
+        Ok(self.engine.admin().manifest()?.source)
     }
 
     pub(crate) fn runtime_stats(&self) -> Result<WorkspaceOverlayRuntimeStats> {

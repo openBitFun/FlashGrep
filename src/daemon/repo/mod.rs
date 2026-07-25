@@ -280,7 +280,7 @@ impl RepoManager {
 
         runtime.bootstrap_from_existing_snapshot()?;
         if runtime.status_snapshot().snapshot_key.is_some() {
-            if let Err(error) = runtime.refresh_workspace_overlay() {
+            if let Err(error) = runtime.restore_or_refresh_workspace_overlay() {
                 runtime.mark_workspace_probe_pending_with_error(format!(
                     "initial workspace refresh failed: {error}"
                 ));

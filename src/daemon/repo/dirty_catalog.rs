@@ -216,6 +216,20 @@ impl DirtyCatalog {
         self.visible_dirty_paths().stats()
     }
 
+    pub(super) fn matches_ready_versions(&self, dirty: &DirtyPathSet) -> Result<bool> {
+        if self.visible_dirty_paths() != *dirty {
+            return Ok(false);
+        }
+        for (path, entry) in &self.entries {
+            if entry.state != DirtyCatalogState::ReadyOverlay
+                || entry.observed_version != observe_file_version(path)?
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub(super) fn mark_building(&mut self, paths: &DirtyPathSet) {
         self.mark_paths(paths, DirtyCatalogState::Building);
     }
@@ -341,6 +355,17 @@ impl RepoRuntime {
         catalog.pending_dirty_paths()
     }
 
+    pub(super) fn dirty_catalog_matches_ready_versions(
+        &self,
+        dirty: &DirtyPathSet,
+    ) -> Result<bool> {
+        let catalog = match self.dirty_catalog.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        catalog.matches_ready_versions(dirty)
+    }
+
     fn update_dirty_catalog_state(
         &self,
         paths: &DirtyPathSet,
@@ -447,5 +472,40 @@ impl DirtyPathSetExt for DirtyPathSet {
                     .map(|path| (path.clone(), DirtyPathKind::New)),
             )
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{fs, thread, time::Duration};
+
+    use tempfile::tempdir;
+
+    use super::*;
+
+    #[test]
+    fn ready_catalog_versions_short_circuit_only_while_files_are_unchanged() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("tracked.rs");
+        fs::write(&path, "const VALUE: &str = \"ONE\";\n").expect("write file");
+        let path = path.to_string_lossy().into_owned();
+        let dirty = DirtyPathSet {
+            modified: HashSet::from([path.clone()]),
+            ..DirtyPathSet::default()
+        };
+        let mut catalog = DirtyCatalog::default();
+        catalog
+            .reconcile_with_dirty_set(&dirty)
+            .expect("reconcile catalog");
+        catalog.mark_ready(&dirty);
+        assert!(catalog
+            .matches_ready_versions(&dirty)
+            .expect("validate unchanged file"));
+
+        thread::sleep(Duration::from_millis(2));
+        fs::write(&path, "const VALUE: &str = \"TWO-TWO\";\n").expect("rewrite file");
+        assert!(!catalog
+            .matches_ready_versions(&dirty)
+            .expect("validate changed file"));
     }
 }

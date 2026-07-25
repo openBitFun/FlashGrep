@@ -100,6 +100,63 @@ impl DirtyPathSet {
 }
 
 impl RepoRuntime {
+    pub(super) fn restore_or_refresh_workspace_overlay(&self) -> Result<()> {
+        let Some(snapshot_key) = self.current_base_snapshot_key()? else {
+            self.apply_missing_base_overlay_state(None);
+            return Ok(());
+        };
+
+        let (candidate_dirty, candidate_paths) = self.startup_worktree_candidates()?;
+        let dirty = if self.dirty_catalog_matches_ready_versions(&candidate_dirty)? {
+            candidate_dirty
+        } else {
+            self.diff_against_base_snapshot_git_worktree_paths(&candidate_paths)?
+        };
+        let current_head = self.current_git_head()?;
+        let overlay = match self.open_workspace_overlay_index_manifest_only() {
+            Ok(overlay) => overlay,
+            Err(AppError::InvalidIndex(_)) => return self.refresh_workspace_overlay(),
+            Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                return self.refresh_workspace_overlay();
+            }
+            Err(error) => return Err(error),
+        };
+        let source_matches = match overlay.manifest_source()? {
+            Some(crate::index_engine::manifest::ManifestSource::WorkspaceOverlay {
+                base_manifest_id,
+                observed_head,
+                ..
+            }) => {
+                let state = match self.state.lock() {
+                    Ok(guard) => guard,
+                    Err(poisoned) => poisoned.into_inner(),
+                };
+                state.base_manifest_id.as_deref() == Some(base_manifest_id.0.as_str())
+                    && observed_head == current_head
+            }
+            _ => false,
+        };
+        if !source_matches {
+            return self.refresh_workspace_overlay();
+        }
+
+        {
+            let mut slot = match self.workspace_overlay_engine.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = Some(std::sync::Arc::new(overlay));
+        }
+        let plan = self.plan_overlay_update_from_dirty_probe(dirty)?;
+        if let Some(plan) = plan {
+            self.apply_refreshed_overlay(snapshot_key, plan);
+        } else {
+            self.mark_overlay_published_for_head(Some(current_head));
+            self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
+        }
+        Ok(())
+    }
+
     pub(super) fn refresh_workspace_overlay(&self) -> Result<()> {
         let mut noop_progress = |_event: IndexProgress| {};
         self.refresh_workspace_overlay_with_progress(&mut noop_progress)

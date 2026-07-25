@@ -212,6 +212,49 @@ fn reopen_drops_uncommitted_overlay_snapshot_without_checkpoint() {
 }
 
 #[test]
+fn manifest_only_reopen_keeps_published_overlay_searchable() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo = temp.path().join("repo");
+    fs::create_dir_all(&repo).expect("create repo");
+    let config = build_config(&repo);
+    let repo_id = RepoId("repo".into());
+    let tracked_path = repo.join("tracked.rs");
+    let mut documents = HashMap::new();
+    documents.insert(
+        tracked_path.to_string_lossy().into_owned(),
+        loaded_doc(&tracked_path, "const VALUE: &str = \"MANIFEST_ONLY\";\n"),
+    );
+    let overlay = WorkspaceOverlayIndex::open(&config).expect("open overlay");
+    let snapshot =
+        WorkspaceOverlaySnapshotState::from_paths(&repo_id, &repo, &documents, &HashSet::new())
+            .expect("build snapshot");
+    overlay.set_manifest_source(
+        crate::index_engine::manifest::ManifestSource::WorkspaceOverlay {
+            base_manifest_id: crate::index_engine::ManifestId("base".into()),
+            observed_head: "head".into(),
+            probe_epoch: 0,
+        },
+    );
+    overlay
+        .rebuild_snapshot(&snapshot)
+        .expect("refresh snapshot");
+    overlay.checkpoint().expect("checkpoint snapshot");
+
+    let reopened = WorkspaceOverlayIndex::open_with_policy_and_hook_manifest_only(
+        &config,
+        WorkspaceOverlayPublishPolicy::Refresh,
+        Arc::new(|_| {}),
+    )
+    .expect("manifest-only reopen");
+    let results = reopened
+        .open_snapshot()
+        .expect("open snapshot")
+        .search(&query("MANIFEST_ONLY"))
+        .expect("search should succeed");
+    assert_eq!(results.matched_lines, 1);
+}
+
+#[test]
 fn checkpoint_publish_policy_updates_committed_snapshot() {
     let temp = TempDir::new().expect("temp dir");
     let repo = temp.path().join("repo");
