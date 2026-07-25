@@ -11,7 +11,8 @@ impl IndexSnapshotReader {
                 prepare: prepare_started.elapsed(),
                 ..SearchPhaseProfile::default()
             };
-            let results = self.search_single_segment_clean_profiled(query, &plan, &mut phases)?;
+            let results =
+                self.search_single_segment_clean_profiled(query, &plan, &mut phases, None)?;
             phases.total = total_started.elapsed();
             return Ok(DetailedSearchProfile {
                 active_segments: self.snapshot.manifest().active_segments.len(),
@@ -32,7 +33,8 @@ impl IndexSnapshotReader {
                 prepare: prepare_started.elapsed(),
                 ..SearchPhaseProfile::default()
             };
-            let results = self.search_multi_segment_clean_profiled(query, &plan, &mut phases)?;
+            let results =
+                self.search_multi_segment_clean_profiled(query, &plan, &mut phases, None)?;
             phases.total = total_started.elapsed();
             return Ok(DetailedSearchProfile {
                 active_segments: self.snapshot.manifest().active_segments.len(),
@@ -60,6 +62,7 @@ impl IndexSnapshotReader {
             &plan,
             Some(&mut phases),
             Some(&mut candidate_build),
+            None,
         )?;
         phases.total = total_started.elapsed();
         candidate_build.total = phases.collect_candidates;

@@ -1,4 +1,7 @@
-use std::collections::HashSet;
+use std::{
+    collections::HashSet,
+    sync::{Arc, Mutex},
+};
 
 mod results;
 
@@ -16,8 +19,8 @@ use crate::{
 };
 
 use self::results::{
-    absolutize_path, absolutize_search_results, empty_search_results, exclude_search_results,
-    merge_search_results, query_with_remaining_global_limit,
+    absolutize_search_results, empty_search_results, merge_search_results,
+    query_with_remaining_global_limit,
 };
 use super::git_snapshot::GitSnapshotIndex;
 
@@ -29,7 +32,7 @@ pub struct SnapshotHandle {
 pub(crate) struct WorkspaceQuerySnapshot {
     base_snapshot: Option<IndexSnapshotReader>,
     overlay_snapshot: Option<IndexSnapshotReader>,
-    shadowed_base_paths: HashSet<String>,
+    shadowed_base_paths: Arc<HashSet<String>>,
 }
 
 impl WorkspaceQuerySnapshot {
@@ -50,7 +53,7 @@ impl WorkspaceQuerySnapshot {
     }
 
     pub(crate) fn shadowed_base_paths(&self) -> Option<&HashSet<String>> {
-        (!self.shadowed_base_paths.is_empty()).then_some(&self.shadowed_base_paths)
+        (!self.shadowed_base_paths.is_empty()).then_some(self.shadowed_base_paths.as_ref())
     }
 
     pub(crate) fn shadowed_base_paths_len(&self) -> usize {
@@ -93,12 +96,22 @@ impl WorkspaceQuerySnapshot {
 
 pub struct WorkspaceSearchView {
     build_config: BuildConfig,
+    shadowed_base_paths_cache: Mutex<Option<ShadowedBasePathsCache>>,
+}
+
+struct ShadowedBasePathsCache {
+    manifest_id: crate::index_engine::ManifestId,
+    refreshed_seq_no: u64,
+    paths: Arc<HashSet<String>>,
 }
 
 impl WorkspaceSearchView {
     pub fn open(build_config: BuildConfig) -> Result<Self> {
         let build_config = build_config.normalized()?;
-        Ok(Self { build_config })
+        Ok(Self {
+            build_config,
+            shadowed_base_paths_cache: Mutex::new(None),
+        })
     }
 
     pub fn current_snapshot(&self) -> Result<SnapshotHandle> {
@@ -154,7 +167,7 @@ impl WorkspaceSearchView {
             shadowed_base_paths: overlay_snapshot
                 .map(|snapshot| self.shadowed_base_paths_for_overlay_snapshot(snapshot))
                 .transpose()?
-                .unwrap_or_default(),
+                .unwrap_or_else(|| Arc::new(HashSet::new())),
         }
         .search(self, query, query_filters, filter, true)
     }
@@ -168,7 +181,7 @@ impl WorkspaceSearchView {
             .as_ref()
             .map(|snapshot| self.shadowed_base_paths_for_overlay_snapshot(snapshot))
             .transpose()?
-            .unwrap_or_default();
+            .unwrap_or_else(|| Arc::new(HashSet::new()));
         Ok(WorkspaceQuerySnapshot {
             base_snapshot,
             overlay_snapshot,
@@ -230,29 +243,48 @@ impl WorkspaceSearchView {
         if let Some(filter) = filter {
             effective_filters.set_path_filter(self.build_config.repo_path.clone(), filter.clone());
         }
-        let mut results = snapshot.search(&QueryRequest::from_config(
-            query,
-            effective_filters,
-            prefer_worktree_for_git_head_blob,
-        ))?;
+        let request =
+            QueryRequest::from_config(query, effective_filters, prefer_worktree_for_git_head_blob);
+        let mut results = if let Some(excluded_paths) = excluded_paths {
+            snapshot.search_excluding_paths(&request, excluded_paths)?
+        } else {
+            snapshot.search(&request)?
+        };
         absolutize_search_results(&mut results, &self.build_config.repo_path);
-        if let Some(excluded_paths) = excluded_paths {
-            exclude_search_results(&mut results, excluded_paths);
-        }
         Ok(results)
     }
 
     fn shadowed_base_paths_for_overlay_snapshot(
         &self,
         overlay_snapshot: &IndexSnapshotReader,
-    ) -> Result<HashSet<String>> {
+    ) -> Result<Arc<HashSet<String>>> {
+        let manifest_id = overlay_snapshot.manifest().manifest_id.clone();
+        let refreshed_seq_no = overlay_snapshot.manifest().refreshed_seq_no;
+        let mut cache = self
+            .shadowed_base_paths_cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(cached) = cache.as_ref().filter(|cached| {
+            cached.manifest_id == manifest_id && cached.refreshed_seq_no == refreshed_seq_no
+        }) {
+            return Ok(Arc::clone(&cached.paths));
+        }
+
         let visible = overlay_snapshot.visible_keys()?;
-        Ok(visible
-            .live
-            .into_iter()
-            .chain(visible.deleted)
-            .map(|key| absolutize_path(&key.logical_path, &self.build_config.repo_path))
-            .collect())
+        let paths = Arc::new(
+            visible
+                .live
+                .into_iter()
+                .chain(visible.deleted)
+                .map(|key| key.logical_path)
+                .collect(),
+        );
+        *cache = Some(ShadowedBasePathsCache {
+            manifest_id,
+            refreshed_seq_no,
+            paths: Arc::clone(&paths),
+        });
+        Ok(paths)
     }
 }
 
@@ -397,6 +429,14 @@ mod tests {
             .reader()
             .open_snapshot()
             .expect("open overlay snapshot");
+
+        let cached_paths_first = view
+            .shadowed_base_paths_for_overlay_snapshot(&overlay_snapshot)
+            .expect("build shadow path cache");
+        let cached_paths_second = view
+            .shadowed_base_paths_for_overlay_snapshot(&overlay_snapshot)
+            .expect("reuse shadow path cache");
+        assert!(Arc::ptr_eq(&cached_paths_first, &cached_paths_second));
 
         let new_results = view
             .search_workspace_snapshots(

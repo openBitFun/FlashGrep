@@ -121,6 +121,7 @@ impl IndexSnapshotReader {
         &self,
         query: &QueryRequest,
         plan: &QueryPlan,
+        excluded_paths: Option<&std::collections::HashSet<String>>,
     ) -> Result<std::collections::BTreeMap<DocKey, IndexDocument>> {
         let segment_ref = self
             .snapshot
@@ -140,6 +141,9 @@ impl IndexSnapshotReader {
             if !matches_key_filters(key, query) {
                 continue;
             }
+            if excluded_paths.is_some_and(|paths| paths.contains(&key.logical_path)) {
+                continue;
+            }
 
             let document = reader.document(doc_id)?;
             if !matches_filters(document, query) {
@@ -157,7 +161,12 @@ impl IndexSnapshotReader {
         query: &QueryRequest,
         plan: &QueryPlan,
     ) -> Result<SearchResults> {
-        self.search_single_segment_clean_profiled(query, plan, &mut SearchPhaseProfile::default())
+        self.search_single_segment_clean_profiled(
+            query,
+            plan,
+            &mut SearchPhaseProfile::default(),
+            None,
+        )
     }
 
     pub(super) fn search_single_segment_clean_profiled(
@@ -165,6 +174,7 @@ impl IndexSnapshotReader {
         query: &QueryRequest,
         plan: &QueryPlan,
         phases: &mut SearchPhaseProfile,
+        excluded_paths: Option<&std::collections::HashSet<String>>,
     ) -> Result<SearchResults> {
         let segment_ref = self
             .snapshot
@@ -184,6 +194,9 @@ impl IndexSnapshotReader {
         for doc_id in candidate_ids {
             let key = reader.doc_key(doc_id)?;
             if !matches_key_filters(key, query) {
+                continue;
+            }
+            if excluded_paths.is_some_and(|paths| paths.contains(&key.logical_path)) {
                 continue;
             }
             candidate_bytes += reader.doc_metadata(doc_id)?.size;
@@ -347,6 +360,7 @@ impl IndexSnapshotReader {
         query: &QueryRequest,
         plan: &QueryPlan,
         phases: &mut SearchPhaseProfile,
+        excluded_paths: Option<&std::collections::HashSet<String>>,
     ) -> Result<SearchResults> {
         let visibility = self.cached_visibility_state(None)?;
         let mut active_segments = self.snapshot.manifest().active_segments.clone();
@@ -394,6 +408,9 @@ impl IndexSnapshotReader {
                     for &doc_id in candidate_chunk {
                         let key = reader.doc_key(doc_id)?;
                         if !matches_key_filters(key, query) {
+                            continue;
+                        }
+                        if excluded_paths.is_some_and(|paths| paths.contains(&key.logical_path)) {
                             continue;
                         }
                         if visibility
@@ -469,6 +486,9 @@ impl IndexSnapshotReader {
             for doc_id in candidate_ids {
                 let key = reader.doc_key(doc_id)?;
                 if !matches_key_filters(key, query) {
+                    continue;
+                }
+                if excluded_paths.is_some_and(|paths| paths.contains(&key.logical_path)) {
                     continue;
                 }
                 if visibility

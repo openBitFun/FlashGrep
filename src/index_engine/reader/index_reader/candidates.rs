@@ -6,7 +6,7 @@ impl IndexSnapshotReader {
         query: &QueryRequest,
         plan: &QueryPlan,
     ) -> Result<std::collections::BTreeMap<DocKey, IndexDocument>> {
-        self.candidate_documents_profiled(query, plan, None)
+        self.candidate_documents_profiled(query, plan, None, None)
     }
 
     pub(super) fn candidate_documents_profiled(
@@ -14,9 +14,10 @@ impl IndexSnapshotReader {
         query: &QueryRequest,
         plan: &QueryPlan,
         mut profile: Option<&mut CandidateBuildProfile>,
+        excluded_paths: Option<&std::collections::HashSet<String>>,
     ) -> Result<std::collections::BTreeMap<DocKey, IndexDocument>> {
         if self.can_use_single_segment_candidate_fast_path() {
-            return self.candidate_documents_single_segment(query, plan);
+            return self.candidate_documents_single_segment(query, plan, excluded_paths);
         }
 
         let mut effective_docs = std::collections::BTreeMap::<DocKey, IndexDocument>::new();
@@ -53,6 +54,9 @@ impl IndexSnapshotReader {
                 if !matches_key_filters(key, query) {
                     continue;
                 }
+                if excluded_paths.is_some_and(|paths| paths.contains(&key.logical_path)) {
+                    continue;
+                }
                 if visibility
                     .latest_live_segment_seq
                     .get(key)
@@ -78,6 +82,9 @@ impl IndexSnapshotReader {
 
         let overlay_started = Instant::now();
         for (key, entry) in &self.data.docs {
+            if excluded_paths.is_some_and(|paths| paths.contains(&key.logical_path)) {
+                continue;
+            }
             if document_matches_query_plan(&entry.document, plan, &self.tokenizer) {
                 effective_docs.insert(key.clone(), entry.document.clone());
             }

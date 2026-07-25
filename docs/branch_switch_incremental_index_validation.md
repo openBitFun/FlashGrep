@@ -64,6 +64,24 @@ initial manifest. The manifest count remained three, `base_delta_depth` returned
 tokenization or candidate publication occurred. The 4.98 s wall time was workspace overlay reconcile
 for the 11,000 changed worktree paths, not base reindexing.
 
+## Overlay Query Optimization
+
+The same Chromium detached worktree was then modified in 1,000, 10,000, and finally all 68,044
+tracked `.cc` files available in this checkout. The 68,044-file state was measured with the baseline
+binary and the optimized binary against the same persisted base and overlay. CLI process startup is
+included in these wall-clock values.
+
+| Query | Baseline | Optimized | Change |
+| --- | ---: | ---: | ---: |
+| Overlay-only marker, 68,044 paths | 182.9 ms | 162.9 ms | 11.0% faster |
+| No-match query, 68,044 paths | 104.3 ms | 98.6 ms | 5.5% faster |
+| `#include`, base + overlay, 68,044 paths | 564.0 ms | 358.0 ms | 36.5% faster |
+
+For the `#include` query, daemon search profiles show base candidate documents falling from 125,336
+to 57,409 and base verification bytes falling from 1,144,459,514 to 314,684,914. The optimized
+path excludes shadowed overlay paths while collecting base candidates, and caches the immutable
+shadow-path set by overlay manifest ID. The overlay itself remained one compacted active segment.
+
 ## Memory And Append Mode
 
 The performance runs include daemon RSS for full readers and searches. The append-mode invariant is

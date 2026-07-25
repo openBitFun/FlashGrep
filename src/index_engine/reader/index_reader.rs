@@ -430,19 +430,45 @@ impl IndexSnapshotReader {
     }
 
     pub fn search(&self, query: &QueryRequest) -> Result<SearchResults> {
+        self.search_internal(query, None)
+    }
+
+    pub fn search_excluding_paths(
+        &self,
+        query: &QueryRequest,
+        excluded_paths: &std::collections::HashSet<String>,
+    ) -> Result<SearchResults> {
+        self.search_internal(query, Some(excluded_paths))
+    }
+
+    fn search_internal(
+        &self,
+        query: &QueryRequest,
+        excluded_paths: Option<&std::collections::HashSet<String>>,
+    ) -> Result<SearchResults> {
         let total_started = Instant::now();
         let plan = QueryPlan::build(query.clone(), &self.tokenizer);
 
         if self.can_use_single_segment_candidate_fast_path() && query.filters.languages.is_empty() {
             let mut phases = SearchPhaseProfile::default();
-            let results = self.search_single_segment_clean_profiled(query, &plan, &mut phases)?;
+            let results = self.search_single_segment_clean_profiled(
+                query,
+                &plan,
+                &mut phases,
+                excluded_paths,
+            )?;
             phases.total = total_started.elapsed();
             self.log_search_phases("single_segment_clean", query, &phases, &results);
             return Ok(results);
         }
         if self.can_use_streaming_segment_fast_path(query) {
             let mut phases = SearchPhaseProfile::default();
-            let results = self.search_multi_segment_clean_profiled(query, &plan, &mut phases)?;
+            let results = self.search_multi_segment_clean_profiled(
+                query,
+                &plan,
+                &mut phases,
+                excluded_paths,
+            )?;
             phases.total = total_started.elapsed();
             self.log_search_phases("multi_segment_clean", query, &phases, &results);
             return Ok(results);
@@ -451,7 +477,7 @@ impl IndexSnapshotReader {
         let regex = RegexBuilder::new(&query.pattern)
             .case_insensitive(query.case_insensitive)
             .build()?;
-        self.search_with_regex(query, &plan, &regex)
+        self.search_with_regex(query, &plan, &regex, excluded_paths)
     }
 
     fn search_with_regex(
@@ -459,8 +485,9 @@ impl IndexSnapshotReader {
         query: &QueryRequest,
         plan: &QueryPlan,
         _regex: &regex::Regex,
+        excluded_paths: Option<&std::collections::HashSet<String>>,
     ) -> Result<SearchResults> {
-        self.search_with_regex_profiled(query, plan, None, None)
+        self.search_with_regex_profiled(query, plan, None, None, excluded_paths)
     }
 
     fn search_with_regex_profiled(
@@ -469,9 +496,11 @@ impl IndexSnapshotReader {
         plan: &QueryPlan,
         mut phases: Option<&mut SearchPhaseProfile>,
         candidate_build: Option<&mut CandidateBuildProfile>,
+        excluded_paths: Option<&std::collections::HashSet<String>>,
     ) -> Result<SearchResults> {
         let candidate_started = Instant::now();
-        let effective_docs = self.candidate_documents_profiled(query, plan, candidate_build)?;
+        let effective_docs =
+            self.candidate_documents_profiled(query, plan, candidate_build, excluded_paths)?;
         if let Some(phases) = phases.as_deref_mut() {
             phases.collect_candidates = candidate_started.elapsed();
         }
