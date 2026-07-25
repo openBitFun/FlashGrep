@@ -59,6 +59,34 @@ large candidate and result set, reducing the advantage to 1.3x. The path-scoped 
 close at 2.1x because rg scans a much smaller subtree. A separate process-cold check on the
 10,000-file overlay measured 0.36 s for flashgrep and 7.40 s for rg using fixed `#include`.
 
+## Diverse Overlay Queries
+
+The overlay was grown cumulatively by appending a marker comment to tracked `.cc` files. The table
+shows flashgrep/rg seconds for the first occurrence of each query at that overlay size. There was no
+same-query warmup. A dash means that the case was not repeated because replaying a 50,000+ file
+overlay in every fresh daemon dominated the experiment.
+
+| Query | 1,000 files | 10,000 files | 50,000 files | 68,044 files |
+| --- | ---: | ---: | ---: | ---: |
+| Rare symbol | 0.19 / 2.64 | 0.13 / 2.62 | 0.20 / 3.84 | 0.18 / 3.99 |
+| Whole-word `scoped_refptr` | 0.49 / 2.84 | 0.15 / 2.44 | 0.60 / 3.00 | 0.57 / 6.86 |
+| Four common types, alternation | 0.74 / 2.56 | 0.44 / 2.39 | 1.03 / 2.95 | 0.96 / 6.79 |
+| Case-insensitive `chromium` | 0.46 / 2.62 | 0.48 / 2.56 | - | - |
+| Common short word `if` | 0.40 / 2.43 | 0.37 / 2.52 | - | - |
+| No-match symbol | 0.14 / 7.45 | 0.10 / 7.32 | - | - |
+| `chrome/browser` path scope | 0.20 / 0.55 | 0.22 / 0.58 | - | - |
+| Comment-tag regex | 0.29 / 2.95 | 0.35 / 2.50 | - | - |
+
+Every measured overlay query produced exactly the same matching-line count as rg. Once the daemon
+was ready, query time stayed sub-second except for the broad alternation at 50,000 files (1.03 s).
+There was no monotonic query-latency growth from 1,000 to 68,044 files.
+
+Overlay synchronization did scale with the number of modified files: 7.91 s at 1,000, 16.29 s at
+10,000, 59.59 s at 50,000, and 94.01 s at 68,044. A fresh daemon also had to replay the published
+large overlay during `open_repo`; at 68,044 files this took more than two minutes and sustained about
+one CPU core before the timed query could start. This replay/open cost is outside the query numbers
+above, but is the main large-overlay restart penalty and needs separate optimization.
+
 ## Result Correctness
 
 Results were compared on H0 using tracked-file references. The comparison covered fixed strings,
