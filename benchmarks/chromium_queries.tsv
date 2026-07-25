@@ -1,0 +1,15 @@
+benchmark	kind	pattern	glob	root
+chromium_01	cpp_literal	ScopedAllowBlockingForTesting	*.{cc,h}	
+chromium_02	cpp_word	\bscoped_refptr\b	*.{cc,h}	
+chromium_03	feature_literal	BackForwardCache	*.{cc,h}	
+chromium_04	browser_test_macro	IN_PROC_BROWSER_TEST_F	*.cc	
+chromium_05	alternates_core_types	(?:scoped_refptr|raw_ptr|std::unique_ptr|std::optional)	*.{cc,h}	
+chromium_06	export_macro_regex	[A-Z][A-Z0-9_]*_EXPORT	*.{cc,h}	
+chromium_07	browser_test_name_regex	IN_PROC_BROWSER_TEST(?:_F)?\([^,]+,\s*[A-Za-z0-9_]+	*.cc	
+chromium_08	header_string	#include "base/	*.{cc,h}	
+chromium_09	case_insensitive_literal	(?i)chromium	*.{cc,h}	
+chromium_10	common_short_word	\bif\b	*.{cc,h}	
+chromium_11	anchored_namespace_regex	(?m)^\s*namespace base \{$	*.{cc,h}	
+chromium_12	no_match_literal	FlashgrepDefinitelyMissingSymbol		
+chromium_13	path_scoped_literal	#include	*.{cc,h}	chrome/browser
+chromium_14	comment_tag_regex	TODO\([^)]+\)	*.{cc,h}	

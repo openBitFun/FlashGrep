@@ -28,23 +28,47 @@ snapshot plus the published workspace overlay or base delta.
 
 ## Cold Query Checks
 
-For cold measurements, a new flashgrep daemon was started and `open_repo` completed before each
-single query. The timed interval covers the one search request, not index construction. Each rg
-measurement is also a new process.
+The reproducible query set is stored in `benchmarks/chromium_queries.tsv`. It covers rare and common
+symbols, word boundaries, feature names, test and export macros, alternation, anchored regexes,
+case folding, header strings, comment tags, no-match behavior, globs, and a path scope.
 
-| Query | Flashgrep cold | rg cold |
-| --- | ---: | ---: |
-| Fixed `#include` | 0.84 s | 7.49 s |
-| Regex `std::(unique_ptr|shared_ptr)` | 0.38 s | 7.50 s |
-| Word-regexp `class` | 0.91 s | 7.55 s |
-| Fixed `#include`, `*.cc` glob | 0.25 s | 2.12 s |
-| Fixed `#include`, 10,000-file overlay | 0.36 s | 7.40 s |
+For each row, a new flashgrep daemon was started and `open_repo` completed before the one timed
+search. Each rg measurement is also a new process. This is process-cold: daemon/query state is not
+reused, but macOS page cache was not forcibly purged. Index construction and `open_repo` are not in
+the timed interval. The table reports one clean-H0 sample and matching-line counts.
+
+| Query kind | Flashgrep | rg | Speedup | Matching lines |
+| --- | ---: | ---: | ---: | ---: |
+| Rare C++ symbol | 0.22 s | 2.29 s | 10.4x | 1,644 |
+| Whole-word `scoped_refptr` | 0.46 s | 6.66 s | 14.5x | 66,003 |
+| Feature symbol | 0.17 s | 6.63 s | 39.0x | 7,571 |
+| Browser-test macro | 0.18 s | 4.06 s | 22.6x | 33,678 |
+| Four common core types, alternation | 4.89 s | 6.59 s | 1.3x | 370,020 |
+| Export-macro regex | 0.22 s | 6.53 s | 29.7x | 42,007 |
+| Browser-test name regex | 0.21 s | 4.16 s | 19.8x | 13,601 |
+| Header string | 0.35 s | 6.59 s | 18.8x | 275,548 |
+| Case-insensitive `chromium` | 0.46 s | 6.28 s | 13.7x | 132,427 |
+| Common short word `if` | 0.84 s | 6.55 s | 7.8x | 895,521 |
+| Anchored namespace regex | 0.19 s | 6.50 s | 34.2x | 5,129 |
+| No-match symbol | 0.13 s | 8.83 s | 67.9x | 0 |
+| `chrome/browser` path scope | 0.28 s | 0.58 s | 2.1x | 416,998 |
+| Comment-tag regex | 0.59 s | 3.43 s | 5.8x | 51,510 |
+
+The broad alternation is the weakest indexed case: its four common alternatives create a very
+large candidate and result set, reducing the advantage to 1.3x. The path-scoped query is similarly
+close at 2.1x because rg scans a much smaller subtree. A separate process-cold check on the
+10,000-file overlay measured 0.36 s for flashgrep and 7.40 s for rg using fixed `#include`.
 
 ## Result Correctness
 
 Results were compared on H0 using tracked-file references. The comparison covered fixed strings,
 regular expressions, case-insensitive search, word boundaries, line-regexp, occurrence counts,
 `*.cc` globs, and the `chrome/browser` path scope.
+
+All 14 diverse cold-query cases produced exactly the same matching-line counts as rg when rg used
+`--no-ignore` and excluded `.git`, matching flashgrep's Git-tracked base corpus. Without
+`--no-ignore`, rg omits tracked files under `chrome/chrome_elf/dll_hash` because Chromium's root
+`.gitignore` contains `**/*_hash`; that is a corpus mismatch rather than a search mismatch.
 
 - `std::(unique_ptr|shared_ptr)` regex: exact, 43,893 files.
 - `*.cc` fixed `#include`: exact, 67,927 files.

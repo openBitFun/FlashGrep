@@ -49,6 +49,12 @@ def friendly_kind_label(kind: str, pattern: str) -> str:
         "export_macro_regex": "Export macro regex",
         "browser_test_name_regex": "BrowserTest regex",
         "header_string": "Header string",
+        "case_insensitive_literal": "Case-insensitive literal",
+        "common_short_word": "Common short word",
+        "anchored_namespace_regex": "Anchored namespace regex",
+        "no_match_literal": "No-match literal",
+        "path_scoped_literal": "Path-scoped literal",
+        "comment_tag_regex": "Comment tag regex",
     }
     if kind in label_map:
         return label_map[kind]
@@ -58,9 +64,11 @@ def friendly_kind_label(kind: str, pattern: str) -> str:
 def load_pattern_labels(path: Path) -> dict[str, str]:
     labels: dict[str, str] = {}
     with path.open() as fh:
-        reader = csv.reader(fh, delimiter="\t")
-        for benchmark, _kind, pattern in reader:
-            labels[benchmark] = friendly_kind_label(_kind, pattern)
+        reader = csv.DictReader(fh, delimiter="\t")
+        if reader.fieldnames != ["benchmark", "kind", "pattern", "glob", "root"]:
+            raise ValueError("unexpected Chromium query map columns")
+        for row in reader:
+            labels[row["benchmark"]] = friendly_kind_label(row["kind"], row["pattern"])
     return labels
 
 
