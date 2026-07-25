@@ -26,6 +26,39 @@ The Chromium checkout contains 493,140 tracked files and 445,491 indexable docum
 The rg command directly scans the current worktree on every run. Flashgrep queries use the base
 snapshot plus the published workspace overlay or base delta.
 
+## Cold Query Checks
+
+For cold measurements, a new flashgrep daemon was started and `open_repo` completed before each
+single query. The timed interval covers the one search request, not index construction. Each rg
+measurement is also a new process.
+
+| Query | Flashgrep cold | rg cold |
+| --- | ---: | ---: |
+| Fixed `#include` | 0.84 s | 7.49 s |
+| Regex `std::(unique_ptr|shared_ptr)` | 0.38 s | 7.50 s |
+| Word-regexp `class` | 0.91 s | 7.55 s |
+| Fixed `#include`, `*.cc` glob | 0.25 s | 2.12 s |
+| Fixed `#include`, 10,000-file overlay | 0.36 s | 7.40 s |
+
+## Result Correctness
+
+Results were compared on H0 using tracked-file references. The comparison covered fixed strings,
+regular expressions, case-insensitive search, word boundaries, line-regexp, occurrence counts,
+`*.cc` globs, and the `chrome/browser` path scope.
+
+- `std::(unique_ptr|shared_ptr)` regex: exact, 43,893 files.
+- `*.cc` fixed `#include`: exact, 67,927 files.
+- `*.cc` case-insensitive `chromium`: exact, 63,100 files.
+- `*.cc` word-regexp `class`: exact, 25,020 files.
+- `chrome/browser` fixed `#include`: exact, 30,222 files.
+- Whole-repository fixed `#include` and occurrence counts differ only on
+  `third_party/liblouis/wasm/liblouis_wasm.data`, which is binary/non-text handling rather than a
+  C++ source mismatch. Whole-repository case/word checks also differ only in non-code artifacts
+  such as `.pdf`, `.mht`, `.json`, `.data`, and generated scripts; source-only checks are exact.
+
+The previous performance table therefore remains valid for throughput, while these checks establish
+that source-code search semantics and path scoping agree with the tracked-file reference.
+
 ## Branch Synchronization
 
 The base build at H0 indexed 445,491 documents in 130.31 s in this run. The machine was also running
