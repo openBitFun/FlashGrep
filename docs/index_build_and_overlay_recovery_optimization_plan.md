@@ -307,8 +307,11 @@ Overlay document preparation now uses a bounded eight-worker local pool while pr
 existing deterministic path ordering at segment construction. On a 2,000-file Chromium rebuild,
 preparation measured 9 ms for 23.6 MB; segment publication fell from 1.77 seconds to 0.58 seconds
 after parallel per-document term collection. A monitored rebuild peaked at 2.66 GiB RSS and 151.5%
-CPU, below the 5.75 GiB Chromium peak from the original full matrix. The remaining streaming writer,
-posting merge, and global memory-budget work remains open.
+CPU, below the 5.75 GiB Chromium peak from the original full matrix. Cumulative Chromium runs then
+measured a 10k delta at 41.30 s open / 2.70 s delta publish with 628.1% CPU, and a 50k rebuild at
+12.92 s open / 12.79 s publish with 936.8% CPU and 3.52 GiB peak RSS. The 50k run had a warmer page
+cache and is not a strict A/B comparison, but it confirms the path scales beyond one core. The
+remaining streaming writer, posting merge, and global memory-budget work remains open.
 
 ## Phase 4: Bounded Parallel Overlay Bulk Build
 

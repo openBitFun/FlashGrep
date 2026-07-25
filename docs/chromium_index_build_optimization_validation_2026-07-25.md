@@ -36,6 +36,24 @@ the detached worktree. The main Chromium worktree was not modified.
 | Same-HEAD no-change refresh | 4.3 s full Git diff | 0.14 s watcher fast path | no segment/catalog change |
 | Same-HEAD 100-path in-place refresh | 4.4 s full Git diff | 0.17 s event delta | one delta segment |
 
+### Large Overlay Runs
+
+These runs use the same detached Chromium checkout and cumulative marker list. The 10k run added
+10,000 files to an existing 1,998-file overlay during daemon downtime. The 50k run added the next
+38,000 files and intentionally included two restored paths, forcing the schema-required full
+rebuild. Process-cold here means a new daemon process; the macOS page cache was not purged, so the
+two open times are not a strict A/B pair.
+
+| State | Dirty files | `open_repo` | Prepare stage | Publish stage | Peak CPU | Peak RSS | Catalog | First query |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| Cumulative 10k delta | 11,998 | 41.30 s | 77 ms / 118 MB | delta 2.70 s | 628.1% | 1,685,344 KiB | 2,021,277 B | 0.23 s |
+| Cumulative 50k rebuild | 49,998 | 12.92 s | 1.06 s / 608 MB | rebuild 12.79 s | 936.8% | 3,695,472 KiB | 8,597,916 B | 0.55 s |
+
+The 10k marker matched exactly 10,000 lines in flashgrep and `rg --no-ignore`. The 50k marker was
+present in exactly 38,000 files in both runners. All 14 diverse query cases remained exact at the
+50k state; the indexed result set included the tracked `chrome/chrome_elf/dll_hash` files, matching
+the explicit `--no-ignore` reference corpus.
+
 The append measurement includes base reader prewarm, Git status, classification of the new paths,
 tokenization, segment publication, and CLI round trip. The unchanged 1,000 already-published paths
 were not rebuilt in that prototype measurement. The final ready daemon used 817,072 KiB RSS and
