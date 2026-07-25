@@ -477,6 +477,10 @@ fn base_snapshot_shard_build_parallelism_is_bounded() {
 #[test]
 fn base_snapshot_low_memory_tuning_prefers_io_over_memory() {
     assert_eq!(
+        super::base_snapshot_spilled_bucket_sort_max_records_per_run_for(None, false),
+        super::BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN
+    );
+    assert_eq!(
         super::build_flow::base_snapshot_shard_build_parallelism_for_mode(16, None, 8, true),
         1
     );

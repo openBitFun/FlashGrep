@@ -125,6 +125,19 @@ including 895,521 common-word lines and 416,998 path-scoped include lines. The m
 not purged, so the wall-time samples show direction and stage attribution rather than a strict cold
 cache comparison.
 
+An adjacent spill-run A/B fixed `FLASHGREP_BASE_SNAPSHOT_LOW_MEMORY=0` so current system pressure
+could not change shard scheduling. A 2,097,152-record run completed in 70.83 s versus 80.12 s at
+the previous 524,288-record default, an 11.6% improvement. The normal default is now 2M records;
+the 64k low-memory default is unchanged. Parallel bucket sorting was rejected after an 84.48 s
+sample showed no stable gain over the existing shard-level parallelism. Both experimental builds
+indexed 445,491 documents, and the 14-query corpus remained exact.
+
+An explicit same-H0 rebuild reused every stable shard: it completed in 13.11 s with no
+`stage=build_segment` event and retained 445,491 documents. The remaining time was 8.82 s of Git
+status/tree/classification plus 3.17 s of clean overlay probing. This validates the need for stable
+shards, but does not establish that 16 is the optimal shard count; 8/10/16 scheduling and memory
+remain a separate benchmark item.
+
 ## Remaining Work
 
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full

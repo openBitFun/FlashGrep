@@ -375,6 +375,18 @@ run took 83.22 s, so the default available-parallelism setting remains preferabl
 sample reached 3,945,185 KiB RSS during a run with concurrent benchmark interference and is not used
 as a clean peak comparison. Posting spill/merge and scheduler tuning remain open.
 
+The second slice increased the normal spilled-bucket sort run from 512k to 2M records while
+retaining the 64k low-memory setting. Adjacent Chromium H0 runs with low-memory auto-detection
+disabled measured 70.83 s at 2M versus 80.12 s at 512k, an 11.6% improvement. The first wave's
+per-shard finish time fell from repeated 9-12 s samples to roughly 5-8 s. Parallel sorting of all
+buckets was also tested and rejected because nested shard/Rayon scheduling did not improve the
+84.48 s full-build sample. Global posting-memory budgeting remains open.
+
+The same-H0 explicit rebuild completed in 13.11 s with all 16 shards reused and no segment-build
+event. Its remaining cost was Git input enumeration plus clean overlay probing. This confirms the
+value of stable shard reuse, while the exact shard count remains unproven; an 8/10/16 Chromium
+matrix is required before changing the compatibility-affecting assignment count.
+
 ### Chromium Gate
 
 Run empty-storage H0 build and same-H0 explicit rebuild. Acceptance:
