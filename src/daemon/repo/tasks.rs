@@ -392,7 +392,7 @@ impl RepoRuntime {
     ) -> Result<String> {
         if !matches!(kind, RepoTaskKind::RefreshWorkspace) {
             self.bootstrap_from_existing_snapshot()?;
-            self.refresh_workspace_overlay_with_progress(on_progress)?;
+            self.rebuild_workspace_overlay_with_progress(on_progress)?;
         }
         if matches!(
             kind,

@@ -1,4 +1,7 @@
-use std::sync::{atomic::Ordering, Arc};
+use std::{
+    sync::{atomic::Ordering, Arc},
+    time::Instant,
+};
 
 use crate::{error::AppError, Result};
 
@@ -23,6 +26,7 @@ pub(super) struct WorkspaceOverlayWritePlan {
     build_paths: DirtyPathSet,
     source_head: Option<String>,
     manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
+    catalog_generation: u64,
     kind: WorkspaceOverlayWritePlanKind,
 }
 
@@ -33,6 +37,7 @@ impl WorkspaceOverlayWritePlan {
             build_paths: DirtyPathSet::default(),
             source_head: None,
             manifest_source: None,
+            catalog_generation: 0,
             kind: WorkspaceOverlayWritePlanKind::Clear,
         }
     }
@@ -46,6 +51,7 @@ impl WorkspaceOverlayWritePlan {
             dirty_paths,
             source_head: None,
             manifest_source: None,
+            catalog_generation: 0,
             kind: WorkspaceOverlayWritePlanKind::Rebuild { snapshot },
         }
     }
@@ -60,6 +66,7 @@ impl WorkspaceOverlayWritePlan {
             dirty_paths,
             source_head: None,
             manifest_source: None,
+            catalog_generation: 0,
             kind: WorkspaceOverlayWritePlanKind::ApplyDelta { batch },
         }
     }
@@ -85,6 +92,11 @@ impl WorkspaceOverlayWritePlan {
         self.manifest_source = Some(manifest_source);
         self
     }
+
+    pub(super) fn with_catalog_generation(mut self, generation: u64) -> Self {
+        self.catalog_generation = generation;
+        self
+    }
 }
 
 impl RepoRuntime {
@@ -102,6 +114,7 @@ impl RepoRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let planned_dirty = plan.dirty_paths.clone();
         let build_paths = plan.build_paths.clone();
+        let catalog_generation = plan.catalog_generation;
         let source_head = plan.source_head.clone();
         let manifest_source = plan.manifest_source.clone();
         let operation = match &plan.kind {
@@ -111,16 +124,16 @@ impl RepoRuntime {
         };
         let dirty_path_count = plan.dirty_path_count();
         let build_path_count = plan.build_path_count();
-        if let Err(error) = self.mark_dirty_catalog_building(&build_paths) {
+        if let Err(error) = self.mark_dirty_catalog_building(&build_paths, catalog_generation) {
             self.handle_workspace_overlay_engine_error("mark dirty catalog building", &error);
             return;
         }
         if let Err(error) = self.try_apply_overlay_write_plan(plan, manifest_source) {
-            let _ = self.mark_dirty_catalog_failed(&build_paths);
+            let _ = self.mark_dirty_catalog_failed(&build_paths, catalog_generation);
             self.handle_workspace_overlay_engine_error("apply plan", &error);
             return;
         }
-        if let Err(error) = self.mark_dirty_catalog_ready(&build_paths) {
+        if let Err(error) = self.mark_dirty_catalog_ready(&build_paths, catalog_generation) {
             self.handle_workspace_overlay_engine_error("mark dirty catalog ready", &error);
             return;
         }
@@ -188,8 +201,16 @@ impl RepoRuntime {
         if let Some(source) = manifest_source {
             overlay_index.set_manifest_source(source);
         }
+        let publish_started_at = Instant::now();
         overlay_index.rebuild_snapshot(&snapshot)?;
+        let segment_elapsed = publish_started_at.elapsed();
+        let checkpoint_started_at = Instant::now();
         overlay_index.checkpoint()?;
+        eprintln!(
+            "flashgrep[overlay-metrics][info] stage=publish_rebuild segment_ms={} checkpoint_ms={}",
+            segment_elapsed.as_millis(),
+            checkpoint_started_at.elapsed().as_millis()
+        );
         let mut slot = match self.workspace_overlay_engine.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -261,7 +282,12 @@ impl RepoRuntime {
         if let Some(source) = manifest_source {
             overlay_index.set_manifest_source(source);
         }
+        let publish_started_at = Instant::now();
         overlay_index.ingest_batch(&batch)?;
+        eprintln!(
+            "flashgrep[overlay-metrics][info] stage=publish_delta elapsed_ms={}",
+            publish_started_at.elapsed().as_millis()
+        );
         Ok(())
     }
 

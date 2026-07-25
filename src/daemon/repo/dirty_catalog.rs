@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     thread,
     time::Duration,
-    time::{SystemTime, UNIX_EPOCH},
+    time::{Instant, SystemTime, UNIX_EPOCH},
 };
 
 use serde::{Deserialize, Serialize};
@@ -14,7 +14,8 @@ use crate::{error::Result, fs_atomic::replace_file, worktree_diff::DirtyPathKind
 
 use super::{DirtyPathSet, DirtyStats, RepoRuntime};
 
-const DIRTY_CATALOG_VERSION: u32 = 1;
+const DIRTY_CATALOG_VERSION: u32 = 2;
+const LEGACY_DIRTY_CATALOG_VERSION: u32 = 1;
 const DIRTY_CATALOG_PERSIST_RETRY_ATTEMPTS: usize = 20;
 const DIRTY_CATALOG_PERSIST_RETRY_DELAY_MS: u64 = 50;
 
@@ -45,21 +46,40 @@ pub(super) struct DirtyCatalogEntry {
 #[derive(Debug, Clone, Default)]
 pub(super) struct DirtyCatalog {
     entries: BTreeMap<String, DirtyCatalogEntry>,
+    generation: u64,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct DirtyCatalogFile {
     version: u32,
-    entries: Vec<DirtyCatalogFileEntry>,
+    entries: Vec<DirtyCatalogFileEntryWire>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
-struct DirtyCatalogFileEntry {
+struct LegacyDirtyCatalogFileEntry {
     path: String,
     kind: String,
     observed_version: ObservedFileVersion,
     state: DirtyCatalogState,
     last_attempt_at_ms: Option<u64>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct CompactDirtyCatalogFileEntry(
+    String,
+    String,
+    bool,
+    Option<u64>,
+    Option<u64>,
+    DirtyCatalogState,
+    Option<u64>,
+);
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+enum DirtyCatalogFileEntryWire {
+    Compact(CompactDirtyCatalogFileEntry),
+    Legacy(LegacyDirtyCatalogFileEntry),
 }
 
 impl DirtyCatalog {
@@ -76,46 +96,83 @@ impl DirtyCatalog {
                 return Ok(Self::default());
             }
         };
-        if parsed.version != DIRTY_CATALOG_VERSION {
+        if !matches!(
+            parsed.version,
+            DIRTY_CATALOG_VERSION | LEGACY_DIRTY_CATALOG_VERSION
+        ) {
             quarantine_corrupt_catalog(path)?;
             return Ok(Self::default());
         }
 
         let mut entries = BTreeMap::new();
         for entry in parsed.entries {
-            let Some(kind) = dirty_kind_from_str(&entry.kind) else {
+            let (path, kind_value, observed_version, state, last_attempt_at_ms) = match entry {
+                DirtyCatalogFileEntryWire::Compact(CompactDirtyCatalogFileEntry(
+                    path,
+                    kind,
+                    exists,
+                    size,
+                    modified_at_nanos,
+                    state,
+                    last_attempt_at_ms,
+                )) => (
+                    path,
+                    kind,
+                    ObservedFileVersion {
+                        exists,
+                        size,
+                        modified_at_nanos,
+                    },
+                    state,
+                    last_attempt_at_ms,
+                ),
+                DirtyCatalogFileEntryWire::Legacy(LegacyDirtyCatalogFileEntry {
+                    path,
+                    kind,
+                    observed_version,
+                    state,
+                    last_attempt_at_ms,
+                }) => (path, kind, observed_version, state, last_attempt_at_ms),
+            };
+            let Some(kind) = dirty_kind_from_str(&kind_value) else {
                 continue;
             };
             entries.insert(
-                entry.path,
+                path,
                 DirtyCatalogEntry {
                     kind,
-                    observed_version: entry.observed_version,
-                    state: entry.state,
-                    last_attempt_at: entry
-                        .last_attempt_at_ms
+                    observed_version,
+                    state,
+                    last_attempt_at: last_attempt_at_ms
                         .map(|millis| UNIX_EPOCH + std::time::Duration::from_millis(millis)),
                 },
             );
         }
-        Ok(Self { entries })
+        Ok(Self {
+            entries,
+            generation: 0,
+        })
     }
 
     pub(super) fn persist(&self, path: &Path) -> Result<()> {
         let Some(parent) = path.parent() else {
             return Ok(());
         };
-        let encoded = serde_json::to_vec_pretty(&DirtyCatalogFile {
+        let encoded = serde_json::to_vec(&DirtyCatalogFile {
             version: DIRTY_CATALOG_VERSION,
             entries: self
                 .entries
                 .iter()
-                .map(|(path, entry)| DirtyCatalogFileEntry {
-                    path: path.clone(),
-                    kind: dirty_kind_to_str(entry.kind).to_string(),
-                    observed_version: entry.observed_version.clone(),
-                    state: entry.state,
-                    last_attempt_at_ms: entry.last_attempt_at.and_then(system_time_millis),
+                .map(|(path, entry)| {
+                    DirtyCatalogFileEntryWire::Compact(CompactDirtyCatalogFileEntry(
+                        path.clone(),
+                        dirty_kind_to_str(entry.kind).to_string(),
+                        entry.observed_version.exists,
+                        entry.observed_version.size,
+                        entry.observed_version.modified_at_nanos,
+                        entry.state,
+                        entry.last_attempt_at.and_then(system_time_millis),
+                    ))
                 })
                 .collect(),
         })
@@ -126,7 +183,15 @@ impl DirtyCatalog {
             ))
         })?;
         let tmp_path = path.with_extension("tmp");
-        persist_dirty_catalog_bytes_with_retry(parent, path, &tmp_path, &encoded)
+        let started_at = Instant::now();
+        persist_dirty_catalog_bytes_with_retry(parent, path, &tmp_path, &encoded)?;
+        eprintln!(
+            "flashgrep[overlay-metrics][info] stage=persist_catalog elapsed_ms={} bytes={} entries={}",
+            started_at.elapsed().as_millis(),
+            encoded.len(),
+            self.entries.len()
+        );
+        Ok(())
     }
 
     pub(super) fn recover_startup(&mut self) {
@@ -140,10 +205,12 @@ impl DirtyCatalog {
         }
     }
 
-    pub(super) fn reconcile_with_dirty_set(&mut self, dirty: &DirtyPathSet) -> Result<()> {
+    pub(super) fn reconcile_with_dirty_set(&mut self, dirty: &DirtyPathSet) -> Result<u64> {
         let active_paths = dirty.all_paths();
+        let entries_before = self.entries.len();
         self.entries
             .retain(|path, _| active_paths.contains(path.as_str()));
+        let mut changed = self.entries.len() != entries_before;
 
         for (path, kind) in dirty.iter_paths() {
             let observed_version = observe_file_version(&path)?;
@@ -156,6 +223,7 @@ impl DirtyCatalog {
                     entry.kind = kind;
                     entry.observed_version = observed_version;
                     entry.state = DirtyCatalogState::Dirty;
+                    changed = true;
                 }
                 None => {
                     self.entries.insert(
@@ -167,11 +235,15 @@ impl DirtyCatalog {
                             last_attempt_at: None,
                         },
                     );
+                    changed = true;
                 }
             }
         }
 
-        Ok(())
+        if changed {
+            self.generation = self.generation.saturating_add(1);
+        }
+        Ok(self.generation)
     }
 
     pub(super) fn visible_dirty_paths(&self) -> DirtyPathSet {
@@ -230,24 +302,30 @@ impl DirtyCatalog {
         Ok(true)
     }
 
-    pub(super) fn mark_building(&mut self, paths: &DirtyPathSet) {
-        self.mark_paths(paths, DirtyCatalogState::Building);
+    pub(super) fn mark_building(&mut self, paths: &DirtyPathSet, generation: u64) {
+        self.mark_paths(paths, DirtyCatalogState::Building, generation);
     }
 
-    pub(super) fn mark_ready(&mut self, paths: &DirtyPathSet) {
-        self.mark_paths(paths, DirtyCatalogState::ReadyOverlay);
+    pub(super) fn mark_ready(&mut self, paths: &DirtyPathSet, generation: u64) {
+        self.mark_paths(paths, DirtyCatalogState::ReadyOverlay, generation);
     }
 
-    pub(super) fn mark_failed(&mut self, paths: &DirtyPathSet) {
-        self.mark_paths(paths, DirtyCatalogState::Failed);
+    pub(super) fn mark_failed(&mut self, paths: &DirtyPathSet, generation: u64) {
+        self.mark_paths(paths, DirtyCatalogState::Failed, generation);
     }
 
-    fn mark_paths(&mut self, paths: &DirtyPathSet, state: DirtyCatalogState) {
+    fn mark_paths(&mut self, paths: &DirtyPathSet, state: DirtyCatalogState, generation: u64) {
+        if self.generation != generation {
+            return;
+        }
         let now = Some(SystemTime::now());
         for path in paths.all_paths() {
+            let expected_kind = paths.kind_for_path(path);
             if let Some(entry) = self.entries.get_mut(path) {
-                entry.state = state;
-                entry.last_attempt_at = now;
+                if expected_kind.is_some_and(|kind| kind == entry.kind) {
+                    entry.state = state;
+                    entry.last_attempt_at = now;
+                }
             }
         }
     }
@@ -309,26 +387,53 @@ impl RepoRuntime {
         catalog.persist(&path)
     }
 
-    pub(super) fn reconcile_dirty_catalog(&self, dirty: &DirtyPathSet) -> Result<()> {
-        let path = dirty_catalog_path(&self.build_config.storage_root);
+    pub(super) fn reconcile_dirty_catalog(&self, dirty: &DirtyPathSet) -> Result<u64> {
         let mut catalog = match self.dirty_catalog.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        catalog.reconcile_with_dirty_set(dirty)?;
+        catalog.reconcile_with_dirty_set(dirty)
+    }
+
+    pub(super) fn persist_dirty_catalog(&self) -> Result<()> {
+        let path = dirty_catalog_path(&self.build_config.storage_root);
+        let catalog = match self.dirty_catalog.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
         catalog.persist(&path)
     }
 
-    pub(super) fn mark_dirty_catalog_building(&self, paths: &DirtyPathSet) -> Result<()> {
-        self.update_dirty_catalog_state(paths, DirtyCatalogState::Building)
+    pub(super) fn mark_dirty_catalog_building(
+        &self,
+        paths: &DirtyPathSet,
+        generation: u64,
+    ) -> Result<()> {
+        let mut catalog = match self.dirty_catalog.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        catalog.mark_building(paths, generation);
+        // The previous durable catalog remains the recovery baseline. Keeping the building
+        // transition in memory avoids a full-catalog write on every success; startup Git
+        // reconciliation rediscovers any newer worktree state after a crash.
+        Ok(())
     }
 
-    pub(super) fn mark_dirty_catalog_ready(&self, paths: &DirtyPathSet) -> Result<()> {
-        self.update_dirty_catalog_state(paths, DirtyCatalogState::ReadyOverlay)
+    pub(super) fn mark_dirty_catalog_ready(
+        &self,
+        paths: &DirtyPathSet,
+        generation: u64,
+    ) -> Result<()> {
+        self.update_dirty_catalog_state(paths, DirtyCatalogState::ReadyOverlay, generation)
     }
 
-    pub(super) fn mark_dirty_catalog_failed(&self, paths: &DirtyPathSet) -> Result<()> {
-        self.update_dirty_catalog_state(paths, DirtyCatalogState::Failed)
+    pub(super) fn mark_dirty_catalog_failed(
+        &self,
+        paths: &DirtyPathSet,
+        generation: u64,
+    ) -> Result<()> {
+        self.update_dirty_catalog_state(paths, DirtyCatalogState::Failed, generation)
     }
 
     pub(super) fn dirty_catalog_visible_paths(&self) -> DirtyPathSet {
@@ -355,6 +460,14 @@ impl RepoRuntime {
         catalog.pending_dirty_paths()
     }
 
+    pub(super) fn dirty_catalog_generation(&self) -> u64 {
+        let catalog = match self.dirty_catalog.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        catalog.generation
+    }
+
     pub(super) fn dirty_catalog_matches_ready_versions(
         &self,
         dirty: &DirtyPathSet,
@@ -370,6 +483,7 @@ impl RepoRuntime {
         &self,
         paths: &DirtyPathSet,
         state: DirtyCatalogState,
+        generation: u64,
     ) -> Result<()> {
         let path = dirty_catalog_path(&self.build_config.storage_root);
         let mut catalog = match self.dirty_catalog.lock() {
@@ -377,9 +491,9 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         match state {
-            DirtyCatalogState::Building => catalog.mark_building(paths),
-            DirtyCatalogState::ReadyOverlay => catalog.mark_ready(paths),
-            DirtyCatalogState::Failed => catalog.mark_failed(paths),
+            DirtyCatalogState::Building => catalog.mark_building(paths, generation),
+            DirtyCatalogState::ReadyOverlay => catalog.mark_ready(paths, generation),
+            DirtyCatalogState::Failed => catalog.mark_failed(paths, generation),
             DirtyCatalogState::Dirty => {}
         }
         catalog.persist(&path)
@@ -497,7 +611,7 @@ mod tests {
         catalog
             .reconcile_with_dirty_set(&dirty)
             .expect("reconcile catalog");
-        catalog.mark_ready(&dirty);
+        catalog.mark_ready(&dirty, catalog.generation);
         assert!(catalog
             .matches_ready_versions(&dirty)
             .expect("validate unchanged file"));
@@ -507,5 +621,32 @@ mod tests {
         assert!(!catalog
             .matches_ready_versions(&dirty)
             .expect("validate changed file"));
+    }
+
+    #[test]
+    fn persisted_catalog_is_compact_and_round_trips() {
+        let temp = tempdir().expect("temp dir");
+        let path = temp.path().join("tracked.rs");
+        fs::write(&path, "const VALUE: &str = \"ONE\";\n").expect("write file");
+        let path = path.to_string_lossy().into_owned();
+        let dirty = DirtyPathSet {
+            modified: HashSet::from([path]),
+            ..DirtyPathSet::default()
+        };
+        let mut catalog = DirtyCatalog::default();
+        catalog
+            .reconcile_with_dirty_set(&dirty)
+            .expect("reconcile catalog");
+        let catalog_path = temp.path().join("dirty-catalog.json");
+        catalog.persist(&catalog_path).expect("persist catalog");
+        let encoded = fs::read_to_string(&catalog_path).expect("read catalog");
+        assert!(!encoded.contains('\n'));
+        assert_eq!(
+            DirtyCatalog::load(&catalog_path)
+                .expect("load catalog")
+                .entries
+                .len(),
+            1
+        );
     }
 }

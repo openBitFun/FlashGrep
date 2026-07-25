@@ -5,6 +5,8 @@ use std::{
     path::Path,
 };
 
+use rayon::prelude::*;
+
 use memmap2::Mmap;
 
 use crate::{
@@ -50,12 +52,20 @@ pub(crate) fn build_posting_lists(
 ) -> HashMap<u64, Vec<u32>> {
     let mut posting_lists = HashMap::<u64, Vec<u32>>::new();
 
-    for (doc_id, document) in documents.iter().enumerate() {
-        let mut unique_terms = collect_document_posting_terms(&document.source_bytes, tokenizer)
-            .into_iter()
-            .collect::<Vec<_>>();
-        unique_terms.sort_unstable();
-        unique_terms.dedup();
+    let document_terms = documents
+        .par_iter()
+        .map(|document| {
+            let mut unique_terms =
+                collect_document_posting_terms(&document.source_bytes, tokenizer)
+                    .into_iter()
+                    .collect::<Vec<_>>();
+            unique_terms.sort_unstable();
+            unique_terms.dedup();
+            unique_terms
+        })
+        .collect::<Vec<_>>();
+
+    for (doc_id, unique_terms) in document_terms.into_iter().enumerate() {
         for term in unique_terms {
             posting_lists.entry(term).or_default().push(doc_id as u32);
         }

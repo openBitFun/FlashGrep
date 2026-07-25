@@ -2,7 +2,9 @@
 
 ## Status
 
-Proposed on 2026-07-25. Implementation has not started.
+Proposed on 2026-07-25. Phases 1 and 2, the first Phase 3 persistence changes, and the first bounded
+overlay preparation slice are implemented and validated on Chromium. Full Phase 4 bulk writing and
+the base-builder phases remain open.
 
 This document is the execution and acceptance contract for improving full base construction,
 workspace overlay refresh, daemon restart recovery, and branch-delta construction. Every
@@ -205,6 +207,13 @@ Run fresh-daemon open at O0-O4 and all correctness queries. Acceptance:
 - O4 ready query latency does not regress by more than 10%;
 - peak restart RSS is lower than the baseline.
 
+### Phase 1 Result (2026-07-25)
+
+The implementation is complete. A published overlay is reopened with manifest-only writer restore,
+validated against the active base and current HEAD, and reconciled through Git candidates plus
+dirty-catalog file versions. Chromium measurements are recorded in
+`docs/chromium_index_build_optimization_validation_2026-07-25.md`.
+
 ## Phase 2: Incremental Explicit Refresh
 
 ### Current Problem
@@ -241,6 +250,16 @@ Run the cumulative O0-O4 matrix. Acceptance:
 - query results remain exact at every state;
 - segment count stays within merge-policy bounds.
 
+### Phase 2 Result (2026-07-25)
+
+Explicit refresh now uses the incremental planner for same-HEAD watcher events. HEAD changes and
+base-advance completion use an explicit full-rebuild method, so branch task ordering is not inferred
+from the dirty set. No-change refresh waits briefly for watcher delivery and does not run a whole
+repository diff when a published snapshot is already current.
+
+Chromium measurements: no-change refresh fell from 4.3 seconds to 0.14 seconds, and a 100-path
+in-place delta fell from 4.4 seconds to 0.17 seconds. Both remained exact.
+
 ## Phase 3: Dirty-Catalog Transaction And Compact Persistence
 
 ### Current Problem
@@ -267,6 +286,29 @@ At O1-O4 record catalog bytes serialized and written. Acceptance:
 - O4 catalog publication bytes fall by at least 50%;
 - O4 refresh wall time improves or remains within 5% when tokenization dominates;
 - kill/restart recovery at publication boundaries remains exact.
+
+### Phase 3 Result (2026-07-25, partial)
+
+The normal success path no longer persists the transient `building` state. The reconciled dirty
+state remains the crash-recovery record, while the final `ready_overlay` state is persisted after
+manifest publication. Catalog serialization is now version 2 compact array JSON with deterministic
+BTree ordering; version 1 object catalogs are read once and migrate on the next successful write.
+Each reconcile increments an in-memory catalog generation, and plans may mark entries ready/failed
+only when both generation and dirty kind still match. This prevents stale concurrent watcher plans
+from overwriting a newer path state without adding another durable write.
+
+On a 2,000-entry Chromium catalog, bytes fell from 695,544 (pretty v1) to 321,532 (compact v2), a
+53.8% reduction. The successful-path transaction consolidation is implemented; the kill-boundary
+matrix remains open.
+
+## Phase 4 Result (2026-07-25, partial)
+
+Overlay document preparation now uses a bounded eight-worker local pool while preserving the
+existing deterministic path ordering at segment construction. On a 2,000-file Chromium rebuild,
+preparation measured 9 ms for 23.6 MB; segment publication fell from 1.77 seconds to 0.58 seconds
+after parallel per-document term collection. A monitored rebuild peaked at 2.66 GiB RSS and 151.5%
+CPU, below the 5.75 GiB Chromium peak from the original full matrix. The remaining streaming writer,
+posting merge, and global memory-budget work remains open.
 
 ## Phase 4: Bounded Parallel Overlay Bulk Build
 

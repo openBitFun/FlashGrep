@@ -44,8 +44,8 @@ impl RepoRuntime {
         &self,
     ) -> Result<WorkspaceOverlayWritePlan> {
         let dirty = self.diff_against_base_snapshot_worktree()?;
-        self.reconcile_dirty_catalog(&dirty)?;
-        self.build_overlay_rebuild_plan(dirty)
+        let catalog_generation = self.reconcile_dirty_catalog(&dirty)?;
+        self.build_overlay_rebuild_plan_at_generation(dirty, catalog_generation)
     }
 
     pub(super) fn plan_overlay_update_from_incremental_probe(
@@ -81,7 +81,9 @@ impl RepoRuntime {
         &self,
         dirty: DirtyPathSet,
     ) -> Result<Option<WorkspaceOverlayWritePlan>> {
-        self.reconcile_dirty_catalog(&dirty)?;
+        let generation_before = self.dirty_catalog_generation();
+        let catalog_generation = self.reconcile_dirty_catalog(&dirty)?;
+        let catalog_changed = catalog_generation != generation_before;
         let published_overlay_paths = self.published_overlay_paths()?;
         let pending_dirty = self.dirty_catalog_pending_paths();
         let published_overlay_snapshot_available =
@@ -94,16 +96,22 @@ impl RepoRuntime {
         //   Delta publish can add/update/delete overlay entries, but it cannot retract already
         //   published overlay-visible paths that should disappear entirely.
         // - Otherwise publish only the pending delta paths.
-        match decide_overlay_update_mode(
+        let mode = decide_overlay_update_mode(
             &dirty,
             &published_overlay_paths,
             &pending_dirty,
             published_overlay_snapshot_available,
-        ) {
+        );
+        if mode == OverlayUpdateMode::NoChange && catalog_changed {
+            self.persist_dirty_catalog()?;
+        }
+        match mode {
             OverlayUpdateMode::NoChange => Ok(None),
-            OverlayUpdateMode::Rebuild => self.build_overlay_rebuild_plan(dirty).map(Some),
+            OverlayUpdateMode::Rebuild => self
+                .build_overlay_rebuild_plan_at_generation(dirty, catalog_generation)
+                .map(Some),
             OverlayUpdateMode::ApplyDelta => self
-                .build_overlay_delta_plan(dirty, pending_dirty)
+                .build_overlay_delta_plan(dirty, pending_dirty, catalog_generation)
                 .map(Some),
         }
     }
@@ -112,11 +120,20 @@ impl RepoRuntime {
         &self,
         dirty: DirtyPathSet,
     ) -> Result<WorkspaceOverlayWritePlan> {
+        self.build_overlay_rebuild_plan_at_generation(dirty, self.dirty_catalog_generation())
+    }
+
+    fn build_overlay_rebuild_plan_at_generation(
+        &self,
+        dirty: DirtyPathSet,
+        catalog_generation: u64,
+    ) -> Result<WorkspaceOverlayWritePlan> {
         let source_head = self.current_git_head()?;
         let manifest_source = self.overlay_manifest_source(&source_head)?;
         if dirty.is_empty() {
             return Ok(WorkspaceOverlayWritePlan::clear()
-                .with_source_identity(source_head, manifest_source));
+                .with_source_identity(source_head, manifest_source)
+                .with_catalog_generation(catalog_generation));
         }
         let documents = self.load_overlay_documents(&dirty)?;
         let mut deleted_paths = dirty.deleted.clone();
@@ -132,19 +149,22 @@ impl RepoRuntime {
             &deleted_paths,
         )?;
         Ok(WorkspaceOverlayWritePlan::rebuild(dirty, snapshot)
-            .with_source_identity(source_head, manifest_source))
+            .with_source_identity(source_head, manifest_source)
+            .with_catalog_generation(catalog_generation))
     }
 
     fn build_overlay_delta_plan(
         &self,
         dirty: DirtyPathSet,
         delta: DirtyPathSet,
+        catalog_generation: u64,
     ) -> Result<WorkspaceOverlayWritePlan> {
         let source_head = self.current_git_head()?;
         let manifest_source = self.overlay_manifest_source(&source_head)?;
         if dirty.is_empty() {
             return Ok(WorkspaceOverlayWritePlan::clear()
-                .with_source_identity(source_head, manifest_source));
+                .with_source_identity(source_head, manifest_source)
+                .with_catalog_generation(catalog_generation));
         }
         let documents = self.load_delta_overlay_documents(&delta)?;
         let batch = WorkspaceOverlayIngestBatch::from_paths(
@@ -156,7 +176,8 @@ impl RepoRuntime {
             &documents,
         )?;
         Ok(WorkspaceOverlayWritePlan::apply_delta(dirty, delta, batch)
-            .with_source_identity(source_head, manifest_source))
+            .with_source_identity(source_head, manifest_source)
+            .with_catalog_generation(catalog_generation))
     }
 
     pub(super) fn clear_base_snapshot_catalog(&self) {

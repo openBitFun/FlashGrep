@@ -35,6 +35,45 @@ fn refresh_workspace_rebuilds_workspace_overlay_engine() {
 }
 
 #[test]
+fn no_change_refresh_preserves_published_overlay_artifacts() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    fs::write(&tracked, "const NAME: &str = \"BASE\";\n").expect("write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    fs::write(&tracked, "const NAME: &str = \"PUBLISHED\";\n").expect("rewrite should succeed");
+    let _ = refresh_repo(&service, &repo_id, true);
+    let status = wait_for_status(&service, &repo_id, |status| {
+        status.dirty_files.modified == 1 && status.overlay.is_some()
+    });
+    let before_overlay = status.overlay.expect("overlay status");
+    let catalog_path = PathBuf::from(&status.storage_root).join("dirty-catalog.json");
+    let before_catalog = fs::read(&catalog_path).expect("read dirty catalog");
+
+    let after = refresh_repo(&service, &repo_id, true);
+    let after_overlay = after.overlay.expect("overlay status after refresh");
+    assert_eq!(
+        after_overlay.committed_seq_no,
+        before_overlay.committed_seq_no
+    );
+    assert_eq!(after_overlay.last_seq_no, before_overlay.last_seq_no);
+    assert_eq!(
+        after_overlay.active_segments,
+        before_overlay.active_segments
+    );
+    assert_eq!(
+        fs::read(catalog_path).expect("read catalog after refresh"),
+        before_catalog
+    );
+}
+
+#[test]
 fn probe_marks_dirty_paths_for_eventual_workspace_search() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();

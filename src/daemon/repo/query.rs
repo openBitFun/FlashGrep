@@ -40,8 +40,20 @@ impl RepoRuntime {
     }
 
     pub(super) fn refresh(&self, force: bool) -> Result<RepoStatus> {
+        let head_changed = self.observe_git_head_transition()?;
         if force || self.workspace_probe_pending() {
-            self.refresh_workspace_overlay()?;
+            if head_changed || self.branch_transition_pending() {
+                self.rebuild_workspace_overlay()?;
+            } else if self.workspace_watcher_active() {
+                std::thread::sleep(Duration::from_millis(50));
+                if self.has_pending_workspace_events() {
+                    self.probe_workspace_overlay_from_events()?;
+                } else if self.workspace_probe_pending() {
+                    self.refresh_workspace_overlay()?;
+                }
+            } else {
+                self.refresh_workspace_overlay()?;
+            }
         }
         Ok(self.status_snapshot())
     }

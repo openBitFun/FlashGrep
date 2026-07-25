@@ -2,8 +2,10 @@ use std::{
     collections::HashMap,
     path::{Path, PathBuf},
     sync::atomic::Ordering,
-    time::SystemTime,
+    time::{Instant, SystemTime},
 };
+
+use rayon::prelude::*;
 
 use crate::{
     error::{AppError, Result},
@@ -12,8 +14,14 @@ use crate::{
     worktree_diff::DirtyPathKind,
 };
 
-use super::{DirtyPathSet, RepoPhase, RepoRuntime};
+use super::{overlay::WorkspaceOverlayWritePlan, DirtyPathSet, RepoPhase, RepoRuntime};
 use crate::daemon::repo::status::apply_workspace_dirty_status;
+
+#[derive(Debug, Clone, Copy)]
+enum OverlayRefreshMode {
+    Incremental,
+    FullRebuild,
+}
 
 impl DirtyPathSet {
     pub(super) fn stats(&self) -> super::DirtyStats {
@@ -115,9 +123,9 @@ impl RepoRuntime {
         let current_head = self.current_git_head()?;
         let overlay = match self.open_workspace_overlay_index_manifest_only() {
             Ok(overlay) => overlay,
-            Err(AppError::InvalidIndex(_)) => return self.refresh_workspace_overlay(),
+            Err(AppError::InvalidIndex(_)) => return self.rebuild_workspace_overlay(),
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
-                return self.refresh_workspace_overlay();
+                return self.rebuild_workspace_overlay();
             }
             Err(error) => return Err(error),
         };
@@ -137,7 +145,7 @@ impl RepoRuntime {
             _ => false,
         };
         if !source_matches {
-            return self.refresh_workspace_overlay();
+            return self.rebuild_workspace_overlay();
         }
 
         {
@@ -162,9 +170,29 @@ impl RepoRuntime {
         self.refresh_workspace_overlay_with_progress(&mut noop_progress)
     }
 
+    pub(super) fn rebuild_workspace_overlay(&self) -> Result<()> {
+        let mut noop_progress = |_event: IndexProgress| {};
+        self.rebuild_workspace_overlay_with_progress(&mut noop_progress)
+    }
+
     pub(super) fn refresh_workspace_overlay_with_progress(
         &self,
         on_progress: &mut dyn FnMut(IndexProgress),
+    ) -> Result<()> {
+        self.refresh_workspace_overlay_with_mode(on_progress, OverlayRefreshMode::Incremental)
+    }
+
+    pub(super) fn rebuild_workspace_overlay_with_progress(
+        &self,
+        on_progress: &mut dyn FnMut(IndexProgress),
+    ) -> Result<()> {
+        self.refresh_workspace_overlay_with_mode(on_progress, OverlayRefreshMode::FullRebuild)
+    }
+
+    fn refresh_workspace_overlay_with_mode(
+        &self,
+        on_progress: &mut dyn FnMut(IndexProgress),
+        mode: OverlayRefreshMode,
     ) -> Result<()> {
         match self.current_base_snapshot_key() {
             Ok(Some(snapshot_key)) => {
@@ -174,15 +202,46 @@ impl RepoRuntime {
                     0,
                     Some(2),
                 ));
-                let plan = self.plan_overlay_full_rebuild_from_worktree()?;
-                let refreshed_paths = plan.dirty_path_count().max(plan.build_path_count());
+                let planning_started_at = Instant::now();
+                let plan = match mode {
+                    OverlayRefreshMode::Incremental => {
+                        self.plan_overlay_update_from_incremental_probe()?
+                    }
+                    OverlayRefreshMode::FullRebuild => {
+                        Some(self.plan_overlay_full_rebuild_from_worktree()?)
+                    }
+                };
+                let planning_stage = match mode {
+                    OverlayRefreshMode::Incremental => "plan_incremental",
+                    OverlayRefreshMode::FullRebuild => "plan_full_rebuild",
+                };
+                let dirty_path_count = plan
+                    .as_ref()
+                    .map(WorkspaceOverlayWritePlan::dirty_path_count)
+                    .unwrap_or_default();
+                let build_path_count = plan
+                    .as_ref()
+                    .map(WorkspaceOverlayWritePlan::build_path_count)
+                    .unwrap_or_default();
+                eprintln!(
+                    "flashgrep[overlay-metrics][info] stage={} elapsed_ms={} dirty_paths={} build_paths={}",
+                    planning_stage,
+                    planning_started_at.elapsed().as_millis(),
+                    dirty_path_count,
+                    build_path_count
+                );
+                let refreshed_paths = dirty_path_count.max(build_path_count);
                 on_progress(IndexProgress::new(
                     IndexProgressPhase::RefreshingOverlay,
                     format!("Applying workspace overlay refresh for {refreshed_paths} path(s)"),
                     1,
                     Some(2),
                 ));
-                self.apply_refreshed_overlay(snapshot_key, plan);
+                if let Some(plan) = plan {
+                    self.apply_refreshed_overlay(snapshot_key.clone(), plan);
+                } else {
+                    self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
+                }
                 on_progress(IndexProgress::new(
                     IndexProgressPhase::RefreshingOverlay,
                     format!("Published workspace overlay refresh for {refreshed_paths} path(s)"),
@@ -372,25 +431,59 @@ impl RepoRuntime {
         &self,
         dirty: &DirtyPathSet,
     ) -> Result<HashMap<String, SearchDocument>> {
-        let mut documents = HashMap::new();
-        for path in dirty.modified.iter().chain(dirty.new.iter()) {
-            if let Some(document) = self.load_known_corpus_search_document(path)? {
-                documents.insert(path.clone(), document);
-            }
-        }
-        Ok(documents)
+        self.load_overlay_documents_for_paths(dirty.modified.iter().chain(dirty.new.iter()))
     }
 
     pub(super) fn load_delta_overlay_documents(
         &self,
         delta: &DirtyPathSet,
     ) -> Result<HashMap<String, SearchDocument>> {
-        let mut documents = HashMap::new();
-        for path in delta.modified.iter().chain(delta.new.iter()) {
-            if let Some(document) = self.load_known_corpus_search_document(path)? {
-                documents.insert(path.clone(), document);
-            }
+        self.load_overlay_documents_for_paths(delta.modified.iter().chain(delta.new.iter()))
+    }
+
+    fn load_overlay_documents_for_paths<'a>(
+        &self,
+        paths: impl Iterator<Item = &'a String>,
+    ) -> Result<HashMap<String, SearchDocument>> {
+        let paths = paths.cloned().collect::<Vec<_>>();
+        if paths.is_empty() {
+            return Ok(HashMap::new());
         }
+        let worker_count = std::thread::available_parallelism()
+            .map(|parallelism| parallelism.get().min(8))
+            .unwrap_or(1);
+        let started_at = Instant::now();
+        let pool = rayon::ThreadPoolBuilder::new()
+            .num_threads(worker_count)
+            .build()
+            .map_err(|error| {
+                AppError::Protocol(format!("failed to build overlay worker pool: {error}"))
+            })?;
+        let documents = pool.install(|| {
+            paths
+                .par_iter()
+                .map(|path| {
+                    self.load_known_corpus_search_document(path)
+                        .map(|document| (path.clone(), document))
+                })
+                .collect::<Result<Vec<_>>>()
+        })?;
+        let documents = documents
+            .into_iter()
+            .filter_map(|(path, document)| document.map(|document| (path, document)))
+            .collect::<HashMap<_, _>>();
+        let source_bytes = documents
+            .values()
+            .map(|document| document.size)
+            .sum::<u64>();
+        eprintln!(
+            "flashgrep[overlay-metrics][info] stage=prepare_documents elapsed_ms={} input_paths={} documents={} source_bytes={} workers={}",
+            started_at.elapsed().as_millis(),
+            paths.len(),
+            documents.len(),
+            source_bytes,
+            worker_count
+        );
         Ok(documents)
     }
 
