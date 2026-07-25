@@ -132,11 +132,10 @@ the 64k low-memory default is unchanged. Parallel bucket sorting was rejected af
 sample showed no stable gain over the existing shard-level parallelism. Both experimental builds
 indexed 445,491 documents, and the 14-query corpus remained exact.
 
-An explicit same-H0 rebuild reused every stable shard: it completed in 13.11 s with no
+An explicit same-H0 rebuild reused every prior stable shard: it completed in 13.11 s with no
 `stage=build_segment` event and retained 445,491 documents. The remaining time was 8.82 s of Git
-status/tree/classification plus 3.17 s of clean overlay probing. This validates the need for stable
-shards, but does not establish that 16 is the optimal shard count; 8/10/16 scheduling and memory
-remain a separate benchmark item.
+status/tree/classification plus 3.17 s of clean overlay probing. The subsequent shard matrix
+selected 10 shards for new builds.
 
 The shard-count matrix used the same Chromium H0 and `FLASHGREP_BASE_SNAPSHOT_LOW_MEMORY=0`:
 
@@ -153,11 +152,12 @@ fingerprints and produces the ten-shard assignment.
 ## Remaining Work
 
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
-run had five watcher timing failures under concurrent daemon load; the base-focused tests and
-individual rebuild test passed, so these are retained as a watcher-race follow-up rather than
-claimed as a clean gate.
+run had six watcher timing/recovery failures under concurrent daemon load; the base-focused tests,
+Chromium query corpus, and individual rebuild test passed. These failures remain a watcher-race
+follow-up rather than being claimed as a clean gate.
 
 Base construction still spends material time in Git input classification, document preparation,
-and posting spill/merge I/O. Posting-bucket parallelism and a global memory budget remain open. The
+and posting spill/merge I/O. Posting-bucket parallelism was measured and rejected; a global memory
+budget remains open. The
 remaining Phase 3 transaction-boundary matrix and a branch-aware large-delta planner remain the next
 overlay-specific phases from the optimization plan.
