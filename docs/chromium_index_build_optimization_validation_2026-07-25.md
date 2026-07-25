@@ -154,7 +154,8 @@ fingerprints and produces the ten-shard assignment.
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
 run had six watcher timing/recovery failures under concurrent daemon load; the base-focused tests,
 Chromium query corpus, and individual rebuild test passed. These failures remain a watcher-race
-follow-up rather than being claimed as a clean gate.
+follow-up rather than being claimed as a clean gate. A serial rerun reduced this to 225 passed, 5
+failed, 1 ignored; the remaining failures are the same watcher event/rebuild timing cases.
 
 Base construction still spends material time in Git input classification, document preparation,
 and posting spill/merge I/O. Posting-bucket parallelism was measured and rejected; a global memory
