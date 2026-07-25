@@ -17,6 +17,7 @@ use super::{QueryBackend, RepoPhase, RepoRuntime, RepoStatus, SearchRequest, Sea
 
 struct SearchActivityGuard<'a> {
     runtime: &'a RepoRuntime,
+    _artifact_guard: std::sync::RwLockReadGuard<'a, ()>,
 }
 
 impl Drop for SearchActivityGuard<'_> {
@@ -27,12 +28,15 @@ impl Drop for SearchActivityGuard<'_> {
 
 impl RepoRuntime {
     fn begin_search_activity(&self) -> SearchActivityGuard<'_> {
+        let artifact_guard = self
+            .artifact_gc_lock
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.active_searches.fetch_add(1, Ordering::Relaxed);
-        SearchActivityGuard { runtime: self }
-    }
-
-    pub(super) fn active_search_count(&self) -> u64 {
-        self.active_searches.load(Ordering::Relaxed)
+        SearchActivityGuard {
+            runtime: self,
+            _artifact_guard: artifact_guard,
+        }
     }
 
     pub(super) fn refresh(&self, force: bool) -> Result<RepoStatus> {
@@ -44,11 +48,17 @@ impl RepoRuntime {
 
     pub(super) fn search(&self, request: SearchRequest) -> Result<SearchResponse> {
         let _search_activity = self.begin_search_activity();
+        if self.observe_git_head_transition()? {
+            self.schedule_workspace_probe(Duration::from_millis(0));
+        }
         let scope =
             normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
         let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
         let query_filters = QueryFilters::default();
         let status = self.status_snapshot();
+        if self.branch_transition_pending() {
+            return self.search_during_transition(&request, &scope, filter.as_ref(), status);
+        }
         let can_search_opening_snapshot =
             matches!(status.phase, RepoPhase::Opening) && status.snapshot_key.is_some();
         match status.phase {
@@ -101,7 +111,6 @@ impl RepoRuntime {
                 let mut response_status = status.clone();
                 super::status::apply_repo_status_dirty_fields(
                     &mut response_status,
-                    self.rebuild_dirty_threshold,
                     tracked_dirty.stats(),
                 );
                 let backend = if tracked_dirty.is_empty() {

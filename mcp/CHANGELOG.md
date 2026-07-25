@@ -2,6 +2,12 @@
 
 ## Unreleased
 
+- Kept compatible base manifests readable across branch switches instead of invalidating the index or scheduling an automatic full rebuild.
+- Added commit-diff base advancement with candidate-manifest CAS activation, delta/delete segments, cancellation, and stale-HEAD rejection.
+- Added a bounded persistent HEAD manifest cache so recent branch switch-backs require zero document tokenization.
+- Added delta-only compaction and GC roots for current, active-search, and cached manifests without selecting foundation segments.
+- Added branch/base/overlay identity, delta metrics, cache count, compaction status, and incremental maintenance configuration to daemon, CLI, and MCP surfaces.
+
 ## v0.2.12 - 2026-07-20
 
 - Reused one managed daemon, index reader, and workspace watcher across MCP processes for the same Git worktree.

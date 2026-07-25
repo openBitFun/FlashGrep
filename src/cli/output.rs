@@ -111,6 +111,33 @@ fn format_repo_status_human(status: &RepoStatus) -> String {
         "snapshot_key: {}",
         status.snapshot_key.as_deref().unwrap_or("-")
     );
+    for (label, value) in [
+        ("base_head_commit", status.base_head_commit.as_deref()),
+        (
+            "workspace_head_commit",
+            status.workspace_head_commit.as_deref(),
+        ),
+        ("overlay_head_commit", status.overlay_head_commit.as_deref()),
+        (
+            "overlay_base_manifest_id",
+            status.overlay_base_manifest_id.as_deref(),
+        ),
+        ("base_manifest_id", status.base_manifest_id.as_deref()),
+        (
+            "base_advance_target_head",
+            status.base_advance_target_head.as_deref(),
+        ),
+    ] {
+        let _ = writeln!(output, "{label}: {}", value.unwrap_or("-"));
+    }
+    let _ = writeln!(output, "base_delta_depth: {}", status.base_delta_depth);
+    let _ = writeln!(output, "base_delta_bytes: {}", status.base_delta_bytes);
+    let _ = writeln!(output, "cached_head_count: {}", status.cached_head_count);
+    let _ = writeln!(
+        output,
+        "base_compaction_recommended: {}",
+        status.base_compaction_recommended
+    );
     let _ = writeln!(
         output,
         "last_probe_unix_secs: {}",
@@ -129,11 +156,6 @@ fn format_repo_status_human(status: &RepoStatus) -> String {
         output,
         "dirty_files: modified={} deleted={} new={}",
         status.dirty_files.modified, status.dirty_files.deleted, status.dirty_files.new
-    );
-    let _ = writeln!(
-        output,
-        "rebuild_recommended: {}",
-        status.rebuild_recommended
     );
     let _ = writeln!(
         output,
@@ -186,6 +208,16 @@ mod tests {
             workspace_overlay_root: "/tmp/repo/.flashgrep-index-engine/workspace-overlay".into(),
             phase: crate::daemon::protocol::RepoPhase::ReadyDirty,
             snapshot_key: Some("snapshot-key".into()),
+            base_head_commit: None,
+            workspace_head_commit: None,
+            overlay_head_commit: None,
+            overlay_base_manifest_id: None,
+            base_manifest_id: None,
+            base_delta_depth: 0,
+            base_delta_bytes: 0,
+            base_advance_target_head: None,
+            cached_head_count: 0,
+            base_compaction_recommended: false,
             last_probe_unix_secs: Some(1),
             last_rebuild_unix_secs: Some(2),
             dirty_files: crate::daemon::protocol::DirtyFileStats {
@@ -193,11 +225,11 @@ mod tests {
                 deleted: 2,
                 new: 3,
             },
-            rebuild_recommended: false,
             active_task_id: None,
             probe_healthy: true,
             last_error: None,
             overlay: Some(crate::daemon::protocol::WorkspaceOverlayStatus {
+                base_manifest_id: None,
                 committed_seq_no: 4,
                 last_seq_no: 5,
                 uncommitted_ops: 1,

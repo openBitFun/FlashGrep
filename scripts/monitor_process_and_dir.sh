@@ -14,17 +14,18 @@ interval="${4:-2}"
 mkdir -p "$(dirname "$output_csv")"
 
 if [[ ! -f "$output_csv" ]]; then
-  printf 'epoch,pid_alive,pcpu,pmem,etime,state,dir_kb\n' > "$output_csv"
+  printf 'epoch,pid_alive,pcpu,pmem,rss_kb,etime,state,dir_kb\n' > "$output_csv"
 fi
 
 while true; do
   epoch="$(date +%s)"
-  if ps_out="$(ps -p "$pid" -o pid=,pcpu=,pmem=,etime=,state= 2>/dev/null)"; then
-    read -r _pid pcpu pmem etime state <<< "$ps_out"
+  if ps_out="$(ps -p "$pid" -o pid=,pcpu=,pmem=,rss=,etime=,state= 2>/dev/null)"; then
+    read -r _pid pcpu pmem rss_kb etime state <<< "$ps_out"
     pid_alive=1
   else
     pcpu=""
     pmem=""
+    rss_kb=""
     etime=""
     state=""
     pid_alive=0
@@ -36,8 +37,8 @@ while true; do
     dir_kb=0
   fi
 
-  printf '%s,%s,%s,%s,%s,%s,%s\n' \
-    "$epoch" "$pid_alive" "$pcpu" "$pmem" "$etime" "$state" "$dir_kb" >> "$output_csv"
+  printf '%s,%s,%s,%s,%s,%s,%s,%s\n' \
+    "$epoch" "$pid_alive" "$pcpu" "$pmem" "$rss_kb" "$etime" "$state" "$dir_kb" >> "$output_csv"
 
   if [[ "$pid_alive" == "0" ]]; then
     break

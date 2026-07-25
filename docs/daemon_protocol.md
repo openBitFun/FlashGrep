@@ -135,6 +135,16 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
   "workspace_overlay_root": "/path/to/repo/.flashgrep-index-engine/workspace-overlay",
   "phase": "ready_dirty",
   "snapshot_key": "base-git:abc123+cfg:deadbeef",
+  "base_head_commit": "abc123",
+  "workspace_head_commit": "def456",
+  "overlay_head_commit": "def456",
+  "overlay_base_manifest_id": "manifest-base-abc123-def456",
+  "base_manifest_id": "manifest-base-abc123-def456",
+  "base_delta_depth": 1,
+  "base_delta_bytes": 8192,
+  "base_advance_target_head": null,
+  "cached_head_count": 2,
+  "base_compaction_recommended": false,
   "last_probe_unix_secs": 1710000000,
   "last_rebuild_unix_secs": 1710000100,
   "dirty_files": {
@@ -142,7 +152,6 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
     "deleted": 1,
     "new": 3
   },
-  "rebuild_recommended": false,
   "active_task_id": null,
   "probe_healthy": true,
   "last_error": null
@@ -165,11 +174,18 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
 - 长任务是否仍在运行，由 `active_task_id` 和 `task/status` 表达
 - `ready_dirty` 表示 daemon 已经通过 published overlay snapshot 表达当前 Git worktree
   相对 base snapshot 的增量视图
+- `base_head_commit` 是当前 base manifest 对应的 commit；`workspace_head_commit` 是当前 worktree HEAD
+- `overlay_head_commit` 和 `overlay_base_manifest_id` 表示已发布 overlay 的源身份
+- `base_delta_depth`、`base_delta_bytes`、`cached_head_count` 和
+  `base_compaction_recommended` 描述增量 base 的维护状态
+- 分支切换不会把兼容 base 置为 missing，也不会自动触发 full rebuild；daemon 先发布当前
+  worktree overlay，再以 commit diff 增量推进 base manifest
 - `overlay` 存在时表示 daemon 已打开 workspace overlay engine，并暴露其当前已发布 overlay 与后台维护状态
 - `probe_healthy=false` 表示最近一次 Git dirty probe 失败；daemon 会保留上一份成功发布的查询视图，并由 maintenance worker 重试
 
 `overlay` 字段：
 
+- `base_manifest_id`
 - `committed_seq_no`
 - `last_seq_no`
 - `uncommitted_ops`
@@ -207,7 +223,13 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
 
 - `build_base_snapshot`
 - `rebuild_base_snapshot`
+- `advance_base_snapshot`
+- `compact_base_deltas`
 - `refresh_workspace`
+
+`advance_base_snapshot` 的 progress message 会分别报告 from/to HEAD、add/modify/delete 路径数、
+过滤路径数、Git blob 读取数、tokenized/deleted 文档数、delta/delete segment 数、delta bytes、
+parent/candidate manifest ID 和 cache hit。
 
 `state` 枚举：
 
@@ -416,8 +438,13 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
     "max_sparse_len": 8
   },
   "refresh": {
-    "rebuild_dirty_threshold": 256,
-    "overlay_auto_checkpoint_max_uncommitted_ops": 256
+    "base_delta_max_segments": 8,
+    "base_delta_max_delete_segments": 8,
+    "base_delta_max_bytes_ratio": 0.1,
+    "base_head_cache_entries": 4,
+    "overlay_auto_checkpoint_max_uncommitted_ops": 256,
+    "overlay_merge_min_delay_ms": 2000,
+    "overlay_merge_retry_delay_ms": 10000
   }
 }
 ```
@@ -437,7 +464,8 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
 用途：
 
 - 确保 repo 已打开
-- 若缺少当前 `HEAD + config fingerprint` 对应的 base snapshot，同步执行一次 build
+- 若没有 repo root、config 和 schema 兼容的 base snapshot，同步执行一次 initial build
+- base HEAD 与当前 HEAD 不同时复用已有 base，并由后台增量 advance 对齐
 
 请求参数与 `open_repo` 相同。
 

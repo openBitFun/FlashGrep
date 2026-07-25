@@ -204,6 +204,7 @@ impl IndexAdmin {
                 &source_delete_segment_ids,
                 result.output_delete_segments.clone(),
             ),
+            source: manifest.source.clone(),
         };
         if !self
             .manifest_store

@@ -61,6 +61,71 @@ pub(crate) struct GitHeadPathEntry {
     pub size: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct GitCommitDiff {
+    pub added: Vec<String>,
+    pub modified: Vec<String>,
+    pub deleted: Vec<String>,
+}
+
+pub(crate) fn commit_diff_paths(
+    repo_root: &Path,
+    from_commit: &str,
+    to_commit: &str,
+    should_cancel: &mut impl FnMut() -> bool,
+) -> Result<GitCommitDiff> {
+    let mut command = Command::new("git");
+    command.arg("-C").arg(repo_root).args([
+        "diff",
+        "--name-status",
+        "-z",
+        "--no-renames",
+        from_commit,
+        to_commit,
+        "--",
+        ".",
+    ]);
+    let output = run_command_with_cancellation(&mut command, should_cancel)?;
+    if !output.status.success() {
+        return Err(AppError::InvalidIndex(format!(
+            "failed to diff git commits {from_commit}..{to_commit} for {}",
+            repo_root.display()
+        )));
+    }
+
+    let mut fields = output.stdout.split(|byte| *byte == 0);
+    let mut diff = GitCommitDiff {
+        added: Vec::new(),
+        modified: Vec::new(),
+        deleted: Vec::new(),
+    };
+    while let Some(status) = fields.next().filter(|field| !field.is_empty()) {
+        let path = fields
+            .next()
+            .filter(|field| !field.is_empty())
+            .ok_or_else(|| {
+                AppError::InvalidIndex(format!(
+                    "git diff returned a status without a path for {}",
+                    repo_root.display()
+                ))
+            })?;
+        let path = String::from_utf8_lossy(path).into_owned();
+        match status.first().copied() {
+            Some(b'A') => diff.added.push(path),
+            Some(b'D') => diff.deleted.push(path),
+            Some(b'M' | b'T') => diff.modified.push(path),
+            Some(other) => {
+                return Err(AppError::InvalidIndex(format!(
+                    "unsupported git diff status {} for {path}",
+                    char::from(other)
+                )));
+            }
+            None => {}
+        }
+    }
+    Ok(diff)
+}
+
 pub(crate) fn tracked_worktree_matches_head(
     repo_root: &Path,
     should_cancel: &mut impl FnMut() -> bool,
@@ -455,4 +520,78 @@ fn join_pipe_reader(
             AppError::InvalidIndex(format!("failed to join command {stream_name} reader"))
         })?
         .map_err(AppError::from)
+}
+
+#[cfg(test)]
+mod commit_diff_tests {
+    use super::*;
+    use std::process::Command;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    fn head(repo: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git should start");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("head should be utf8")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn commit_diff_classifies_add_modify_delete_type_and_rename_without_rename_detection() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        let repo = temp.path();
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.email", "flashgrep@example.invalid"]);
+        git(repo, &["config", "user.name", "Flashgrep Test"]);
+        for path in ["modify.txt", "delete.txt", "rename-old.txt", "type.txt"] {
+            fs::write(repo.join(path), format!("initial {path}\n")).expect("write should succeed");
+        }
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", "base"]);
+        let from = head(repo);
+
+        fs::write(repo.join("modify.txt"), "modified\n").expect("rewrite should succeed");
+        fs::remove_file(repo.join("delete.txt")).expect("delete should succeed");
+        fs::write(repo.join("added.txt"), "added\n").expect("add should succeed");
+        fs::rename(repo.join("rename-old.txt"), repo.join("rename-new.txt"))
+            .expect("rename should succeed");
+        fs::remove_file(repo.join("type.txt")).expect("type source delete should succeed");
+        symlink("modify.txt", repo.join("type.txt")).expect("symlink should succeed");
+        git(repo, &["add", "-A"]);
+        git(repo, &["commit", "-q", "-m", "changes"]);
+        let to = head(repo);
+
+        let diff =
+            commit_diff_paths(repo, &from, &to, &mut || false).expect("commit diff should succeed");
+        assert_eq!(
+            diff.added.into_iter().collect::<HashSet<_>>(),
+            HashSet::from(["added.txt".into(), "rename-new.txt".into()])
+        );
+        assert_eq!(
+            diff.modified.into_iter().collect::<HashSet<_>>(),
+            HashSet::from(["modify.txt".into(), "type.txt".into()])
+        );
+        assert_eq!(
+            diff.deleted.into_iter().collect::<HashSet<_>>(),
+            HashSet::from(["delete.txt".into(), "rename-old.txt".into()])
+        );
+    }
 }

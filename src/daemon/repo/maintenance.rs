@@ -13,22 +13,14 @@ pub(super) struct MaintenanceWorkerState {
     pub(super) requested_reasons: u32,
     pub(super) overlay_merge_due_at: Option<Instant>,
     pub(super) workspace_probe_due_at: Option<Instant>,
-    pub(super) base_rebuild_due_at: Option<Instant>,
     pub(super) shutdown: bool,
 }
 
 const MAINTENANCE_REASON_OVERLAY_MERGE: u32 = 1 << 0;
 const MAINTENANCE_REASON_WORKSPACE_POLL: u32 = 1 << 1;
-#[allow(dead_code)]
-const MAINTENANCE_REASON_OVERLAY_REBUILD: u32 = 1 << 2;
-const MAINTENANCE_REASON_BASE_REBUILD: u32 = 1 << 3;
-#[allow(dead_code)]
-const MAINTENANCE_REASON_BASE_PROMOTE: u32 = 1 << 4;
 pub(super) const GIT_WORKSPACE_EVENT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const GIT_WORKSPACE_POLL_FALLBACK_INTERVAL: Duration = Duration::from_millis(100);
-const AUTO_BASE_REBUILD_MIN_DELAY: Duration = Duration::from_secs(2);
-const AUTO_BASE_REBUILD_RETRY_DELAY: Duration = Duration::from_secs(2);
 
 impl RepoRuntime {
     pub(super) fn start_maintenance_worker(self: &Arc<Self>) {
@@ -86,9 +78,6 @@ impl RepoRuntime {
         if reasons & MAINTENANCE_REASON_WORKSPACE_POLL != 0 {
             self.run_workspace_probe_maintenance();
         }
-        if reasons & MAINTENANCE_REASON_BASE_REBUILD != 0 {
-            self.run_base_rebuild_maintenance();
-        }
     }
 
     fn run_overlay_merge_maintenance(&self) {
@@ -142,7 +131,8 @@ impl RepoRuntime {
             return;
         }
 
-        let probe_result = if self.has_pending_workspace_events() {
+        let event_driven_probe = self.has_pending_workspace_events();
+        let probe_result = if event_driven_probe {
             self.probe_workspace_overlay_from_events()
         } else {
             self.probe_workspace_overlay()
@@ -154,42 +144,11 @@ impl RepoRuntime {
         } else {
             self.set_probe_healthy(true);
         }
-        self.schedule_workspace_probe(probe_interval);
-    }
-
-    fn run_base_rebuild_maintenance(&self) {
-        if self.shutting_down.load(Ordering::Relaxed) {
-            return;
-        }
-
-        let status = self.status_snapshot();
-
-        let eligible = matches!(status.phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
-            && status.snapshot_key.is_some()
-            && status.rebuild_recommended;
-        if !eligible {
-            return;
-        }
-
-        if self.has_active_task()
-            || self.workspace_probe_pending()
-            || self.active_search_count() > 0
-        {
-            self.schedule_background_base_rebuild_after(AUTO_BASE_REBUILD_RETRY_DELAY);
-            return;
-        }
-
-        let Some(runtime) = self.self_handle.get().and_then(Weak::upgrade) else {
-            self.schedule_background_base_rebuild_after(AUTO_BASE_REBUILD_RETRY_DELAY);
-            return;
-        };
-        let task_id = self.allocate_background_task_id(super::RepoTaskKind::RebuildBaseSnapshot);
-        if runtime
-            .start_background_task(task_id, super::RepoTaskKind::RebuildBaseSnapshot)
-            .is_err()
-        {
-            self.schedule_background_base_rebuild_after(AUTO_BASE_REBUILD_RETRY_DELAY);
-        }
+        self.schedule_workspace_probe(if event_driven_probe {
+            GIT_WORKSPACE_EVENT_RETRY_DELAY
+        } else {
+            probe_interval
+        });
     }
 
     pub(super) fn schedule_maintenance(&self, reasons: u32) {
@@ -219,25 +178,6 @@ impl RepoRuntime {
         state.workspace_probe_due_at = Some(
             state
                 .workspace_probe_due_at
-                .map_or(due_at, |existing| existing.min(due_at)),
-        );
-        condvar.notify_one();
-    }
-
-    pub(super) fn schedule_background_base_rebuild(&self) {
-        self.schedule_background_base_rebuild_after(AUTO_BASE_REBUILD_MIN_DELAY);
-    }
-
-    fn schedule_background_base_rebuild_after(&self, delay: Duration) {
-        let (lock, condvar) = &*self.maintenance_worker;
-        let mut state = lock
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        state.requested_reasons |= MAINTENANCE_REASON_BASE_REBUILD;
-        let due_at = Instant::now() + delay;
-        state.base_rebuild_due_at = Some(
-            state
-                .base_rebuild_due_at
                 .map_or(due_at, |existing| existing.min(due_at)),
         );
         condvar.notify_one();
@@ -282,9 +222,7 @@ impl RepoRuntime {
 
 fn take_ready_maintenance_reasons(state: &mut MaintenanceWorkerState) -> Option<u32> {
     let mut reasons = state.requested_reasons
-        & !(MAINTENANCE_REASON_OVERLAY_MERGE
-            | MAINTENANCE_REASON_WORKSPACE_POLL
-            | MAINTENANCE_REASON_BASE_REBUILD);
+        & !(MAINTENANCE_REASON_OVERLAY_MERGE | MAINTENANCE_REASON_WORKSPACE_POLL);
     let overlay_merge_ready = state.requested_reasons & MAINTENANCE_REASON_OVERLAY_MERGE != 0
         && state
             .overlay_merge_due_at
@@ -300,14 +238,6 @@ fn take_ready_maintenance_reasons(state: &mut MaintenanceWorkerState) -> Option<
     if workspace_probe_ready {
         reasons |= MAINTENANCE_REASON_WORKSPACE_POLL;
         state.workspace_probe_due_at = None;
-    }
-    let base_rebuild_ready = state.requested_reasons & MAINTENANCE_REASON_BASE_REBUILD != 0
-        && state
-            .base_rebuild_due_at
-            .is_none_or(|due_at| Instant::now() >= due_at);
-    if base_rebuild_ready {
-        reasons |= MAINTENANCE_REASON_BASE_REBUILD;
-        state.base_rebuild_due_at = None;
     }
     if reasons == 0 {
         return None;
@@ -327,12 +257,7 @@ fn next_maintenance_deadline(state: &MaintenanceWorkerState) -> Option<Instant> 
     } else {
         None
     };
-    let base_rebuild_deadline = if state.requested_reasons & MAINTENANCE_REASON_BASE_REBUILD != 0 {
-        state.base_rebuild_due_at
-    } else {
-        None
-    };
-    [overlay_deadline, workspace_deadline, base_rebuild_deadline]
+    [overlay_deadline, workspace_deadline]
         .into_iter()
         .flatten()
         .min()

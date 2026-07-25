@@ -15,7 +15,7 @@ use crate::{
         segment::{DeleteSegmentBuildOutput, DeleteSegmentMeta},
         types::DeleteSegmentId,
     },
-    AppError, Result,
+    Result,
 };
 
 #[derive(Debug, Default)]
@@ -105,15 +105,6 @@ impl DeleteStore for FileDeleteStore {
     fn remove_delete_segment(&self, id: DeleteSegmentId) -> Result<()> {
         let delete_dir = self.delete_dir(&id);
         if delete_dir.exists() {
-            for required in [DELETE_META_FILE, DELETE_RECORDS_FILE] {
-                let path = delete_dir.join(required);
-                if !path.exists() {
-                    return Err(AppError::InvalidIndex(format!(
-                        "delete segment {} is missing {} before removal",
-                        id.0, required
-                    )));
-                }
-            }
             fs::remove_dir_all(delete_dir)?;
         }
         Ok(())

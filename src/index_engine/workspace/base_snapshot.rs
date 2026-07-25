@@ -14,6 +14,9 @@ use std::{
 use rayon::prelude::*;
 
 mod build_flow;
+mod compaction;
+mod delta;
+mod head_cache;
 mod input;
 mod metadata;
 mod reuse;
@@ -31,7 +34,7 @@ use crate::{
     index_engine::{
         config::{EngineConfig, PostingTokenizerConfig},
         delete::FileDeleteStore,
-        manifest::{FileManifestStore, Manifest, ManifestStore, SegmentRef},
+        manifest::{FileManifestStore, Manifest, ManifestSource, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
             collect_document_posting_terms_from_text, encoded_source_bytes_len,
@@ -370,10 +373,14 @@ impl WorkspaceBaseSnapshotIndex {
 
     pub fn open_read_only(build_config: &BuildConfig) -> Result<Self> {
         let config = Self::engine_config(build_config);
-        let base_head_commit =
-            Self::read_metadata_file(build_config)?.and_then(|metadata| metadata.head_commit);
+        let manifest_store = FileManifestStore::open(&config.index_root)?;
+        let manifest = manifest_store.load_current()?;
+        let base_head_commit = match manifest.source.as_ref() {
+            Some(ManifestSource::GitBase { head_commit, .. }) => Some(head_commit.clone()),
+            _ => Self::read_metadata_file(build_config)?.and_then(|metadata| metadata.head_commit),
+        };
         let reader = Arc::new(IndexReaderFactory::new(
-            Arc::new(FileManifestStore::open(&config.index_root)?),
+            Arc::new(manifest_store),
             Arc::new(FileSegmentStore::open_with_repo_root(
                 &config.index_root,
                 config.tokenizer.clone(),
@@ -391,6 +398,17 @@ impl WorkspaceBaseSnapshotIndex {
         build_config: &BuildConfig,
         expected_snapshot_key: &str,
     ) -> Result<bool> {
+        let manifest = FileManifestStore::open(&Self::index_root(build_config))?.load_current()?;
+        if let Some(ManifestSource::GitBase {
+            head_commit,
+            config_fingerprint,
+            ..
+        }) = manifest.source
+        {
+            return Ok(format!(
+                "base-git-{head_commit}-{config_fingerprint}-{SEGMENT_SCHEMA_FINGERPRINT}"
+            ) == expected_snapshot_key);
+        }
         Ok(Self::read_marker(build_config)?.as_deref() == Some(expected_snapshot_key))
     }
 
@@ -432,7 +450,31 @@ impl WorkspaceBaseSnapshotIndex {
     pub fn read_snapshot_metadata(
         build_config: &BuildConfig,
     ) -> Result<Option<WorkspaceBaseSnapshotMetadata>> {
-        if let Some(metadata) = Self::read_metadata_file(build_config)? {
+        let manifest = FileManifestStore::open(&Self::index_root(build_config))?.load_current()?;
+        if let Some(ManifestSource::GitBase {
+            head_commit,
+            config_fingerprint,
+            repo_root,
+            document_count,
+            ..
+        }) = manifest.source
+        {
+            let legacy_metadata = Self::read_metadata_file(build_config).ok().flatten();
+            let snapshot_key =
+                format!("base-git-{head_commit}-{config_fingerprint}-{SEGMENT_SCHEMA_FINGERPRINT}");
+            return Ok(Some(WorkspaceBaseSnapshotMetadata {
+                snapshot_key,
+                revision: Some(GitRevision(head_commit.clone())),
+                tokenizer: Some(build_config.tokenizer),
+                doc_count: Some(document_count),
+                head_commit: Some(head_commit),
+                config_fingerprint: Some(config_fingerprint),
+                repo_root: Some(repo_root),
+                shards: legacy_metadata.map_or_else(Vec::new, |metadata| metadata.shards),
+            }));
+        }
+        let legacy_metadata = Self::read_metadata_file(build_config)?;
+        if let Some(metadata) = legacy_metadata {
             return Ok(Some(metadata));
         }
 
@@ -448,6 +490,65 @@ impl WorkspaceBaseSnapshotIndex {
                 shards: Vec::new(),
             }),
         )
+    }
+
+    pub(crate) fn ensure_manifest_source_identity(build_config: &BuildConfig) -> Result<()> {
+        let _build_lock = BaseSnapshotBuildLock::acquire(build_config, &mut || false)?;
+        let manifest_store = FileManifestStore::open(&Self::index_root(build_config))?;
+        let current = manifest_store.load_current()?;
+        if current.source.is_some() || current.generation == 0 {
+            return Ok(());
+        }
+        let Some(metadata) = Self::read_metadata_file(build_config)? else {
+            return Ok(());
+        };
+        let head_commit = metadata
+            .head_commit
+            .clone()
+            .or_else(|| {
+                metadata
+                    .revision
+                    .as_ref()
+                    .map(|revision| revision.0.clone())
+            })
+            .ok_or_else(|| {
+                AppError::InvalidIndex("legacy base snapshot is missing Git HEAD identity".into())
+            })?;
+        let config_fingerprint = metadata.config_fingerprint.clone().ok_or_else(|| {
+            AppError::InvalidIndex("legacy base snapshot is missing config fingerprint".into())
+        })?;
+        let repo_root = metadata.repo_root.clone().ok_or_else(|| {
+            AppError::InvalidIndex("legacy base snapshot is missing repository root".into())
+        })?;
+        let mut migrated = current.clone();
+        migrated.manifest_id = ManifestId(format!(
+            "manifest-base-{head_commit}-migrated-{}",
+            delta::next_candidate_nonce()
+        ));
+        migrated.generation = current.generation.saturating_add(1);
+        migrated.created_at_unix_ms = now_unix_ms();
+        migrated.source = Some(ManifestSource::GitBase {
+            head_commit,
+            config_fingerprint,
+            repo_root,
+            document_count: metadata.doc_count.unwrap_or_else(|| {
+                current
+                    .active_segments
+                    .iter()
+                    .map(|segment| segment.doc_count as usize)
+                    .sum()
+            }),
+            parent_manifest_id: Some(current.manifest_id.clone()),
+            foundation_segment_ids: current
+                .active_segments
+                .iter()
+                .map(|segment| segment.id.clone())
+                .collect(),
+            delta_depth: 0,
+            delta_bytes: 0,
+        });
+        let _ = manifest_store.publish_if_current(&current.manifest_id, &migrated)?;
+        Ok(())
     }
 
     pub(crate) fn write_marker(build_config: &BuildConfig, snapshot_key: &str) -> Result<()> {
@@ -540,6 +641,7 @@ impl WorkspaceBaseSnapshotIndex {
                         &build_config.repo_path,
                     ),
                     previous_snapshot.as_ref(),
+                    Some(head_commit),
                     on_progress,
                 )?
             } else {
@@ -557,6 +659,7 @@ impl WorkspaceBaseSnapshotIndex {
                     &build_config.repo_path,
                     files,
                     previous_snapshot.as_ref(),
+                    Some(head_commit),
                     on_progress,
                 )?
             }
@@ -580,6 +683,7 @@ impl WorkspaceBaseSnapshotIndex {
                 &build_config.repo_path,
                 base_snapshot_input_files_from_repository_files(&files, &build_config.repo_path),
                 previous_snapshot.as_ref(),
+                None,
                 on_progress,
             )?
         };

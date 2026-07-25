@@ -10,7 +10,7 @@ use crate::daemon::{
 #[derive(Debug, Clone)]
 pub enum ServiceNotificationEvent {
     TaskProgress(RepoTaskStatus),
-    WorkspaceStatus(RepoStatusPayload),
+    WorkspaceStatus(Box<RepoStatusPayload>),
     TaskFinished(RepoTaskStatus),
 }
 
@@ -45,7 +45,7 @@ pub(super) fn notification_for_event(event: ServiceNotificationEvent) -> Notific
         ServiceNotificationEvent::WorkspaceStatus(status) => Notification::WorkspaceStatusChanged {
             params: WorkspaceStatusChangedParams {
                 workspace_id: status.repo_id.clone(),
-                status,
+                status: *status,
             },
         },
         ServiceNotificationEvent::TaskFinished(task) => Notification::TaskFinished {
@@ -60,5 +60,5 @@ pub(super) fn notification_for_event(event: ServiceNotificationEvent) -> Notific
 pub(super) fn workspace_status_event(
     status: crate::daemon::repo::RepoStatus,
 ) -> ServiceNotificationEvent {
-    ServiceNotificationEvent::WorkspaceStatus(convert_repo_status(status))
+    ServiceNotificationEvent::WorkspaceStatus(Box::new(convert_repo_status(status)))
 }

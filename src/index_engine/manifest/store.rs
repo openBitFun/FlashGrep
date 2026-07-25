@@ -21,6 +21,12 @@ pub trait ManifestStore: Send + Sync {
         expected_manifest_id: &crate::index_engine::types::ManifestId,
         manifest: &Manifest,
     ) -> Result<bool>;
+    fn write_candidate(&self, manifest: &Manifest) -> Result<()>;
+    fn activate_candidate_if_current(
+        &self,
+        expected_manifest_id: &crate::index_engine::types::ManifestId,
+        candidate_manifest_id: &crate::index_engine::types::ManifestId,
+    ) -> Result<bool>;
     fn list_manifests(&self) -> Result<Vec<ManifestMeta>>;
     fn remove_manifest(&self, manifest_id: &crate::index_engine::types::ManifestId) -> Result<()>;
 }
@@ -28,6 +34,7 @@ pub trait ManifestStore: Send + Sync {
 #[derive(Debug, Default)]
 pub struct MemoryManifestStore {
     current: Arc<RwLock<Manifest>>,
+    candidates: Mutex<std::collections::HashMap<String, Manifest>>,
 }
 
 impl ManifestStore for MemoryManifestStore {
@@ -45,16 +52,23 @@ impl ManifestStore for MemoryManifestStore {
     ) -> Result<Manifest> {
         let manifest = self.load_current()?;
         if manifest.manifest_id == *manifest_id {
-            Ok(manifest)
-        } else {
-            Err(AppError::InvalidIndex(format!(
-                "manifest {} is not available in memory store",
-                manifest_id.0
-            )))
+            return Ok(manifest);
         }
+        self.candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&manifest_id.0)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::InvalidIndex(format!(
+                    "manifest {} is not available in memory store",
+                    manifest_id.0
+                ))
+            })
     }
 
     fn publish(&self, manifest: &Manifest) -> Result<()> {
+        self.write_candidate(manifest)?;
         let mut guard = self
             .current
             .write()
@@ -68,6 +82,45 @@ impl ManifestStore for MemoryManifestStore {
         expected_manifest_id: &crate::index_engine::types::ManifestId,
         manifest: &Manifest,
     ) -> Result<bool> {
+        self.write_candidate(manifest)?;
+        self.activate_candidate_if_current(expected_manifest_id, &manifest.manifest_id)
+    }
+
+    fn write_candidate(&self, manifest: &Manifest) -> Result<()> {
+        let mut candidates = self
+            .candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if let Some(existing) = candidates.get(&manifest.manifest_id.0) {
+            if existing != manifest {
+                return Err(AppError::InvalidIndex(format!(
+                    "manifest id collision for {}",
+                    manifest.manifest_id.0
+                )));
+            }
+            return Ok(());
+        }
+        candidates.insert(manifest.manifest_id.0.clone(), manifest.clone());
+        Ok(())
+    }
+
+    fn activate_candidate_if_current(
+        &self,
+        expected_manifest_id: &crate::index_engine::types::ManifestId,
+        candidate_manifest_id: &crate::index_engine::types::ManifestId,
+    ) -> Result<bool> {
+        let candidate = self
+            .candidates
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&candidate_manifest_id.0)
+            .cloned()
+            .ok_or_else(|| {
+                AppError::InvalidIndex(format!(
+                    "candidate manifest {} is not available",
+                    candidate_manifest_id.0
+                ))
+            })?;
         let mut guard = self
             .current
             .write()
@@ -75,7 +128,7 @@ impl ManifestStore for MemoryManifestStore {
         if guard.manifest_id != *expected_manifest_id {
             return Ok(false);
         }
-        *guard = manifest.clone();
+        *guard = candidate;
         Ok(true)
     }
 
@@ -96,6 +149,59 @@ impl ManifestStore for MemoryManifestStore {
             )));
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index_engine::ManifestId;
+
+    #[test]
+    fn candidate_activation_uses_parent_compare_and_swap() {
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        let store = FileManifestStore::open(temp.path()).expect("store should open");
+        let parent = Manifest {
+            manifest_id: ManifestId("parent".into()),
+            generation: 1,
+            ..Manifest::default()
+        };
+        store.publish(&parent).expect("parent should publish");
+        let candidate = Manifest {
+            manifest_id: ManifestId("candidate".into()),
+            generation: 2,
+            ..Manifest::default()
+        };
+        store
+            .write_candidate(&candidate)
+            .expect("candidate should be written");
+        assert_eq!(
+            store
+                .load_current()
+                .expect("current should load")
+                .manifest_id,
+            parent.manifest_id
+        );
+        assert!(!store
+            .activate_candidate_if_current(&ManifestId("stale".into()), &candidate.manifest_id)
+            .expect("stale CAS should be handled"));
+        assert_eq!(
+            store
+                .load_current()
+                .expect("current should load")
+                .manifest_id,
+            parent.manifest_id
+        );
+        assert!(store
+            .activate_candidate_if_current(&parent.manifest_id, &candidate.manifest_id)
+            .expect("matching CAS should succeed"));
+        assert_eq!(
+            store
+                .load_current()
+                .expect("current should load")
+                .manifest_id,
+            candidate.manifest_id
+        );
     }
 }
 
@@ -141,12 +247,42 @@ impl FileManifestStore {
         })
     }
 
-    fn publish_locked(&self, manifest: &Manifest) -> Result<()> {
-        let file_name = format!("{}.json", manifest.manifest_id.0);
+    fn write_candidate_locked(&self, manifest: &Manifest) -> Result<()> {
         let path = self.manifest_path(&manifest.manifest_id);
         let encoded = serde_json::to_vec_pretty(manifest)
             .map_err(|error| AppError::Protocol(format!("manifest encode failed: {error}")))?;
+        if path.exists() {
+            let existing = fs::read(&path)?;
+            let existing = serde_json::from_slice::<Manifest>(&existing).map_err(|error| {
+                AppError::InvalidIndex(format!(
+                    "failed to decode manifest {}: {error}",
+                    path.display()
+                ))
+            })?;
+            if existing != *manifest {
+                return Err(AppError::InvalidIndex(format!(
+                    "manifest id collision for {}",
+                    manifest.manifest_id.0
+                )));
+            }
+            return Ok(());
+        }
         fs::write(&path, encoded)?;
+        Ok(())
+    }
+
+    fn activate_candidate_locked(
+        &self,
+        candidate_manifest_id: &crate::index_engine::types::ManifestId,
+    ) -> Result<()> {
+        let file_name = format!("{}.json", candidate_manifest_id.0);
+        let path = self.manifest_path(candidate_manifest_id);
+        if !path.exists() {
+            return Err(AppError::InvalidIndex(format!(
+                "candidate manifest {} is not available",
+                candidate_manifest_id.0
+            )));
+        }
         let tmp_current = self.current_path.with_extension("tmp");
         fs::write(&tmp_current, format!("{file_name}\n"))?;
         replace_file(&tmp_current, &self.current_path)?;
@@ -178,7 +314,8 @@ impl ManifestStore for FileManifestStore {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        self.publish_locked(manifest)
+        self.write_candidate_locked(manifest)?;
+        self.activate_candidate_locked(&manifest.manifest_id)
     }
 
     fn publish_if_current(
@@ -190,11 +327,37 @@ impl ManifestStore for FileManifestStore {
             .publish_lock
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.write_candidate_locked(manifest)?;
         let current = self.load_current_from_disk()?;
         if current.manifest_id != *expected_manifest_id {
             return Ok(false);
         }
-        self.publish_locked(manifest)?;
+        self.activate_candidate_locked(&manifest.manifest_id)?;
+        Ok(true)
+    }
+
+    fn write_candidate(&self, manifest: &Manifest) -> Result<()> {
+        let _guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        self.write_candidate_locked(manifest)
+    }
+
+    fn activate_candidate_if_current(
+        &self,
+        expected_manifest_id: &crate::index_engine::types::ManifestId,
+        candidate_manifest_id: &crate::index_engine::types::ManifestId,
+    ) -> Result<bool> {
+        let _guard = self
+            .publish_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let current = self.load_current_from_disk()?;
+        if current.manifest_id != *expected_manifest_id {
+            return Ok(false);
+        }
+        self.activate_candidate_locked(candidate_manifest_id)?;
         Ok(true)
     }
 
@@ -206,16 +369,22 @@ impl ManifestStore for FileManifestStore {
                 continue;
             }
             let bytes = fs::read(entry.path())?;
-            let manifest = serde_json::from_slice::<Manifest>(&bytes).map_err(|error| {
-                AppError::InvalidIndex(format!(
-                    "failed to decode manifest {}: {error}",
-                    entry.path().display()
-                ))
-            })?;
-            manifests.push(ManifestMeta {
-                manifest_id: manifest.manifest_id,
-                generation: manifest.generation,
-            });
+            match serde_json::from_slice::<Manifest>(&bytes) {
+                Ok(manifest) => manifests.push(ManifestMeta {
+                    manifest_id: manifest.manifest_id,
+                    generation: manifest.generation,
+                }),
+                Err(_) => {
+                    let path = entry.path();
+                    let Some(file_stem) = path.file_stem().and_then(OsStr::to_str) else {
+                        continue;
+                    };
+                    manifests.push(ManifestMeta {
+                        manifest_id: crate::index_engine::types::ManifestId(file_stem.into()),
+                        generation: 0,
+                    });
+                }
+            }
         }
         manifests.sort_unstable_by_key(|meta| meta.generation);
         Ok(manifests)

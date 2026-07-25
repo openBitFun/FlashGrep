@@ -289,8 +289,14 @@ pub(super) struct DaemonOpenArgs {
     pub(super) min_sparse_len: usize,
     #[arg(long, default_value_t = 8)]
     pub(super) max_sparse_len: usize,
-    #[arg(long, default_value_t = 256)]
-    pub(super) rebuild_dirty_threshold: usize,
+    #[arg(long, default_value_t = 8)]
+    pub(super) base_delta_max_segments: usize,
+    #[arg(long, default_value_t = 8)]
+    pub(super) base_delta_max_delete_segments: usize,
+    #[arg(long, default_value_t = 0.10)]
+    pub(super) base_delta_max_bytes_ratio: f64,
+    #[arg(long, default_value_t = 4)]
+    pub(super) base_head_cache_entries: usize,
     #[arg(
         long,
         default_value_t = DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS
@@ -320,7 +326,10 @@ impl DaemonOpenArgs {
                 max_sparse_len: self.max_sparse_len,
             },
             refresh: crate::daemon::protocol::RefreshPolicyConfig {
-                rebuild_dirty_threshold: self.rebuild_dirty_threshold,
+                base_delta_max_segments: self.base_delta_max_segments,
+                base_delta_max_delete_segments: self.base_delta_max_delete_segments,
+                base_delta_max_bytes_ratio: self.base_delta_max_bytes_ratio,
+                base_head_cache_entries: self.base_head_cache_entries,
                 overlay_auto_checkpoint_max_uncommitted_ops: self
                     .overlay_auto_checkpoint_max_uncommitted_ops,
                 overlay_merge_min_delay_ms: self.overlay_merge_min_delay_ms,

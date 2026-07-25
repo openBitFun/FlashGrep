@@ -1,4 +1,9 @@
-use crate::index_engine::{config::MergePolicyConfig, manifest::Manifest};
+use std::collections::BTreeSet;
+
+use crate::index_engine::{
+    config::MergePolicyConfig,
+    manifest::{Manifest, ManifestSource},
+};
 
 use super::{MergeStats, MergeTask};
 
@@ -92,5 +97,187 @@ impl MergePolicy for TieredMergePolicy {
             source_segments,
             source_delete_segments: Vec::new(),
         }]
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct BaseDeltaMergePolicy {
+    max_delta_segments: usize,
+    max_delete_segments: usize,
+    max_delta_bytes_ratio: f64,
+}
+
+impl BaseDeltaMergePolicy {
+    pub fn new(
+        max_delta_segments: usize,
+        max_delete_segments: usize,
+        max_delta_bytes_ratio: f64,
+    ) -> Self {
+        Self {
+            max_delta_segments,
+            max_delete_segments,
+            max_delta_bytes_ratio,
+        }
+    }
+}
+
+impl Default for BaseDeltaMergePolicy {
+    fn default() -> Self {
+        Self::new(8, 8, 0.10)
+    }
+}
+
+impl MergePolicy for BaseDeltaMergePolicy {
+    fn pick_merges(&self, manifest: &Manifest, _stats: &MergeStats) -> Vec<MergeTask> {
+        let Some(ManifestSource::GitBase {
+            foundation_segment_ids,
+            ..
+        }) = manifest.source.as_ref()
+        else {
+            return Vec::new();
+        };
+        let foundation = foundation_segment_ids
+            .iter()
+            .cloned()
+            .collect::<BTreeSet<_>>();
+        let foundation_bytes = manifest
+            .active_segments
+            .iter()
+            .filter(|segment| foundation.contains(&segment.id))
+            .map(|segment| segment.size_bytes)
+            .sum::<u64>();
+        let delta_bytes = manifest
+            .active_segments
+            .iter()
+            .filter(|segment| !foundation.contains(&segment.id))
+            .map(|segment| segment.size_bytes)
+            .chain(
+                manifest
+                    .active_delete_segments
+                    .iter()
+                    .map(|segment| segment.size_bytes),
+            )
+            .sum::<u64>();
+        let bytes_exceeded = foundation_bytes > 0
+            && delta_bytes as f64 > foundation_bytes as f64 * self.max_delta_bytes_ratio;
+        if manifest.active_delete_segments.len() >= 2
+            && (manifest.active_delete_segments.len() > self.max_delete_segments || bytes_exceeded)
+        {
+            return vec![MergeTask {
+                source_segments: Vec::new(),
+                source_delete_segments: manifest
+                    .active_delete_segments
+                    .iter()
+                    .map(|segment| segment.id.clone())
+                    .collect(),
+            }];
+        }
+
+        let mut deltas = manifest
+            .active_segments
+            .iter()
+            .filter(|segment| !foundation.contains(&segment.id))
+            .collect::<Vec<_>>();
+        if deltas.len() < 2 || (deltas.len() <= self.max_delta_segments && !bytes_exceeded) {
+            return Vec::new();
+        }
+        deltas.sort_unstable_by_key(|segment| (segment.max_seq_no, segment.min_seq_no));
+        let merge_count = deltas
+            .len()
+            .saturating_sub(self.max_delta_segments)
+            .saturating_add(1)
+            .max(2);
+        vec![MergeTask {
+            source_segments: deltas
+                .into_iter()
+                .take(merge_count)
+                .map(|segment| segment.id.clone())
+                .collect(),
+            source_delete_segments: Vec::new(),
+        }]
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::index_engine::{manifest::SegmentRef, ManifestId, RepoId, SegmentId};
+
+    #[test]
+    fn base_delta_policy_never_selects_foundation_segments() {
+        let foundation = SegmentId("foundation".into());
+        let mut manifest = Manifest {
+            manifest_id: ManifestId("base".into()),
+            source: Some(ManifestSource::GitBase {
+                head_commit: "head".into(),
+                config_fingerprint: "config".into(),
+                repo_root: RepoId("repo".into()).0,
+                document_count: 3,
+                parent_manifest_id: None,
+                foundation_segment_ids: vec![foundation.clone()],
+                delta_depth: 3,
+                delta_bytes: 3,
+            }),
+            ..Manifest::default()
+        };
+        manifest.active_segments = [
+            foundation.clone(),
+            SegmentId("d1".into()),
+            SegmentId("d2".into()),
+        ]
+        .into_iter()
+        .enumerate()
+        .map(|(index, id)| SegmentRef {
+            id,
+            min_seq_no: index as u64,
+            max_seq_no: index as u64,
+            doc_count: 1,
+            size_bytes: 1,
+        })
+        .collect();
+        let tasks = BaseDeltaMergePolicy::new(1, 8, 0.10).pick_merges(
+            &manifest,
+            &MergeStats {
+                segment_count: 3,
+                delete_segment_count: 0,
+            },
+        );
+        assert_eq!(tasks.len(), 1);
+        assert!(!tasks[0].source_segments.contains(&foundation));
+        assert_eq!(tasks[0].source_segments.len(), 2);
+    }
+
+    #[test]
+    fn base_delta_policy_does_not_schedule_single_segment_noop_merges() {
+        let delta = SegmentId("delta".into());
+        let manifest = Manifest {
+            source: Some(ManifestSource::GitBase {
+                head_commit: "head".into(),
+                config_fingerprint: "config".into(),
+                repo_root: "repo".into(),
+                document_count: 1,
+                parent_manifest_id: None,
+                foundation_segment_ids: Vec::new(),
+                delta_depth: 1,
+                delta_bytes: 1,
+            }),
+            active_segments: vec![SegmentRef {
+                id: delta,
+                min_seq_no: 1,
+                max_seq_no: 1,
+                doc_count: 1,
+                size_bytes: 1,
+            }],
+            ..Manifest::default()
+        };
+        assert!(BaseDeltaMergePolicy::new(0, 0, 0.0)
+            .pick_merges(
+                &manifest,
+                &MergeStats {
+                    segment_count: 1,
+                    delete_segment_count: 0,
+                },
+            )
+            .is_empty());
     }
 }

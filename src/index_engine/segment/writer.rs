@@ -11,13 +11,13 @@ use crate::index_engine::segment::reader::{
 };
 use crate::{
     index_engine::{config::PostingTokenizerConfig, types::SegmentId},
-    AppError, Result,
+    Result,
 };
 
 use super::{
     build_posting_lists, read_segment_meta, write_postings_file, write_segment_documents,
     write_segment_meta, write_term_dict_file, FileSegmentDocTable, PostingLists,
-    SegmentBuildOutput, SegmentMeta, TermDictionary, DOCS_FILE, PATH_MAP_FILE, SEGMENT_META_FILE,
+    SegmentBuildOutput, SegmentMeta, TermDictionary, SEGMENT_META_FILE,
 };
 const TERM_DICT_FILE: &str = "term_dict.bin";
 const POSTINGS_FILE: &str = "postings.bin";
@@ -170,21 +170,6 @@ impl SegmentStore for FileSegmentStore {
     fn remove_segment(&self, id: SegmentId) -> Result<()> {
         let segment_dir = self.segment_dir(&id);
         if segment_dir.exists() {
-            for required in [
-                SEGMENT_META_FILE,
-                DOCS_FILE,
-                PATH_MAP_FILE,
-                TERM_DICT_FILE,
-                POSTINGS_FILE,
-            ] {
-                let path = segment_dir.join(required);
-                if !path.exists() {
-                    return Err(AppError::InvalidIndex(format!(
-                        "segment {} is missing {} before removal",
-                        id.0, required
-                    )));
-                }
-            }
             fs::remove_dir_all(segment_dir)?;
         }
         let mut cache = self

@@ -20,7 +20,10 @@ const DEFAULTS = {
   maxFileSize: 8 * 1024 * 1024,
   minSparseLen: 3,
   maxSparseLen: 8,
-  rebuildDirtyThreshold: 256,
+  baseDeltaMaxSegments: 8,
+  baseDeltaMaxDeleteSegments: 8,
+  baseDeltaMaxBytesRatio: 0.10,
+  baseHeadCacheEntries: 4,
   overlayAutoCheckpointMaxUncommittedOps: 256,
   overlayMergeMinDelayMs: 2000,
   overlayMergeRetryDelayMs: 10000,
@@ -416,7 +419,10 @@ function parseServerArgs(argv) {
       max_sparse_len: DEFAULTS.maxSparseLen,
     },
     refresh: {
-      rebuild_dirty_threshold: DEFAULTS.rebuildDirtyThreshold,
+      base_delta_max_segments: DEFAULTS.baseDeltaMaxSegments,
+      base_delta_max_delete_segments: DEFAULTS.baseDeltaMaxDeleteSegments,
+      base_delta_max_bytes_ratio: DEFAULTS.baseDeltaMaxBytesRatio,
+      base_head_cache_entries: DEFAULTS.baseHeadCacheEntries,
       overlay_auto_checkpoint_max_uncommitted_ops:
         DEFAULTS.overlayAutoCheckpointMaxUncommittedOps,
       overlay_merge_min_delay_ms: DEFAULTS.overlayMergeMinDelayMs,
@@ -464,12 +470,24 @@ function parseServerArgs(argv) {
         args.config.max_sparse_len = parseNonNegativeInt(arg, next);
         index += 1;
         break;
-      case "--rebuild-dirty-threshold":
-        args.refresh.rebuild_dirty_threshold = parseNonNegativeInt(arg, next);
-        index += 1;
-        break;
       case "--overlay-auto-checkpoint-max-uncommitted-ops":
         args.refresh.overlay_auto_checkpoint_max_uncommitted_ops = parseNonNegativeInt(arg, next);
+        index += 1;
+        break;
+      case "--base-delta-max-segments":
+        args.refresh.base_delta_max_segments = parseNonNegativeInt(arg, next);
+        index += 1;
+        break;
+      case "--base-delta-max-delete-segments":
+        args.refresh.base_delta_max_delete_segments = parseNonNegativeInt(arg, next);
+        index += 1;
+        break;
+      case "--base-delta-max-bytes-ratio":
+        args.refresh.base_delta_max_bytes_ratio = parseNonNegativeNumber(arg, next);
+        index += 1;
+        break;
+      case "--base-head-cache-entries":
+        args.refresh.base_head_cache_entries = parseNonNegativeInt(arg, next);
         index += 1;
         break;
       case "--overlay-merge-min-delay-ms":
@@ -659,7 +677,10 @@ function managedBridgeArgs(options) {
     "--max-file-size", String(options.config.max_file_size),
     "--min-sparse-len", String(options.config.min_sparse_len),
     "--max-sparse-len", String(options.config.max_sparse_len),
-    "--rebuild-dirty-threshold", String(options.refresh.rebuild_dirty_threshold),
+    "--base-delta-max-segments", String(options.refresh.base_delta_max_segments),
+    "--base-delta-max-delete-segments", String(options.refresh.base_delta_max_delete_segments),
+    "--base-delta-max-bytes-ratio", String(options.refresh.base_delta_max_bytes_ratio),
+    "--base-head-cache-entries", String(options.refresh.base_head_cache_entries),
     "--overlay-auto-checkpoint-max-uncommitted-ops",
     String(options.refresh.overlay_auto_checkpoint_max_uncommitted_ops),
     "--overlay-merge-min-delay-ms", String(options.refresh.overlay_merge_min_delay_ms),
@@ -1323,6 +1344,14 @@ function parseNonNegativeInt(flag, value) {
   return parsed;
 }
 
+function parseNonNegativeNumber(flag, value) {
+  const parsed = Number(requireValue(flag, value));
+  if (!Number.isFinite(parsed) || parsed < 0) {
+    throw new Error(`${flag} must be a non-negative number`);
+  }
+  return parsed;
+}
+
 function requireValue(flag, value) {
   if (value === undefined) {
     throw new Error(`missing value for ${flag}`);
@@ -1343,7 +1372,10 @@ Options:
   --max-file-size <BYTES>
   --min-sparse-len <N>
   --max-sparse-len <N>
-  --rebuild-dirty-threshold <N>
+  --base-delta-max-segments <N>
+  --base-delta-max-delete-segments <N>
+  --base-delta-max-bytes-ratio <RATIO>
+  --base-head-cache-entries <N>
   --overlay-auto-checkpoint-max-uncommitted-ops <N>
   --overlay-merge-min-delay-ms <MS>
   --overlay-merge-retry-delay-ms <MS>

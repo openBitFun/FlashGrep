@@ -2,7 +2,11 @@ use std::{path::PathBuf, time::SystemTime};
 
 use crate::{
     error::{AppError, Result},
-    index_engine::WorkspaceBaseSnapshotIndex,
+    git_snapshot::resolve_git_head,
+    index_engine::{
+        manifest::{FileManifestStore, ManifestSource, ManifestStore},
+        WorkspaceBaseSnapshotIndex,
+    },
 };
 
 use super::RepoRuntime;
@@ -11,30 +15,81 @@ use crate::daemon::repo::status::apply_workspace_dirty_status;
 impl RepoRuntime {
     pub(super) fn bootstrap_from_existing_snapshot(&self) -> Result<()> {
         self.recover_dirty_catalog_for_startup()?;
+        WorkspaceBaseSnapshotIndex::ensure_manifest_source_identity(&self.build_config)?;
         let now = SystemTime::now();
-        let snapshot_key = match self.current_base_snapshot_key_matching_git_identity() {
-            Ok(snapshot_key) => snapshot_key,
+        let compatible_metadata = match self.current_compatible_base_snapshot_metadata() {
+            Ok(metadata) => metadata,
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => None,
             Err(AppError::InvalidIndex(_)) => None,
             Err(error) => return Err(error),
         };
-        let opened_base_snapshot = match snapshot_key.as_deref() {
-            Some(snapshot_key) => {
-                match WorkspaceBaseSnapshotIndex::open_if_matching(&self.build_config, snapshot_key)
-                {
-                    Ok(index) => index,
-                    Err(error) => {
-                        eprintln!(
+        let snapshot_key = compatible_metadata
+            .as_ref()
+            .map(|metadata| metadata.snapshot_key.clone());
+        let base_head_commit = compatible_metadata.as_ref().and_then(|metadata| {
+            metadata.head_commit.clone().or_else(|| {
+                metadata
+                    .revision
+                    .as_ref()
+                    .map(|revision| revision.0.clone())
+            })
+        });
+        let observed_head_commit = self.current_git_head().ok();
+        let opened_base_snapshot = compatible_metadata.as_ref().and_then(|_| {
+            match WorkspaceBaseSnapshotIndex::open_read_only(&self.build_config) {
+                Ok(index) => Some(index),
+                Err(error) => {
+                    eprintln!(
                         "flashgrep[bootstrap][warn] failed to open base snapshot index engine for {} during bootstrap: {error}",
                         self.build_config.repo_path.display()
                     );
-                        None
-                    }
+                    None
                 }
             }
-            None => None,
-        };
+        });
         let base_snapshot_ready = opened_base_snapshot.is_some();
+        let active_manifest = base_snapshot_ready
+            .then(|| {
+                FileManifestStore::open(&WorkspaceBaseSnapshotIndex::index_root(
+                    &self.build_config,
+                ))?
+                .load_current()
+            })
+            .transpose()?;
+        let (
+            base_manifest_id,
+            base_delta_depth,
+            base_delta_bytes,
+            base_delete_segment_count,
+            base_foundation_bytes,
+        ) = active_manifest
+            .as_ref()
+            .map_or((None, 0, 0, 0, 0), |manifest| {
+                let (delta_depth, delta_bytes, foundation_bytes) = match manifest.source.as_ref() {
+                    Some(ManifestSource::GitBase {
+                        delta_depth,
+                        delta_bytes,
+                        foundation_segment_ids,
+                        ..
+                    }) => {
+                        let foundation_bytes = manifest
+                            .active_segments
+                            .iter()
+                            .filter(|segment| foundation_segment_ids.contains(&segment.id))
+                            .map(|segment| segment.size_bytes)
+                            .sum();
+                        (*delta_depth, *delta_bytes, foundation_bytes)
+                    }
+                    _ => (0, 0, 0),
+                };
+                (
+                    Some(manifest.manifest_id.0.clone()),
+                    delta_depth,
+                    delta_bytes,
+                    manifest.active_delete_segments.len(),
+                    foundation_bytes,
+                )
+            });
         {
             let mut slot = match self.base_snapshot_engine.lock() {
                 Ok(guard) => guard,
@@ -44,6 +99,10 @@ impl RepoRuntime {
         }
         self.clear_cached_base_snapshot_reader();
         if base_snapshot_ready {
+            WorkspaceBaseSnapshotIndex::record_active_head_in_cache(
+                &self.build_config,
+                self.base_head_cache_entries,
+            )?;
             let prewarm_result = {
                 let guard = match self.base_snapshot_engine.lock() {
                     Ok(guard) => guard,
@@ -81,43 +140,103 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         state.snapshot_key = base_snapshot_ready.then_some(snapshot_key).flatten();
+        state.base_head_commit = base_snapshot_ready.then_some(base_head_commit).flatten();
+        state.observed_head_commit = observed_head_commit;
+        state.overlay_head_commit = None;
+        state.overlay_base_manifest_id = None;
+        state.base_manifest_id = base_manifest_id;
+        state.base_delta_depth = base_delta_depth;
+        state.base_delta_bytes = base_delta_bytes;
+        state.base_delete_segment_count = base_delete_segment_count;
+        state.base_foundation_bytes = base_foundation_bytes;
         state.last_probe_at = Some(now);
         state.last_error = None;
-        apply_workspace_dirty_status(
-            &mut state,
-            self.rebuild_dirty_threshold,
-            super::DirtyStats::default(),
-        );
+        apply_workspace_dirty_status(&mut state, super::DirtyStats::default());
         drop(state);
         self.emit_workspace_status_changed();
         Ok(())
     }
 
-    pub(super) fn refresh_base_snapshot_identity_state(&self) -> Result<()> {
-        let current_snapshot_key = self.current_base_snapshot_key_matching_git_identity()?;
+    pub(super) fn current_git_head(&self) -> Result<String> {
+        let mut should_cancel = || false;
+        resolve_git_head(&self.build_config.repo_path, &mut should_cancel)?.ok_or_else(|| {
+            AppError::InvalidIndex(format!(
+                "daemon workspace requires a Git HEAD commit for {}",
+                self.build_config.repo_path.display()
+            ))
+        })
+    }
+
+    pub(super) fn observe_git_head_transition(&self) -> Result<bool> {
+        let current_head = self.current_git_head()?;
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if state.snapshot_key == current_snapshot_key {
-            return Ok(());
+        if state.observed_head_commit.as_deref() == Some(&current_head) {
+            return Ok(false);
         }
-
-        state.snapshot_key = current_snapshot_key.clone();
-        if current_snapshot_key.is_none() {
-            state.dirty_files = super::DirtyStats::default();
-            state.rebuild_recommended = false;
-            state.phase = super::RepoPhase::MissingBaseSnapshot;
+        state.observed_head_commit = Some(current_head);
+        state.overlay_head_commit = None;
+        state.overlay_base_manifest_id = None;
+        if state.snapshot_key.is_some() {
+            state.phase = super::RepoPhase::ReadyDirty;
         }
         drop(state);
-
-        if current_snapshot_key.is_none() {
-            self.clear_cached_base_snapshot_reader();
-            self.clear_base_snapshot_catalog();
-            self.clear_overlay();
-        }
         self.emit_workspace_status_changed();
-        Ok(())
+        Ok(true)
+    }
+
+    pub(super) fn branch_transition_pending(&self) -> bool {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.base_head_commit != state.observed_head_commit
+            && state.overlay_head_commit != state.observed_head_commit
+    }
+
+    pub(super) fn overlay_manifest_source(
+        &self,
+        observed_head: &str,
+    ) -> Result<crate::index_engine::manifest::ManifestSource> {
+        let state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        let base_manifest_id = state.base_manifest_id.clone().ok_or_else(|| {
+            AppError::InvalidIndex("base manifest identity is unavailable".into())
+        })?;
+        Ok(
+            crate::index_engine::manifest::ManifestSource::WorkspaceOverlay {
+                base_manifest_id: crate::index_engine::ManifestId(base_manifest_id),
+                observed_head: observed_head.to_string(),
+                probe_epoch: self
+                    .glob_cache_epoch
+                    .load(std::sync::atomic::Ordering::Relaxed),
+            },
+        )
+    }
+
+    pub(super) fn mark_overlay_published_for_head(&self, source_head: Option<String>) {
+        let current_head = self.current_git_head().ok();
+        let aligned = source_head.is_some() && source_head == current_head;
+        let mut state = match self.state.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        state.observed_head_commit = current_head;
+        state.overlay_head_commit = aligned.then_some(source_head).flatten();
+        state.overlay_base_manifest_id = aligned.then(|| state.base_manifest_id.clone()).flatten();
+        let should_advance = aligned
+            && state.base_head_commit.is_some()
+            && state.base_head_commit != state.observed_head_commit;
+        drop(state);
+        if !aligned {
+            self.schedule_workspace_probe(std::time::Duration::from_millis(0));
+        } else if should_advance {
+            self.schedule_base_advance();
+        }
     }
 
     pub(super) fn open_base_snapshot_reader(

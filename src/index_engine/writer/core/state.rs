@@ -4,7 +4,7 @@ use std::{
 };
 
 use crate::index_engine::{
-    manifest::{DeleteSegmentRef, Manifest, SegmentRef},
+    manifest::{DeleteSegmentRef, Manifest, ManifestSource, SegmentRef},
     reader::state::{SnapshotData, VersionedDocument},
     types::{DocKey, SeqNo},
 };
@@ -30,6 +30,7 @@ pub(super) struct WriterState {
     pub(super) active_delete_segments: Vec<DeleteSegmentRef>,
     pub(super) pending_segments: Vec<SegmentRef>,
     pub(super) pending_delete_segments: Vec<DeleteSegmentRef>,
+    pub(super) manifest_source: Option<ManifestSource>,
 }
 
 #[derive(Debug, Clone)]
@@ -85,6 +86,7 @@ pub(super) fn build_snapshot(
             schema_fingerprint: "segment-publish-v2".into(),
             active_segments: visible_segment_refs(state, snapshot_kind),
             active_delete_segments: visible_delete_segment_refs(state, snapshot_kind),
+            source: state.manifest_source.clone(),
         },
         docs,
         deleted_keys,

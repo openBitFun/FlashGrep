@@ -123,7 +123,12 @@ impl DaemonService {
                 let status = self.repos.open_repo(OpenRepoRequest {
                     build_config: resolved.build_config,
                     refresh_policy: RepoRefreshPolicy {
-                        rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
+                        base_delta_max_segments: params.refresh.base_delta_max_segments,
+                        base_delta_max_delete_segments: params
+                            .refresh
+                            .base_delta_max_delete_segments,
+                        base_delta_max_bytes_ratio: params.refresh.base_delta_max_bytes_ratio,
+                        base_head_cache_entries: params.refresh.base_head_cache_entries,
                         overlay_auto_checkpoint_max_uncommitted_ops: params
                             .refresh
                             .overlay_auto_checkpoint_max_uncommitted_ops,
@@ -281,7 +286,10 @@ impl DaemonService {
         let mut status = self.repos.open_repo(OpenRepoRequest {
             build_config: resolved.build_config,
             refresh_policy: RepoRefreshPolicy {
-                rebuild_dirty_threshold: params.refresh.rebuild_dirty_threshold,
+                base_delta_max_segments: params.refresh.base_delta_max_segments,
+                base_delta_max_delete_segments: params.refresh.base_delta_max_delete_segments,
+                base_delta_max_bytes_ratio: params.refresh.base_delta_max_bytes_ratio,
+                base_head_cache_entries: params.refresh.base_head_cache_entries,
                 overlay_auto_checkpoint_max_uncommitted_ops: params
                     .refresh
                     .overlay_auto_checkpoint_max_uncommitted_ops,

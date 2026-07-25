@@ -1,5 +1,6 @@
 use super::*;
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_sharded_base_snapshot(
     index_root: &Path,
     build_config: &BuildConfig,
@@ -7,6 +8,7 @@ pub(super) fn build_sharded_base_snapshot(
     repo_root: &Path,
     files: Vec<BaseSnapshotInputFile>,
     previous_snapshot: Option<&ReusableBaseSnapshotShards>,
+    head_commit: Option<&str>,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<(usize, Vec<WorkspaceBaseSnapshotShardMetadata>)> {
     fs::create_dir_all(index_root)?;
@@ -155,6 +157,19 @@ pub(super) fn build_sharded_base_snapshot(
         Some(3),
     );
     let committed_seq_no = u64::from(!active_segments.is_empty());
+    let source = head_commit.map(|head_commit| ManifestSource::GitBase {
+        head_commit: head_commit.to_string(),
+        config_fingerprint: base_snapshot_config_fingerprint(build_config),
+        repo_root: canonical_repo_root(&build_config.repo_path),
+        document_count: doc_count,
+        parent_manifest_id: None,
+        foundation_segment_ids: active_segments
+            .iter()
+            .map(|segment| segment.id.clone())
+            .collect(),
+        delta_depth: 0,
+        delta_bytes: 0,
+    });
     let manifest_store = FileManifestStore::open(index_root)?;
     manifest_store.publish(&Manifest {
         manifest_id: ManifestId(BASE_SNAPSHOT_MANIFEST_ID.into()),
@@ -166,6 +181,7 @@ pub(super) fn build_sharded_base_snapshot(
         schema_fingerprint: SEGMENT_SCHEMA_FINGERPRINT.into(),
         active_segments,
         active_delete_segments: Vec::new(),
+        source,
     })?;
     report_progress(
         on_progress,

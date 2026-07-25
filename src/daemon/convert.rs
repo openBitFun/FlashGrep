@@ -184,6 +184,8 @@ pub(super) fn convert_task_kind(kind: RepoTaskKind) -> proto::TaskKind {
     match kind {
         RepoTaskKind::BuildBaseSnapshot => proto::TaskKind::BuildBaseSnapshot,
         RepoTaskKind::RebuildBaseSnapshot => proto::TaskKind::RebuildBaseSnapshot,
+        RepoTaskKind::AdvanceBaseSnapshot => proto::TaskKind::AdvanceBaseSnapshot,
+        RepoTaskKind::CompactBaseDeltas => proto::TaskKind::CompactBaseDeltas,
         RepoTaskKind::RefreshWorkspace => proto::TaskKind::RefreshWorkspace,
     }
 }
@@ -238,10 +240,19 @@ pub(super) fn convert_repo_status(status: RepoStatus) -> proto::RepoStatus {
         workspace_overlay_root: status.workspace_overlay_root.to_string_lossy().into_owned(),
         phase: convert_repo_phase(status.phase),
         snapshot_key: status.snapshot_key,
+        base_head_commit: status.base_head_commit,
+        workspace_head_commit: status.workspace_head_commit,
+        overlay_head_commit: status.overlay_head_commit,
+        overlay_base_manifest_id: status.overlay_base_manifest_id,
+        base_manifest_id: status.base_manifest_id,
+        base_delta_depth: status.base_delta_depth,
+        base_delta_bytes: status.base_delta_bytes,
+        base_advance_target_head: status.base_advance_target_head,
+        cached_head_count: status.cached_head_count,
+        base_compaction_recommended: status.base_compaction_recommended,
         last_probe_unix_secs: system_time_to_unix_secs(status.last_probe_at),
         last_rebuild_unix_secs: system_time_to_unix_secs(status.last_rebuild_at),
         dirty_files: convert_dirty_stats(status.dirty_files),
-        rebuild_recommended: status.rebuild_recommended,
         active_task_id: status.active_task_id,
         probe_healthy: status.probe_healthy,
         last_error: status.last_error,
@@ -261,6 +272,7 @@ fn convert_workspace_overlay_status(
     status: WorkspaceOverlayStatus,
 ) -> proto::WorkspaceOverlayStatus {
     proto::WorkspaceOverlayStatus {
+        base_manifest_id: status.base_manifest_id,
         committed_seq_no: status.committed_seq_no,
         last_seq_no: status.last_seq_no,
         uncommitted_ops: status.uncommitted_ops,

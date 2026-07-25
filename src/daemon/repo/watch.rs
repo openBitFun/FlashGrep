@@ -197,7 +197,7 @@ impl RepoRuntime {
         self.workspace_probe_pending
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.invalidate_glob_cache();
-        self.schedule_workspace_probe(Duration::from_millis(0));
+        self.schedule_workspace_probe(super::maintenance::GIT_WORKSPACE_EVENT_RETRY_DELAY);
         self.emit_workspace_status_changed();
     }
 

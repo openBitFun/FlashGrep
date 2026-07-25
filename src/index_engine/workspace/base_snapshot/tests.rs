@@ -14,6 +14,7 @@ use super::{
 use crate::base_snapshot_build::BaseSnapshotBuildOptions;
 use crate::config::{BuildConfig, CorpusMode, TokenizerMode};
 use crate::files::{scan_paths, ScanOptions};
+use crate::index_engine::manifest::{FileManifestStore, ManifestSource, ManifestStore};
 use crate::index_engine::segment::{
     read_postings_file, read_term_dict_file, FileSegmentDocTable, PostingsStreamWriter,
     SegmentDocSourceKind, TermDictStreamWriter,
@@ -196,6 +197,79 @@ fn collect_base_input_files(build_config: &BuildConfig) -> Vec<BaseSnapshotInput
 }
 
 #[test]
+fn compatible_legacy_manifest_migrates_source_identity_without_retokenizing() {
+    let temp = TempDir::new().expect("temp dir");
+    let repo = temp.path().join("repo");
+    let storage = temp.path().join("index");
+    std::fs::create_dir_all(&repo).expect("repo dir should succeed");
+    std::fs::write(
+        repo.join("tracked.rs"),
+        "const VALUE: &str = \"MIGRATE\";\n",
+    )
+    .expect("write should succeed");
+    run_git(&repo, &["init", "-q"]);
+    run_git(
+        &repo,
+        &["config", "user.email", "flashgrep@example.invalid"],
+    );
+    run_git(&repo, &["config", "user.name", "Flashgrep Test"]);
+    run_git(&repo, &["add", "."]);
+    run_git(&repo, &["commit", "-q", "-m", "base"]);
+    let build_config = build_config(&repo, &storage);
+    WorkspaceBaseSnapshotIndex::build_with_options(
+        &build_config,
+        &RepoId("repo".into()),
+        BaseSnapshotBuildOptions::new().requiring_git_head(),
+    )
+    .expect("base build should succeed");
+
+    let index_root = WorkspaceBaseSnapshotIndex::index_root(&build_config);
+    let store = FileManifestStore::open(&index_root).expect("manifest store should open");
+    let mut legacy = store.load_current().expect("current manifest should load");
+    let original_segments = legacy.active_segments.clone();
+    let original_delete_segments = legacy.active_delete_segments.clone();
+    let original_generation = legacy.generation;
+    legacy.source = None;
+    let current_name = std::fs::read_to_string(index_root.join("CURRENT_MANIFEST"))
+        .expect("current pointer should read");
+    std::fs::write(
+        index_root.join("manifests").join(current_name.trim()),
+        serde_json::to_vec_pretty(&legacy).expect("legacy manifest should encode"),
+    )
+    .expect("legacy manifest should write");
+
+    WorkspaceBaseSnapshotIndex::ensure_manifest_source_identity(&build_config)
+        .expect("manifest migration should succeed");
+    let migrated = store.load_current().expect("migrated manifest should load");
+    assert_eq!(migrated.generation, original_generation + 1);
+    assert_eq!(migrated.active_segments, original_segments);
+    assert_eq!(migrated.active_delete_segments, original_delete_segments);
+    assert!(matches!(
+        migrated.source,
+        Some(ManifestSource::GitBase {
+            document_count: 1,
+            delta_depth: 0,
+            delta_bytes: 0,
+            ..
+        })
+    ));
+    std::fs::write(
+        WorkspaceBaseSnapshotIndex::metadata_path(&build_config),
+        b"not json",
+    )
+    .expect("legacy metadata corruption should succeed");
+    let metadata = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&build_config)
+        .expect("manifest identity should not depend on legacy metadata")
+        .expect("manifest metadata should exist");
+    assert_eq!(metadata.doc_count, Some(1));
+    assert!(metadata.head_commit.is_some());
+    WorkspaceBaseSnapshotIndex::open_read_only(&build_config)
+        .expect("base should open without legacy metadata")
+        .open_committed()
+        .expect("base reader should open without legacy metadata");
+}
+
+#[test]
 #[cfg(unix)]
 fn sharded_base_snapshot_reuses_unchanged_segment_files_via_hard_links() {
     let temp = TempDir::new().expect("temp dir");
@@ -254,6 +328,7 @@ fn sharded_base_snapshot_reuses_unchanged_segment_files_via_hard_links() {
         &repo,
         collect_base_input_files(&build_config),
         Some(&previous_snapshot),
+        None,
         &mut |_| {},
     )
     .expect("staged build should succeed");
@@ -343,6 +418,7 @@ fn sharded_base_snapshot_reports_incremental_tokenizing_progress() {
         &repo_id,
         &repo,
         collect_base_input_files(&build_config),
+        None,
         None,
         &mut |event| events.push(event),
     )

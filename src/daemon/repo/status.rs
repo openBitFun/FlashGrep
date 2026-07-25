@@ -15,10 +15,18 @@ impl Default for RepoState {
         Self {
             phase: RepoPhase::Opening,
             snapshot_key: None,
+            base_head_commit: None,
+            observed_head_commit: None,
+            overlay_head_commit: None,
+            overlay_base_manifest_id: None,
+            base_manifest_id: None,
+            base_delta_depth: 0,
+            base_delta_bytes: 0,
+            base_delete_segment_count: 0,
+            base_foundation_bytes: 0,
             last_probe_at: None,
             last_rebuild_at: None,
             dirty_files: DirtyStats::default(),
-            rebuild_recommended: false,
             active_task_id: None,
             probe_healthy: true,
             last_error: None,
@@ -33,6 +41,13 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         let overlay = self.workspace_overlay_status();
+        let base_advance_target_head = state.active_task_id.as_ref().and_then(|task_id| {
+            self.task_status(task_id).and_then(|task| {
+                (task.kind == super::RepoTaskKind::AdvanceBaseSnapshot)
+                    .then(|| state.observed_head_commit.clone())
+                    .flatten()
+            })
+        });
         let mut status = RepoStatus {
             repo_id: self.repo_id.clone(),
             repo_path: self.build_config.repo_path.clone(),
@@ -41,10 +56,27 @@ impl RepoRuntime {
             workspace_overlay_root: WorkspaceOverlayIndex::index_root(&self.build_config),
             phase: state.phase,
             snapshot_key: state.snapshot_key,
+            base_head_commit: state.base_head_commit,
+            workspace_head_commit: state.observed_head_commit,
+            overlay_head_commit: state.overlay_head_commit,
+            overlay_base_manifest_id: state.overlay_base_manifest_id,
+            base_manifest_id: state.base_manifest_id,
+            base_delta_depth: state.base_delta_depth,
+            base_delta_bytes: state.base_delta_bytes,
+            base_advance_target_head,
+            cached_head_count: WorkspaceBaseSnapshotIndex::cached_manifest_ids(&self.build_config)
+                .len(),
+            base_compaction_recommended: (state.base_delta_depth > 1
+                && state.base_delta_depth as usize > self.base_delta_max_segments)
+                || (state.base_delete_segment_count > 1
+                    && state.base_delete_segment_count > self.base_delta_max_delete_segments)
+                || (state.base_foundation_bytes > 0
+                    && (state.base_delta_depth > 1 || state.base_delete_segment_count > 1)
+                    && state.base_delta_bytes as f64
+                        > state.base_foundation_bytes as f64 * self.base_delta_max_bytes_ratio),
             last_probe_at: state.last_probe_at,
             last_rebuild_at: state.last_rebuild_at,
             dirty_files: state.dirty_files,
-            rebuild_recommended: state.rebuild_recommended,
             active_task_id: state.active_task_id,
             probe_healthy: state.probe_healthy,
             last_error: state.last_error,
@@ -55,19 +87,15 @@ impl RepoRuntime {
             RepoPhase::Opening | RepoPhase::ReadyClean | RepoPhase::ReadyDirty
         ) && status.snapshot_key.is_some()
         {
-            apply_repo_status_dirty_fields(
-                &mut status,
-                self.rebuild_dirty_threshold,
-                self.dirty_catalog_stats(),
-            );
+            apply_repo_status_dirty_fields(&mut status, self.dirty_catalog_stats());
         }
         status
     }
 
     pub(super) fn emit_workspace_status_changed(&self) {
-        (self.notifier)(super::ServiceNotificationEvent::WorkspaceStatus(
+        (self.notifier)(super::ServiceNotificationEvent::WorkspaceStatus(Box::new(
             convert::convert_repo_status(self.status_snapshot()),
-        ));
+        )));
     }
 
     pub(super) fn emit_task_progress(&self, task: RepoTaskStatus) {
@@ -184,34 +212,20 @@ impl RepoRuntime {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        apply_workspace_dirty_status(&mut state, self.rebuild_dirty_threshold, dirty_stats);
-        let rebuild_recommended = state.rebuild_recommended;
+        apply_workspace_dirty_status(&mut state, dirty_stats);
         drop(state);
-        if rebuild_recommended {
-            self.schedule_background_base_rebuild();
-        }
         self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
     }
 }
 
-pub(super) fn apply_workspace_dirty_status(
-    state: &mut RepoState,
-    rebuild_dirty_threshold: usize,
-    dirty_stats: DirtyStats,
-) {
+pub(super) fn apply_workspace_dirty_status(state: &mut RepoState, dirty_stats: DirtyStats) {
     state.dirty_files = dirty_stats;
-    state.rebuild_recommended = dirty_stats_total(dirty_stats) >= rebuild_dirty_threshold;
     state.phase = derive_workspace_phase(state.snapshot_key.as_deref(), dirty_stats);
 }
 
-pub(super) fn apply_repo_status_dirty_fields(
-    status: &mut RepoStatus,
-    rebuild_dirty_threshold: usize,
-    dirty_stats: DirtyStats,
-) {
+pub(super) fn apply_repo_status_dirty_fields(status: &mut RepoStatus, dirty_stats: DirtyStats) {
     status.dirty_files = dirty_stats;
-    status.rebuild_recommended = dirty_stats_total(dirty_stats) >= rebuild_dirty_threshold;
     status.phase = derive_workspace_phase(status.snapshot_key.as_deref(), dirty_stats);
 }
 

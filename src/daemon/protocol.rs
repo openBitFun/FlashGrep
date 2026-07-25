@@ -238,8 +238,14 @@ impl Default for RepoConfig {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RefreshPolicyConfig {
-    #[serde(default = "default_rebuild_dirty_threshold")]
-    pub rebuild_dirty_threshold: usize,
+    #[serde(default = "default_base_delta_max_segments")]
+    pub base_delta_max_segments: usize,
+    #[serde(default = "default_base_delta_max_delete_segments")]
+    pub base_delta_max_delete_segments: usize,
+    #[serde(default = "default_base_delta_max_bytes_ratio")]
+    pub base_delta_max_bytes_ratio: f64,
+    #[serde(default = "default_base_head_cache_entries")]
+    pub base_head_cache_entries: usize,
     #[serde(default = "default_overlay_auto_checkpoint_max_uncommitted_ops")]
     pub overlay_auto_checkpoint_max_uncommitted_ops: u64,
     #[serde(default = "default_overlay_merge_min_delay_ms")]
@@ -251,7 +257,10 @@ pub struct RefreshPolicyConfig {
 impl Default for RefreshPolicyConfig {
     fn default() -> Self {
         Self {
-            rebuild_dirty_threshold: default_rebuild_dirty_threshold(),
+            base_delta_max_segments: default_base_delta_max_segments(),
+            base_delta_max_delete_segments: default_base_delta_max_delete_segments(),
+            base_delta_max_bytes_ratio: default_base_delta_max_bytes_ratio(),
+            base_head_cache_entries: default_base_head_cache_entries(),
             overlay_auto_checkpoint_max_uncommitted_ops:
                 default_overlay_auto_checkpoint_max_uncommitted_ops(),
             overlay_merge_min_delay_ms: default_overlay_merge_min_delay_ms(),
@@ -496,10 +505,29 @@ pub struct RepoStatus {
     pub workspace_overlay_root: String,
     pub phase: RepoPhase,
     pub snapshot_key: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_head_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub workspace_head_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_head_commit: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub overlay_base_manifest_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_manifest_id: Option<String>,
+    #[serde(default)]
+    pub base_delta_depth: u32,
+    #[serde(default)]
+    pub base_delta_bytes: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_advance_target_head: Option<String>,
+    #[serde(default)]
+    pub cached_head_count: usize,
+    #[serde(default)]
+    pub base_compaction_recommended: bool,
     pub last_probe_unix_secs: Option<u64>,
     pub last_rebuild_unix_secs: Option<u64>,
     pub dirty_files: DirtyFileStats,
-    pub rebuild_recommended: bool,
     pub active_task_id: Option<String>,
     pub probe_healthy: bool,
     pub last_error: Option<String>,
@@ -528,6 +556,8 @@ pub struct DirtyFileStats {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct WorkspaceOverlayStatus {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub base_manifest_id: Option<String>,
     pub committed_seq_no: u64,
     pub last_seq_no: u64,
     pub uncommitted_ops: u64,
@@ -565,6 +595,8 @@ pub struct TaskStatus {
 pub enum TaskKind {
     BuildBaseSnapshot,
     RebuildBaseSnapshot,
+    AdvanceBaseSnapshot,
+    CompactBaseDeltas,
     RefreshWorkspace,
 }
 
@@ -696,12 +728,24 @@ fn default_max_sparse_len() -> usize {
     8
 }
 
-fn default_rebuild_dirty_threshold() -> usize {
-    256
-}
-
 fn default_overlay_auto_checkpoint_max_uncommitted_ops() -> u64 {
     DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS
+}
+
+fn default_base_delta_max_segments() -> usize {
+    8
+}
+
+fn default_base_delta_max_delete_segments() -> usize {
+    8
+}
+
+fn default_base_delta_max_bytes_ratio() -> f64 {
+    0.10
+}
+
+fn default_base_head_cache_entries() -> usize {
+    4
 }
 
 fn default_overlay_merge_min_delay_ms() -> u64 {

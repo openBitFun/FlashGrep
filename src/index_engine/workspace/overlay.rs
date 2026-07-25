@@ -123,6 +123,7 @@ pub(crate) const DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS: 
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceOverlayRuntimeStats {
+    pub base_manifest_id: Option<crate::index_engine::ManifestId>,
     pub committed_seq_no: u64,
     pub last_seq_no: u64,
     pub uncommitted_ops: u64,
@@ -248,6 +249,13 @@ impl WorkspaceOverlayIndex {
         self.engine.writer().stats()
     }
 
+    pub(crate) fn set_manifest_source(
+        &self,
+        source: crate::index_engine::manifest::ManifestSource,
+    ) {
+        self.engine.writer().set_manifest_source(Some(source));
+    }
+
     pub(crate) fn runtime_stats(&self) -> Result<WorkspaceOverlayRuntimeStats> {
         let writer_stats = self.engine.writer().stats();
         let manifest = self.engine.admin().manifest()?;
@@ -256,6 +264,13 @@ impl WorkspaceOverlayIndex {
             Err(poisoned) => poisoned.into_inner(),
         };
         Ok(WorkspaceOverlayRuntimeStats {
+            base_manifest_id: match manifest.source.as_ref() {
+                Some(crate::index_engine::manifest::ManifestSource::WorkspaceOverlay {
+                    base_manifest_id,
+                    ..
+                }) => Some(base_manifest_id.clone()),
+                _ => None,
+            },
             committed_seq_no: writer_stats.committed_seq_no,
             last_seq_no: writer_stats.last_seq_no,
             uncommitted_ops: writer_stats.uncommitted_ops,

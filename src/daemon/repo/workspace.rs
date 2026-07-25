@@ -290,7 +290,7 @@ impl RepoRuntime {
         state.snapshot_key = snapshot_key;
         state.last_probe_at = Some(SystemTime::now());
         state.last_error = None;
-        apply_workspace_dirty_status(&mut state, self.rebuild_dirty_threshold, dirty_stats);
+        apply_workspace_dirty_status(&mut state, dirty_stats);
         drop(state);
         self.invalidate_glob_cache();
         self.emit_workspace_status_changed();
@@ -306,11 +306,7 @@ impl RepoRuntime {
         state.snapshot_key = None;
         state.last_probe_at = Some(SystemTime::now());
         state.last_error = last_error;
-        apply_workspace_dirty_status(
-            &mut state,
-            self.rebuild_dirty_threshold,
-            super::DirtyStats::default(),
-        );
+        apply_workspace_dirty_status(&mut state, super::DirtyStats::default());
         drop(state);
         self.emit_workspace_status_changed();
     }

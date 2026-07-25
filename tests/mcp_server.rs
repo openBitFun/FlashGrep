@@ -384,7 +384,6 @@ fn mcp_processes_share_the_repo_managed_daemon() {
     )
     .expect("write should succeed");
     ensure_git_repo_with_head(&repo_path);
-
     let mut first_server = McpServerProcess::spawn(&repo_path);
     let mut first_stdin = first_server
         .child
@@ -460,7 +459,6 @@ fn mcp_dispatches_ping_without_waiting_for_search() {
     )
     .expect("write should succeed");
     ensure_git_repo_with_head(&repo_path);
-
     let mut server = McpServerProcess::spawn(&repo_path);
     let mut stdin = server.child.stdin.take().expect("stdin should be piped");
     let stdout = server.child.stdout.take().expect("stdout should be piped");
@@ -502,6 +500,191 @@ fn mcp_dispatches_ping_without_waiting_for_search() {
         "search response should follow: {second}"
     );
     assert_ne!(second["result"]["isError"], Value::Bool(true), "{second}");
+
+    drop(stdin);
+    server.wait_or_kill();
+    shutdown_managed_daemon(&repo_path);
+}
+
+#[test]
+fn repeated_mcp_open_after_checkout_keeps_base_readable_and_advances_incrementally() {
+    if !node_is_available() {
+        return;
+    }
+
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    std::fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    std::fs::write(
+        repo_path.join("main.rs"),
+        "const TOKEN: &str = \"MCP_MAIN_BRANCH\";\n",
+    )
+    .expect("write should succeed");
+    std::fs::write(repo_path.join(".gitignore"), "/.flashgrep-index-engine/\n")
+        .expect("gitignore write should succeed");
+    ensure_git_repo_with_head(&repo_path);
+    let main_branch = Command::new("git")
+        .current_dir(&repo_path)
+        .args(["rev-parse", "--abbrev-ref", "HEAD"])
+        .output()
+        .expect("git branch should run");
+    let main_branch = String::from_utf8_lossy(&main_branch.stdout)
+        .trim()
+        .to_string();
+
+    let mut server = McpServerProcess::spawn(&repo_path);
+    let mut stdin = server.child.stdin.take().expect("stdin should be piped");
+    let stdout = server.child.stdout.take().expect("stdout should be piped");
+    let mut stdout = BufReader::new(stdout);
+
+    let initial = send_mcp_request(
+        &mut stdin,
+        &mut stdout,
+        search_request(1, "MCP_MAIN_BRANCH"),
+    );
+    assert_ne!(initial["result"]["isError"], Value::Bool(true), "{initial}");
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let initial_status = loop {
+        let status = send_mcp_request(
+            &mut stdin,
+            &mut stdout,
+            json!({
+                "jsonrpc": "2.0",
+                "id": 2,
+                "method": "tools/call",
+                "params": { "name": "repo_status", "arguments": {} }
+            }),
+        );
+        let payload = &status["result"]["structuredContent"]["response"]["status"];
+        if matches!(
+            payload["phase"].as_str(),
+            Some("ready_clean" | "ready_dirty")
+        ) && payload["base_manifest_id"].is_string()
+        {
+            break payload.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "initial index timed out: {status}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    let initial_manifest = initial_status["base_manifest_id"].clone();
+
+    run_git(&repo_path, ["checkout", "-qb", "feature-mcp"]);
+    std::fs::write(
+        repo_path.join("main.rs"),
+        "const TOKEN: &str = \"MCP_FEATURE_BRANCH\";\n",
+    )
+    .expect("feature write should succeed");
+    run_git(&repo_path, ["add", "."]);
+    run_git(&repo_path, ["commit", "-qm", "feature"]);
+    let feature_head = Command::new("git")
+        .current_dir(&repo_path)
+        .args(["rev-parse", "HEAD"])
+        .output()
+        .expect("git head should run");
+    let feature_head = String::from_utf8_lossy(&feature_head.stdout)
+        .trim()
+        .to_string();
+
+    let transition = send_mcp_request(
+        &mut stdin,
+        &mut stdout,
+        search_request(3, "MCP_FEATURE_BRANCH"),
+    );
+    assert_ne!(
+        transition["result"]["isError"],
+        Value::Bool(true),
+        "{transition}"
+    );
+    let response = &transition["result"]["structuredContent"]["response"];
+    assert!(matches!(
+        response["backend"].as_str(),
+        Some("rg_fallback" | "scan_fallback" | "indexed_workspace_view")
+    ));
+    assert_ne!(
+        response["status"]["phase"],
+        Value::String("missing_base_snapshot".into())
+    );
+    assert!(
+        response["results"].to_string().contains("main.rs"),
+        "{transition}"
+    );
+
+    let deadline = Instant::now() + Duration::from_secs(15);
+    let settled = loop {
+        let search = send_mcp_request(
+            &mut stdin,
+            &mut stdout,
+            search_request(4, "MCP_FEATURE_BRANCH"),
+        );
+        let response = &search["result"]["structuredContent"]["response"];
+        let status = &response["status"];
+        if status["base_head_commit"] == Value::String(feature_head.clone())
+            && status["active_task_id"].is_null()
+            && matches!(
+                status["phase"].as_str(),
+                Some("ready_clean" | "ready_dirty")
+            )
+        {
+            break status.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "base advance timed out: {search}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    };
+    assert_eq!(settled["base_delta_depth"], Value::from(1));
+    assert_ne!(settled["base_manifest_id"], initial_manifest);
+    let feature_manifest = settled["base_manifest_id"].clone();
+
+    run_git(&repo_path, ["checkout", "-q", &main_branch]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let search = send_mcp_request(
+            &mut stdin,
+            &mut stdout,
+            search_request(5, "MCP_MAIN_BRANCH"),
+        );
+        let response = &search["result"]["structuredContent"]["response"];
+        assert_ne!(response["status"]["phase"], "missing_base_snapshot");
+        if response["status"]["base_manifest_id"] == initial_manifest
+            && response["status"]["active_task_id"].is_null()
+        {
+            assert!(response["results"].to_string().contains("main.rs"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cached main switch timed out: {search}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
+
+    run_git(&repo_path, ["checkout", "-q", "feature-mcp"]);
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let search = send_mcp_request(
+            &mut stdin,
+            &mut stdout,
+            search_request(6, "MCP_FEATURE_BRANCH"),
+        );
+        let response = &search["result"]["structuredContent"]["response"];
+        assert_ne!(response["status"]["phase"], "missing_base_snapshot");
+        if response["status"]["base_manifest_id"] == feature_manifest
+            && response["status"]["active_task_id"].is_null()
+        {
+            assert!(response["results"].to_string().contains("main.rs"));
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "cached feature switch timed out: {search}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 
     drop(stdin);
     server.wait_or_kill();

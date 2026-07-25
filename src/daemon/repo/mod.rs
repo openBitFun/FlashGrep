@@ -3,7 +3,7 @@ use std::{
     path::PathBuf,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
-        Arc, Condvar, Mutex, OnceLock, Weak,
+        Arc, Condvar, Mutex, OnceLock, RwLock, Weak,
     },
     thread::JoinHandle,
     time::SystemTime,
@@ -79,10 +79,19 @@ pub struct RepoStatus {
     pub workspace_overlay_root: PathBuf,
     pub phase: RepoPhase,
     pub snapshot_key: Option<String>,
+    pub base_head_commit: Option<String>,
+    pub workspace_head_commit: Option<String>,
+    pub overlay_head_commit: Option<String>,
+    pub overlay_base_manifest_id: Option<String>,
+    pub base_manifest_id: Option<String>,
+    pub base_delta_depth: u32,
+    pub base_delta_bytes: u64,
+    pub base_advance_target_head: Option<String>,
+    pub cached_head_count: usize,
+    pub base_compaction_recommended: bool,
     pub last_probe_at: Option<SystemTime>,
     pub last_rebuild_at: Option<SystemTime>,
     pub dirty_files: DirtyStats,
-    pub rebuild_recommended: bool,
     pub active_task_id: Option<String>,
     pub probe_healthy: bool,
     pub last_error: Option<String>,
@@ -91,6 +100,7 @@ pub struct RepoStatus {
 
 #[derive(Debug, Clone)]
 pub struct WorkspaceOverlayStatus {
+    pub base_manifest_id: Option<String>,
     pub committed_seq_no: u64,
     pub last_seq_no: u64,
     pub uncommitted_ops: u64,
@@ -110,6 +120,8 @@ pub struct WorkspaceOverlayStatus {
 pub enum RepoTaskKind {
     BuildBaseSnapshot,
     RebuildBaseSnapshot,
+    AdvanceBaseSnapshot,
+    CompactBaseDeltas,
     RefreshWorkspace,
 }
 
@@ -139,9 +151,12 @@ pub struct RepoTaskStatus {
     pub error: Option<String>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct RepoRefreshPolicy {
-    pub rebuild_dirty_threshold: usize,
+    pub base_delta_max_segments: usize,
+    pub base_delta_max_delete_segments: usize,
+    pub base_delta_max_bytes_ratio: f64,
+    pub base_head_cache_entries: usize,
     pub overlay_auto_checkpoint_max_uncommitted_ops: u64,
     pub overlay_merge_min_delay_ms: u64,
     pub overlay_merge_retry_delay_ms: u64,
@@ -150,7 +165,10 @@ pub struct RepoRefreshPolicy {
 impl Default for RepoRefreshPolicy {
     fn default() -> Self {
         Self {
-            rebuild_dirty_threshold: 256,
+            base_delta_max_segments: 8,
+            base_delta_max_delete_segments: 8,
+            base_delta_max_bytes_ratio: 0.10,
+            base_head_cache_entries: 4,
             overlay_auto_checkpoint_max_uncommitted_ops:
                 DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
             overlay_merge_min_delay_ms: 2_000,
@@ -233,7 +251,9 @@ impl RepoManager {
             }
         };
         if let Some(runtime) = existing_runtime {
-            runtime.refresh_base_snapshot_identity_state()?;
+            if runtime.observe_git_head_transition()? {
+                runtime.schedule_workspace_probe(std::time::Duration::from_millis(0));
+            }
             return Ok(runtime.status_snapshot());
         }
         if let Some(runtime) = stale_runtime {
@@ -457,7 +477,10 @@ struct RepoRuntime {
     workspace_overlay_engine: Mutex<Option<Arc<WorkspaceOverlayIndex>>>,
     dirty_catalog: Mutex<dirty_catalog::DirtyCatalog>,
     overlay_write_lock: Mutex<()>,
-    rebuild_dirty_threshold: usize,
+    base_delta_max_segments: usize,
+    base_delta_max_delete_segments: usize,
+    base_delta_max_bytes_ratio: f64,
+    base_head_cache_entries: usize,
     overlay_auto_checkpoint_max_uncommitted_ops: u64,
     overlay_merge_min_delay: std::time::Duration,
     overlay_merge_retry_delay: std::time::Duration,
@@ -473,6 +496,7 @@ struct RepoRuntime {
     glob_cache: Mutex<GlobCacheState>,
     glob_cache_epoch: AtomicU64,
     active_searches: AtomicU64,
+    artifact_gc_lock: RwLock<()>,
     next_background_task_id: AtomicU64,
     workspace_probe_pending: AtomicBool,
     task_handle: Mutex<Option<ActiveTaskHandle>>,
@@ -488,10 +512,18 @@ struct ActiveTaskHandle {
 struct RepoState {
     phase: RepoPhase,
     snapshot_key: Option<String>,
+    base_head_commit: Option<String>,
+    observed_head_commit: Option<String>,
+    overlay_head_commit: Option<String>,
+    overlay_base_manifest_id: Option<String>,
+    base_manifest_id: Option<String>,
+    base_delta_depth: u32,
+    base_delta_bytes: u64,
+    base_delete_segment_count: usize,
+    base_foundation_bytes: u64,
     last_probe_at: Option<SystemTime>,
     last_rebuild_at: Option<SystemTime>,
     dirty_files: DirtyStats,
-    rebuild_recommended: bool,
     active_task_id: Option<String>,
     probe_healthy: bool,
     last_error: Option<String>,
@@ -529,7 +561,10 @@ impl RepoRuntime {
         refresh_policy: &RepoRefreshPolicy,
     ) -> bool {
         self.build_config == *build_config
-            && self.rebuild_dirty_threshold == refresh_policy.rebuild_dirty_threshold
+            && self.base_delta_max_segments == refresh_policy.base_delta_max_segments
+            && self.base_delta_max_delete_segments == refresh_policy.base_delta_max_delete_segments
+            && self.base_delta_max_bytes_ratio == refresh_policy.base_delta_max_bytes_ratio
+            && self.base_head_cache_entries == refresh_policy.base_head_cache_entries
             && self.overlay_auto_checkpoint_max_uncommitted_ops
                 == refresh_policy.overlay_auto_checkpoint_max_uncommitted_ops
             && self.overlay_merge_min_delay
@@ -544,6 +579,13 @@ impl RepoRuntime {
         refresh_policy: RepoRefreshPolicy,
         notifier: Arc<dyn Fn(ServiceNotificationEvent) + Send + Sync>,
     ) -> Result<Self> {
+        if !refresh_policy.base_delta_max_bytes_ratio.is_finite()
+            || refresh_policy.base_delta_max_bytes_ratio < 0.0
+        {
+            return Err(AppError::Protocol(
+                "base_delta_max_bytes_ratio must be a finite non-negative number".into(),
+            ));
+        }
         let dirty_catalog_path = dirty_catalog::dirty_catalog_path(&build_config.storage_root);
         let workspace_search_view = WorkspaceSearchView::open(build_config.clone())?;
         let search_engine = SearchEngine::new(build_config.clone());
@@ -559,7 +601,10 @@ impl RepoRuntime {
             workspace_overlay_engine: Mutex::new(None),
             dirty_catalog: Mutex::new(dirty_catalog::DirtyCatalog::load(&dirty_catalog_path)?),
             overlay_write_lock: Mutex::new(()),
-            rebuild_dirty_threshold: refresh_policy.rebuild_dirty_threshold,
+            base_delta_max_segments: refresh_policy.base_delta_max_segments,
+            base_delta_max_delete_segments: refresh_policy.base_delta_max_delete_segments,
+            base_delta_max_bytes_ratio: refresh_policy.base_delta_max_bytes_ratio,
+            base_head_cache_entries: refresh_policy.base_head_cache_entries,
             overlay_auto_checkpoint_max_uncommitted_ops: refresh_policy
                 .overlay_auto_checkpoint_max_uncommitted_ops,
             overlay_merge_min_delay: std::time::Duration::from_millis(
@@ -583,6 +628,7 @@ impl RepoRuntime {
             glob_cache: Mutex::new(GlobCacheState::default()),
             glob_cache_epoch: AtomicU64::new(0),
             active_searches: AtomicU64::new(0),
+            artifact_gc_lock: RwLock::new(()),
             next_background_task_id: AtomicU64::new(0),
             workspace_probe_pending: AtomicBool::new(false),
             task_handle: Mutex::new(None),

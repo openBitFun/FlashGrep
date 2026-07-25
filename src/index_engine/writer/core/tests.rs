@@ -122,6 +122,38 @@ fn commit_persists_recent_adds_for_reopen() {
 }
 
 #[test]
+fn manifest_only_reopen_does_not_read_segment_documents() {
+    let config = test_config();
+    let engine = IndexEngine::open(config.clone()).expect("engine should open");
+    engine
+        .writer()
+        .add_document(test_doc("src/lib.rs", "MANIFEST_ONLY\n"))
+        .expect("add should succeed");
+    engine.writer().commit().expect("commit should succeed");
+    let manifest = engine.admin().manifest().expect("manifest should load");
+    let segment_id = manifest
+        .active_segments
+        .first()
+        .expect("segment should exist")
+        .id
+        .0
+        .clone();
+    drop(engine);
+    fs::remove_file(
+        config
+            .index_root
+            .join("segments")
+            .join(segment_id)
+            .join("docs.bin"),
+    )
+    .expect("document table should be removed");
+
+    let reopened = IndexEngine::open_manifest_only(config)
+        .expect("manifest-only reopen must not read segment documents");
+    assert_eq!(reopened.writer().stats().committed_seq_no, 1);
+}
+
+#[test]
 fn flush_writes_segment_files_and_commit_publishes_segment_refs() {
     let config = test_config();
     let engine = IndexEngine::open(config.clone()).expect("engine should open");

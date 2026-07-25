@@ -210,8 +210,32 @@ impl IndexWriter {
         }
     }
 
+    pub(crate) fn set_manifest_source(
+        &self,
+        source: Option<crate::index_engine::manifest::ManifestSource>,
+    ) {
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        state.manifest_source = source;
+    }
+
     pub(crate) fn restore_from_manifest(&self, manifest: &Manifest) -> Result<()> {
         let durable_docs = self.load_durable_history(manifest)?;
+        self.restore_manifest_state(manifest, durable_docs);
+        Ok(())
+    }
+
+    pub(crate) fn restore_from_manifest_only(&self, manifest: &Manifest) {
+        self.restore_manifest_state(manifest, BTreeMap::new());
+    }
+
+    fn restore_manifest_state(
+        &self,
+        manifest: &Manifest,
+        durable_docs: BTreeMap<DocKey, (SeqNo, IndexDocument)>,
+    ) {
         let mut state = self
             .state
             .lock()
@@ -227,6 +251,7 @@ impl IndexWriter {
         state.active_delete_segments = manifest.active_delete_segments.clone();
         state.pending_segments.clear();
         state.pending_delete_segments.clear();
+        state.manifest_source = manifest.source.clone();
         for (key, (seq_no, document)) in durable_docs {
             state.history.insert(
                 key,
@@ -245,7 +270,6 @@ impl IndexWriter {
         };
         self.snapshots.publish_committed(committed.clone());
         self.snapshots.publish_refreshed(committed);
-        Ok(())
     }
 
     fn next_seq_no(&self) -> SeqNo {
@@ -312,6 +336,14 @@ pub struct IndexEngine {
 
 impl IndexEngine {
     pub fn open(config: EngineConfig) -> Result<Self> {
+        Self::open_with_restore_mode(config, true)
+    }
+
+    pub(crate) fn open_manifest_only(config: EngineConfig) -> Result<Self> {
+        Self::open_with_restore_mode(config, false)
+    }
+
+    fn open_with_restore_mode(config: EngineConfig, load_durable_history: bool) -> Result<Self> {
         let manifest_store: Arc<dyn ManifestStore> =
             Arc::new(FileManifestStore::open(&config.index_root)?);
         let segment_store: Arc<dyn SegmentStore> = Arc::new(FileSegmentStore::open(
@@ -351,7 +383,11 @@ impl IndexEngine {
             admin,
         };
         let manifest = engine.admin.manifest()?;
-        engine.writer.restore_from_manifest(&manifest)?;
+        if load_durable_history {
+            engine.writer.restore_from_manifest(&manifest)?;
+        } else {
+            engine.writer.restore_from_manifest_only(&manifest);
+        }
         Ok(engine)
     }
 

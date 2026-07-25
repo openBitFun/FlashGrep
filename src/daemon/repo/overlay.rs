@@ -21,6 +21,8 @@ enum WorkspaceOverlayWritePlanKind {
 pub(super) struct WorkspaceOverlayWritePlan {
     dirty_paths: DirtyPathSet,
     build_paths: DirtyPathSet,
+    source_head: Option<String>,
+    manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
     kind: WorkspaceOverlayWritePlanKind,
 }
 
@@ -29,6 +31,8 @@ impl WorkspaceOverlayWritePlan {
         Self {
             dirty_paths: DirtyPathSet::default(),
             build_paths: DirtyPathSet::default(),
+            source_head: None,
+            manifest_source: None,
             kind: WorkspaceOverlayWritePlanKind::Clear,
         }
     }
@@ -40,6 +44,8 @@ impl WorkspaceOverlayWritePlan {
         Self {
             build_paths: dirty_paths.clone(),
             dirty_paths,
+            source_head: None,
+            manifest_source: None,
             kind: WorkspaceOverlayWritePlanKind::Rebuild { snapshot },
         }
     }
@@ -52,6 +58,8 @@ impl WorkspaceOverlayWritePlan {
         Self {
             build_paths,
             dirty_paths,
+            source_head: None,
+            manifest_source: None,
             kind: WorkspaceOverlayWritePlanKind::ApplyDelta { batch },
         }
     }
@@ -66,6 +74,16 @@ impl WorkspaceOverlayWritePlan {
         self.build_paths.modified.len()
             + self.build_paths.deleted.len()
             + self.build_paths.new.len()
+    }
+
+    pub(super) fn with_source_identity(
+        mut self,
+        source_head: String,
+        manifest_source: crate::index_engine::manifest::ManifestSource,
+    ) -> Self {
+        self.source_head = Some(source_head);
+        self.manifest_source = Some(manifest_source);
+        self
     }
 }
 
@@ -84,6 +102,8 @@ impl RepoRuntime {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let planned_dirty = plan.dirty_paths.clone();
         let build_paths = plan.build_paths.clone();
+        let source_head = plan.source_head.clone();
+        let manifest_source = plan.manifest_source.clone();
         let operation = match &plan.kind {
             WorkspaceOverlayWritePlanKind::Clear => "clear",
             WorkspaceOverlayWritePlanKind::Rebuild { .. } => "rebuild",
@@ -95,7 +115,7 @@ impl RepoRuntime {
             self.handle_workspace_overlay_engine_error("mark dirty catalog building", &error);
             return;
         }
-        if let Err(error) = self.try_apply_overlay_write_plan(plan) {
+        if let Err(error) = self.try_apply_overlay_write_plan(plan, manifest_source) {
             let _ = self.mark_dirty_catalog_failed(&build_paths);
             self.handle_workspace_overlay_engine_error("apply plan", &error);
             return;
@@ -105,6 +125,9 @@ impl RepoRuntime {
             return;
         }
         self.replace_published_overlay_paths_cache(planned_dirty);
+        if source_head.is_some() {
+            self.mark_overlay_published_for_head(source_head);
+        }
         self.update_overlay_state();
         match operation {
             "clear" => eprintln!(
@@ -125,20 +148,28 @@ impl RepoRuntime {
         self.apply_overlay_write_plan(WorkspaceOverlayWritePlan::clear());
     }
 
-    fn try_apply_overlay_write_plan(&self, plan: WorkspaceOverlayWritePlan) -> Result<()> {
+    fn try_apply_overlay_write_plan(
+        &self,
+        plan: WorkspaceOverlayWritePlan,
+        manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
+    ) -> Result<()> {
         let dirty_paths = plan.dirty_paths;
         match plan.kind {
             WorkspaceOverlayWritePlanKind::Clear => self.try_reset_workspace_overlay_engine(),
             WorkspaceOverlayWritePlanKind::Rebuild { snapshot } => {
-                self.try_apply_overlay_snapshot(snapshot)
+                self.try_apply_overlay_snapshot(snapshot, manifest_source)
             }
             WorkspaceOverlayWritePlanKind::ApplyDelta { batch } => {
-                self.try_apply_overlay_ingest_batch(&dirty_paths, batch)
+                self.try_apply_overlay_ingest_batch(&dirty_paths, batch, manifest_source)
             }
         }
     }
 
-    fn try_apply_overlay_snapshot(&self, snapshot: WorkspaceOverlaySnapshotState) -> Result<()> {
+    fn try_apply_overlay_snapshot(
+        &self,
+        snapshot: WorkspaceOverlaySnapshotState,
+        manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
+    ) -> Result<()> {
         if !self.build_config.repo_path.exists() {
             return Ok(());
         }
@@ -154,6 +185,9 @@ impl RepoRuntime {
         WorkspaceOverlayIndex::clear_storage(&self.build_config)?;
 
         let overlay_index = Arc::new(self.open_workspace_overlay_index()?);
+        if let Some(source) = manifest_source {
+            overlay_index.set_manifest_source(source);
+        }
         overlay_index.rebuild_snapshot(&snapshot)?;
         overlay_index.checkpoint()?;
         let mut slot = match self.workspace_overlay_engine.lock() {
@@ -179,6 +213,7 @@ impl RepoRuntime {
         &self,
         dirty: &DirtyPathSet,
         batch: WorkspaceOverlayIngestBatch,
+        manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
     ) -> Result<()> {
         if !self.build_config.repo_path.exists() {
             return Ok(());
@@ -196,6 +231,9 @@ impl RepoRuntime {
             if self.dirty_catalog_pending_paths() == *dirty {
                 WorkspaceOverlayIndex::clear_storage(&self.build_config)?;
                 let overlay_index = Arc::new(self.open_workspace_overlay_index()?);
+                if let Some(source) = manifest_source {
+                    overlay_index.set_manifest_source(source);
+                }
                 overlay_index.ingest_batch(&batch)?;
                 let mut slot = match self.workspace_overlay_engine.lock() {
                     Ok(guard) => guard,
@@ -212,13 +250,17 @@ impl RepoRuntime {
                 dirty.new.len()
             );
             let rebuild = self.build_overlay_rebuild_plan(dirty.clone())?;
-            return self.try_apply_overlay_write_plan(rebuild);
+            let rebuild_source = rebuild.manifest_source.clone();
+            return self.try_apply_overlay_write_plan(rebuild, rebuild_source);
         }
         let Some(overlay_index) = overlay_index else {
             return Err(AppError::Protocol(
                 "workspace overlay engine missing during overlay delta publish".into(),
             ));
         };
+        if let Some(source) = manifest_source {
+            overlay_index.set_manifest_source(source);
+        }
         overlay_index.ingest_batch(&batch)?;
         Ok(())
     }
@@ -291,6 +333,7 @@ fn workspace_overlay_status_from_runtime(
     stats: WorkspaceOverlayRuntimeStats,
 ) -> WorkspaceOverlayStatus {
     WorkspaceOverlayStatus {
+        base_manifest_id: stats.base_manifest_id.map(|id| id.0),
         committed_seq_no: stats.committed_seq_no,
         last_seq_no: stats.last_seq_no,
         uncommitted_ops: stats.uncommitted_ops,

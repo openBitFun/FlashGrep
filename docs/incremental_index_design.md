@@ -5,13 +5,14 @@
 `flashgrep` 的增量索引运行时有三块状态，但查询真相源只有两层只读 snapshot：
 
 1. `base snapshot`
-   只读、稳定；daemon runtime 中锚定某个 Git `HEAD + config fingerprint`。
+   只读、稳定；由带 Git source identity 的 active manifest 表达 foundation segments 与
+   commit-to-commit delta segments。
 2. `dirty catalog`
    记录工作区里哪些路径变了、当前处于 `dirty / building / ready_overlay / failed` 哪个状态。
 3. `published overlay snapshot`
    只包含已经构建完成并原子发布、对查询可见的 workspace 增量层。
 
-目标不是让查询线程参与构建，而是把“变化发现”“后台构建”“查询可见”拆成三条边界清晰的流程；查询线程始终只读 `base snapshot + published overlay snapshot`。
+目标不是让查询线程参与构建，而是把“变化发现”“后台构建”“查询可见”拆成三条边界清晰的流程；正常状态查询只读 `base snapshot + published overlay snapshot`。分支刚切换且新 HEAD overlay 尚未发布时，单次查询使用有界 transition backend 读取当前 worktree，不会返回旧分支内容或等待构建。
 
 ## Design Principles
 
@@ -62,7 +63,31 @@ overlay 必须先在 staging 或临时产物中构建完整，再通过 manifest
 - base snapshot 负责稳定、低抖动、可复用的大索引基线
 - overlay 负责工作区最新变化的快速可见层
 
-base rebuild 是独立流程，不阻塞 overlay 的局部更新。
+base 的正常推进使用 Git commit diff 追加 delta/delete segments。Full build 只用于首次建库、
+不兼容配置/格式、显式 rebuild 或无法恢复的 active index 损坏，不是分支切换 fallback。
+
+## Branch And Base Manifest Lifecycle
+
+active base manifest 的 `ManifestSource::GitBase` 记录：
+
+- `head_commit`、`config_fingerprint`、`repo_root`
+- `parent_manifest_id`
+- `foundation_segment_ids`
+- `delta_depth`、`delta_bytes`、`document_count`
+
+HEAD 从 H0 变为 H1 时：
+
+1. 继续保留并查询 H0 base；
+2. 发布针对当前 H1 worktree 的 overlay，未发布前使用 transition backend；
+3. 用 `git diff --name-status -z --no-renames H0 H1` 枚举变化路径；
+4. 只读取变化路径的 H0/H1 Git blobs，写 live delta 和 delete delta；
+5. 写不可变 candidate manifest，复核当前 HEAD 后以 parent manifest CAS 激活；
+6. reconcile overlay，使其只保留未提交变化；
+7. 将 HEAD manifest 写入有界 LRU cache，回切命中时零 tokenization 激活。
+
+快速 H0 -> H1 -> H2 时，H1 candidate 可以进入 HEAD cache，但只有当前 HEAD 仍为 H1 才能
+激活；任务结束后只为最新 H2 补排 advance。Foundation segments 不会被正常 branch advance
+读取或重写。
 
 ## High-Level Architecture
 
@@ -162,7 +187,8 @@ EffectiveCandidates =
     UNION OverlayLiveCandidates
 ```
 
-dirty 但尚未 `ready_overlay` 的路径不会进入查询结果。
+dirty 但尚未发布 overlay 时，查询通过 transition backend 读取当前 worktree；发布后才进入
+indexed workspace view。
 
 ## Dirty Catalog
 
@@ -232,15 +258,19 @@ Clean@Base
 - worker 开始构建: `Building`
 - 发布成功: `ReadyOverlay`
 - 构建失败: `Failed`
-- base snapshot 重建并吸收这些变化后: 回到 `Clean@Base`
+- base manifest 增量推进并 reconcile overlay 后: 已提交变化回到 `Clean@Base`，未提交变化继续
+  留在 `ReadyOverlay`
 
 ## Directory Layout
 
 ```text
 .flashgrep-index-engine/
   base-snapshot/
-    <snapshot-key>/
-      ...
+    CURRENT_MANIFEST
+    HEAD_MANIFESTS.json
+    manifests/
+    segments/
+    deletes/
 
   workspace-overlay/
     CURRENT_MANIFEST

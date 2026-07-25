@@ -13,7 +13,7 @@ use crate::{
     files::{
         is_corpus_text_file, is_workspace_internal_path, repo_relative_path, resolve_repo_path,
     },
-    git_snapshot::{canonical_repo_root, resolve_git_head},
+    git_snapshot::canonical_repo_root,
     index_engine::{
         reader::SnapshotPathCatalog, workspace::WorkspaceBaseSnapshotMetadata,
         WorkspaceBaseSnapshotIndex,
@@ -112,8 +112,11 @@ impl RepoRuntime {
         &self,
         dirty: DirtyPathSet,
     ) -> Result<WorkspaceOverlayWritePlan> {
+        let source_head = self.current_git_head()?;
+        let manifest_source = self.overlay_manifest_source(&source_head)?;
         if dirty.is_empty() {
-            return Ok(WorkspaceOverlayWritePlan::clear());
+            return Ok(WorkspaceOverlayWritePlan::clear()
+                .with_source_identity(source_head, manifest_source));
         }
         let documents = self.load_overlay_documents(&dirty)?;
         let mut deleted_paths = dirty.deleted.clone();
@@ -128,7 +131,8 @@ impl RepoRuntime {
             &documents,
             &deleted_paths,
         )?;
-        Ok(WorkspaceOverlayWritePlan::rebuild(dirty, snapshot))
+        Ok(WorkspaceOverlayWritePlan::rebuild(dirty, snapshot)
+            .with_source_identity(source_head, manifest_source))
     }
 
     fn build_overlay_delta_plan(
@@ -136,8 +140,11 @@ impl RepoRuntime {
         dirty: DirtyPathSet,
         delta: DirtyPathSet,
     ) -> Result<WorkspaceOverlayWritePlan> {
+        let source_head = self.current_git_head()?;
+        let manifest_source = self.overlay_manifest_source(&source_head)?;
         if dirty.is_empty() {
-            return Ok(WorkspaceOverlayWritePlan::clear());
+            return Ok(WorkspaceOverlayWritePlan::clear()
+                .with_source_identity(source_head, manifest_source));
         }
         let documents = self.load_delta_overlay_documents(&delta)?;
         let batch = WorkspaceOverlayIngestBatch::from_paths(
@@ -148,7 +155,8 @@ impl RepoRuntime {
             &delta.deleted,
             &documents,
         )?;
-        Ok(WorkspaceOverlayWritePlan::apply_delta(dirty, delta, batch))
+        Ok(WorkspaceOverlayWritePlan::apply_delta(dirty, delta, batch)
+            .with_source_identity(source_head, manifest_source))
     }
 
     pub(super) fn clear_base_snapshot_catalog(&self) {
@@ -166,49 +174,44 @@ impl RepoRuntime {
         )
     }
 
-    pub(super) fn current_base_snapshot_key_matching_git_identity(&self) -> Result<Option<String>> {
+    pub(super) fn current_compatible_base_snapshot_metadata(
+        &self,
+    ) -> Result<Option<WorkspaceBaseSnapshotMetadata>> {
         let Some(metadata) =
             WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
         else {
             return Ok(None);
         };
-        match self.base_snapshot_metadata_matches_current_git_identity(&metadata)? {
-            true => Ok(Some(metadata.snapshot_key)),
+        match self.base_snapshot_metadata_is_compatible(&metadata) {
+            true => Ok(Some(metadata)),
             false => Ok(None),
         }
     }
 
-    pub(super) fn base_snapshot_metadata_matches_current_git_identity(
+    pub(super) fn base_snapshot_metadata_is_compatible(
         &self,
         metadata: &WorkspaceBaseSnapshotMetadata,
-    ) -> Result<bool> {
-        let Some(head_commit) = metadata.head_commit.as_deref() else {
-            return Ok(false);
-        };
+    ) -> bool {
+        if metadata.head_commit.is_none() && metadata.revision.is_none() {
+            return false;
+        }
         let Some(config_fingerprint) = metadata.config_fingerprint.as_deref() else {
-            return Ok(false);
+            return false;
         };
         let Some(repo_root) = metadata.repo_root.as_deref() else {
-            return Ok(false);
+            return false;
         };
         if config_fingerprint
             != crate::index_engine::workspace::base_snapshot_config_fingerprint_for(
                 &self.build_config,
             )
         {
-            return Ok(false);
+            return false;
         }
         if repo_root != canonical_repo_root(&self.build_config.repo_path) {
-            return Ok(false);
+            return false;
         }
-        let mut should_cancel = || false;
-        match resolve_git_head(&self.build_config.repo_path, &mut should_cancel)? {
-            Some(current_head) => Ok(current_head == head_commit),
-            None => Err(AppError::InvalidIndex(format!(
-                "daemon base snapshot identity requires a Git HEAD commit for {}",
-                self.build_config.repo_path.display()
-            ))),
-        }
+        true
     }
 
     pub(super) fn base_snapshot_catalog(&self) -> Result<Option<SnapshotPathCatalog>> {
@@ -622,6 +625,10 @@ fn decide_overlay_update_mode(
         } else {
             OverlayUpdateMode::Rebuild
         };
+    }
+
+    if !published_overlay_snapshot_available {
+        return OverlayUpdateMode::Rebuild;
     }
 
     if dirty == published_overlay_paths {

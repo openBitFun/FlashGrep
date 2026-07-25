@@ -135,6 +135,15 @@ args = ["<FLASHGREP_MCP_DIR>/server.js"]
 
 通常无需配置。发布包中的 `server.js` 会从 `bin/` 目录中自动选择与当前系统匹配的二进制文件；直接从源码仓库运行时会使用 `target/release/flashgrep` 或 `target/debug/flashgrep`。
 
+### 增量 base 维护参数
+
+- `--base-delta-max-segments <N>`：live delta segment 预算，默认 `8`
+- `--base-delta-max-delete-segments <N>`：delete segment 预算，默认 `8`
+- `--base-delta-max-bytes-ratio <RATIO>`：delta bytes 相对 foundation bytes 的预算，默认 `0.1`
+- `--base-head-cache-entries <N>`：可零 tokenization 回切的 HEAD manifest 数量，默认 `4`
+
+这些参数只控制增量合并和 HEAD cache，不会把大 diff 转成自动 full rebuild。
+
 ## 可用工具
 
 当前 MCP Server 提供以下 5 个工具。
@@ -158,6 +167,10 @@ args = ["<FLASHGREP_MCP_DIR>/server.js"]
 索引尚未建立或正在构建时，搜索会立即使用过渡后端返回结果，不会等待索引完成。响应中的 `backend` 字段会说明本次使用的是索引还是过渡搜索。
 
 同一 Git worktree 中启动的多个 MCP session 会连接同一个 managed daemon，共享索引 reader、后台构建任务和 workspace watcher。搜索请求可以并发执行；过渡 `rg` 搜索达到 `global_max_results` 后会主动结束子进程，避免高频匹配在大型仓库中持续占用 CPU 和内存。
+
+分支切换时，兼容 base 会保持可读。新 HEAD overlay 发布前，本次搜索使用有界 transition
+backend 读取当前 worktree；overlay 发布后立即恢复 indexed workspace view，base 再在后台按
+commit diff 增量推进。回切到 HEAD cache 中的 commit 时直接激活原 manifest，不重新 tokenize。
 
 常用限制参数：
 
@@ -252,7 +265,7 @@ Agent 会先调用 `refresh_repo`，再继续执行后续搜索。
 
 ### 搜索结果像是旧分支内容
 
-通常是工作区状态尚未刷新。
+通常是工作区状态尚未刷新。分支切换本身不会删除 base 或启动 full rebuild。
 可以输入：
 
 ```text

@@ -4,4 +4,4 @@ mod policy;
 
 pub use executor::{MergeExecutor, MergeResult, MergeTask, NoopMergeExecutor, StoreMergeExecutor};
 pub use planner::MergeStats;
-pub use policy::{MergePolicy, TieredMergePolicy};
+pub use policy::{BaseDeltaMergePolicy, MergePolicy, TieredMergePolicy};

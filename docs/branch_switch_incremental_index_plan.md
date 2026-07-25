@@ -2,9 +2,11 @@
 
 ## Status
 
-This document is an implementation plan for replacing branch-switch base snapshot rebuilds with
-incremental manifest updates. It is intentionally specific to the daemon + MCP + distributed binary
-runtime. The general workspace overlay contract remains documented in
+Implemented on 2026-07-24. Automated gates plus 100k synthetic and Chromium detached-worktree
+measurements are recorded in
+[branch_switch_incremental_index_validation.md](./branch_switch_incremental_index_validation.md).
+This document remains the design and acceptance contract for the daemon + MCP + distributed binary
+runtime. The general workspace overlay contract is documented in
 [incremental_index_design.md](./incremental_index_design.md).
 
 The target behavior is:
