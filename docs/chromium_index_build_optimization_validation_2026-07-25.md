@@ -138,6 +138,18 @@ status/tree/classification plus 3.17 s of clean overlay probing. This validates 
 shards, but does not establish that 16 is the optimal shard count; 8/10/16 scheduling and memory
 remain a separate benchmark item.
 
+The shard-count matrix used the same Chromium H0 and `FLASHGREP_BASE_SNAPSHOT_LOW_MEMORY=0`:
+
+| Shards | H0 build | Documents | Result |
+| ---: | ---: | ---: | --- |
+| 8 | 68.39 s | 445,491 | exact |
+| 10 | 63.84 s | 445,491 | selected |
+| 16 | 70.83 s | 445,491 | prior default |
+
+Ten shards matches the measured ten-worker scheduling point. The segment format is unchanged; a
+previous 16-shard manifest remains readable, while an explicit rebuild recalculates shard
+fingerprints and produces the ten-shard assignment.
+
 ## Remaining Work
 
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full

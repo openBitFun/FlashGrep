@@ -382,10 +382,12 @@ per-shard finish time fell from repeated 9-12 s samples to roughly 5-8 s. Parall
 buckets was also tested and rejected because nested shard/Rayon scheduling did not improve the
 84.48 s full-build sample. Global posting-memory budgeting remains open.
 
-The same-H0 explicit rebuild completed in 13.11 s with all 16 shards reused and no segment-build
-event. Its remaining cost was Git input enumeration plus clean overlay probing. This confirms the
-value of stable shard reuse, while the exact shard count remains unproven; an 8/10/16 Chromium
-matrix is required before changing the compatibility-affecting assignment count.
+The same-H0 explicit rebuild completed in 13.11 s with all 16 prior shards reused and no
+segment-build event. Its remaining cost was Git input enumeration plus clean overlay probing. A
+fresh H0 matrix then measured 63.84 s at 10 shards, 68.39 s at 8 shards, and 70.83 s at 16 shards
+with the same 2M run setting. Ten shards is now the selected default because it matches the measured
+worker count; old manifests remain readable and naturally rebuild into the new assignment when
+explicitly rebuilt.
 
 ### Chromium Gate
 
