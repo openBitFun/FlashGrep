@@ -496,6 +496,7 @@ Candidate changes:
 - prepare target-side changed documents in bounded parallel workers;
 - rejected after Chromium A/B: use the base bulk segment writer for large deltas;
 - rejected: store delta sources as `GitHeadBlob` references in the normal segment writer;
+- rejected after Chromium A/B: stream generic segment document records instead of building full buffers;
 - keep delete-before-add sequence ordering and candidate CAS activation unchanged.
 
 Chromium acceptance:
@@ -539,6 +540,14 @@ generic segment store has no manifest HEAD context for resolving Git-backed sour
 the requested optimization is build/rebuild speed, expanding compaction semantics for a
 storage-only result would add complexity without satisfying the gate; this experiment was also
 removed completely.
+
+The generic document writer was separately rewritten as a streaming prototype using two file
+cursors for records and source bytes, avoiding the full `docs.bin` and source buffers. On the same
+Chromium H0 -> H2 transition, write time was 2,756 ms before and 2,743 ms after; complete base delta
+time was 3,399 ms versus 3,390 ms. The sub-percent difference is noise, and the current writer's
+existing batch construction is not a measured speed bottleneck. The prototype was removed; Phase
+4's streaming writer remains open only if a future memory profile proves aggregate residency, not
+as an assumed latency optimization.
 
 ## Automated Gates After Every Phase
 

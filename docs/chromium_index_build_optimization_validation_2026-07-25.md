@@ -230,6 +230,13 @@ could not resolve the Git-backed delta source. The daemon remained searchable bu
 compaction error. The source-kind experiment was removed rather than expanding compaction and
 recovery behavior for a storage reduction with no measured build-speed benefit.
 
+Finally, a streaming rewrite of the generic document writer was tested on the same H0 -> H2
+Chromium transition. It used separate record/source file cursors to avoid constructing the complete
+`docs.bin` buffer in memory, but write time changed only from 2,756 ms to 2,743 ms and complete
+base-delta time from 3,399 ms to 3,390 ms. The sub-percent difference is noise, so the prototype
+was removed. Aggregate memory residency was not changed by default; streaming remains an open
+Phase 4 memory investigation rather than an accepted speed optimization.
+
 ## Background Compaction Results
 
 The Chromium H9 -> H10 run used a one-delta test threshold to make background maintenance visible.
