@@ -202,6 +202,21 @@ The same query marker returned exactly 1,000 matching lines from flashgrep and `
 roughly 90% of the measured post-transition scan time without changing shard assignment or worker
 defaults; it is therefore a path-count-based optimization rather than a machine-topology tuning.
 
+Multi-request Git blob batching was then tested on a fresh pair of cloned H0 indexes advancing
+directly to H2 (10,000 modified files). The existing persistent reader measured 537 ms for old
+blobs, 486 ms for new blobs, and 3,895 ms for the complete base delta. Grouping up to 256 requests
+measured 563 ms, 455 ms, and 3,907 ms respectively. Both wrote 120,735,023 delta bytes and returned
+the same 10,000 marker lines as `rg --no-ignore`. With no end-to-end gain, the grouped implementation
+was removed; segment writing at roughly 2.76 s, not Git request flushing, is the dominant stage.
+
+The accepted replacement uses the already-preloaded active snapshot path catalog to determine
+whether modified/deleted old-side paths were indexed. It therefore reads only target-side blobs and
+shares the 444k-entry daemon catalog through `Arc` instead of deep-cloning it. On the same H0 -> H2
+transition, old-side classification fell from 537 ms to 1 ms, Git blob reads fell from 20,000 to
+10,000, and complete base-delta time fell from 3,895 ms to 3,252 ms (16.5%). The output remained
+120,735,023 delta bytes. All 14 diverse H2 queries matched `rg --no-ignore` exactly, as did the
+combined H1/H2 marker at 10,000 lines.
+
 ## Background Compaction Results
 
 The Chromium H9 -> H10 run used a one-delta test threshold to make background maintenance visible.
@@ -232,10 +247,10 @@ a repository with an already-over-limit compatible base schedules the same backg
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
 run had six watcher timing/recovery failures under concurrent daemon load; the base-focused tests,
 Chromium query corpus, and individual rebuild test passed. These failures remain a watcher-race
-follow-up rather than being claimed as a clean gate. The latest serial rerun after clean-input
-metadata elision completed with 225 passed, 6 failed, and 1 ignored; an earlier rerun completed
-226/5/1. The remaining failures are the same watcher event/rebuild timing cases, while base input,
-branch transition, lifecycle, and background compaction coverage passed.
+follow-up rather than being claimed as a clean gate. The latest serial rerun after catalog-based
+old-side branch classification completed with 225 passed, 6 failed, and 1 ignored; an earlier
+rerun completed 226/5/1. The remaining failures are the same watcher event/rebuild timing cases,
+while base input, branch transition, lifecycle, and background compaction coverage passed.
 
 The authoritative execution order is maintained in
 `docs/index_build_and_overlay_recovery_optimization_plan.md`. The remaining work is:

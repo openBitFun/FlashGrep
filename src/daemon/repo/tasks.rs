@@ -316,9 +316,15 @@ impl RepoRuntime {
                     None,
                 ));
                 self.current_git_head().and_then(|target_head| {
+                    let base_catalog = self.base_snapshot_catalog()?.ok_or_else(|| {
+                        AppError::InvalidIndex(
+                            "base snapshot catalog is unavailable during branch advance".into(),
+                        )
+                    })?;
                     WorkspaceBaseSnapshotIndex::advance_to_head(
                         &self.build_config,
                         &self.overlay_repo_id,
+                        &base_catalog,
                         &target_head,
                         self.base_head_cache_entries,
                         &mut should_cancel,

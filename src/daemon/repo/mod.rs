@@ -546,7 +546,7 @@ struct RepoTaskRecord {
 #[derive(Debug, Clone)]
 struct CachedBaseSnapshotCatalog {
     snapshot_key: String,
-    catalog: crate::index_engine::reader::SnapshotPathCatalog,
+    catalog: Arc<crate::index_engine::reader::SnapshotPathCatalog>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]

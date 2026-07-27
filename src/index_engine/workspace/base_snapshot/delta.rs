@@ -15,6 +15,7 @@ use crate::{
         manifest::{
             DeleteSegmentRef, FileManifestStore, ManifestSource, ManifestStore, SegmentRef,
         },
+        reader::SnapshotPathCatalog,
         segment::{
             DeleteSegmentBuildOutput, DeleteSegmentMeta, FileSegmentStore, SegmentBuildOutput,
             SegmentMeta, SegmentStore,
@@ -51,6 +52,7 @@ impl WorkspaceBaseSnapshotIndex {
     pub(crate) fn advance_to_head(
         build_config: &BuildConfig,
         repo_id: &RepoId,
+        base_catalog: &SnapshotPathCatalog,
         target_head: &str,
         head_cache_entries: usize,
         should_cancel: &mut impl FnMut() -> bool,
@@ -131,20 +133,19 @@ impl WorkspaceBaseSnapshotIndex {
         let modified_paths = diff.modified.len();
         let deleted_paths = diff.deleted.len();
         let enumerated_paths = added_paths + modified_paths + deleted_paths;
-        let git_blobs_read = added_paths + deleted_paths + modified_paths.saturating_mul(2);
+        let git_blobs_read = added_paths + modified_paths;
         let diff_ms = diff_started.elapsed().as_millis();
         let blob_reader = GitBlobReader::new(&build_config.repo_path)?;
 
-        let old_read_started = std::time::Instant::now();
+        let old_lookup_started = std::time::Instant::now();
         let mut old_live_paths = Vec::new();
         for path in diff.deleted.iter().chain(diff.modified.iter()) {
             check_cancel(should_cancel)?;
-            let bytes = blob_reader.read_blob(&from_head, path)?;
-            if is_indexable_blob(build_config, path, &bytes) {
+            if base_catalog.get(path).is_some() {
                 old_live_paths.push(path.clone());
             }
         }
-        let old_read_ms = old_read_started.elapsed().as_millis();
+        let old_lookup_ms = old_lookup_started.elapsed().as_millis();
 
         let new_read_started = std::time::Instant::now();
         let mut documents = Vec::new();
@@ -244,12 +245,12 @@ impl WorkspaceBaseSnapshotIndex {
         Self::record_manifest_in_cache(build_config, &candidate, head_cache_entries)?;
 
         eprintln!(
-            "[flashgrep][base-delta-metrics] from={} to={} elapsed_ms={} diff_ms={} old_read_ms={} new_read_ms={} write_ms={} paths={} added={} modified={} deleted={} blobs={} tokenized={} deleted_docs={} delta_bytes={}",
+            "[flashgrep][base-delta-metrics] from={} to={} elapsed_ms={} diff_ms={} old_lookup_ms={} new_read_ms={} write_ms={} paths={} added={} modified={} deleted={} blobs={} tokenized={} deleted_docs={} delta_bytes={}",
             from_head,
             target_head,
             advance_started.elapsed().as_millis(),
             diff_ms,
-            old_read_ms,
+            old_lookup_ms,
             new_read_ms,
             write_ms,
             enumerated_paths,
@@ -468,6 +469,15 @@ mod tests {
         }
     }
 
+    fn current_path_catalog(build_config: &BuildConfig) -> SnapshotPathCatalog {
+        WorkspaceBaseSnapshotIndex::open_read_only(build_config)
+            .expect("base snapshot should open")
+            .open_committed()
+            .expect("committed snapshot should open")
+            .path_catalog()
+            .expect("path catalog should load")
+    }
+
     fn initialize_repo(repo: &Path) {
         fs::create_dir_all(repo).expect("repo dir should succeed");
         git(repo, &["init", "-q"]);
@@ -507,6 +517,7 @@ mod tests {
             .into_iter()
             .map(|segment| segment.id)
             .collect::<Vec<_>>();
+        let base_catalog = current_path_catalog(&build_config);
 
         fs::write(repo.join("live.rs"), "const VALUE: &str = \"NEW\";\n")
             .expect("rewrite should succeed");
@@ -522,6 +533,7 @@ mod tests {
         let result = WorkspaceBaseSnapshotIndex::advance_to_head(
             &build_config,
             &repo_id,
+            &base_catalog,
             &target,
             4,
             &mut || false,
@@ -537,7 +549,7 @@ mod tests {
             (1, 4, 1)
         );
         assert_eq!(result.filtered_paths, 3);
-        assert_eq!(result.git_blobs_read, 10);
+        assert_eq!(result.git_blobs_read, 5);
         assert_eq!(result.tokenized_documents, 2);
         assert_eq!(result.deleted_documents, 2);
         assert_eq!(
@@ -586,6 +598,7 @@ mod tests {
             BaseSnapshotBuildOptions::new().requiring_git_head(),
         )
         .expect("base build should succeed");
+        let base_catalog = current_path_catalog(&build_config);
 
         git(&repo, &["checkout", "-q", "-b", "h1"]);
         fs::write(repo.join("value.rs"), "const VALUE: &str = \"H1\";\n")
@@ -609,6 +622,7 @@ mod tests {
         let result = WorkspaceBaseSnapshotIndex::advance_to_head(
             &build_config,
             &repo_id,
+            &base_catalog,
             &h1,
             4,
             &mut || {
@@ -659,6 +673,7 @@ mod tests {
             BaseSnapshotBuildOptions::new().requiring_git_head(),
         )
         .expect("base build should succeed");
+        let base_catalog = current_path_catalog(&build_config);
         fs::write(repo.join("value.rs"), "const VALUE: &str = \"TARGET\";\n")
             .expect("rewrite should succeed");
         git(&repo, &["add", "."]);
@@ -672,6 +687,7 @@ mod tests {
         let result = WorkspaceBaseSnapshotIndex::advance_to_head(
             &build_config,
             &repo_id,
+            &base_catalog,
             &target,
             4,
             &mut || {

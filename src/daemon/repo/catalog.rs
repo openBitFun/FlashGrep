@@ -235,7 +235,7 @@ impl RepoRuntime {
         true
     }
 
-    pub(super) fn base_snapshot_catalog(&self) -> Result<Option<SnapshotPathCatalog>> {
+    pub(super) fn base_snapshot_catalog(&self) -> Result<Option<Arc<SnapshotPathCatalog>>> {
         let Some(snapshot_key) = self.current_base_snapshot_key()? else {
             self.clear_base_snapshot_catalog();
             return Ok(None);
@@ -248,7 +248,7 @@ impl RepoRuntime {
             };
             if let Some(cached) = catalog.as_ref() {
                 if cached.snapshot_key == snapshot_key {
-                    return Ok(Some(cached.catalog.clone()));
+                    return Ok(Some(Arc::clone(&cached.catalog)));
                 }
             }
         }
@@ -257,14 +257,14 @@ impl RepoRuntime {
             self.clear_base_snapshot_catalog();
             return Ok(None);
         };
-        let catalog = reader.path_catalog()?;
+        let catalog = Arc::new(reader.path_catalog()?);
         let mut slot = match self.base_snapshot_catalog.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         *slot = Some(CachedBaseSnapshotCatalog {
             snapshot_key,
-            catalog: catalog.clone(),
+            catalog: Arc::clone(&catalog),
         });
         Ok(Some(catalog))
     }

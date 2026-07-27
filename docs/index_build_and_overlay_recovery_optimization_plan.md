@@ -21,7 +21,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
 | Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while all-file Git-batch reads, 2,048-document prepare chunks, bucket parallelism, and 192 MiB posting residency were rejected. |
-| Phase 6 branch delta | Partial (background compaction accepted) | Chromium H1/H2 transitions, scoped post-transition overlay rebuild, and silent delta compaction are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
+| Phase 6 branch delta | Partial (catalog lookup and background compaction accepted) | Chromium H1/H2 transitions, catalog-based old-path classification, scoped post-transition overlay rebuild, and silent delta compaction are measured; multi-request Git blob batching was rejected, while the complete cache-switch matrix and kill-boundary coverage remain. |
 | Final gate | Blocked by known failures | Chromium query results are exact, but six watcher/event timing tests failed in the latest serial full Rust gate; the count has fluctuated between five and six across runs. |
 
 ## Next Execution Queue
@@ -491,7 +491,8 @@ Only proceed if Phase 0/5 profiling shows meaningful remaining cost in branch ad
 
 Candidate changes:
 
-- batch Git old/new blob reads instead of serial request/flush cycles;
+- accepted: classify old-side indexed paths through the active snapshot catalog instead of rereading old blobs;
+- rejected after Chromium A/B: batch Git old/new blob requests instead of serial request/flush cycles;
 - prepare target-side changed documents in bounded parallel workers;
 - use the bulk segment writer for large deltas;
 - keep delete-before-add sequence ordering and candidate CAS activation unchanged.
@@ -502,6 +503,25 @@ Chromium acceptance:
 - H2 -> H0 remains a zero-tokenization cache activation;
 - search stays available and exact during transition;
 - foundation segments are neither read nor rewritten by normal advance/merge.
+
+The multi-request Git blob experiment grouped up to 256 `cat-file --batch` requests while streaming
+responses one blob at a time. On the same Chromium H0 -> H2 transition with 10,000 modified files,
+the existing persistent reader spent 537 ms on old blobs and 486 ms on new blobs (1,023 ms total),
+and completed the base delta in 3,895 ms. The grouped path spent 563 ms and 455 ms respectively
+(1,018 ms total), while total delta time regressed to 3,907 ms. The 0.5% read change and 0.3%
+end-to-end regression are noise; both produced 120,735,023 delta bytes and exact 10,000-line query
+results. The experiment was removed rather than adding protocol and cancellation complexity to a
+stage that is no longer the branch-transition bottleneck.
+
+The accepted follow-up removes that old-side read stage entirely. The daemon already preloads the
+active manifest's `SnapshotPathCatalog`, which is the authoritative set of indexed paths, so
+modified/deleted paths are now classified by catalog membership and only target-side blobs are
+read. The cached catalog is shared through `Arc` rather than deep-cloned for each consumer. On the
+same Chromium H0 -> H2 transition, old-side work fell from 537 ms and 10,000 blob reads to a 1 ms
+catalog lookup; total Git reads fell from 20,000 to 10,000 and the complete base delta improved
+from 3,895 ms to 3,252 ms (16.5%). Delta bytes remained exactly 120,735,023. All 14 recorded H2
+query counts and the 10,000-line branch marker matched `rg --no-ignore`. This removes redundant I/O
+without adding worker or memory tuning, so it is portable across repository storage layouts.
 
 ## Automated Gates After Every Phase
 
