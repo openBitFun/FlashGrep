@@ -20,7 +20,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 2 incremental refresh | Complete | Watcher-driven no-change and event delta paths are proportional to changed paths. |
 | Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
-| Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while all-file Git-batch reads, bucket parallelism, and 192 MiB posting residency were rejected. |
+| Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while all-file Git-batch reads, 2,048-document prepare chunks, bucket parallelism, and 192 MiB posting residency were rejected. |
 | Phase 6 branch delta | Partial (background compaction accepted) | Chromium H1/H2 transitions, scoped post-transition overlay rebuild, and silent delta compaction are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
 | Final gate | Blocked by known failures | Chromium query results are exact, but six watcher/event timing tests failed in the latest serial full Rust gate; the count has fluctuated between five and six across runs. |
 
@@ -466,6 +466,14 @@ After the 10,000-file overlay was opened, all 14 recorded query counts and a 10,
 marker query matched `rg --no-ignore` exactly. The trigger depends only on source kind, not CPU,
 memory, shard count, or storage topology, while clean regular files still use parallel worktree
 reads because the all-file Git-batch experiment regressed.
+
+Doubling the normal preparation chunk from 1,024 to 2,048 documents was also rejected. Two initial
+alternating CLI runs suggested an 11.8% mean improvement, but they did not measure the detached
+daemon's resource peak. A controlled fixed-daemon rerun measured 64 s and 3,421,168 KiB peak RSS at
+1,024 versus 63 s and 3,924,128 KiB at 2,048. The 1.6% wall-time change is within noise while RSS
+increased 14.7%; sampled peak CPU was effectively unchanged (816.5% versus 822.2%). The portable
+default therefore stays at 1,024, and low-memory mode stays at 128. This is exactly the class of
+host-local throughput result that must not become a cross-machine memory regression.
 
 ### Chromium Gate
 

@@ -179,6 +179,13 @@ unchanged. After opening the resulting 10,000-file overlay, all 14 recorded quer
 `rg --no-ignore`, as did a dedicated dirty marker query at 10,000 lines. The superseded
 process-per-file reader was removed rather than retained as a compatibility branch.
 
+Preparation chunks of 2,048 documents were tested and rejected. Although two alternating managed
+CLI runs averaged 63.07 s at 2,048 versus 71.52 s at the 1,024 default, those runs did not sample
+the detached daemon and were too variable to justify a default change. A fixed-daemon resource
+rerun measured 63 s at 2,048 versus 64 s at 1,024, while peak RSS increased from 3,421,168 KiB to
+3,924,128 KiB (+14.7%). Peak sampled CPU was nearly identical (822.2% versus 816.5%). The 1.6%
+latency difference is within noise, so the 1,024 normal and 128 low-memory defaults remain unchanged.
+
 ## Branch Delta Results
 
 The detached Chromium branch matrix used cumulative 1,000-file commits. H1 (1,000 files) and H2
