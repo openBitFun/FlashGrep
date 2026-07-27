@@ -15,30 +15,31 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 
 | Phase | Status | Evidence / remaining work |
 | --- | --- | --- |
-| Phase 0 instrumentation | Partial | Overlay and base stage metrics exist; branch-delta metrics and the complete branch matrix remain. |
+| Phase 0 instrumentation | Complete | Overlay/base stage metrics and branch-delta metrics are recorded; the Chromium branch/cache/interruption matrix is complete. |
 | Phase 1 manifest-only startup | Complete | Published overlays reopen without durable-history replay; Chromium restart and query checks passed. |
 | Phase 2 incremental refresh | Complete | Watcher-driven no-change and event delta paths are proportional to changed paths. |
-| Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
-| Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
-| Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while all-file Git-batch reads, 2,048-document prepare chunks, bucket parallelism, and 192 MiB posting residency were rejected. |
-| Phase 6 branch delta | Partial (catalog lookup and background compaction accepted) | Chromium H1/H2 transitions, catalog-based old-path classification, scoped post-transition overlay rebuild, and silent delta compaction are measured; multi-request Git batching, the base bulk writer, and Git-backed delta sources were rejected, while the complete cache-switch matrix and kill-boundary coverage remain. |
-| Final gate | Complete | The serial Rust gate is green at 232 passed, 0 failed, 1 ignored; clippy, formatting, and diff checks also pass. Chromium clean and one-file watcher overlay checks remain exact. |
+| Phase 3 catalog transaction | Complete | Compact v2 catalog, one-write success path, generation CAS, and three publication-boundary restart cases recover exact indexed views. |
+| Phase 4 overlay bulk build | Complete (streaming rejected) | Bounded preparation and parallel term collection pass the 10k/50k Chromium gate; monitored RSS stays below the 5.75 GiB bound, so streaming/aggregate-memory changes are rejected as unjustified. |
+| Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable. Optional future aggregate-memory profiling remains separate from the completed overlay objective; all-file Git-batch reads, 2,048-document prepare chunks, bucket parallelism, and 192 MiB posting residency were rejected. |
+| Phase 6 branch delta | Complete | Chromium H0→H1→H2→H0 cache activation, H2→H3 interruption/restart recovery, catalog-based old-path classification, scoped post-transition overlay rebuild, and silent delta compaction are measured; rejected writer experiments remain removed. |
+| Final gate | Complete | The serial Rust gate is green at 233 passed, 0 failed, 1 ignored; 34 e2e, 5 managed-daemon, and 5 MCP tests also pass. Clippy, formatting, and diff checks pass. |
 
 ## Next Execution Queue
 
-1. Run the Phase 3 publication-boundary kill/restart matrix and fix any mixed manifest/catalog
-   recovery behavior.
-2. Run the Phase 6 Chromium H0 -> H1 -> H2 -> H0 branch matrix, including tokenized-object counts,
-   synchronization wall time, CPU/RSS, index bytes, and queries during/after transition.
-3. Implement the Phase 4 streaming overlay writer and aggregate memory budget only if the branch
-   and O4 profiles still show material writer or peak-RSS cost.
-4. Keep the complete gate and Chromium matrix current as each remaining phase lands.
+1. Keep the complete automated gate and Chromium matrix current for future changes.
 
 The watcher gate was closed on 2026-07-27. Git's own `.git/index` and `.git/index.lock` writes
 during Git probes are now excluded from the candidate event buffer, so they cannot force an
 unrelated full probe. The sequence tests also wait for the asynchronous status publication after
 the indexed view changes, eliminating a test-only intermediate-state race without changing the
 production event-driven path.
+
+The remaining Phase 3 and Phase 6 gates were closed on 2026-07-27. Publication-boundary recovery,
+the current-config Chromium H0→H1→H2→H0 cache matrix, and an H2→H3 daemon interruption/restart
+were all exercised against isolated storage. The Phase 4 memory decision is intentionally negative:
+the largest monitored rebuild remained below the 5.75 GiB RSS bound and the measured cost is
+tokenization/segment writing, so no streaming compatibility path or speculative global budget was
+added.
 
 This document is the execution and acceptance contract for improving full base construction,
 workspace overlay refresh, daemon restart recovery, and branch-delta construction. Every
@@ -336,7 +337,7 @@ At O1-O4 record catalog bytes serialized and written. Acceptance:
 - O4 refresh wall time improves or remains within 5% when tokenization dominates;
 - kill/restart recovery at publication boundaries remains exact.
 
-### Phase 3 Result (2026-07-25, partial)
+### Phase 3 Result (2026-07-25, complete on 2026-07-27)
 
 The normal success path no longer persists the transient `building` state. The reconciled dirty
 state remains the crash-recovery record, while the final `ready_overlay` state is persisted after
@@ -347,8 +348,14 @@ only when both generation and dirty kind still match. This prevents stale concur
 from overwriting a newer path state without adding another durable write.
 
 On a 2,000-entry Chromium catalog, bytes fell from 695,544 (pretty v1) to 321,532 (compact v2), a
-53.8% reduction. The successful-path transaction consolidation is implemented; the kill-boundary
-matrix remains open.
+53.8% reduction. The successful-path transaction consolidation is implemented.
+
+The publication-boundary matrix uses a test-only one-shot failpoint at three boundaries: before
+overlay publication, after the overlay manifest is published but before catalog-ready persistence,
+and after catalog-ready persistence but before status/cache publication. Each case destroys the
+daemon, reopens the same storage, and verifies `ReadyDirty`, one modified path, the new marker only,
+the base marker absent, and `IndexedWorkspaceView`. All three cases pass; the failpoint is consumed
+in each case and is compiled only for tests.
 
 ## Phase 4: Bounded Parallel Overlay Bulk Build
 
@@ -378,7 +385,7 @@ Run a first-time O4 build and O1 -> O4 cumulative growth. Acceptance:
 - index and catalog size do not grow by more than 5%;
 - all 14 query cases remain exact.
 
-### Phase 4 Result (2026-07-25, partial)
+### Phase 4 Result (2026-07-25, complete on 2026-07-27)
 
 Overlay document preparation now uses a bounded eight-worker local pool while preserving the
 existing deterministic path ordering at segment construction. On a 2,000-file Chromium rebuild,
@@ -387,8 +394,13 @@ after parallel per-document term collection. A monitored rebuild peaked at 2.66 
 CPU, below the 5.75 GiB Chromium peak from the original full matrix. Cumulative Chromium runs then
 measured a 10k delta at 41.30 s open / 2.70 s delta publish with 628.1% CPU, and a 50k rebuild at
 12.92 s open / 12.79 s publish with 936.8% CPU and 3.52 GiB peak RSS. The 50k run had a warmer page
-cache and is not a strict A/B comparison, but it confirms the path scales beyond one core. The
-streaming writer and aggregate memory-budget work remain open.
+cache and is not a strict A/B comparison, but it confirms the path scales beyond one core.
+
+The final memory decision is to reject both open experiments for this release. The 50k rebuild
+monitor measured 3,695,472 KiB peak RSS, below the 5.75 GiB gate, and a process-cold published
+overlay reopen measured 1,953,984 KiB peak RSS. The 50k path spent 13.99 s in delta writing and
+18.39 s in base-delta construction, so the measured bottleneck is content/token/posting work rather
+than aggregate residency. No streaming writer or global budget branch was retained.
 
 ## Phase 5: Full Base Builder Pipeline
 
@@ -431,7 +443,8 @@ retaining the 64k low-memory setting. Adjacent Chromium H0 runs with low-memory 
 disabled measured 70.83 s at 2M versus 80.12 s at 512k, an 11.6% improvement. The first wave's
 per-shard finish time fell from repeated 9-12 s samples to roughly 5-8 s. Parallel sorting of all
 buckets was also tested and rejected because nested shard/Rayon scheduling did not improve the
-84.48 s full-build sample. Global posting-memory budgeting remains open.
+84.48 s full-build sample. Global posting-memory budgeting remains an optional future base-builder
+profile, outside the completed overlay/branch objective.
 
 The same-H0 explicit rebuild completed in 13.11 s with all 16 prior shards reused and no
 segment-build event. Its remaining cost was Git input enumeration plus clean overlay probing. A
@@ -549,9 +562,24 @@ The generic document writer was separately rewritten as a streaming prototype us
 cursors for records and source bytes, avoiding the full `docs.bin` and source buffers. On the same
 Chromium H0 -> H2 transition, write time was 2,756 ms before and 2,743 ms after; complete base delta
 time was 3,399 ms versus 3,390 ms. The sub-percent difference is noise, and the current writer's
-existing batch construction is not a measured speed bottleneck. The prototype was removed; Phase
-4's streaming writer remains open only if a future memory profile proves aggregate residency, not
-as an assumed latency optimization.
+existing batch construction is not a measured speed bottleneck. The prototype was removed; the
+final 50k resource profile did not prove an aggregate-residency problem, so streaming is deferred
+and not retained as an assumed latency optimization.
+
+The final current-config Chromium matrix used detached worktree commits H1 (`021d0725`, 1,000
+files), H2 (`49d44eef`, 10,000 cumulative files), and H3 (`5007c397`, 50,000 additional files).
+H0→H1 completed in 2.85 s with depth 1 and 13,361,702 delta bytes; H1→H2 completed in 5.15 s with
+depth 2 and 119,068,663 cumulative delta bytes. H1 and H2 marker counts were exactly 1,000 and
+9,000 in the indexed view. H2→H0 restored `manifest-0000000000000001`, depth/bytes zero, and
+`cached_head_count=3`; the H1 marker disappeared and the worktree ended clean.
+
+For interruption recovery, H2→H3 was terminated while the 50k-file advance was active. After
+restart the H2 manifest remained active, the daemon reported `ReadyDirty` with
+`base_advance_target_head=H3`, and the 50k overlay marker was immediately searchable. Recovery
+then completed in 11.47 s of base advance plus overlay finish, reached depth 1 after background
+compaction, and returned `ReadyClean`, zero dirty paths, and exactly 50,000 marker lines in both
+flashgrep and `rg --no-ignore`. The H3 delta recorded 50,000 target paths, 50,000 tokenized docs,
+and 625,684,321 delta bytes before compaction.
 
 ## Automated Gates After Every Phase
 
@@ -586,14 +614,14 @@ Rollback means reverting the incomplete phase, not retaining both old and new ex
 
 1. Complete: instrument overlay/base construction and capture Chromium baselines.
 2. Complete: implement manifest-only overlay startup and incremental explicit refresh.
-3. Partial: consolidate dirty-catalog persistence; finish its interruption matrix.
-4. Partial: implement bounded overlay preparation; defer the streaming writer until profiling
-   proves it remains worthwhile.
+3. Complete: consolidate dirty-catalog persistence and verify publication-boundary interruption.
+4. Complete: implement bounded overlay preparation; reject streaming/aggregate-memory work after
+   the resource gate showed no material memory risk.
 5. Complete for accepted slices: optimize Git-object base construction, posting runs, and shard
    scheduling.
-6. Partial: optimize branch delta construction and remove the redundant post-transition full Git scan; finish the cache-switch matrix.
-7. Pending: restore the full automated gate and publish the final validation report with
-   correctness checks, resource peaks, and before/after tables.
+6. Complete: optimize branch delta construction, remove the redundant post-transition full Git
+   scan, and verify the cache-switch/interruption matrix.
+7. Complete: restore the full automated gate and publish the consolidated validation report.
 
 The expected largest user-visible gain is Phase 1: eliminating minutes of unnecessary overlay work
 after daemon restart. Phase 2 and Phase 4 target large-change refresh latency. Phase 5 targets the

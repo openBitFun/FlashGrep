@@ -125,13 +125,31 @@ impl RepoRuntime {
         let dirty_path_count = plan.dirty_path_count();
         let build_path_count = plan.build_path_count();
         self.mark_dirty_catalog_building(&build_paths, catalog_generation);
+        #[cfg(test)]
+        if self.take_overlay_publication_failpoint(
+            super::OverlayPublicationFailpoint::BeforeOverlayPublish,
+        ) {
+            return;
+        }
         if let Err(error) = self.try_apply_overlay_write_plan(plan, manifest_source) {
             let _ = self.mark_dirty_catalog_failed(&build_paths, catalog_generation);
             self.handle_workspace_overlay_engine_error("apply plan", &error);
             return;
         }
+        #[cfg(test)]
+        if self.take_overlay_publication_failpoint(
+            super::OverlayPublicationFailpoint::AfterOverlayPublish,
+        ) {
+            return;
+        }
         if let Err(error) = self.mark_dirty_catalog_ready(&build_paths, catalog_generation) {
             self.handle_workspace_overlay_engine_error("mark dirty catalog ready", &error);
+            return;
+        }
+        #[cfg(test)]
+        if self.take_overlay_publication_failpoint(
+            super::OverlayPublicationFailpoint::AfterCatalogReady,
+        ) {
             return;
         }
         self.replace_published_overlay_paths_cache(planned_dirty);
@@ -152,6 +170,22 @@ impl RepoRuntime {
             ),
             _ => {}
         }
+    }
+
+    #[cfg(test)]
+    fn take_overlay_publication_failpoint(
+        &self,
+        expected: super::OverlayPublicationFailpoint,
+    ) -> bool {
+        let mut slot = match self.overlay_publication_failpoint.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if *slot != Some(expected) {
+            return false;
+        }
+        slot.take();
+        true
     }
 
     pub(super) fn reset_workspace_overlay_engine(&self) {

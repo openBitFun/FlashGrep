@@ -63,6 +63,14 @@ pub enum QueryBackend {
     ScanFallback,
 }
 
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum OverlayPublicationFailpoint {
+    BeforeOverlayPublish,
+    AfterOverlayPublish,
+    AfterCatalogReady,
+}
+
 #[derive(Debug, Clone, Copy, Default)]
 pub struct DirtyStats {
     pub modified: usize,
@@ -421,6 +429,34 @@ impl RepoManager {
     }
 
     #[cfg(test)]
+    pub(crate) fn set_overlay_publication_failpoint_for_tests(
+        &self,
+        repo_id: &str,
+        failpoint: OverlayPublicationFailpoint,
+    ) -> Result<()> {
+        let runtime = self.repo(repo_id)?;
+        let mut slot = match runtime.overlay_publication_failpoint.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        *slot = Some(failpoint);
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn overlay_publication_failpoint_pending_for_tests(
+        &self,
+        repo_id: &str,
+    ) -> Result<bool> {
+        let runtime = self.repo(repo_id)?;
+        let slot = match runtime.overlay_publication_failpoint.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        Ok(slot.is_some())
+    }
+
+    #[cfg(test)]
     pub(crate) fn has_base_snapshot_engine_for_tests(&self, repo_id: &str) -> Result<bool> {
         let runtime = self.repo(repo_id)?;
         let slot = match runtime.base_snapshot_engine.lock() {
@@ -485,6 +521,8 @@ struct RepoRuntime {
     workspace_overlay_engine: Mutex<Option<Arc<WorkspaceOverlayIndex>>>,
     dirty_catalog: Mutex<dirty_catalog::DirtyCatalog>,
     overlay_write_lock: Mutex<()>,
+    #[cfg(test)]
+    overlay_publication_failpoint: Mutex<Option<OverlayPublicationFailpoint>>,
     base_delta_max_segments: usize,
     base_delta_max_delete_segments: usize,
     base_delta_max_bytes_ratio: f64,
@@ -609,6 +647,8 @@ impl RepoRuntime {
             workspace_overlay_engine: Mutex::new(None),
             dirty_catalog: Mutex::new(dirty_catalog::DirtyCatalog::load(&dirty_catalog_path)?),
             overlay_write_lock: Mutex::new(()),
+            #[cfg(test)]
+            overlay_publication_failpoint: Mutex::new(None),
             base_delta_max_segments: refresh_policy.base_delta_max_segments,
             base_delta_max_delete_segments: refresh_policy.base_delta_max_delete_segments,
             base_delta_max_bytes_ratio: refresh_policy.base_delta_max_bytes_ratio,

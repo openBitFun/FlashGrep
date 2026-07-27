@@ -1,6 +1,62 @@
 use super::*;
 
 #[test]
+fn overlay_publication_boundaries_recover_exactly_after_restart() {
+    let _serial = daemon_test_serial();
+    let failpoints = [
+        crate::daemon::repo::OverlayPublicationFailpoint::BeforeOverlayPublish,
+        crate::daemon::repo::OverlayPublicationFailpoint::AfterOverlayPublish,
+        crate::daemon::repo::OverlayPublicationFailpoint::AfterCatalogReady,
+    ];
+
+    for (index, failpoint) in failpoints.into_iter().enumerate() {
+        let temp = tempdir().expect("temp dir should succeed");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+        let tracked = repo_path.join("tracked.rs");
+        fs::write(&tracked, "const VALUE: &str = \"BOUNDARY_BASE\";\n")
+            .expect("base write should succeed");
+
+        let service = DaemonService::new();
+        let (repo_id, _) = open_repo(&service, repo_path.clone());
+        build_repo(&service, &repo_id);
+        wait_for_status(&service, &repo_id, |status| {
+            matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+        });
+
+        let marker = format!("BOUNDARY_DIRTY_{index}");
+        fs::write(&tracked, format!("const VALUE: &str = \"{marker}\";\n"))
+            .expect("dirty write should succeed");
+        service
+            .repos
+            .set_overlay_publication_failpoint_for_tests(&repo_id, failpoint)
+            .expect("failpoint should install");
+        let _ = refresh_repo(&service, &repo_id, true);
+        assert!(!service
+            .repos
+            .overlay_publication_failpoint_pending_for_tests(&repo_id)
+            .expect("failpoint state should be readable"));
+        service.shutdown_all();
+        drop(service);
+
+        let restarted = DaemonService::new();
+        let (reopened_repo_id, _) = open_repo(&restarted, repo_path.clone());
+        let status = wait_for_dirty_stats(&restarted, &reopened_repo_id, 1, 0, 0);
+        assert!(matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyDirty
+        ));
+        let (backend, status) =
+            wait_for_search_count(&restarted, &reopened_repo_id, marker.as_str(), 1);
+        assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+        assert_exact_dirty_stats(&status, 1, 0, 0);
+        let (_, status) = wait_for_search_count(&restarted, &reopened_repo_id, "BOUNDARY_BASE", 0);
+        assert_exact_dirty_stats(&status, 1, 0, 0);
+        restarted.shutdown_all();
+    }
+}
+
+#[test]
 fn refresh_workspace_rebuilds_workspace_overlay_engine() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();

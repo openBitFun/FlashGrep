@@ -234,8 +234,8 @@ Finally, a streaming rewrite of the generic document writer was tested on the sa
 Chromium transition. It used separate record/source file cursors to avoid constructing the complete
 `docs.bin` buffer in memory, but write time changed only from 2,756 ms to 2,743 ms and complete
 base-delta time from 3,399 ms to 3,390 ms. The sub-percent difference is noise, so the prototype
-was removed. Aggregate memory residency was not changed by default; streaming remains an open
-Phase 4 memory investigation rather than an accepted speed optimization.
+was removed. Aggregate memory residency was not changed by default; the final 50k resource profile
+below the RSS gate rejects further streaming work for this release.
 
 ## Background Compaction Results
 
@@ -256,6 +256,36 @@ phase stayed `ready_clean`; every request returned exactly 10,000 H12 marker lin
 and `rg` counts were both 10,000, and the manifest ended at depth 1 with no recommendation pending.
 Compaction logs now report merge input/output bytes, segment counts, and elapsed time.
 
+## Final Phase 3/6 Matrix (2026-07-27)
+
+The publication-boundary test matrix uses three test-only one-shot failpoints: before overlay
+publication, after overlay manifest publication but before catalog-ready persistence, and after
+catalog-ready persistence but before status/cache publication. Each case destroys the daemon and
+reopens the same storage. All three cases recovered `ReadyDirty`, one modified path, the new marker
+only, the base marker absent, and `IndexedWorkspaceView`; each failpoint was consumed exactly once.
+
+The final current-config Chromium run used detached worktree `/private/tmp/flashgrep-chromium-base-opt`
+and isolated storage. H0 was rebuilt because older H0 artifacts had an incompatible configuration
+fingerprint and were correctly rejected by startup. H1 (`021d0725`) changed 1,000 `.cc` files and
+H2 (`49d44eef`) added 9,000 more. H0→H1 took 2.85 s at depth 1 with 13,361,702 delta bytes;
+H1→H2 took 5.15 s at depth 2 with 119,068,663 cumulative delta bytes. Indexed marker counts were
+1,000 and 9,000 respectively. H2→H0 restored `manifest-0000000000000001`, depth/bytes zero,
+`cached_head_count=3`, and zero dirty files; the H1 marker was absent after the switch.
+
+For interruption recovery, H3 (`5007c397`) added 50,000 more `.cc` files. The daemon was terminated
+while H2→H3 was active. On restart, H2 remained the active parent manifest, the status exposed
+`base_advance_target_head=H3` and `active_task_id=auto:advance:*`, and the 50,000-file overlay marker
+was immediately searchable. Recovery completed in 11.47 s of base advance plus overlay finish,
+then background compaction reduced the depth to 1. The final state was `ReadyClean`, zero dirty
+files, and exactly 50,000 marker lines in both flashgrep and `rg --no-ignore`. The delta metrics
+recorded 50,000 target paths/docs and 625,684,321 delta bytes before compaction.
+
+The memory decision is negative for the remaining Phase 4 experiments. The monitored 50k rebuild
+peaked at 3,695,472 KiB RSS, while a process-cold published-overlay reopen peaked at 1,953,984 KiB;
+both are below the 5.75 GiB gate. The 50k delta spent 13.99 s writing and 18.39 s in base-delta
+construction, so the measured cost is tokenization/posting/write work rather than aggregate
+residency. The streaming writer and speculative global memory budget were not added.
+
 ## Open Work
 
 The maintenance contract is explicit: `ensure` reuses a compatible base, HEAD changes use base
@@ -264,7 +294,8 @@ background work that keeps the active manifest searchable while candidate merges
 atomically activated. Compaction now reports merge input/output bytes and elapsed time, and opening
 a repository with an already-over-limit compatible base schedules the same background task.
 
-The final serial Rust gate on 2026-07-27 completed with 232 passed, 0 failed, and 1 ignored.
+The final serial Rust gate on 2026-07-27 completed with 233 library tests passed, 0 failed, and 1
+ignored; the 34 e2e, 5 managed-daemon, and 5 MCP integration tests also passed.
 `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and
 `git diff --check` also passed. The six watcher failures from the preceding run were traced to Git
 index-file notification noise plus assertions racing asynchronous status publication. Filtering
@@ -282,7 +313,5 @@ after restoring the file, five consecutive checks returned `ReadyClean`, zero di
 marker matches. The Chromium checkout retained only its pre-existing `.gitignore` change.
 
 The authoritative execution order is maintained in
-`docs/index_build_and_overlay_recovery_optimization_plan.md`. Remaining work is the Phase 3
-publication-boundary kill/restart matrix, the complete Chromium H0 -> H1 -> H2 -> H0 cache-switch
-and interruption matrix, and the Phase 4 streaming/aggregate-memory investigation only if its
-profiles still justify implementation.
+`docs/index_build_and_overlay_recovery_optimization_plan.md`. There is no required optimization
+work remaining in this plan; future changes should rerun the full gate and Chromium matrix.
