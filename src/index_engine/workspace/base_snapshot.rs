@@ -28,7 +28,7 @@ use crate::{
     files::{repo_relative_path, scan_paths, RepositoryFile, ScanOptions},
     git_snapshot::{
         build_config_fingerprint, canonical_repo_root, dirty_tracked_paths, head_tracked_entries,
-        read_git_blob, resolve_git_head,
+        resolve_git_head, GitBlobReader,
     },
     index_engine::{
         config::{EngineConfig, PostingTokenizerConfig},
@@ -56,7 +56,7 @@ use self::{
     input::{
         base_snapshot_input_files_from_repository_files, build_head_snapshot_input_files,
         prepare_base_document, should_parallel_prepare_base_documents, BaseSnapshotFileFingerprint,
-        BaseSnapshotInputFile, PreparedBaseDocument,
+        BaseSnapshotFileSource, BaseSnapshotInputFile, PreparedBaseDocument,
     },
     metadata::{
         parse_snapshot_revision, parse_tokenizer_mode, write_marker_for_root,

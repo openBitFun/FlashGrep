@@ -323,6 +323,11 @@ fn build_base_snapshot_segment(
     let mut prepared_documents = 0usize;
     let mut posting_terms = 0usize;
     let mut source_bytes = 0u64;
+    let git_blob_reader = files
+        .iter()
+        .any(|file| matches!(file.source, BaseSnapshotFileSource::GitHeadBlob { .. }))
+        .then(|| GitBlobReader::new(repo_root))
+        .transpose()?;
 
     let prepare_chunk_docs = base_snapshot_prepare_chunk_docs();
     for chunk in files.chunks(prepare_chunk_docs) {
@@ -334,8 +339,13 @@ fn build_base_snapshot_segment(
             chunk
                 .par_iter()
                 .map(|file| {
-                    let prepared =
-                        prepare_base_document(repo_id, repo_root, file, &builder.tokenizer);
+                    let prepared = prepare_base_document(
+                        repo_id,
+                        repo_root,
+                        file,
+                        &builder.tokenizer,
+                        git_blob_reader.as_ref(),
+                    );
                     let processed = processed_files
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         .saturating_add(1);
@@ -352,8 +362,13 @@ fn build_base_snapshot_segment(
             chunk
                 .iter()
                 .map(|file| {
-                    let prepared =
-                        prepare_base_document(repo_id, repo_root, file, &builder.tokenizer);
+                    let prepared = prepare_base_document(
+                        repo_id,
+                        repo_root,
+                        file,
+                        &builder.tokenizer,
+                        git_blob_reader.as_ref(),
+                    );
                     let processed = processed_files
                         .fetch_add(1, std::sync::atomic::Ordering::Relaxed)
                         .saturating_add(1);

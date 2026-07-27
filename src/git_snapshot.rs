@@ -215,23 +215,6 @@ pub(crate) fn dirty_tracked_paths(
     Ok(paths)
 }
 
-pub(crate) fn read_git_blob(
-    repo_root: &Path,
-    head_commit: &str,
-    logical_path: &str,
-    should_cancel: &mut impl FnMut() -> bool,
-) -> Result<Vec<u8>> {
-    let spec = format!("{head_commit}:{logical_path}");
-    let output = run_git_command(repo_root, ["cat-file", "blob", &spec], should_cancel)?;
-    if !output.status.success() {
-        return Err(AppError::InvalidIndex(format!(
-            "failed to read git blob {spec} from {}",
-            repo_root.display()
-        )));
-    }
-    Ok(output.stdout)
-}
-
 impl GitBlobReader {
     pub(crate) fn new(repo_root: &Path) -> Result<Self> {
         Ok(Self {

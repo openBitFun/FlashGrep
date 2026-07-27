@@ -150,8 +150,11 @@ pub(super) fn prepare_base_document(
     repo_root: &Path,
     file: &BaseSnapshotInputFile,
     tokenizer: &PostingTokenizerConfig,
+    git_blob_reader: Option<&GitBlobReader>,
 ) -> Result<Option<PreparedBaseDocument>> {
-    let Some(document) = repository_file_to_index_document(repo_id, repo_root, file)? else {
+    let Some(document) =
+        repository_file_to_index_document(repo_id, repo_root, file, git_blob_reader)?
+    else {
         return Ok(None);
     };
     let text = String::from_utf8_lossy(&document.source_bytes);
@@ -175,32 +178,20 @@ pub(super) fn should_parallel_prepare_base_documents(files: &[BaseSnapshotInputF
             >= BASE_SNAPSHOT_PREPARE_PARALLEL_BYTE_THRESHOLD
 }
 
-fn read_base_snapshot_file_source_bytes(file: &BaseSnapshotInputFile) -> Result<Vec<u8>> {
+fn read_base_snapshot_file_source_bytes(
+    file: &BaseSnapshotInputFile,
+    git_blob_reader: Option<&GitBlobReader>,
+) -> Result<Vec<u8>> {
     match &file.source {
         BaseSnapshotFileSource::Worktree => Ok(fs::read(&file.path)?),
-        BaseSnapshotFileSource::GitHeadBlob { head_commit } => {
-            let mut should_cancel = || false;
-            read_git_blob(
-                &infer_repo_root_from_logical_path(file),
-                head_commit,
-                &file.logical_path,
-                &mut should_cancel,
-            )
-        }
+        BaseSnapshotFileSource::GitHeadBlob { head_commit } => git_blob_reader
+            .ok_or_else(|| {
+                AppError::InvalidIndex(
+                    "Git-backed base input is missing its shard-local batch reader".into(),
+                )
+            })?
+            .read_blob(head_commit, &file.logical_path),
     }
-}
-
-fn infer_repo_root_from_logical_path(file: &BaseSnapshotInputFile) -> PathBuf {
-    let component_count = std::path::Path::new(&file.logical_path)
-        .components()
-        .count();
-    let mut root = file.path.clone();
-    for _ in 0..component_count {
-        if let Some(parent) = root.parent() {
-            root = parent.to_path_buf();
-        }
-    }
-    root
 }
 
 fn path_has_hidden_components(path: &Path, root: &Path) -> bool {
@@ -215,13 +206,15 @@ fn repository_file_to_index_document(
     repo_id: &RepoId,
     _repo_root: &Path,
     file: &BaseSnapshotInputFile,
+    git_blob_reader: Option<&GitBlobReader>,
 ) -> Result<Option<IndexDocument>> {
     let logical_path = file.logical_path.clone();
     let key = DocKey {
         repo_id: repo_id.clone(),
         logical_path: logical_path.clone(),
     };
-    let source_bytes = Arc::<[u8]>::from(read_base_snapshot_file_source_bytes(file)?);
+    let source_bytes =
+        Arc::<[u8]>::from(read_base_snapshot_file_source_bytes(file, git_blob_reader)?);
     if has_binary_source_bytes(&source_bytes) {
         return Ok(None);
     }

@@ -169,6 +169,16 @@ wall time fell from 71.75 s to 64.75 s (9.8%), with 444,146 documents and 2,674,
 all 14 query counts stayed exact. A same-H0 explicit rebuild completed in 9.18 s, reused all 16
 shards, and emitted no `stage=build_segment` event; the input enumeration stage was 4.08 s.
 
+A separate dirty-worktree A/B isolated the remaining process-per-file Git blob cost. The test
+modified 10,000 tracked `.cc` files while constructing the H0 base from HEAD. On the same
+clean-metadata revision, the old source reader took 115.99 s and the shard-local persistent
+`git cat-file --batch` reader took 69.29 s, a 40.3% reduction; both produced 444,146 documents.
+Storage changed from 2,857,204 KiB to 2,858,476 KiB (+0.04%). The batch process is now created only
+for shards that contain dirty `GitHeadBlob` inputs, so the accepted 64.75 s clean-worktree path is
+unchanged. After opening the resulting 10,000-file overlay, all 14 recorded query counts matched
+`rg --no-ignore`, as did a dedicated dirty marker query at 10,000 lines. The superseded
+process-per-file reader was removed rather than retained as a compatibility branch.
+
 ## Branch Delta Results
 
 The detached Chromium branch matrix used cumulative 1,000-file commits. H1 (1,000 files) and H2

@@ -20,7 +20,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 2 incremental refresh | Complete | Watcher-driven no-change and event delta paths are proportional to changed paths. |
 | Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
-| Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while Git-batch source reads, bucket parallelism, and 192 MiB posting residency were rejected. |
+| Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while all-file Git-batch reads, bucket parallelism, and 192 MiB posting residency were rejected. |
 | Phase 6 branch delta | Partial (background compaction accepted) | Chromium H1/H2 transitions, scoped post-transition overlay rebuild, and silent delta compaction are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
 | Final gate | Blocked by known failures | Chromium query results are exact, but six watcher/event timing tests failed in the latest serial full Rust gate; the count has fluctuated between five and six across runs. |
 
@@ -455,6 +455,17 @@ fell from 71.75 s to 64.75 s (9.8%) with the same 444,146 documents and 2,674,95
 all 14 query counts remained exact. A same-H0 explicit rebuild then completed in 9.18 s with no
 `build_segment` event; its input enumeration measured 4.08 s and it reused all 16 shard segments.
 This is a status-proven path omission, not a worker-count or storage-specific tuning.
+
+The dirty-input follow-up keeps that clean path unchanged and creates one persistent
+`git cat-file --batch` reader only for a shard containing `GitHeadBlob` inputs. It replaces the
+previous process-per-dirty-file reads instead of retaining them as a fallback. On a detached
+Chromium H0 worktree with 10,000 modified `.cc` files, the clean-metadata baseline built the same
+444,146-document HEAD snapshot in 115.99 s; the shard-local batch path took 69.29 s, a 40.3%
+reduction. Index storage was effectively unchanged (2,857,204 KiB versus 2,858,476 KiB, +0.04%).
+After the 10,000-file overlay was opened, all 14 recorded query counts and a 10,000-line dirty
+marker query matched `rg --no-ignore` exactly. The trigger depends only on source kind, not CPU,
+memory, shard count, or storage topology, while clean regular files still use parallel worktree
+reads because the all-file Git-batch experiment regressed.
 
 ### Chromium Gate
 
