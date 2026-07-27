@@ -21,7 +21,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
 | Phase 5 base builder | Partial (core path accepted) | Git-object sources and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while bucket parallelism and 192 MiB posting residency were measured and rejected. |
-| Phase 6 branch delta | Partial | Chromium H1/H2 transitions and a scoped post-transition overlay rebuild are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
+| Phase 6 branch delta | Partial (background compaction accepted) | Chromium H1/H2 transitions, scoped post-transition overlay rebuild, and silent delta compaction are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
 | Final gate | Blocked by known failures | Chromium query results are exact, but five watcher/rebuild timing tests still fail in the serial full Rust gate. |
 
 ## Next Execution Queue
@@ -40,6 +40,21 @@ This document is the execution and acceptance contract for improving full base c
 workspace overlay refresh, daemon restart recovery, and branch-delta construction. Every
 performance change must be measured on `chromium-src` immediately after it lands; a final benchmark
 alone is not sufficient.
+
+### Build And Rebuild Semantics
+
+There is one initial-build decision, not two competing automatic rebuild algorithms. `ensure`/`build`
+creates a base only when no compatible searchable snapshot exists; an existing compatible base is
+reused, and a different Git HEAD advances through the bounded base-delta path. The explicit
+`rebuild` operation is a user-requested repair or force-refresh boundary and may reconstruct the
+foundation synchronously. It is not used for ordinary branch changes or dirty-file thresholds.
+
+Routine maintenance is background-only: once delta segment count, delete segment count, or the
+delta/foundation byte ratio crosses its configured bound, the daemon schedules `CompactBaseDeltas`
+with the repository kept in a searchable ready phase. Candidate merge artifacts are built off to
+the side, the active manifest remains the query source, and a successful CAS publishes the compacted
+manifest without waiting for active searches. Startup also schedules this maintenance when a
+persisted compatible base is already over the bound.
 
 Once a new primary path is accepted, it replaces the previous slow path. The implementation must
 not retain the old implementation as a compatibility branch or accumulate speculative fallback

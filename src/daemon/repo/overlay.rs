@@ -124,10 +124,7 @@ impl RepoRuntime {
         };
         let dirty_path_count = plan.dirty_path_count();
         let build_path_count = plan.build_path_count();
-        if let Err(error) = self.mark_dirty_catalog_building(&build_paths, catalog_generation) {
-            self.handle_workspace_overlay_engine_error("mark dirty catalog building", &error);
-            return;
-        }
+        self.mark_dirty_catalog_building(&build_paths, catalog_generation);
         if let Err(error) = self.try_apply_overlay_write_plan(plan, manifest_source) {
             let _ = self.mark_dirty_catalog_failed(&build_paths, catalog_generation);
             self.handle_workspace_overlay_engine_error("apply plan", &error);

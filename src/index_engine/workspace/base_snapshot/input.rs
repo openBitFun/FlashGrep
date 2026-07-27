@@ -76,7 +76,7 @@ pub(super) fn build_head_snapshot_input_files(
 
         let worktree_metadata = fs::metadata(&path).ok();
         if entry.mode == "120000" {
-            let Some(metadata) = worktree_metadata.filter(|metadata| metadata.is_file()) else {
+            let Some(metadata) = worktree_metadata.filter(std::fs::Metadata::is_file) else {
                 continue;
             };
             files.push(BaseSnapshotInputFile {

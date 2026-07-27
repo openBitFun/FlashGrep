@@ -170,13 +170,39 @@ The same query marker returned exactly 1,000 matching lines from flashgrep and `
 roughly 90% of the measured post-transition scan time without changing shard assignment or worker
 defaults; it is therefore a path-count-based optimization rather than a machine-topology tuning.
 
+## Background Compaction Results
+
+The Chromium H9 -> H10 run used a one-delta test threshold to make background maintenance visible.
+The first implementation exposed a real correctness failure: repeated compaction candidate IDs
+embedded the complete parent ID, eventually exceeding the filesystem filename limit. Candidate IDs
+are now bounded by generation plus a monotonic nonce.
+
+After restarting the daemon on the same H10 storage, startup detected the over-limit compatible
+base and scheduled compaction automatically. It merged 29.66 MB of live delta input in 756 ms,
+left `ReadyClean` searchable, reduced `base_delta_depth` from 2 to 1, and cleared
+`base_compaction_recommended`. H10 marker results remained exact at 1,000 lines.
+
+The larger H12 transition changed 10,000 files. Base delta construction took 4.01 s and the
+catalog-based overlay finish took 968 ms. During the resulting 2.84 s background compaction window,
+five of twenty process-cold search requests observed `active_task_id=auto:compact:*` while the repo
+phase stayed `ready_clean`; every request returned exactly 10,000 H12 marker lines. Final flashgrep
+and `rg` counts were both 10,000, and the manifest ended at depth 1 with no recommendation pending.
+Compaction logs now report merge input/output bytes, segment counts, and elapsed time.
+
 ## Open Work
+
+The maintenance contract is explicit: `ensure` reuses a compatible base, HEAD changes use base
+deltas, and only the user-requested rebuild reconstructs a foundation. Delta compaction is
+background work that keeps the active manifest searchable while candidate merges are written and
+atomically activated. Compaction now reports merge input/output bytes and elapsed time, and opening
+a repository with an already-over-limit compatible base schedules the same background task.
 
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
 run had six watcher timing/recovery failures under concurrent daemon load; the base-focused tests,
 Chromium query corpus, and individual rebuild test passed. These failures remain a watcher-race
-follow-up rather than being claimed as a clean gate. A serial rerun reduced this to 225 passed, 5
-failed, 1 ignored; the remaining failures are the same watcher event/rebuild timing cases.
+follow-up rather than being claimed as a clean gate. The latest serial rerun completed with 226
+passed, 5 failed, and 1 ignored; the remaining failures are the same watcher event/rebuild timing
+cases, while branch transition, lifecycle, and background compaction coverage passed.
 
 The authoritative execution order is maintained in
 `docs/index_build_and_overlay_recovery_optimization_plan.md`. The remaining work is:

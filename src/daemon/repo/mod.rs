@@ -254,7 +254,11 @@ impl RepoManager {
             if runtime.observe_git_head_transition()? {
                 runtime.schedule_workspace_probe(std::time::Duration::from_millis(0));
             }
-            return Ok(runtime.status_snapshot());
+            let status = runtime.status_snapshot();
+            if status.base_compaction_recommended {
+                runtime.schedule_base_compaction();
+            }
+            return Ok(status);
         }
         if let Some(runtime) = stale_runtime {
             runtime.shutdown();
@@ -287,7 +291,11 @@ impl RepoManager {
             }
         }
         runtime.schedule_workspace_probe(runtime.workspace_probe_interval());
-        Ok(runtime.status_snapshot())
+        let status = runtime.status_snapshot();
+        if status.base_compaction_recommended {
+            runtime.schedule_base_compaction();
+        }
+        Ok(status)
     }
 
     pub fn get_status(&self, repo_id: &str) -> Result<RepoStatus> {

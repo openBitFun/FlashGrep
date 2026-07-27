@@ -404,11 +404,7 @@ impl RepoRuntime {
         catalog.persist(&path)
     }
 
-    pub(super) fn mark_dirty_catalog_building(
-        &self,
-        paths: &DirtyPathSet,
-        generation: u64,
-    ) -> Result<()> {
+    pub(super) fn mark_dirty_catalog_building(&self, paths: &DirtyPathSet, generation: u64) {
         let mut catalog = match self.dirty_catalog.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -417,7 +413,6 @@ impl RepoRuntime {
         // The previous durable catalog remains the recovery baseline. Keeping the building
         // transition in memory avoids a full-catalog write on every success; startup Git
         // reconciliation rediscovers any newer worktree state after a crash.
-        Ok(())
     }
 
     pub(super) fn mark_dirty_catalog_ready(

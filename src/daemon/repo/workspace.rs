@@ -496,9 +496,8 @@ impl RepoRuntime {
         if paths.is_empty() {
             return Ok(HashMap::new());
         }
-        let worker_count = std::thread::available_parallelism()
-            .map(|parallelism| parallelism.get().min(8))
-            .unwrap_or(1);
+        let worker_count =
+            std::thread::available_parallelism().map_or(1, |parallelism| parallelism.get().min(8));
         let started_at = Instant::now();
         let pool = rayon::ThreadPoolBuilder::new()
             .num_threads(worker_count)

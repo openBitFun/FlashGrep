@@ -367,19 +367,20 @@ impl RepoRuntime {
 
         match result.and_then(|indexed_docs| {
             self.finish_task_success(task.kind, indexed_docs, &mut progress)
+                .map(|message| (message, indexed_docs))
         }) {
-            Ok(message) => {
+            Ok((message, completed_units)) => {
                 task.finish_completed(message);
-                self.finish_task_execution(&task, None);
+                self.finish_task_execution(&task, Some(completed_units), None);
             }
             Err(AppError::Cancelled) => {
                 task.finish_cancelled("operation cancelled".into());
-                self.finish_task_execution(&task, None);
+                self.finish_task_execution(&task, None, None);
             }
             Err(error) => {
                 let message = error.to_string();
                 task.finish_failed(message.clone());
-                self.finish_task_execution(&task, Some(Some(message)));
+                self.finish_task_execution(&task, None, Some(Some(message)));
             }
         }
     }
@@ -423,7 +424,12 @@ impl RepoRuntime {
         Ok(message)
     }
 
-    fn finish_task_execution(&self, task: &RepoTaskRecord, last_error: Option<Option<String>>) {
+    fn finish_task_execution(
+        &self,
+        task: &RepoTaskRecord,
+        completed_units: Option<usize>,
+        last_error: Option<Option<String>>,
+    ) {
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -466,6 +472,11 @@ impl RepoRuntime {
             } else if self.status_snapshot().base_compaction_recommended {
                 self.schedule_base_compaction();
             }
+        } else if task.kind == RepoTaskKind::CompactBaseDeltas
+            && completed_units.is_some_and(|units| units > 0)
+            && self.status_snapshot().base_compaction_recommended
+        {
+            self.schedule_base_compaction();
         }
     }
 
