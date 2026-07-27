@@ -34,13 +34,15 @@ impl WorkspaceEventBuffer {
 
 impl RepoRuntime {
     pub(super) fn start_workspace_watcher(self: &Arc<Self>) {
+        let (ready_tx, ready_rx) = mpsc::sync_channel(0);
         let runtime = Arc::clone(self);
-        let handle = thread::spawn(move || runtime.run_workspace_watcher());
+        let handle = thread::spawn(move || runtime.run_workspace_watcher(ready_tx));
         let mut slot = match self.watcher_handle.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
         *slot = Some(handle);
+        let _ = ready_rx.recv_timeout(Duration::from_secs(1));
     }
 
     pub(super) fn workspace_watcher_active(&self) -> bool {
@@ -64,7 +66,7 @@ impl RepoRuntime {
         std::mem::take(&mut *buffer)
     }
 
-    fn run_workspace_watcher(self: Arc<Self>) {
+    fn run_workspace_watcher(self: Arc<Self>, ready: mpsc::SyncSender<()>) {
         let (tx, rx) = mpsc::channel();
         let repo_path = self.build_config.repo_path.clone();
         if let Some(reason) = linux_workspace_watcher_skip_reason(&repo_path) {
@@ -74,6 +76,7 @@ impl RepoRuntime {
             );
             self.workspace_watcher_active
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = ready.send(());
             return;
         }
         let mut watcher = match notify::recommended_watcher(move |result| {
@@ -87,6 +90,7 @@ impl RepoRuntime {
                 );
                 self.workspace_watcher_active
                     .store(false, std::sync::atomic::Ordering::Relaxed);
+                let _ = ready.send(());
                 return;
             }
         };
@@ -97,10 +101,12 @@ impl RepoRuntime {
             );
             self.workspace_watcher_active
                 .store(false, std::sync::atomic::Ordering::Relaxed);
+            let _ = ready.send(());
             return;
         }
         self.workspace_watcher_active
             .store(true, std::sync::atomic::Ordering::Relaxed);
+        let _ = ready.send(());
         eprintln!(
             "flashgrep[watch][info] workspace watcher active for {}",
             repo_path.display()
@@ -175,7 +181,6 @@ impl RepoRuntime {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        let changed = !buffer.observed;
         buffer.observed = true;
         if full_probe_required {
             buffer.full_probe_required = true;
@@ -191,9 +196,6 @@ impl RepoRuntime {
             }
         }
         drop(buffer);
-        if !changed {
-            return;
-        }
         self.workspace_probe_pending
             .store(true, std::sync::atomic::Ordering::Relaxed);
         self.invalidate_glob_cache();
