@@ -22,7 +22,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
 | Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while Git-batch source reads, bucket parallelism, and 192 MiB posting residency were rejected. |
 | Phase 6 branch delta | Partial (background compaction accepted) | Chromium H1/H2 transitions, scoped post-transition overlay rebuild, and silent delta compaction are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
-| Final gate | Blocked by known failures | Chromium query results are exact, but five watcher/rebuild timing tests still fail in the serial full Rust gate. |
+| Final gate | Blocked by known failures | Chromium query results are exact, but six watcher/event timing tests failed in the latest serial full Rust gate; the count has fluctuated between five and six across runs. |
 
 ## Next Execution Queue
 

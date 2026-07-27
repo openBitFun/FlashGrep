@@ -215,9 +215,10 @@ a repository with an already-over-limit compatible base schedules the same backg
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
 run had six watcher timing/recovery failures under concurrent daemon load; the base-focused tests,
 Chromium query corpus, and individual rebuild test passed. These failures remain a watcher-race
-follow-up rather than being claimed as a clean gate. The latest serial rerun completed with 226
-passed, 5 failed, and 1 ignored; the remaining failures are the same watcher event/rebuild timing
-cases, while branch transition, lifecycle, and background compaction coverage passed.
+follow-up rather than being claimed as a clean gate. The latest serial rerun after clean-input
+metadata elision completed with 225 passed, 6 failed, and 1 ignored; an earlier rerun completed
+226/5/1. The remaining failures are the same watcher event/rebuild timing cases, while base input,
+branch transition, lifecycle, and background compaction coverage passed.
 
 The authoritative execution order is maintained in
 `docs/index_build_and_overlay_recovery_optimization_plan.md`. The remaining work is:
