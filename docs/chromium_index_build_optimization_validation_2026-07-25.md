@@ -162,6 +162,13 @@ storage was effectively unchanged (2,674,324 KiB versus 2,676,004 KiB). The expe
 and removed: object IDs remain fingerprints, but clean source bytes stay on the parallel filesystem
 path because Git-pack reads are not a generally faster source across storage layouts or machines.
 
+The accepted metadata-elision follow-up retained the parallel filesystem source for clean regular
+files, but stopped calling `fs::metadata` for each path after Git status had proved it clean. Dirty
+regular paths still use HEAD blobs and symlinks still use worktree metadata. On the same Chromium H0,
+wall time fell from 71.75 s to 64.75 s (9.8%), with 444,146 documents and 2,674,956 KiB of index;
+all 14 query counts stayed exact. A same-H0 explicit rebuild completed in 9.18 s, reused all 16
+shards, and emitted no `stage=build_segment` event; the input enumeration stage was 4.08 s.
+
 ## Branch Delta Results
 
 The detached Chromium branch matrix used cumulative 1,000-file commits. H1 (1,000 files) and H2

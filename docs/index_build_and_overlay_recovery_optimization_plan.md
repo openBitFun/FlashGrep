@@ -20,7 +20,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 2 incremental refresh | Complete | Watcher-driven no-change and event delta paths are proportional to changed paths. |
 | Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
-| Phase 5 base builder | Partial (core path accepted) | Git-object sources and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while bucket parallelism and 192 MiB posting residency were measured and rejected. |
+| Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while Git-batch source reads, bucket parallelism, and 192 MiB posting residency were rejected. |
 | Phase 6 branch delta | Partial (background compaction accepted) | Chromium H1/H2 transitions, scoped post-transition overlay rebuild, and silent delta compaction are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
 | Final gate | Blocked by known failures | Chromium query results are exact, but five watcher/rebuild timing tests still fail in the serial full Rust gate. |
 
@@ -447,6 +447,14 @@ build regressed from 71.75 s to 87.06 s (21.3%). Both runs produced 444,146 docu
 identical index bytes. Git object identity remains the stable fingerprint and dirty-file source,
 while clean regular files continue to use parallel worktree reads. The experimental path was removed
 rather than retained as a machine-dependent branch.
+
+The accepted follow-up keeps parallel worktree reads but trusts `git status` for clean regular paths:
+it uses the Git tree size/object fingerprint without a second `fs::metadata` call. Dirty regular
+paths still use the HEAD blob source and symlinks still validate their worktree target. Chromium H0
+fell from 71.75 s to 64.75 s (9.8%) with the same 444,146 documents and 2,674,956 KiB index size;
+all 14 query counts remained exact. A same-H0 explicit rebuild then completed in 9.18 s with no
+`build_segment` event; its input enumeration measured 4.08 s and it reused all 16 shard segments.
+This is a status-proven path omission, not a worker-count or storage-specific tuning.
 
 ### Chromium Gate
 

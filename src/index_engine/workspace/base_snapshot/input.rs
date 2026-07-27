@@ -74,8 +74,8 @@ pub(super) fn build_head_snapshot_input_files(
             continue;
         }
 
-        let worktree_metadata = fs::metadata(&path).ok();
         if entry.mode == "120000" {
+            let worktree_metadata = fs::metadata(&path).ok();
             let Some(metadata) = worktree_metadata.filter(std::fs::Metadata::is_file) else {
                 continue;
             };
@@ -101,25 +101,16 @@ pub(super) fn build_head_snapshot_input_files(
             });
             continue;
         }
-        let use_worktree = !dirty_paths.contains(&entry.logical_path)
-            && worktree_metadata
-                .as_ref()
-                .is_some_and(|metadata| metadata.is_file() && metadata.len() == entry.size);
-        if let Some(metadata) = worktree_metadata.filter(|_| use_worktree) {
+        if !dirty_paths.contains(&entry.logical_path) {
             files.push(BaseSnapshotInputFile {
                 path,
                 logical_path: entry.logical_path,
-                size: metadata.len(),
-                mtime_nanos: metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
-                    .unwrap_or_default(),
+                size: entry.size,
+                mtime_nanos: 0,
                 source: BaseSnapshotFileSource::Worktree,
                 fingerprint: BaseSnapshotFileFingerprint::GitObject {
                     object_id: entry.object_id,
-                    size: metadata.len(),
+                    size: entry.size,
                 },
             });
         } else {
