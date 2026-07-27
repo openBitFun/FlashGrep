@@ -154,6 +154,14 @@ Raising the in-memory posting threshold from 128 MiB to 192 MiB was rejected. Wi
 same H0 build regressed from 63.84 s to 71.32 s, and per-shard finish times rose to 9-11 s. The
 existing 128 MiB threshold remains the measured performance point.
 
+A later input-source A/B tested removing regular-file worktree metadata probes and reading all
+regular HEAD content through persistent `git cat-file --batch` processes. With 16 shards and
+`FLASHGREP_BASE_SNAPSHOT_LOW_MEMORY=0`, the existing worktree-read path completed Chromium H0 in
+71.75 s; the Git-batch path took 87.06 s, a 21.3% regression. Both indexed 444,146 documents, and
+storage was effectively unchanged (2,674,324 KiB versus 2,676,004 KiB). The experiment was rejected
+and removed: object IDs remain fingerprints, but clean source bytes stay on the parallel filesystem
+path because Git-pack reads are not a generally faster source across storage layouts or machines.
+
 ## Branch Delta Results
 
 The detached Chromium branch matrix used cumulative 1,000-file commits. H1 (1,000 files) and H2

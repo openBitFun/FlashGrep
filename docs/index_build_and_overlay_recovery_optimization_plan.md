@@ -440,6 +440,14 @@ from 63.84 s at 128 MiB, with finish stages increasing to roughly 9-11 s. The gl
 therefore retains 128 MiB as the performance point and should focus on bounding aggregate memory,
 not increasing per-shard residency.
 
+Using Git objects as the source bytes for every regular file was also measured and rejected. A
+persistent `git cat-file --batch` reader removed roughly seven seconds of status/metadata
+enumeration work, but Git pack reads serialized source preparation enough that the same Chromium H0
+build regressed from 71.75 s to 87.06 s (21.3%). Both runs produced 444,146 documents and nearly
+identical index bytes. Git object identity remains the stable fingerprint and dirty-file source,
+while clean regular files continue to use parallel worktree reads. The experimental path was removed
+rather than retained as a machine-dependent branch.
+
 ### Chromium Gate
 
 Run empty-storage H0 build and same-H0 explicit rebuild. Acceptance:
