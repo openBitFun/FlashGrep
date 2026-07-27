@@ -215,6 +215,9 @@ impl RepoRuntime {
         if path.starts_with(&self.build_config.storage_root) || is_workspace_internal_path(&path) {
             return None;
         }
+        if is_git_index_noise_path(&path, &self.build_config.repo_path) {
+            return None;
+        }
         Some(path)
     }
 
@@ -237,6 +240,13 @@ impl RepoRuntime {
         }
         false
     }
+}
+
+fn is_git_index_noise_path(path: &Path, repo_root: &Path) -> bool {
+    let Some(relative) = path.strip_prefix(repo_root).ok() else {
+        return false;
+    };
+    relative == Path::new(".git/index") || relative == Path::new(".git/index.lock")
 }
 
 #[cfg(target_os = "linux")]
@@ -305,6 +315,29 @@ fn push_child_directories(stack: &mut Vec<PathBuf>, path: &Path) {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
+
+    #[test]
+    fn git_index_probe_artifacts_are_ignored_without_hiding_worktree_paths() {
+        let repo = Path::new("/tmp/repo");
+        assert!(super::is_git_index_noise_path(
+            &repo.join(".git/index"),
+            repo
+        ));
+        assert!(super::is_git_index_noise_path(
+            &repo.join(".git/index.lock"),
+            repo
+        ));
+        assert!(!super::is_git_index_noise_path(
+            &repo.join(".git/HEAD"),
+            repo
+        ));
+        assert!(!super::is_git_index_noise_path(
+            &repo.join("src/lib.rs"),
+            repo
+        ));
+    }
+
     #[cfg(target_os = "linux")]
     #[test]
     fn count_directories_stops_at_limit() {

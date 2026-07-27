@@ -22,19 +22,23 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
 | Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while all-file Git-batch reads, 2,048-document prepare chunks, bucket parallelism, and 192 MiB posting residency were rejected. |
 | Phase 6 branch delta | Partial (catalog lookup and background compaction accepted) | Chromium H1/H2 transitions, catalog-based old-path classification, scoped post-transition overlay rebuild, and silent delta compaction are measured; multi-request Git batching, the base bulk writer, and Git-backed delta sources were rejected, while the complete cache-switch matrix and kill-boundary coverage remain. |
-| Final gate | Blocked by known failures | Chromium query results are exact, but six watcher/event timing tests failed in the latest serial full Rust gate; the count has fluctuated between five and six across runs. |
+| Final gate | Complete | The serial Rust gate is green at 232 passed, 0 failed, 1 ignored; clippy, formatting, and diff checks also pass. Chromium clean and one-file watcher overlay checks remain exact. |
 
 ## Next Execution Queue
 
-1. Resolve the six reproducible watcher/overlay-rebuild timing failures and restore a green serial
-   Rust gate.
-2. Run the Phase 3 publication-boundary kill/restart matrix and fix any mixed manifest/catalog
+1. Run the Phase 3 publication-boundary kill/restart matrix and fix any mixed manifest/catalog
    recovery behavior.
-3. Run the Phase 6 Chromium H0 -> H1 -> H2 -> H0 branch matrix, including tokenized-object counts,
+2. Run the Phase 6 Chromium H0 -> H1 -> H2 -> H0 branch matrix, including tokenized-object counts,
    synchronization wall time, CPU/RSS, index bytes, and queries during/after transition.
-4. Implement the Phase 4 streaming overlay writer and aggregate memory budget only if the branch
+3. Implement the Phase 4 streaming overlay writer and aggregate memory budget only if the branch
    and O4 profiles still show material writer or peak-RSS cost.
-5. Run the complete automated gate and publish the final consolidated validation result.
+4. Keep the complete gate and Chromium matrix current as each remaining phase lands.
+
+The watcher gate was closed on 2026-07-27. Git's own `.git/index` and `.git/index.lock` writes
+during Git probes are now excluded from the candidate event buffer, so they cannot force an
+unrelated full probe. The sequence tests also wait for the asynchronous status publication after
+the indexed view changes, eliminating a test-only intermediate-state race without changing the
+production event-driven path.
 
 This document is the execution and acceptance contract for improving full base construction,
 workspace overlay refresh, daemon restart recovery, and branch-delta construction. Every

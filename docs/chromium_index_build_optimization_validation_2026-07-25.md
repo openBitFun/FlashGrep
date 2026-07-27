@@ -264,20 +264,25 @@ background work that keeps the active manifest searchable while candidate merges
 atomically activated. Compaction now reports merge input/output bytes and elapsed time, and opening
 a repository with an already-over-limit compatible base schedules the same background task.
 
-The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
-run had six watcher timing/recovery failures under concurrent daemon load; the base-focused tests,
-Chromium query corpus, and individual rebuild test passed. These failures remain a watcher-race
-follow-up rather than being claimed as a clean gate. The latest serial rerun after catalog-based
-old-side branch classification completed with 225 passed, 6 failed, and 1 ignored; an earlier
-rerun completed 226/5/1. The remaining failures are the same watcher event/rebuild timing cases,
-while base input, branch transition, lifecycle, and background compaction coverage passed.
+The final serial Rust gate on 2026-07-27 completed with 232 passed, 0 failed, and 1 ignored.
+`cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and
+`git diff --check` also passed. The six watcher failures from the preceding run were traced to Git
+index-file notification noise plus assertions racing asynchronous status publication. Filtering
+only `.git/index` and `.git/index.lock` events fixed the production probe selection; the tests now
+wait for the expected dirty stats after the indexed result is visible. All 13 watcher sequence
+tests pass.
+
+The release binary was then exercised against `/Users/user/workspace/chromium-src` at HEAD
+`606acc70f6320a025c719d7eee8a4583c9205252` with an isolated daemon and storage root. Clean indexed
+queries returned exact counts for the compared scopes (`ScopedAllowBlockingForTesting`: 1,644 and
+whole-word `scoped_refptr`: 66,003 in `*.{cc,h}`; no-match: 0). The unrestricted rare-symbol query
+returned 1,672 lines. A tracked header edit
+was observed as `ReadyDirty`, `modified=1`, and a marker query returned one indexed-workspace match;
+after restoring the file, five consecutive checks returned `ReadyClean`, zero dirty files, and zero
+marker matches. The Chromium checkout retained only its pre-existing `.gitignore` change.
 
 The authoritative execution order is maintained in
-`docs/index_build_and_overlay_recovery_optimization_plan.md`. The remaining work is:
-
-1. fix the five reproducible watcher/overlay-rebuild timing failures;
-2. complete the Phase 3 publication-boundary kill/restart matrix;
-3. complete the Chromium H0 -> H1 -> H2 -> H0 cache-switch and interruption matrix;
-4. implement the overlay streaming writer and aggregate memory budget only if profiling still
-   justifies them;
-5. rerun the complete automated gate and publish the final report.
+`docs/index_build_and_overlay_recovery_optimization_plan.md`. Remaining work is the Phase 3
+publication-boundary kill/restart matrix, the complete Chromium H0 -> H1 -> H2 -> H0 cache-switch
+and interruption matrix, and the Phase 4 streaming/aggregate-memory investigation only if its
+profiles still justify implementation.

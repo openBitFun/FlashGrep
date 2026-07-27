@@ -1058,12 +1058,19 @@ fn run_common_sequence_steps(
             .expected_token
             .or(step.absent_token)
             .unwrap_or(base_token);
-        let mut status = wait_for_scoped_token_count(
+        let _ = wait_for_scoped_token_count(
             service,
             repo_id,
             path,
             probe_token,
             usize::from(step.expected_token == Some(probe_token)),
+        );
+        let mut status = wait_for_dirty_stats(
+            service,
+            repo_id,
+            step.expected_dirty_stats.0,
+            step.expected_dirty_stats.1,
+            step.expected_dirty_stats.2,
         );
         assert_exact_dirty_stats(
             &status,
@@ -1395,7 +1402,8 @@ fn watcher_reconciles_repeated_tracked_file_operation_sequences() {
     assert_exact_dirty_stats(&status, 0, 0, 0);
 
     remove_sequence_file(&tracked);
-    let status = wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_BASE", 0);
+    let _ = wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_TRACKED_BASE", 0);
+    let status = wait_for_dirty_stats(&service, &repo_id, 0, 1, 0);
     assert_exact_dirty_stats(&status, 0, 1, 0);
 
     write_sequence_token(&tracked, "SEQ_TRACKED_DELETE_ADD_1");
@@ -1606,7 +1614,8 @@ fn watcher_reconciles_mixed_directory_operation_sequences() {
     remove_sequence_file(&first);
     write_sequence_token(&second, "SEQ_DIR_SECOND_MOD_1");
     write_sequence_token(&third, "SEQ_DIR_THIRD_NEW_1");
-    let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_FIRST_BASE", 0);
+    let _ = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_FIRST_BASE", 0);
+    let status = wait_for_dirty_stats(&service, &repo_id, 1, 1, 1);
     assert_exact_dirty_stats(&status, 1, 1, 1);
     let status = wait_for_scoped_token_count(&service, &repo_id, &src, "SEQ_DIR_SECOND_MOD_1", 1);
     assert_exact_dirty_stats(&status, 1, 1, 1);
@@ -1661,13 +1670,14 @@ fn watcher_reconciles_tracked_move_and_recreate_sequences() {
     fs::rename(&original, &moved).expect("rename should succeed");
     write_sequence_token(&moved, "SEQ_MOVE_NEW_1");
     let move_roots = vec![original.clone(), moved.clone()];
-    let status = wait_for_scoped_token_count_for_roots(
+    let _ = wait_for_scoped_token_count_for_roots(
         &service,
         &repo_id,
         &move_roots,
         "SEQ_MOVE_ORIGINAL_BASE",
         0,
     );
+    let status = wait_for_dirty_stats(&service, &repo_id, 0, 1, 1);
     assert_exact_dirty_stats(&status, 0, 1, 1);
     let status =
         wait_for_scoped_token_count_for_roots(&service, &repo_id, &move_roots, "SEQ_MOVE_NEW_1", 1);
@@ -1948,8 +1958,8 @@ fn watcher_reconciles_text_binary_text_sequences() {
     });
 
     fs::write(&tracked, b"\0SEQ_BINARY_TRACKED_HIDDEN\n").expect("binary write should succeed");
-    let status =
-        wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_BINARY_TRACKED_BASE", 0);
+    let _ = wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_BINARY_TRACKED_BASE", 0);
+    let status = wait_for_dirty_stats(&service, &repo_id, 0, 1, 0);
     assert_exact_dirty_stats(&status, 0, 1, 0);
     let status =
         wait_for_scoped_token_count(&service, &repo_id, &tracked, "SEQ_BINARY_TRACKED_HIDDEN", 0);
