@@ -217,6 +217,19 @@ transition, old-side classification fell from 537 ms to 1 ms, Git blob reads fel
 120,735,023 delta bytes. All 14 diverse H2 queries matched `rg --no-ignore` exactly, as did the
 combined H1/H2 marker at 10,000 lines.
 
+Two attempts to replace the normal delta segment writer were rejected. On H2 -> H12, reusing the
+foundation bulk writer reduced the new segment from 182,432 KiB to 66,436 KiB, but write time rose
+from 2,737 ms to 3,602 ms and complete base-delta time rose from 3,364 ms to 4,223 ms (+25.5%). The
+bulk implementation was removed.
+
+Keeping the normal posting writer while marking delta documents as `GitHeadBlob` reduced the
+segment further to 64,676 KiB, but did not improve latency: H2 -> H12 took 3,449 ms versus 3,364 ms,
+and H12 -> H11 took 3,406 ms versus 3,381 ms. The latter transition also exposed a contract failure:
+background compaction opens a generic segment store without the active manifest HEAD and therefore
+could not resolve the Git-backed delta source. The daemon remained searchable but reported the
+compaction error. The source-kind experiment was removed rather than expanding compaction and
+recovery behavior for a storage reduction with no measured build-speed benefit.
+
 ## Background Compaction Results
 
 The Chromium H9 -> H10 run used a one-delta test threshold to make background maintenance visible.

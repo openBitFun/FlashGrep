@@ -21,7 +21,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 | Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
 | Phase 5 base builder | Partial (core path accepted) | Git-object fingerprints, clean-input metadata elision, dirty-only Git batch reads, and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while all-file Git-batch reads, 2,048-document prepare chunks, bucket parallelism, and 192 MiB posting residency were rejected. |
-| Phase 6 branch delta | Partial (catalog lookup and background compaction accepted) | Chromium H1/H2 transitions, catalog-based old-path classification, scoped post-transition overlay rebuild, and silent delta compaction are measured; multi-request Git blob batching was rejected, while the complete cache-switch matrix and kill-boundary coverage remain. |
+| Phase 6 branch delta | Partial (catalog lookup and background compaction accepted) | Chromium H1/H2 transitions, catalog-based old-path classification, scoped post-transition overlay rebuild, and silent delta compaction are measured; multi-request Git batching, the base bulk writer, and Git-backed delta sources were rejected, while the complete cache-switch matrix and kill-boundary coverage remain. |
 | Final gate | Blocked by known failures | Chromium query results are exact, but six watcher/event timing tests failed in the latest serial full Rust gate; the count has fluctuated between five and six across runs. |
 
 ## Next Execution Queue
@@ -494,7 +494,8 @@ Candidate changes:
 - accepted: classify old-side indexed paths through the active snapshot catalog instead of rereading old blobs;
 - rejected after Chromium A/B: batch Git old/new blob requests instead of serial request/flush cycles;
 - prepare target-side changed documents in bounded parallel workers;
-- use the bulk segment writer for large deltas;
+- rejected after Chromium A/B: use the base bulk segment writer for large deltas;
+- rejected: store delta sources as `GitHeadBlob` references in the normal segment writer;
 - keep delete-before-add sequence ordering and candidate CAS activation unchanged.
 
 Chromium acceptance:
@@ -522,6 +523,22 @@ catalog lookup; total Git reads fell from 20,000 to 10,000 and the complete base
 from 3,895 ms to 3,252 ms (16.5%). Delta bytes remained exactly 120,735,023. All 14 recorded H2
 query counts and the 10,000-line branch marker matched `rg --no-ignore`. This removes redundant I/O
 without adding worker or memory tuning, so it is portable across repository storage layouts.
+
+Reusing the full-base bulk writer for a 10,000-document branch delta was rejected. On Chromium
+H2 -> H12, the existing writer completed the base delta in 3,364 ms with 2,737 ms in writing; the
+bulk writer took 4,223 ms with 3,602 ms in writing, a 25.5% end-to-end regression. It reduced the
+new segment from 182,432 KiB to 66,436 KiB by storing Git source references, but its posting pipeline
+is tuned for much larger foundation shards and is slower at this delta size. The implementation was
+removed rather than selected by a machine- or size-specific compatibility branch.
+
+A narrower experiment kept the existing posting writer and made its source kind explicit so the
+delta could omit inline source bytes. Storage fell to 64,676 KiB, but H2 -> H12 still regressed from
+3,364 ms to 3,449 ms. A second H12 -> H11 run measured 3,381 ms inline versus 3,406 ms Git-backed,
+again showing no speed gain. More importantly, subsequent background compaction failed because its
+generic segment store has no manifest HEAD context for resolving Git-backed source records. Since
+the requested optimization is build/rebuild speed, expanding compaction semantics for a
+storage-only result would add complexity without satisfying the gate; this experiment was also
+removed completely.
 
 ## Automated Gates After Every Phase
 
