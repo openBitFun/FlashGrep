@@ -360,7 +360,7 @@ impl RepoRuntime {
         Ok(dirty)
     }
 
-    fn classify_paths_against_base_snapshot<I>(&self, paths: I) -> Result<DirtyPathSet>
+    pub(super) fn classify_paths_against_base_snapshot<I>(&self, paths: I) -> Result<DirtyPathSet>
     where
         I: IntoIterator<Item = String>,
     {

@@ -36,6 +36,15 @@ impl DirtyPathSet {
         self.modified.is_empty() && self.deleted.is_empty() && self.new.is_empty()
     }
 
+    pub(super) fn paths(&self) -> Vec<PathBuf> {
+        self.modified
+            .iter()
+            .chain(self.deleted.iter())
+            .chain(self.new.iter())
+            .map(PathBuf::from)
+            .collect()
+    }
+
     pub(super) fn upsert(&mut self, path: String, kind: DirtyPathKind) -> bool {
         let changed = self.remove(&path);
         match kind {
@@ -187,6 +196,44 @@ impl RepoRuntime {
         on_progress: &mut dyn FnMut(IndexProgress),
     ) -> Result<()> {
         self.refresh_workspace_overlay_with_mode(on_progress, OverlayRefreshMode::FullRebuild)
+    }
+
+    pub(super) fn finish_base_transition_overlay(
+        &self,
+        on_progress: &mut dyn FnMut(IndexProgress),
+    ) -> Result<()> {
+        let started = Instant::now();
+        on_progress(IndexProgress::new(
+            IndexProgressPhase::RefreshingOverlay,
+            "Reconciling workspace overlay with the new base",
+            0,
+            Some(2),
+        ));
+        let candidate_paths = self.dirty_catalog_visible_paths().paths();
+        let dirty = self.classify_paths_against_base_snapshot(
+            candidate_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned()),
+        )?;
+        let generation = self.reconcile_dirty_catalog(&dirty)?;
+        let dirty_count = dirty.stats().modified + dirty.stats().deleted + dirty.stats().new;
+        let plan = self
+            .build_overlay_rebuild_plan(dirty)?
+            .with_catalog_generation(generation);
+        self.apply_overlay_write_plan(plan);
+        on_progress(IndexProgress::new(
+            IndexProgressPhase::RefreshingOverlay,
+            format!("Published workspace overlay refresh for {dirty_count} path(s)"),
+            2,
+            Some(2),
+        ));
+        eprintln!(
+            "flashgrep[overlay-metrics][info] stage=finish_base_transition_overlay elapsed_ms={} action=catalog_rebuild candidate_paths={} dirty_paths={}",
+            started.elapsed().as_millis(),
+            candidate_paths.len(),
+            dirty_count,
+        );
+        Ok(())
     }
 
     fn refresh_workspace_overlay_with_mode(

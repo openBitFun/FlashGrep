@@ -4,6 +4,15 @@
 
 Proposed on 2026-07-25 and last reconciled on 2026-07-27.
 
+### Generalization Constraint
+
+An optimization is accepted only when it is expected to improve or preserve behavior across
+different CPU counts, memory sizes, storage speeds, and filesystem cache states. A benchmark
+result tied to this host's worker count is evidence for investigation, not a portable default.
+Stable shard assignment must not follow host topology; runtime scheduling and memory budgets may
+adapt within that fixed assignment. Every Chromium result is therefore labeled as machine-specific
+evidence unless the mechanism is topology-independent or has a cross-machine model.
+
 | Phase | Status | Evidence / remaining work |
 | --- | --- | --- |
 | Phase 0 instrumentation | Partial | Overlay and base stage metrics exist; branch-delta metrics and the complete branch matrix remain. |
@@ -11,8 +20,8 @@ Proposed on 2026-07-25 and last reconciled on 2026-07-27.
 | Phase 2 incremental refresh | Complete | Watcher-driven no-change and event delta paths are proportional to changed paths. |
 | Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
 | Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
-| Phase 5 base builder | Partial (core path accepted) | Git-object sources, 2M spill runs, and ten shards are accepted; aggregate memory bounding remains open, while bucket parallelism and 192 MiB posting residency were measured and rejected. |
-| Phase 6 branch delta | Pending | H0 -> H1 -> H2 -> H0 Chromium matrix and any evidence-driven delta optimization remain. |
+| Phase 5 base builder | Partial (core path accepted) | Git-object sources and 2M spill runs are accepted; stable 16-shard assignment remains portable; aggregate memory bounding remains open, while bucket parallelism and 192 MiB posting residency were measured and rejected. |
+| Phase 6 branch delta | Partial | Chromium H1/H2 transitions and a scoped post-transition overlay rebuild are measured; the complete cache-switch matrix and kill-boundary coverage remain. |
 | Final gate | Blocked by known failures | Chromium query results are exact, but five watcher/rebuild timing tests still fail in the serial full Rust gate. |
 
 ## Next Execution Queue
@@ -376,8 +385,10 @@ Candidate changes, applied only when supported by the profile:
 6. Avoid redundant metadata/content reads when Git object identity already proves a file unchanged.
 7. Reuse prepared buffers and avoid repeated lowercasing, sorting, and allocation where possible.
 
-The stable shard/fingerprint model remains. Chromium measurement selected ten shards; previous
-sixteen-shard manifests remain readable and naturally rebuild into the new assignment.
+The stable shard/fingerprint model remains at 16 shards. The shard-count experiment is treated as
+host-specific evidence only: 10 was fastest on this machine, while 8 and 16 were slower. It is not
+selected as a default because changing assignment based on local worker count would penalize other
+machines and destabilize reuse.
 
 ### Phase 5 Result (2026-07-25, accepted slices)
 
@@ -406,9 +417,8 @@ buckets was also tested and rejected because nested shard/Rayon scheduling did n
 The same-H0 explicit rebuild completed in 13.11 s with all 16 prior shards reused and no
 segment-build event. Its remaining cost was Git input enumeration plus clean overlay probing. A
 fresh H0 matrix then measured 63.84 s at 10 shards, 68.39 s at 8 shards, and 70.83 s at 16 shards
-with the same 2M run setting. Ten shards is now the selected default because it matches the measured
-worker count; old manifests remain readable and naturally rebuild into the new assignment when
-explicitly rebuilt.
+with the same 2M run setting. The 10-shard result is local scheduling evidence, not a portable
+default; the fixed 16-shard assignment remains in production.
 
 A 192 MiB per-shard posting threshold was rejected: the ten-shard H0 build regressed to 71.32 s
 from 63.84 s at 128 MiB, with finish stages increasing to roughly 9-11 s. The global-budget work
@@ -481,7 +491,7 @@ Rollback means reverting the incomplete phase, not retaining both old and new ex
    proves it remains worthwhile.
 5. Complete for accepted slices: optimize Git-object base construction, posting runs, and shard
    scheduling.
-6. Pending: profile and optimize branch delta construction.
+6. Partial: optimize branch delta construction and remove the redundant post-transition full Git scan; finish the cache-switch matrix.
 7. Pending: restore the full automated gate and publish the final validation report with
    correctness checks, resource peaks, and before/after tables.
 

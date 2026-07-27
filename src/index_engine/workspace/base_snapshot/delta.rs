@@ -55,6 +55,7 @@ impl WorkspaceBaseSnapshotIndex {
         head_cache_entries: usize,
         should_cancel: &mut impl FnMut() -> bool,
     ) -> Result<BaseAdvanceResult> {
+        let advance_started = std::time::Instant::now();
         let _build_lock = BaseSnapshotBuildLock::acquire(build_config, should_cancel)?;
         let index_root = Self::index_root(build_config);
         let manifest_store = FileManifestStore::open(&index_root)?;
@@ -119,6 +120,7 @@ impl WorkspaceBaseSnapshotIndex {
             });
         }
 
+        let diff_started = std::time::Instant::now();
         let diff = commit_diff_paths(
             &build_config.repo_path,
             &from_head,
@@ -130,8 +132,10 @@ impl WorkspaceBaseSnapshotIndex {
         let deleted_paths = diff.deleted.len();
         let enumerated_paths = added_paths + modified_paths + deleted_paths;
         let git_blobs_read = added_paths + deleted_paths + modified_paths.saturating_mul(2);
+        let diff_ms = diff_started.elapsed().as_millis();
         let blob_reader = GitBlobReader::new(&build_config.repo_path)?;
 
+        let old_read_started = std::time::Instant::now();
         let mut old_live_paths = Vec::new();
         for path in diff.deleted.iter().chain(diff.modified.iter()) {
             check_cancel(should_cancel)?;
@@ -140,7 +144,9 @@ impl WorkspaceBaseSnapshotIndex {
                 old_live_paths.push(path.clone());
             }
         }
+        let old_read_ms = old_read_started.elapsed().as_millis();
 
+        let new_read_started = std::time::Instant::now();
         let mut documents = Vec::new();
         for path in diff.added.iter().chain(diff.modified.iter()) {
             check_cancel(should_cancel)?;
@@ -149,6 +155,7 @@ impl WorkspaceBaseSnapshotIndex {
                 documents.push(document);
             }
         }
+        let new_read_ms = new_read_started.elapsed().as_millis();
         documents.sort_by(|left, right| left.key.cmp(&right.key));
         let filtered_paths = added_paths
             .saturating_add(modified_paths)
@@ -163,6 +170,7 @@ impl WorkspaceBaseSnapshotIndex {
             FileSegmentStore::open(&index_root, PostingTokenizerConfig::from(build_config))?;
         let delete_store = FileDeleteStore::open(&index_root)?;
 
+        let write_started = std::time::Instant::now();
         let live_segment = write_live_delta(&segment_store, &transition_id, add_seq, documents)?;
         let delete_segment = write_delete_delta(
             &delete_store,
@@ -171,6 +179,7 @@ impl WorkspaceBaseSnapshotIndex {
             delete_seq,
             old_live_paths,
         )?;
+        let write_ms = write_started.elapsed().as_millis();
 
         let mut active_segments = parent.active_segments.clone();
         if let Some(segment) = live_segment.clone() {
@@ -233,6 +242,25 @@ impl WorkspaceBaseSnapshotIndex {
             )));
         }
         Self::record_manifest_in_cache(build_config, &candidate, head_cache_entries)?;
+
+        eprintln!(
+            "[flashgrep][base-delta-metrics] from={} to={} elapsed_ms={} diff_ms={} old_read_ms={} new_read_ms={} write_ms={} paths={} added={} modified={} deleted={} blobs={} tokenized={} deleted_docs={} delta_bytes={}",
+            from_head,
+            target_head,
+            advance_started.elapsed().as_millis(),
+            diff_ms,
+            old_read_ms,
+            new_read_ms,
+            write_ms,
+            enumerated_paths,
+            added_paths,
+            modified_paths,
+            deleted_paths,
+            git_blobs_read,
+            tokenized_documents,
+            deleted_documents,
+            written_delta_bytes,
+        );
 
         Ok(BaseAdvanceResult {
             from_head,

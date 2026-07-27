@@ -135,23 +135,40 @@ indexed 445,491 documents, and the 14-query corpus remained exact.
 An explicit same-H0 rebuild reused every prior stable shard: it completed in 13.11 s with no
 `stage=build_segment` event and retained 445,491 documents. The remaining time was 8.82 s of Git
 status/tree/classification plus 3.17 s of clean overlay probing. The subsequent shard matrix
-selected 10 shards for new builds.
+tested 8/10/16 shard assignments; the production assignment remains 16 because shard count must
+not be selected from one host's worker topology.
 
 The shard-count matrix used the same Chromium H0 and `FLASHGREP_BASE_SNAPSHOT_LOW_MEMORY=0`:
 
 | Shards | H0 build | Documents | Result |
 | ---: | ---: | ---: | --- |
 | 8 | 68.39 s | 445,491 | exact |
-| 10 | 63.84 s | 445,491 | selected |
-| 16 | 70.83 s | 445,491 | prior default |
+| 10 | 63.84 s | 445,491 | fastest on this host only |
+| 16 | 70.83 s | 445,491 | portable default |
 
-Ten shards matches the measured ten-worker scheduling point. The segment format is unchanged; a
-previous 16-shard manifest remains readable, while an explicit rebuild recalculates shard
-fingerprints and produces the ten-shard assignment.
+Ten shards matches this host's measured worker count, but that is not a portable optimization.
+The fixed 16-shard assignment remains so indexes can be reused across machines; runtime worker
+scheduling and memory controls are the portable tuning points.
 
 Raising the in-memory posting threshold from 128 MiB to 192 MiB was rejected. With ten shards the
 same H0 build regressed from 63.84 s to 71.32 s, and per-shard finish times rose to 9-11 s. The
 existing 128 MiB threshold remains the measured performance point.
+
+## Branch Delta Results
+
+The detached Chromium branch matrix used cumulative 1,000-file commits. H1 (1,000 files) and H2
+(10,000 cumulative files) advanced the base without tokenizing unchanged documents; H2 reached
+`base_delta_depth=2` and `base_delta_bytes=120,735,023`. The H3/H4 measurements showed that the
+old post-transition overlay path still spent about 3.6-3.8 s in a clean full probe after the
+delta was published.
+
+The accepted path now reclassifies only the prior dirty-catalog paths against the new base catalog.
+On Chromium H8 (1,000 changed files, cumulative depth 3), base delta construction took 795 ms
+(`diff=60 ms`, old blob reads `100 ms`, new blob reads `170 ms`, writes `401 ms`) and the final
+catalog-based overlay rebuild took 366 ms for 1,000 candidates, with zero remaining dirty paths.
+The same query marker returned exactly 1,000 matching lines from flashgrep and `rg`. This removes
+roughly 90% of the measured post-transition scan time without changing shard assignment or worker
+defaults; it is therefore a path-count-based optimization rather than a machine-topology tuning.
 
 ## Open Work
 
@@ -166,7 +183,7 @@ The authoritative execution order is maintained in
 
 1. fix the five reproducible watcher/overlay-rebuild timing failures;
 2. complete the Phase 3 publication-boundary kill/restart matrix;
-3. run the Chromium H0 -> H1 -> H2 -> H0 branch-delta matrix;
+3. complete the Chromium H0 -> H1 -> H2 -> H0 cache-switch and interruption matrix;
 4. implement the overlay streaming writer and aggregate memory budget only if profiling still
    justifies them;
 5. rerun the complete automated gate and publish the final report.
