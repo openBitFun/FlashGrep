@@ -26,7 +26,7 @@ evidence unless the mechanism is topology-independent or has a cross-machine mod
 
 ## Next Execution Queue
 
-1. Resolve the five reproducible watcher/overlay-rebuild timing failures and restore a green serial
+1. Resolve the six reproducible watcher/overlay-rebuild timing failures and restore a green serial
    Rust gate.
 2. Run the Phase 3 publication-boundary kill/restart matrix and fix any mixed manifest/catalog
    recovery behavior.
