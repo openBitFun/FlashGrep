@@ -2,9 +2,30 @@
 
 ## Status
 
-Proposed on 2026-07-25. Phases 1 and 2, the first Phase 3 persistence changes, the bounded overlay
-preparation slice, and the first base-builder optimization are implemented and validated on
-Chromium. Full Phase 4 bulk writing and the remaining base-builder phases remain open.
+Proposed on 2026-07-25 and last reconciled on 2026-07-27.
+
+| Phase | Status | Evidence / remaining work |
+| --- | --- | --- |
+| Phase 0 instrumentation | Partial | Overlay and base stage metrics exist; branch-delta metrics and the complete branch matrix remain. |
+| Phase 1 manifest-only startup | Complete | Published overlays reopen without durable-history replay; Chromium restart and query checks passed. |
+| Phase 2 incremental refresh | Complete | Watcher-driven no-change and event delta paths are proportional to changed paths. |
+| Phase 3 catalog transaction | Partial | Compact v2 catalog, one-write success path, and generation CAS are complete; publication-boundary kill/restart matrix remains. |
+| Phase 4 overlay bulk build | Partial | Bounded preparation, parallel term collection, and 10k/50k Chromium runs are complete; streaming writer and aggregate memory budget remain unimplemented. |
+| Phase 5 base builder | Partial (core path accepted) | Git-object sources, 2M spill runs, and ten shards are accepted; aggregate memory bounding remains open, while bucket parallelism and 192 MiB posting residency were measured and rejected. |
+| Phase 6 branch delta | Pending | H0 -> H1 -> H2 -> H0 Chromium matrix and any evidence-driven delta optimization remain. |
+| Final gate | Blocked by known failures | Chromium query results are exact, but five watcher/rebuild timing tests still fail in the serial full Rust gate. |
+
+## Next Execution Queue
+
+1. Resolve the five reproducible watcher/overlay-rebuild timing failures and restore a green serial
+   Rust gate.
+2. Run the Phase 3 publication-boundary kill/restart matrix and fix any mixed manifest/catalog
+   recovery behavior.
+3. Run the Phase 6 Chromium H0 -> H1 -> H2 -> H0 branch matrix, including tokenized-object counts,
+   synchronization wall time, CPU/RSS, index bytes, and queries during/after transition.
+4. Implement the Phase 4 streaming overlay writer and aggregate memory budget only if the branch
+   and O4 profiles still show material writer or peak-RSS cost.
+5. Run the complete automated gate and publish the final consolidated validation result.
 
 This document is the execution and acceptance contract for improving full base construction,
 workspace overlay refresh, daemon restart recovery, and branch-delta construction. Every
@@ -301,18 +322,6 @@ On a 2,000-entry Chromium catalog, bytes fell from 695,544 (pretty v1) to 321,53
 53.8% reduction. The successful-path transaction consolidation is implemented; the kill-boundary
 matrix remains open.
 
-## Phase 4 Result (2026-07-25, partial)
-
-Overlay document preparation now uses a bounded eight-worker local pool while preserving the
-existing deterministic path ordering at segment construction. On a 2,000-file Chromium rebuild,
-preparation measured 9 ms for 23.6 MB; segment publication fell from 1.77 seconds to 0.58 seconds
-after parallel per-document term collection. A monitored rebuild peaked at 2.66 GiB RSS and 151.5%
-CPU, below the 5.75 GiB Chromium peak from the original full matrix. Cumulative Chromium runs then
-measured a 10k delta at 41.30 s open / 2.70 s delta publish with 628.1% CPU, and a 50k rebuild at
-12.92 s open / 12.79 s publish with 936.8% CPU and 3.52 GiB peak RSS. The 50k run had a warmer page
-cache and is not a strict A/B comparison, but it confirms the path scales beyond one core. The
-remaining streaming writer, posting merge, and global memory-budget work remains open.
-
 ## Phase 4: Bounded Parallel Overlay Bulk Build
 
 ### Current Problem
@@ -341,6 +350,18 @@ Run a first-time O4 build and O1 -> O4 cumulative growth. Acceptance:
 - index and catalog size do not grow by more than 5%;
 - all 14 query cases remain exact.
 
+### Phase 4 Result (2026-07-25, partial)
+
+Overlay document preparation now uses a bounded eight-worker local pool while preserving the
+existing deterministic path ordering at segment construction. On a 2,000-file Chromium rebuild,
+preparation measured 9 ms for 23.6 MB; segment publication fell from 1.77 seconds to 0.58 seconds
+after parallel per-document term collection. A monitored rebuild peaked at 2.66 GiB RSS and 151.5%
+CPU, below the 5.75 GiB Chromium peak from the original full matrix. Cumulative Chromium runs then
+measured a 10k delta at 41.30 s open / 2.70 s delta publish with 628.1% CPU, and a 50k rebuild at
+12.92 s open / 12.79 s publish with 936.8% CPU and 3.52 GiB peak RSS. The 50k run had a warmer page
+cache and is not a strict A/B comparison, but it confirms the path scales beyond one core. The
+streaming writer and aggregate memory-budget work remain open.
+
 ## Phase 5: Full Base Builder Pipeline
 
 This phase begins only after Phase 0 identifies the dominant base-build stages.
@@ -355,10 +376,10 @@ Candidate changes, applied only when supported by the profile:
 6. Avoid redundant metadata/content reads when Git object identity already proves a file unchanged.
 7. Reuse prepared buffers and avoid repeated lowercasing, sorting, and allocation where possible.
 
-The stable shard/fingerprint model remains. Changing shard count or assignment is deferred because it
-would invalidate reuse and change index compatibility.
+The stable shard/fingerprint model remains. Chromium measurement selected ten shards; previous
+sixteen-shard manifests remain readable and naturally rebuild into the new assignment.
 
-### Phase 5 Result (2026-07-25, first slice)
+### Phase 5 Result (2026-07-25, accepted slices)
 
 Base construction now uses the Git tree input path whenever a HEAD exists, including a clean
 worktree. Regular files are stored as `GitHeadBlob` sources rather than duplicating their bytes as
@@ -373,7 +394,7 @@ final semantics-preserving run overlapped another benchmark daemon and is not a 
 Earlier isolated runs were 84.38 s before the duplicate binary scan removal and 72.81 s after it. A four-shard-worker
 run took 83.22 s, so the default available-parallelism setting remains preferable. The resource
 sample reached 3,945,185 KiB RSS during a run with concurrent benchmark interference and is not used
-as a clean peak comparison. Posting spill/merge and scheduler tuning remain open.
+as a clean peak comparison.
 
 The second slice increased the normal spilled-bucket sort run from 512k to 2M records while
 retaining the 64k low-memory setting. Adjacent Chromium H0 runs with low-memory auto-detection
@@ -453,15 +474,16 @@ Rollback means reverting the incomplete phase, not retaining both old and new ex
 
 ## Delivery Order
 
-1. Instrument and capture isolated Chromium baseline.
-2. Implement manifest-only overlay startup and validate on Chromium.
-3. Implement incremental explicit refresh and validate on Chromium.
-4. Batch dirty-catalog persistence and validate on Chromium.
-5. Implement bounded parallel overlay bulk build and validate on Chromium.
-6. Profile and optimize full base construction, then validate on Chromium.
-7. Optimize branch delta only if remaining measurements justify it.
-8. Publish one validation report containing per-phase raw-data links, correctness checks, resource
-   peaks, and before/after tables.
+1. Complete: instrument overlay/base construction and capture Chromium baselines.
+2. Complete: implement manifest-only overlay startup and incremental explicit refresh.
+3. Partial: consolidate dirty-catalog persistence; finish its interruption matrix.
+4. Partial: implement bounded overlay preparation; defer the streaming writer until profiling
+   proves it remains worthwhile.
+5. Complete for accepted slices: optimize Git-object base construction, posting runs, and shard
+   scheduling.
+6. Pending: profile and optimize branch delta construction.
+7. Pending: restore the full automated gate and publish the final validation report with
+   correctness checks, resource peaks, and before/after tables.
 
 The expected largest user-visible gain is Phase 1: eliminating minutes of unnecessary overlay work
 after daemon restart. Phase 2 and Phase 4 target large-change refresh latency. Phase 5 targets the

@@ -94,7 +94,9 @@ The complete 14-case query corpus was rerun after the event fast path. Every mat
 exact against `rg`: rare symbols 1,644, common short word 895,521, path-scoped `#include` 416,998,
 and the no-match case 0, with all intermediate regex, glob, case, and word cases also exact.
 
-## Test Gates
+## Earlier Test Gate
+
+The following gate was captured before the later base-builder slices:
 
 - `cargo check -p flashgrep --all-targets`: passed.
 - `cargo test -p flashgrep --lib`: 230 passed, 0 failed, 1 pre-existing ignored test.
@@ -105,9 +107,7 @@ and the no-match case 0, with all intermediate regex, glob, case, and word cases
 - no-change refresh artifact-preservation regression: passed.
 - repeated tracked/untracked watcher permutations with catalog-generation CAS: passed.
 
-## Remaining Work
-
-## Base Builder First Slice
+## Base Builder Results
 
 The base builder now reports input enumeration and per-shard prepare/append/finish metrics. An
 instrumented prior-path empty-storage H0 build indexed 445,491 documents in 84.38 s. Per-shard
@@ -153,7 +153,7 @@ Raising the in-memory posting threshold from 128 MiB to 192 MiB was rejected. Wi
 same H0 build regressed from 63.84 s to 71.32 s, and per-shard finish times rose to 9-11 s. The
 existing 128 MiB threshold remains the measured performance point.
 
-## Remaining Work
+## Open Work
 
 The full Rust gate before the base slice was 230 passed, 0 failed, 1 ignored. A post-change full
 run had six watcher timing/recovery failures under concurrent daemon load; the base-focused tests,
@@ -161,8 +161,12 @@ Chromium query corpus, and individual rebuild test passed. These failures remain
 follow-up rather than being claimed as a clean gate. A serial rerun reduced this to 225 passed, 5
 failed, 1 ignored; the remaining failures are the same watcher event/rebuild timing cases.
 
-Base construction still spends material time in Git input classification, document preparation,
-and posting spill/merge I/O. Posting-bucket parallelism was measured and rejected; a global memory
-budget remains open. The
-remaining Phase 3 transaction-boundary matrix and a branch-aware large-delta planner remain the next
-overlay-specific phases from the optimization plan.
+The authoritative execution order is maintained in
+`docs/index_build_and_overlay_recovery_optimization_plan.md`. The remaining work is:
+
+1. fix the five reproducible watcher/overlay-rebuild timing failures;
+2. complete the Phase 3 publication-boundary kill/restart matrix;
+3. run the Chromium H0 -> H1 -> H2 -> H0 branch-delta matrix;
+4. implement the overlay streaming writer and aggregate memory budget only if profiling still
+   justifies them;
+5. rerun the complete automated gate and publish the final report.
