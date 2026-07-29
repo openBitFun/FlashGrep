@@ -15,8 +15,9 @@ use crate::{
     index_engine::WorkspaceSearchView,
     index_engine::{
         workspace::{
-            WorkspaceOverlayIngestBatch, WorkspaceOverlayMergeEvent, WorkspaceOverlayPublishPolicy,
-            WorkspaceOverlayRuntimeStats, WorkspaceOverlaySnapshotState,
+            WorkspaceOverlayIngestBatch, WorkspaceOverlayMergeEvent, WorkspaceOverlayPublication,
+            WorkspaceOverlayPublishPolicy, WorkspaceOverlayRuntimeStats,
+            WorkspaceOverlaySnapshotState,
             DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
         },
         RepoId, WorkspaceBaseSnapshotIndex, WorkspaceOverlayIndex,
@@ -76,6 +77,12 @@ pub struct DirtyStats {
     pub modified: usize,
     pub deleted: usize,
     pub new: usize,
+}
+
+impl DirtyStats {
+    pub fn is_empty(self) -> bool {
+        self.modified == 0 && self.deleted == 0 && self.new == 0
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -426,6 +433,24 @@ impl RepoManager {
         runtime.reset_workspace_overlay_engine();
         runtime.mark_workspace_probe_pending();
         Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn checkpoint_workspace_overlay_for_tests(&self, repo_id: &str) -> Result<()> {
+        self.repo(repo_id)?
+            .checkpoint_workspace_overlay_for_shutdown()
+    }
+
+    #[cfg(test)]
+    pub(crate) fn candidate_dirty_stats_for_tests(
+        &self,
+        repo_id: &str,
+        candidate_paths: &[PathBuf],
+    ) -> Result<(usize, usize, usize)> {
+        let dirty = self
+            .repo(repo_id)?
+            .diff_against_base_snapshot_git_worktree_paths(candidate_paths)?;
+        Ok((dirty.modified.len(), dirty.deleted.len(), dirty.new.len()))
     }
 
     #[cfg(test)]

@@ -336,9 +336,13 @@ fn auto_checkpoint_publish_policy_commits_after_threshold() {
         &documents,
     )
     .expect("build first batch");
-    overlay
+    let first_publication = overlay
         .ingest_batch(&first_batch)
         .expect("ingest first batch");
+    assert_eq!(
+        first_publication,
+        super::WorkspaceOverlayPublication::Refreshed
+    );
 
     let committed_before = overlay
         .engine
@@ -362,9 +366,13 @@ fn auto_checkpoint_publish_policy_commits_after_threshold() {
         &documents,
     )
     .expect("build second batch");
-    overlay
+    let second_publication = overlay
         .ingest_batch(&second_batch)
         .expect("ingest second batch");
+    assert_eq!(
+        second_publication,
+        super::WorkspaceOverlayPublication::Committed
+    );
 
     let committed_after = overlay
         .engine

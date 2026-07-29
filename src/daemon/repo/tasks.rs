@@ -593,5 +593,11 @@ impl RepoRuntime {
         } {
             let _ = handle.join();
         }
+        if let Err(error) = self.checkpoint_workspace_overlay_for_shutdown() {
+            eprintln!(
+                "flashgrep[overlay][warn] failed to checkpoint workspace overlay during shutdown for {}: {error}",
+                self.build_config.repo_path.display()
+            );
+        }
     }
 }

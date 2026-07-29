@@ -119,6 +119,18 @@ pub(crate) enum WorkspaceOverlayPublishPolicy {
     },
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum WorkspaceOverlayPublication {
+    Refreshed,
+    Committed,
+}
+
+impl WorkspaceOverlayPublication {
+    pub(crate) fn is_durable(self) -> bool {
+        self == Self::Committed
+    }
+}
+
 pub(crate) const DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS: u64 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -374,12 +386,16 @@ impl WorkspaceOverlayIndex {
         for key in &snapshot.deleted_keys {
             writer.delete_document(key)?;
         }
-        self.publish_after_write(&writer)
+        let _ = self.publish_after_write(&writer)?;
+        Ok(())
     }
 
-    pub(crate) fn ingest_batch(&self, batch: &WorkspaceOverlayIngestBatch) -> Result<()> {
+    pub(crate) fn ingest_batch(
+        &self,
+        batch: &WorkspaceOverlayIngestBatch,
+    ) -> Result<WorkspaceOverlayPublication> {
         if batch.is_empty() {
-            return Ok(());
+            return Ok(WorkspaceOverlayPublication::Committed);
         }
         let writer = self.engine.writer();
         for key in &batch.deleted_keys {
@@ -397,14 +413,19 @@ impl WorkspaceOverlayIndex {
         self.publish_after_write(&writer)
     }
 
-    fn publish_after_write(&self, writer: &Arc<IndexWriter>) -> Result<()> {
+    fn publish_after_write(
+        &self,
+        writer: &Arc<IndexWriter>,
+    ) -> Result<WorkspaceOverlayPublication> {
         match self.publish_policy {
             WorkspaceOverlayPublishPolicy::Refresh => {
                 writer.refresh()?;
+                Ok(WorkspaceOverlayPublication::Refreshed)
             }
             WorkspaceOverlayPublishPolicy::Checkpoint => {
                 let _ = writer.commit()?;
                 self.request_background_merge();
+                Ok(WorkspaceOverlayPublication::Committed)
             }
             WorkspaceOverlayPublishPolicy::AutoCheckpoint {
                 max_uncommitted_ops,
@@ -413,12 +434,13 @@ impl WorkspaceOverlayIndex {
                 if stats.uncommitted_ops >= max_uncommitted_ops {
                     let _ = writer.commit()?;
                     self.request_background_merge();
+                    Ok(WorkspaceOverlayPublication::Committed)
                 } else {
                     writer.refresh()?;
+                    Ok(WorkspaceOverlayPublication::Refreshed)
                 }
             }
         }
-        Ok(())
     }
 
     pub(crate) fn request_background_merge(&self) {

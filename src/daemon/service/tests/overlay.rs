@@ -2146,13 +2146,8 @@ fn watcher_handles_many_paths_across_directories() {
     }
 
     let roots = vec![src.clone(), generated.clone()];
-    let status = wait_for_scoped_token_count_for_roots(
-        &service,
-        &repo_id,
-        &roots,
-        "SEQ_MANY_TRACKED_MOD_0",
-        1,
-    );
+    wait_for_scoped_token_count_for_roots(&service, &repo_id, &roots, "SEQ_MANY_TRACKED_MOD_0", 1);
+    let status = wait_for_dirty_stats(&service, &repo_id, 3, 3, 3);
     assert_exact_dirty_stats(&status, 3, 3, 3);
     let status = wait_for_scoped_token_count_for_roots(
         &service,
@@ -2171,13 +2166,8 @@ fn watcher_handles_many_paths_across_directories() {
         remove_sequence_file(&generated.join(format!("new_{index}.rs")));
     }
 
-    let status = wait_for_scoped_token_count_for_roots(
-        &service,
-        &repo_id,
-        &roots,
-        "SEQ_MANY_TRACKED_MOD_0",
-        0,
-    );
+    wait_for_scoped_token_count_for_roots(&service, &repo_id, &roots, "SEQ_MANY_TRACKED_MOD_0", 0);
+    let status = wait_for_dirty_stats(&service, &repo_id, 0, 0, 0);
     assert_exact_dirty_stats(&status, 0, 0, 0);
     let status = wait_for_scoped_token_count_for_roots(
         &service,
@@ -2434,6 +2424,89 @@ fn repeated_incremental_edits_converge_to_expected_overlay_state() {
     for token in prior_tokens {
         let _ = wait_for_search_count(&service, &repo_id, &token, 0);
     }
+}
+
+#[test]
+fn large_event_path_batches_are_probed_without_exceeding_process_argv() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    fs::write(&tracked, "const VALUE: &str = \"LARGE_EVENT_BASE\";\n")
+        .expect("base write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    fs::write(&tracked, "const VALUE: &str = \"LARGE_EVENT_DIRTY\";\n")
+        .expect("dirty write should succeed");
+    let canonical_repo = fs::canonicalize(&repo_path).expect("repo path should canonicalize");
+
+    let mut candidates = Vec::with_capacity(40_001);
+    candidates.push(canonical_repo.join("tracked.rs"));
+    candidates.extend((0..40_000).map(|index| {
+        canonical_repo.join(format!(
+            "generated/event/path/{index:05}/candidate_file_that_does_not_exist.cc"
+        ))
+    }));
+
+    let stats = service
+        .repos
+        .candidate_dirty_stats_for_tests(&repo_id, &candidates)
+        .expect("large candidate probe should succeed");
+
+    assert_eq!(stats, (1, 0, 0));
+}
+
+#[test]
+fn refreshed_dirty_update_is_durable_after_graceful_restart() {
+    let _serial = daemon_test_serial();
+    let setup_service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    fs::write(&tracked, "const VALUE: &str = \"RESTART_BASE\";\n")
+        .expect("base write should succeed");
+
+    let (repo_id, opened) = open_repo(&setup_service, repo_path.clone());
+    build_repo(&setup_service, &repo_id);
+    let catalog_path = PathBuf::from(opened.storage_root).join("dirty-catalog.json");
+
+    fs::write(&tracked, "const VALUE: &str = \"RESTART_FIRST\";\n")
+        .expect("first dirty write should succeed");
+    let _ = wait_for_search_count(&setup_service, &repo_id, "RESTART_FIRST", 1);
+    setup_service
+        .repos
+        .checkpoint_workspace_overlay_for_tests(&repo_id)
+        .expect("baseline overlay checkpoint should succeed");
+    let durable_catalog_before = fs::read(&catalog_path).expect("catalog should be durable");
+
+    fs::write(&tracked, "const VALUE: &str = \"RESTART_SECOND\";\n")
+        .expect("second dirty write should succeed");
+    let _ = wait_for_search_count(&setup_service, &repo_id, "RESTART_SECOND", 1);
+    let status = wait_for_status(&setup_service, &repo_id, |status| {
+        status
+            .overlay
+            .as_ref()
+            .is_some_and(|overlay| overlay.uncommitted_ops > 0 && overlay.pending_docs == 1)
+    });
+    assert!(status.probe_healthy);
+    let durable_catalog_after_refresh =
+        fs::read(&catalog_path).expect("catalog should remain readable");
+    assert_eq!(durable_catalog_after_refresh, durable_catalog_before);
+
+    setup_service.shutdown_all();
+    drop(setup_service);
+
+    let restarted = DaemonService::new();
+    let (reopened_repo_id, _) = open_repo(&restarted, repo_path);
+    let (backend, status) =
+        wait_for_search_count(&restarted, &reopened_repo_id, "RESTART_SECOND", 1);
+    assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+    assert!(status.probe_healthy);
+    let _ = wait_for_search_count(&restarted, &reopened_repo_id, "RESTART_FIRST", 0);
 }
 
 #[test]

@@ -1,5 +1,6 @@
 use std::{
     collections::HashSet,
+    env,
     ffi::OsString,
     fs,
     path::{Path, PathBuf},
@@ -33,6 +34,10 @@ enum OverlayUpdateMode {
     Rebuild,
     ApplyDelta,
 }
+
+const GIT_PATHSPEC_CHUNK_MAX_BYTES: usize = 512 * 1024;
+const GIT_PATHSPEC_CHUNK_MIN_BYTES: usize = 8 * 1024;
+const GIT_ARGV_HEADROOM_BYTES: usize = 32 * 1024;
 
 impl RepoRuntime {
     pub(super) fn preload_base_snapshot_catalog(&self) -> Result<()> {
@@ -492,28 +497,45 @@ impl RepoRuntime {
         args: [&str; N],
         paths: Option<&[PathBuf]>,
     ) -> Result<Vec<u8>> {
-        let mut command = Command::new("git");
-        command
+        let exclude = self.git_exclude_pathspec().map(OsString::from);
+        let Some(paths) = paths else {
+            return self.run_git_output(args, exclude.as_slice());
+        };
+        let pathspecs = self.git_candidate_pathspecs(paths);
+        if pathspecs.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let mut combined = Vec::new();
+        for chunk in git_pathspec_chunks(&pathspecs, git_pathspec_chunk_budget()) {
+            let mut command_pathspecs =
+                Vec::with_capacity(chunk.len() + usize::from(exclude.is_some()));
+            command_pathspecs.extend(exclude.iter().cloned());
+            command_pathspecs.extend(chunk.iter().cloned());
+            combined.extend(self.run_git_output(args, &command_pathspecs)?);
+        }
+        Ok(combined)
+    }
+
+    fn run_git_output<const N: usize>(
+        &self,
+        args: [&str; N],
+        pathspecs: &[OsString],
+    ) -> Result<Vec<u8>> {
+        let output = Command::new("git")
             .arg("-C")
             .arg(&self.build_config.repo_path)
             .env("GIT_OPTIONAL_LOCKS", "0")
-            .args(args);
-        if let Some(pathspec) = self.git_exclude_pathspec() {
-            command.arg(pathspec);
-        }
-        if let Some(paths) = paths {
-            for pathspec in self.git_candidate_pathspecs(paths) {
-                command.arg(pathspec);
-            }
-        }
-        let output = command.output()?;
+            .args(args.iter().copied())
+            .args(pathspecs)
+            .output()?;
         if !output.status.success() {
             return Err(crate::error::AppError::InvalidIndex(format!(
-                "failed to inspect git worktree state for {}",
-                self.build_config.repo_path.display()
+                "failed to inspect git worktree state for {}: {}",
+                self.build_config.repo_path.display(),
+                String::from_utf8_lossy(&output.stderr).trim()
             )));
         }
-
         Ok(output.stdout)
     }
 
@@ -624,6 +646,47 @@ impl RepoRuntime {
     }
 }
 
+fn git_pathspec_chunks(pathspecs: &[OsString], budget: usize) -> Vec<&[OsString]> {
+    let mut chunks = Vec::new();
+    let mut start = 0usize;
+    let mut bytes = 0usize;
+    for (index, pathspec) in pathspecs.iter().enumerate() {
+        let pathspec_bytes = pathspec.to_string_lossy().len() + 1;
+        if index > start && bytes.saturating_add(pathspec_bytes) > budget {
+            chunks.push(&pathspecs[start..index]);
+            start = index;
+            bytes = 0;
+        }
+        bytes = bytes.saturating_add(pathspec_bytes);
+    }
+    if start < pathspecs.len() {
+        chunks.push(&pathspecs[start..]);
+    }
+    chunks
+}
+
+fn git_pathspec_chunk_budget() -> usize {
+    #[cfg(unix)]
+    {
+        // ARG_MAX includes the inherited environment and argv pointer storage. Use half of the
+        // remaining space and retain fixed headroom so the same path works across Unix hosts.
+        let arg_max = unsafe { libc::sysconf(libc::_SC_ARG_MAX) };
+        let arg_max = usize::try_from(arg_max).unwrap_or(GIT_PATHSPEC_CHUNK_MIN_BYTES * 2);
+        let environment_bytes = env::vars_os()
+            .map(|(key, value)| key.to_string_lossy().len() + value.to_string_lossy().len() + 2)
+            .sum::<usize>();
+        arg_max
+            .saturating_sub(environment_bytes + GIT_ARGV_HEADROOM_BYTES)
+            .saturating_div(2)
+            .clamp(GIT_PATHSPEC_CHUNK_MIN_BYTES, GIT_PATHSPEC_CHUNK_MAX_BYTES)
+    }
+
+    #[cfg(not(unix))]
+    {
+        24 * 1024
+    }
+}
+
 fn parse_git_name_status_z(output: &[u8]) -> Vec<(String, String)> {
     let mut parsed = Vec::new();
     let mut records = output
@@ -711,7 +774,9 @@ fn decide_overlay_update_mode(
 
 #[cfg(test)]
 mod tests {
-    use super::{decide_overlay_update_mode, DirtyPathSet, OverlayUpdateMode};
+    use std::ffi::OsString;
+
+    use super::{decide_overlay_update_mode, git_pathspec_chunks, DirtyPathSet, OverlayUpdateMode};
 
     fn dirty_paths(modified: &[&str], deleted: &[&str], new: &[&str]) -> DirtyPathSet {
         DirtyPathSet {
@@ -731,6 +796,33 @@ mod tests {
             decide_overlay_update_mode(&dirty, &published_overlay_paths, &pending_dirty, true);
 
         assert_eq!(mode, OverlayUpdateMode::Rebuild);
+    }
+
+    #[test]
+    fn git_pathspec_chunks_keep_large_event_batches_bounded() {
+        let budget = 64 * 1024;
+        let pathspecs = (0..40_000)
+            .map(|index| {
+                OsString::from(format!(
+                    "very/long/generated/path/{index:05}/candidate_file_for_git_probe.cc"
+                ))
+            })
+            .collect::<Vec<_>>();
+
+        let chunks = git_pathspec_chunks(&pathspecs, budget);
+
+        assert!(chunks.len() > 1);
+        assert_eq!(
+            chunks.iter().map(|chunk| chunk.len()).sum::<usize>(),
+            40_000
+        );
+        for chunk in chunks {
+            let bytes = chunk
+                .iter()
+                .map(|pathspec| pathspec.to_string_lossy().len() + 1)
+                .sum::<usize>();
+            assert!(bytes <= budget || chunk.len() == 1);
+        }
     }
 
     #[test]

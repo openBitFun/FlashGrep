@@ -124,7 +124,7 @@ impl RepoRuntime {
         };
 
         let (candidate_dirty, candidate_paths) = self.startup_worktree_candidates()?;
-        let dirty = if self.dirty_catalog_matches_ready_versions(&candidate_dirty)? {
+        let dirty = if self.dirty_catalog_visible_paths() == candidate_dirty {
             candidate_dirty
         } else {
             self.diff_against_base_snapshot_git_worktree_paths(&candidate_paths)?
@@ -132,8 +132,18 @@ impl RepoRuntime {
         let current_head = self.current_git_head()?;
         let overlay = match self.open_workspace_overlay_index_manifest_only() {
             Ok(overlay) => overlay,
-            Err(AppError::InvalidIndex(_)) => return self.rebuild_workspace_overlay(),
+            Err(AppError::InvalidIndex(error)) => {
+                eprintln!(
+                    "flashgrep[overlay][warn] persisted overlay is invalid for {}; rebuilding: {error}",
+                    self.build_config.repo_path.display()
+                );
+                return self.rebuild_workspace_overlay();
+            }
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                eprintln!(
+                    "flashgrep[overlay][info] persisted overlay is missing for {}; rebuilding",
+                    self.build_config.repo_path.display()
+                );
                 return self.rebuild_workspace_overlay();
             }
             Err(error) => return Err(error),
@@ -154,6 +164,10 @@ impl RepoRuntime {
             _ => false,
         };
         if !source_matches {
+            eprintln!(
+                "flashgrep[overlay][info] persisted overlay source does not match the active base for {}; rebuilding",
+                self.build_config.repo_path.display()
+            );
             return self.rebuild_workspace_overlay();
         }
 
@@ -341,8 +355,7 @@ impl RepoRuntime {
             Ok(Some(snapshot_key)) => {
                 let plan = match self.plan_overlay_update_from_incremental_probe()? {
                     Some(plan) => Some(plan),
-                    None if self.workspace_watcher_active()
-                        && self.dirty_catalog_pending_paths().is_empty()
+                    None if self.dirty_catalog_pending_paths().is_empty()
                         && self.snapshot_published_overlay_paths()?.is_some() =>
                     {
                         None

@@ -3,3 +3,4 @@
 /bench_data
 .bitfun/
 /.bitfun/search/flashgrep-index/
+/.flashgrep-index-engine/

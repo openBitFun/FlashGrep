@@ -2,7 +2,7 @@ use std::{path::PathBuf, time::SystemTime};
 
 use crate::{
     error::{AppError, Result},
-    git_snapshot::resolve_git_head,
+    git_snapshot::resolve_git_head_blocking,
     index_engine::{
         manifest::{FileManifestStore, ManifestSource, ManifestStore},
         WorkspaceBaseSnapshotIndex,
@@ -158,8 +158,7 @@ impl RepoRuntime {
     }
 
     pub(super) fn current_git_head(&self) -> Result<String> {
-        let mut should_cancel = || false;
-        resolve_git_head(&self.build_config.repo_path, &mut should_cancel)?.ok_or_else(|| {
+        resolve_git_head_blocking(&self.build_config.repo_path)?.ok_or_else(|| {
             AppError::InvalidIndex(format!(
                 "daemon workspace requires a Git HEAD commit for {}",
                 self.build_config.repo_path.display()

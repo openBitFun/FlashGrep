@@ -111,27 +111,21 @@ impl RepoRuntime {
                     }
                     Err(error) => return Err(error),
                 };
-                let tracked_dirty = self.dirty_catalog_visible_paths();
-                let overlay_snapshot = if tracked_dirty.is_empty() {
-                    None
-                } else {
-                    overlay_snapshot
-                };
+                let dirty_stats = self.dirty_catalog_stats();
+                let has_dirty = !dirty_stats.is_empty();
+                let overlay_snapshot = if has_dirty { overlay_snapshot } else { None };
                 let workspace_snapshot = self
                     .workspace_search_view
                     .open_workspace_query_snapshot(base_snapshot, overlay_snapshot)?;
                 let mut response_status = status.clone();
-                super::status::apply_repo_status_dirty_fields(
-                    &mut response_status,
-                    tracked_dirty.stats(),
-                );
-                let backend = if tracked_dirty.is_empty() {
-                    QueryBackend::IndexedClean
-                } else {
+                super::status::apply_repo_status_dirty_fields(&mut response_status, dirty_stats);
+                let backend = if has_dirty {
                     QueryBackend::IndexedWorkspaceView
+                } else {
+                    QueryBackend::IndexedClean
                 };
                 let overlay_snapshot_unavailable_for_dirty =
-                    !tracked_dirty.is_empty() && !workspace_snapshot.has_overlay_snapshot();
+                    has_dirty && !workspace_snapshot.has_overlay_snapshot();
                 if overlay_snapshot_unavailable_for_dirty {
                     self.schedule_workspace_probe(Duration::from_millis(0));
                 }

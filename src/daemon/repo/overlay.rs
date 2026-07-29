@@ -7,8 +7,8 @@ use crate::{error::AppError, Result};
 
 use super::{
     DirtyPathSet, RepoRuntime, WorkspaceOverlayIndex, WorkspaceOverlayIngestBatch,
-    WorkspaceOverlayPublishPolicy, WorkspaceOverlayRuntimeStats, WorkspaceOverlaySnapshotState,
-    WorkspaceOverlayStatus,
+    WorkspaceOverlayPublication, WorkspaceOverlayPublishPolicy, WorkspaceOverlayRuntimeStats,
+    WorkspaceOverlaySnapshotState, WorkspaceOverlayStatus,
 };
 
 enum WorkspaceOverlayWritePlanKind {
@@ -131,20 +131,26 @@ impl RepoRuntime {
         ) {
             return;
         }
-        if let Err(error) = self.try_apply_overlay_write_plan(plan, manifest_source) {
-            let _ = self.mark_dirty_catalog_failed(&build_paths, catalog_generation);
-            self.handle_workspace_overlay_engine_error("apply plan", &error);
-            return;
-        }
+        let publication = match self.try_apply_overlay_write_plan(plan, manifest_source) {
+            Ok(publication) => publication,
+            Err(error) => {
+                let _ = self.mark_dirty_catalog_failed(&build_paths, catalog_generation);
+                self.handle_workspace_overlay_engine_error("apply plan", &error);
+                return;
+            }
+        };
         #[cfg(test)]
         if self.take_overlay_publication_failpoint(
             super::OverlayPublicationFailpoint::AfterOverlayPublish,
         ) {
             return;
         }
-        if let Err(error) = self.mark_dirty_catalog_ready(&build_paths, catalog_generation) {
-            self.handle_workspace_overlay_engine_error("mark dirty catalog ready", &error);
-            return;
+        self.mark_dirty_catalog_ready_in_memory(&build_paths, catalog_generation);
+        if publication.is_durable() {
+            if let Err(error) = self.persist_dirty_catalog() {
+                self.handle_workspace_overlay_engine_error("persist dirty catalog ready", &error);
+                return;
+            }
         }
         #[cfg(test)]
         if self.take_overlay_publication_failpoint(
@@ -196,7 +202,7 @@ impl RepoRuntime {
         &self,
         plan: WorkspaceOverlayWritePlan,
         manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
-    ) -> Result<()> {
+    ) -> Result<WorkspaceOverlayPublication> {
         let dirty_paths = plan.dirty_paths;
         match plan.kind {
             WorkspaceOverlayWritePlanKind::Clear => self.try_reset_workspace_overlay_engine(),
@@ -213,9 +219,9 @@ impl RepoRuntime {
         &self,
         snapshot: WorkspaceOverlaySnapshotState,
         manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
-    ) -> Result<()> {
+    ) -> Result<WorkspaceOverlayPublication> {
         if !self.build_config.repo_path.exists() {
-            return Ok(());
+            return Ok(WorkspaceOverlayPublication::Committed);
         }
         let previous = {
             let mut slot = match self.workspace_overlay_engine.lock() {
@@ -247,10 +253,10 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner(),
         };
         *slot = Some(overlay_index);
-        Ok(())
+        Ok(WorkspaceOverlayPublication::Committed)
     }
 
-    fn try_reset_workspace_overlay_engine(&self) -> Result<()> {
+    fn try_reset_workspace_overlay_engine(&self) -> Result<WorkspaceOverlayPublication> {
         {
             let mut slot = match self.workspace_overlay_engine.lock() {
                 Ok(guard) => guard,
@@ -258,7 +264,8 @@ impl RepoRuntime {
             };
             *slot = None;
         }
-        WorkspaceOverlayIndex::clear_storage(&self.build_config)
+        WorkspaceOverlayIndex::clear_storage(&self.build_config)?;
+        Ok(WorkspaceOverlayPublication::Committed)
     }
 
     fn try_apply_overlay_ingest_batch(
@@ -266,9 +273,9 @@ impl RepoRuntime {
         dirty: &DirtyPathSet,
         batch: WorkspaceOverlayIngestBatch,
         manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
-    ) -> Result<()> {
+    ) -> Result<WorkspaceOverlayPublication> {
         if !self.build_config.repo_path.exists() {
-            return Ok(());
+            return Ok(WorkspaceOverlayPublication::Committed);
         }
         let overlay_index = match self.workspace_overlay_engine.lock() {
             Ok(guard) => guard,
@@ -286,13 +293,13 @@ impl RepoRuntime {
                 if let Some(source) = manifest_source {
                     overlay_index.set_manifest_source(source);
                 }
-                overlay_index.ingest_batch(&batch)?;
+                let publication = overlay_index.ingest_batch(&batch)?;
                 let mut slot = match self.workspace_overlay_engine.lock() {
                     Ok(guard) => guard,
                     Err(poisoned) => poisoned.into_inner(),
                 };
                 *slot = Some(overlay_index);
-                return Ok(());
+                return Ok(publication);
             }
             eprintln!(
                 "flashgrep[overlay][info] workspace overlay engine missing for {}; rebuilding from dirty paths: modified={} deleted={} new={}",
@@ -314,12 +321,12 @@ impl RepoRuntime {
             overlay_index.set_manifest_source(source);
         }
         let publish_started_at = Instant::now();
-        overlay_index.ingest_batch(&batch)?;
+        let publication = overlay_index.ingest_batch(&batch)?;
         eprintln!(
             "flashgrep[overlay-metrics][info] stage=publish_delta elapsed_ms={}",
             publish_started_at.elapsed().as_millis()
         );
-        Ok(())
+        Ok(publication)
     }
 
     fn open_workspace_overlay_index(&self) -> Result<WorkspaceOverlayIndex> {
@@ -383,6 +390,31 @@ impl RepoRuntime {
             .as_ref()
             .and_then(|overlay| overlay.runtime_stats().ok())
             .map(workspace_overlay_status_from_runtime)
+    }
+
+    pub(super) fn checkpoint_workspace_overlay_for_shutdown(&self) -> Result<()> {
+        if !self.build_config.repo_path.exists() || !self.build_config.storage_root.exists() {
+            return Ok(());
+        }
+        let _write_guard = self
+            .overlay_write_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let overlay = match self.workspace_overlay_engine.lock() {
+            Ok(guard) => guard,
+            Err(poisoned) => poisoned.into_inner(),
+        }
+        .as_ref()
+        .cloned();
+        let Some(overlay) = overlay else {
+            return Ok(());
+        };
+        if overlay.runtime_stats()?.uncommitted_ops == 0 {
+            return Ok(());
+        }
+
+        overlay.checkpoint()?;
+        self.persist_dirty_catalog()
     }
 
     pub(super) fn should_suppress_workspace_overlay_io_error(&self, error: &AppError) -> bool {

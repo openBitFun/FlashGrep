@@ -18,7 +18,8 @@ use crate::{
     error::{AppError, Result},
 };
 
-const CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
+const INITIAL_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
+const MAX_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_INDEX_FINGERPRINT_VERSION: &str = "index-engine-postings-v2";
 
 pub(crate) struct GitBlobReader {
@@ -45,15 +46,100 @@ pub(crate) fn resolve_git_head(
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<Option<String>> {
     let output = run_git_command(repo_root, ["rev-parse", "--verify", "HEAD"], should_cancel)?;
+    Ok(parse_git_head_output(output))
+}
+
+pub(crate) fn resolve_git_head_blocking(repo_root: &Path) -> Result<Option<String>> {
+    if let Some(head) = resolve_git_head_from_files(repo_root) {
+        return Ok(Some(head));
+    }
+
+    let output = Command::new("git")
+        .arg("-C")
+        .arg(repo_root)
+        .args(["rev-parse", "--verify", "HEAD"])
+        .output()?;
+    Ok(parse_git_head_output(output))
+}
+
+fn resolve_git_head_from_files(repo_root: &Path) -> Option<String> {
+    let dot_git = repo_root.join(".git");
+    let git_dir = if dot_git.is_dir() {
+        dot_git
+    } else {
+        let contents = std::fs::read_to_string(&dot_git).ok()?;
+        let path = contents.trim().strip_prefix("gitdir:")?.trim();
+        let path = Path::new(path);
+        if path.is_absolute() {
+            path.to_path_buf()
+        } else {
+            repo_root.join(path)
+        }
+    };
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(reference) = head.strip_prefix("ref:").map(str::trim) {
+        let common_dir = std::fs::read_to_string(git_dir.join("commondir"))
+            .ok()
+            .map_or_else(
+                || git_dir.clone(),
+                |path| {
+                    let path = Path::new(path.trim());
+                    if path.is_absolute() {
+                        path.to_path_buf()
+                    } else {
+                        git_dir.join(path)
+                    }
+                },
+            );
+        for base in [&git_dir, &common_dir] {
+            if let Some(head) = read_git_ref(base, reference) {
+                return Some(head);
+            }
+        }
+        for packed_refs in [common_dir.join("packed-refs"), git_dir.join("packed-refs")] {
+            if let Some(head) = read_packed_git_ref(&packed_refs, reference) {
+                return Some(head);
+            }
+        }
+        return None;
+    }
+    is_git_object_id(head).then(|| head.to_string())
+}
+
+fn read_git_ref(git_dir: &Path, reference: &str) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join(reference)).ok()?;
+    let head = head.trim();
+    is_git_object_id(head).then(|| head.to_string())
+}
+
+fn read_packed_git_ref(path: &Path, reference: &str) -> Option<String> {
+    let contents = std::fs::read_to_string(path).ok()?;
+    contents.lines().find_map(|line| {
+        if line.is_empty() || line.starts_with('#') || line.starts_with('^') {
+            return None;
+        }
+        let mut fields = line.split_whitespace();
+        let object_id = fields.next()?;
+        let name = fields.next()?;
+        (name == reference && is_git_object_id(object_id)).then(|| object_id.to_string())
+    })
+}
+
+fn is_git_object_id(value: &str) -> bool {
+    matches!(value.len(), 40 | 64) && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn parse_git_head_output(output: Output) -> Option<String> {
     if !output.status.success() {
-        return Ok(None);
+        return None;
     }
 
     let head_commit = String::from_utf8_lossy(&output.stdout).trim().to_string();
     if head_commit.is_empty() {
-        return Ok(None);
+        return None;
     }
-    Ok(Some(head_commit))
+    Some(head_commit)
 }
 
 pub(crate) struct GitHeadPathEntry {
@@ -355,6 +441,7 @@ fn run_command_with_cancellation(
         .ok_or_else(|| AppError::InvalidIndex("failed to capture command stderr".into()))?;
     let stdout_reader = thread::spawn(move || read_command_pipe(stdout));
     let stderr_reader = thread::spawn(move || read_command_pipe(stderr));
+    let mut poll_interval = INITIAL_CANCEL_POLL_INTERVAL;
     loop {
         if should_cancel() {
             let _ = child.kill();
@@ -372,8 +459,17 @@ fn run_command_with_cancellation(
                 stderr,
             });
         }
-        thread::sleep(CANCEL_POLL_INTERVAL);
+        thread::sleep(poll_interval);
+        poll_interval = next_cancel_poll_interval(poll_interval);
     }
+}
+
+fn next_cancel_poll_interval(current: Duration) -> Duration {
+    let next_millis = current
+        .as_millis()
+        .saturating_mul(2)
+        .min(MAX_CANCEL_POLL_INTERVAL.as_millis());
+    Duration::from_millis(next_millis as u64)
 }
 
 fn check_cancel(should_cancel: &mut impl FnMut() -> bool) -> Result<()> {
@@ -399,6 +495,66 @@ fn join_pipe_reader(
             AppError::InvalidIndex(format!("failed to join command {stream_name} reader"))
         })?
         .map_err(AppError::from)
+}
+
+#[cfg(test)]
+mod head_resolution_tests {
+    use super::*;
+
+    const SHA1: &str = "0123456789abcdef0123456789abcdef01234567";
+    const SHA1_ALT: &str = "89abcdef0123456789abcdef0123456789abcdef";
+
+    #[test]
+    fn resolves_loose_branch_head_from_git_dir() {
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        let repo = temp.path();
+        fs::create_dir_all(repo.join(".git/refs/heads")).expect("git refs should be created");
+        fs::write(repo.join(".git/HEAD"), "ref: refs/heads/main\n")
+            .expect("HEAD should be written");
+        fs::write(repo.join(".git/refs/heads/main"), format!("{SHA1}\n"))
+            .expect("ref should be written");
+
+        assert_eq!(resolve_git_head_from_files(repo), Some(SHA1.to_string()));
+    }
+
+    #[test]
+    fn resolves_detached_head_from_git_dir() {
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        let repo = temp.path();
+        fs::create_dir_all(repo.join(".git")).expect("git dir should be created");
+        fs::write(repo.join(".git/HEAD"), format!("{SHA1}\n")).expect("HEAD should be written");
+
+        assert_eq!(resolve_git_head_from_files(repo), Some(SHA1.to_string()));
+    }
+
+    #[test]
+    fn resolves_git_file_common_dir_packed_ref() {
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        let repo = temp.path().join("worktree");
+        let git_dir = temp.path().join("git/worktrees/worktree");
+        let common_dir = temp.path().join("git/common");
+        fs::create_dir_all(&repo).expect("repo should be created");
+        fs::create_dir_all(&git_dir).expect("git dir should be created");
+        fs::create_dir_all(&common_dir).expect("common dir should be created");
+        fs::write(
+            repo.join(".git"),
+            format!("gitdir: {}\n", git_dir.display()),
+        )
+        .expect("git file should be written");
+        fs::write(git_dir.join("HEAD"), "ref: refs/heads/main\n").expect("HEAD should be written");
+        fs::write(git_dir.join("commondir"), common_dir.display().to_string())
+            .expect("commondir should be written");
+        fs::write(
+            common_dir.join("packed-refs"),
+            format!("# pack-refs\n{SHA1_ALT} refs/heads/main\n"),
+        )
+        .expect("packed refs should be written");
+
+        assert_eq!(
+            resolve_git_head_from_files(&repo),
+            Some(SHA1_ALT.to_string())
+        );
+    }
 }
 
 #[cfg(test)]
