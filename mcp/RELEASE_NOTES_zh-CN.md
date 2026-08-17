@@ -1,11 +1,11 @@
 # flashgrep MCP 变更说明
 
-发布时间：2026-07-20 +0800
+发布时间：2026-08-17 +0800
 
 ## 本次包内容
 
-- MCP Server 版本：`0.2.12`
-- 内置 `flashgrep` 后端版本：`0.2.12`
+- MCP Server 版本：`0.2.13`
+- 内置 `flashgrep` 后端版本：`0.2.13`
 - 打包平台：
   - `flashgrep-aarch64-apple-darwin`
   - `flashgrep-x86_64-apple-darwin`
@@ -14,64 +14,59 @@
   - `flashgrep-aarch64-pc-windows-msvc.exe`
   - `flashgrep-x86_64-pc-windows-msvc.exe`
 
+本次为修复版本，针对用户反馈的两个缺陷。两者根源相同：仓库 `phase` 是被写入的状态而非
+从磁盘事实推导出来的状态，而每一条恢复路径又都以它卡住的那个 phase 作为准入条件。
+
 ## 关键修复
 
-### 缺失索引时立即返回搜索结果
+### 构建索引时切分支不再导致索引永久失效
 
-首次打开尚未建立索引的仓库时，`search_code` 会在后台启动 base snapshot 构建，并立即
-通过 transition backend 返回结果，不再等待完整索引构建完成。
+在 base snapshot 构建过程中切换 Git 分支，此前会让索引一直处于失效状态。这需要同时打开
+四道互相咬合的关卡：
 
-transition `rg` 改为流式读取。达到 `global_max_results` 后会主动终止子进程，避免高频
-匹配在大型仓库中继续消耗 CPU 和内存。
+- 任务结束时不再只清空 `active_task_id` 而不归还 `phase`。任务现在会记录自己是否占用了
+  仓库 phase，未成功结束时必须交还，不再把仓库留在 `building_base_snapshot` 而背后没有
+  任何任务。
+- 后台 workspace probe 此前拒绝在 ready 之外的 phase 运行，而 probe 是唯一能从磁盘重新
+  推导 phase 的代码——这正是失效从"恢复得慢"变成"永久"的原因。现在它也会以较慢的节奏
+  探测那些搁浅在中间态或 degraded 且无任务在跑的仓库。
+- `ensure_repo` 和 MCP server 两个构建入口此前只在 `missing_base_snapshot` 时触发，现在
+  同样会把"正在构建但没有活跃任务"视为需要重建。
+- 上述状态下搜索会静默走 `rg` fallback 并"成功"返回，因此该问题表现为索引变慢而不是报错。
 
-### 同一仓库的 MCP 进程共享 daemon
+同时修复了同类的潜在缺陷：`RepoPhase::Degraded` 此前同样是终态陷阱，由 probe 失败设置后
+就再也不会被 probe。
 
-同一 Git worktree 的多个 MCP session 现在通过轻量 `mcp-bridge` 连接同一个 managed
-daemon，共享：
+### `mcp-bridge` 复用已有索引时不再超时
 
-- base index reader
-- workspace overlay reader
-- workspace watcher
-- 后台构建任务
+此前 `open_repo` 在回复 `initialize` 之前同步执行，使得大型索引上 10-12 秒的 open 落在
+固定 10 秒的握手预算之内，健康的索引也会握手超时。
 
-大量 subagent 并发搜索时不会再为每个 MCP 进程各自启动一套重型 daemon 和索引 reader。
-MCP JSON-RPC 请求也改为并发分发，慢搜索不会阻塞无关请求。
+现在握手先在本地回答；该请求仍会重放给 daemon 以便注册连接，daemon 返回的重复响应按 id
+抑制。open 改为阻塞第一个真实请求——在那里等待是符合预期的。
 
-### 跨进程索引构建串行化
+两侧的启动预算同时上调，并支持通过环境变量配置：
 
-base snapshot 构建和发布增加了 OS 文件锁。多个 MCP/subagent 同时请求建立同一仓库索引
-时，只会有一个实际构建者；重复请求复用已有活动任务，避免 staging 清理和发布竞争。
+- `FLASHGREP_MCP_START_TIMEOUT_MS`
+- `FLASHGREP_DAEMON_START_TIMEOUT_MS`
 
-### 子目录继续复用 Git worktree 根索引
-
-从仓库子目录启动 MCP 时，会使用 canonical Git worktree root 作为 repo identity 和索引
-存储根，同时把搜索结果限制在用户打开的子目录范围内。
+超时错误信息中会指明前者，便于大仓库场景下自行调整。
 
 ## 工程质量
 
-- `cargo clippy --all-targets --all-features -- -D warnings` 已通过。
-- 完整测试：`246 passed, 0 failed, 1 ignored`。
-- MCP 集成测试覆盖多个 MCP 进程共享 managed daemon、并发请求和子目录索引复用。
-
-## Chromium 大仓库验证
-
-在 Chromium 大型 Git worktree 上完成了冷索引和多进程验证：
-
-- 冷索引搜索约 `442 ms` 返回 10 条 transition 结果，索引继续在后台构建。
-- 4 个并发 MCP session 只启动 1 个重型 managed daemon。
-- managed daemon RSS 约 `383 MB`，轻量 bridge 进程内存占用接近 0。
-- 热态 daemon 搜索耗时约 `7-13 ms`。
-- 从 `chromium-src/base` 打开时复用 `chromium-src` 根索引，结果保持在 `base` scope。
-
-具体耗时受机器、仓库状态、缓存和查询模式影响，上述数字用于说明本次验证环境中的行为。
+- `cargo clippy --all-targets` 无告警。
+- 完整测试：`241 passed, 1 failed, 1 ignored`。唯一失败项为
+  `bench_rg_runner_uses_snapshot_visible_scope_for_custom_repo`，属于开发环境问题——该
+  环境中 `rg` 是 shell 函数而非真实可执行文件，而该测试需要启动该可执行文件。已在干净
+  工作树上确认该失败与本次改动无关。
+- 新增三个回归测试，每个都单独验证过：只回退其对应的那一处修复即失败。
 
 ## 后续设计
 
-本仓库新增了 branch switch 增量 base promotion 的详细改造方案：
+本仓库的 branch switch 增量 base promotion 改造方案仍位于：
 
 ```text
 docs/branch_switch_incremental_index_plan.md
 ```
 
-该方案用于后续替换切分支时的粗粒度 base rebuild；它是设计文档，不属于 `0.2.12` 已实现
-功能。
+该文档为设计方案，不属于 `0.2.13` 已实现功能。
