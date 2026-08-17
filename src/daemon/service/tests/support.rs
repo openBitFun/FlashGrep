@@ -323,6 +323,18 @@ pub(super) fn mark_workspace_probe_pending(service: &DaemonService, repo_id: &st
         .expect("mark workspace probe pending should succeed");
 }
 
+pub(super) fn strand_repo_phase(
+    service: &DaemonService,
+    repo_id: &str,
+    phase: crate::daemon::repo::RepoPhase,
+    wake_maintenance: bool,
+) {
+    service
+        .repos
+        .strand_repo_phase_for_tests(repo_id, phase, wake_maintenance)
+        .expect("stranding the repo phase should succeed");
+}
+
 pub(super) fn wait_for_workspace_watcher_active(service: &DaemonService, repo_id: &str) {
     for _ in 0..STATUS_WAIT_ATTEMPTS {
         if service

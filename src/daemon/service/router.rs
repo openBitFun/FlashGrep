@@ -301,12 +301,11 @@ impl DaemonService {
             status = wait_for_repo_open(&self.repos, &repo_id)?;
         }
 
-        let (indexed_docs, status) = match status.phase {
-            crate::daemon::repo::RepoPhase::MissingBaseSnapshot => {
-                let (indexed_docs, status) = self.repos.build_base_snapshot(&repo_id)?;
-                (Some(indexed_docs), status)
-            }
-            _ => (None, status),
+        let (indexed_docs, status) = if repo_needs_base_snapshot_build(&status) {
+            let (indexed_docs, status) = self.repos.build_base_snapshot(&repo_id)?;
+            (Some(indexed_docs), status)
+        } else {
+            (None, status)
         };
 
         Ok((
@@ -318,6 +317,20 @@ impl DaemonService {
             None,
             false,
         ))
+    }
+}
+
+/// A repo needs a base snapshot build when it has none, and also when it is
+/// reported as building one with no task behind it. The latter means an earlier
+/// build ended without handing the phase back, and nothing else will restart it.
+fn repo_needs_base_snapshot_build(status: &crate::daemon::repo::RepoStatus) -> bool {
+    use crate::daemon::repo::RepoPhase;
+    match status.phase {
+        RepoPhase::MissingBaseSnapshot => true,
+        RepoPhase::BuildingBaseSnapshot | RepoPhase::RebuildingBaseSnapshot => {
+            status.active_task_id.is_none()
+        }
+        _ => false,
     }
 }
 

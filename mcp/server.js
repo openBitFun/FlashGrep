@@ -28,7 +28,11 @@ const DEFAULTS = {
   overlayMergeMinDelayMs: 2000,
   overlayMergeRetryDelayMs: 10000,
 };
-const START_TIMEOUT_MS = 10_000;
+const DEFAULT_START_TIMEOUT_MS = 30_000;
+const START_TIMEOUT_MS = readPositiveIntEnv(
+  "FLASHGREP_MCP_START_TIMEOUT_MS",
+  DEFAULT_START_TIMEOUT_MS,
+);
 const RETRY_INTERVAL_MS = 100;
 const SHUTDOWN_TIMEOUT_MS = 2_000;
 const MCP_TEXT_FILE_PREVIEW_LIMIT = 20;
@@ -589,8 +593,24 @@ async function openRepoForCall(server, args) {
   };
 }
 
+// A repo reported as building a base snapshot with no active task behind it is
+// stranded: an earlier build ended without handing the phase back. Treat it the
+// same as a missing snapshot so the next tool call restarts the build instead of
+// falling back to `rg` forever.
+const BUILD_PHASES = new Set([
+  "building_base_snapshot",
+  "rebuilding_base_snapshot",
+]);
+
+function needsBaseSnapshotBuild(status) {
+  if (status.phase === "missing_base_snapshot") {
+    return true;
+  }
+  return BUILD_PHASES.has(status.phase) && !status.active_task_id;
+}
+
 async function startIndexBuildIfMissing(repoContext) {
-  if (repoContext.status.phase !== "missing_base_snapshot") {
+  if (!needsBaseSnapshotBuild(repoContext.status)) {
     return repoContext.status.active_task_id
       ? { task_id: repoContext.status.active_task_id, already_running: true }
       : null;
@@ -654,7 +674,8 @@ async function spawnBackend(options) {
     await withTimeout(
       initializeBackend(backend),
       START_TIMEOUT_MS,
-      `failed to initialize flashgrep backend within ${START_TIMEOUT_MS}ms`,
+      `failed to initialize flashgrep backend within ${START_TIMEOUT_MS}ms ` +
+        "(raise FLASHGREP_MCP_START_TIMEOUT_MS if this repository is large)",
     );
     return backend;
   } catch (error) {
@@ -1442,6 +1463,15 @@ function formatBackendExit(backend, prefix) {
     return `${prefix} (signal=${backend.exitSignal})`;
   }
   return `${prefix} (code=${backend.exitCode ?? "unknown"})`;
+}
+
+function readPositiveIntEnv(name, fallback) {
+  const raw = process.env[name];
+  if (raw === undefined) {
+    return fallback;
+  }
+  const parsed = Number.parseInt(raw.trim(), 10);
+  return Number.isFinite(parsed) && parsed > 0 ? parsed : fallback;
 }
 
 function withTimeout(promise, timeoutMs, message) {

@@ -21,6 +21,10 @@ const MAINTENANCE_REASON_WORKSPACE_POLL: u32 = 1 << 1;
 pub(super) const GIT_WORKSPACE_EVENT_RETRY_DELAY: Duration = Duration::from_millis(50);
 const GIT_WORKSPACE_RECONCILE_INTERVAL: Duration = Duration::from_secs(300);
 const GIT_WORKSPACE_POLL_FALLBACK_INTERVAL: Duration = Duration::from_millis(100);
+/// Retry cadence for probing a repo stranded in a transient or degraded phase.
+/// Deliberately slower than the regular poll so a repo that cannot recover
+/// retries steadily instead of spinning.
+const STRANDED_RECOVERY_PROBE_INTERVAL: Duration = Duration::from_secs(5);
 
 impl RepoRuntime {
     pub(super) fn start_maintenance_worker(self: &Arc<Self>) {
@@ -115,8 +119,21 @@ impl RepoRuntime {
         };
         let ready_for_probe = matches!(state.phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
             && state.snapshot_key.is_some();
+        // A repo sitting in a transient or degraded phase with nothing running
+        // behind it is stranded: every other recovery path is gated on the very
+        // phase it is stuck in, and only a probe re-derives the phase from what
+        // is actually on disk. Probe it on a slow cadence so a repo that keeps
+        // failing to recover does not spin.
+        let stranded = !ready_for_probe
+            && state.active_task_id.is_none()
+            && matches!(
+                state.phase,
+                RepoPhase::BuildingBaseSnapshot
+                    | RepoPhase::RebuildingBaseSnapshot
+                    | RepoPhase::Degraded
+            );
 
-        if !ready_for_probe {
+        if !ready_for_probe && !stranded {
             self.schedule_workspace_probe(probe_interval);
             return;
         }
@@ -131,7 +148,9 @@ impl RepoRuntime {
             return;
         }
 
-        let event_driven_probe = self.has_pending_workspace_events();
+        // Recovering a stranded repo needs the authoritative full probe; the
+        // event fast path only reconciles paths it was told about.
+        let event_driven_probe = !stranded && self.has_pending_workspace_events();
         let probe_result = if event_driven_probe {
             self.probe_workspace_overlay_from_events()
         } else {
@@ -144,7 +163,9 @@ impl RepoRuntime {
         } else {
             self.set_probe_healthy(true);
         }
-        self.schedule_workspace_probe(if event_driven_probe {
+        self.schedule_workspace_probe(if stranded {
+            STRANDED_RECOVERY_PROBE_INTERVAL
+        } else if event_driven_probe {
             GIT_WORKSPACE_EVENT_RETRY_DELAY
         } else {
             probe_interval

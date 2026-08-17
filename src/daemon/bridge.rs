@@ -25,9 +25,18 @@ pub fn serve_managed_stdio_bridge(repo: OpenRepoParams) -> Result<()> {
     let Some(initial_request) = read_content_length_request(&mut stdin_reader)? else {
         return Ok(());
     };
+
+    // Answer the handshake locally before opening the repo. Opening a large base
+    // snapshot is synchronous and can take tens of seconds; while that ran ahead
+    // of the handshake, clients timed out during `initialize` on indexes that
+    // were perfectly healthy. The repo open now blocks the first real request
+    // instead, where waiting is expected.
+    answer_handshake_locally(&initial_request)?;
+    let handshake_response_id = initial_request.id;
+
     let opened = match ManagedDaemonClient::new().open_repo(repo) {
         Ok(opened) => opened,
-        Err(error) => return serve_failed_bridge(&mut stdin_reader, initial_request, error),
+        Err(error) => return serve_failed_bridge(&mut stdin_reader, error),
     };
     let stream = TcpStream::connect(&opened.addr)?;
     let reader_stream = stream.try_clone()?;
@@ -54,6 +63,14 @@ pub fn serve_managed_stdio_bridge(repo: OpenRepoParams) -> Result<()> {
             let message = serde_json::from_str::<ServerMessage>(&line).map_err(|error| {
                 AppError::Protocol(format!("failed to decode managed daemon response: {error}"))
             })?;
+            // The handshake was already answered locally; the daemon still gets
+            // the request so it registers this connection, but its duplicate
+            // response must not reach the client.
+            if let ServerMessage::Response(response) = &message {
+                if response.id.is_some() && response.id == handshake_response_id {
+                    continue;
+                }
+            }
             if daemon_out.send(message).is_err() {
                 break;
             }
@@ -104,17 +121,22 @@ fn write_daemon_request(writer: &mut impl Write, request: &RequestEnvelope) -> R
     Ok(())
 }
 
-fn serve_failed_bridge(
-    stdin: &mut impl BufRead,
-    initial_request: RequestEnvelope,
-    error: AppError,
-) -> Result<()> {
+/// Answers the opening handshake from a throwaway local service so the client is
+/// not left waiting on the managed daemon. The same request is replayed to the
+/// daemon once the connection is up, so the daemon still sees the handshake.
+fn answer_handshake_locally(initial_request: &RequestEnvelope) -> Result<()> {
+    let service = DaemonService::new();
+    let Some(response) = service.handle_for_connection(None, initial_request.clone()) else {
+        return Ok(());
+    };
     let stdout = std::io::stdout();
     let mut writer = BufWriter::new(stdout.lock());
-    let service = DaemonService::new();
-    if let Some(response) = service.handle_for_connection(None, initial_request) {
-        write_content_length_message(&mut writer, &ServerMessage::Response(response))?;
-    }
+    write_content_length_message(&mut writer, &ServerMessage::Response(response))
+}
+
+fn serve_failed_bridge(stdin: &mut impl BufRead, error: AppError) -> Result<()> {
+    let stdout = std::io::stdout();
+    let mut writer = BufWriter::new(stdout.lock());
     let message = error.to_string();
     while let Some(request) = read_content_length_request(stdin)? {
         let response = match request.request {
