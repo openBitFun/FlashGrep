@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## v0.2.13 - 2026-08-17
 
 - Fixed an index that stayed permanently invalid after switching Git branches during a base snapshot build: a build that ended without succeeding now hands the repository phase back instead of stranding it mid-build.
 - Recovered repositories already stranded in a build or degraded phase through the background workspace probe, which now re-derives the phase from on-disk state rather than refusing to run outside the ready phases.
