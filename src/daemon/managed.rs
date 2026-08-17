@@ -21,6 +21,19 @@ use super::{
 const DEFAULT_DAEMON_STATE_FILE: &str = "daemon-state.json";
 const DEFAULT_DAEMON_START_LOCK_FILE: &str = "daemon-state.lock";
 const MIN_STALE_STARTUP_LOCK_AGE: Duration = Duration::from_secs(30);
+/// How long to keep retrying a repo open while the managed daemon comes up.
+/// Opening a large base snapshot is synchronous and can take tens of seconds, so
+/// this budget has to outlast a slow open rather than assume a fast one.
+const DEFAULT_DAEMON_START_TIMEOUT: Duration = Duration::from_secs(120);
+const DAEMON_START_TIMEOUT_ENV: &str = "FLASHGREP_DAEMON_START_TIMEOUT_MS";
+
+fn configured_daemon_start_timeout() -> Duration {
+    std::env::var(DAEMON_START_TIMEOUT_ENV)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .map_or(DEFAULT_DAEMON_START_TIMEOUT, Duration::from_millis)
+}
 
 #[derive(Debug, Clone)]
 pub struct ManagedDaemonClient {
@@ -48,7 +61,7 @@ impl Default for ManagedDaemonClient {
     fn default() -> Self {
         Self {
             daemon_program: None,
-            start_timeout: Duration::from_secs(10),
+            start_timeout: configured_daemon_start_timeout(),
             retry_interval: Duration::from_millis(100),
         }
     }

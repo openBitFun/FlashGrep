@@ -1172,3 +1172,138 @@ fn ensure_repo_builds_missing_index_once() {
         other => panic!("unexpected response: {other:?}"),
     }
 }
+
+#[test]
+fn failed_base_snapshot_build_hands_the_repo_phase_back() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
+        .expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+
+    // Fail the build the way a mid-build branch switch does: the Git state the
+    // build reads disappears from under it.
+    fs::remove_dir_all(repo_path.join(".git")).expect("removing .git should succeed");
+
+    let started = service
+        .handle_request_only(Request::BaseSnapshotBuild {
+            params: crate::daemon::protocol::RepoRef {
+                repo_id: repo_id.clone(),
+            },
+        })
+        .expect("async build should start");
+    let task_id = match started {
+        Response::TaskStarted { task } => task.task_id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+
+    let task = wait_for_task_status(&service, &task_id, |task| {
+        matches!(task.state, TaskState::Failed)
+    });
+    assert!(task.error.is_some(), "failed build should record an error");
+
+    // The phase must go back to what is actually on disk. Leaving it on
+    // `BuildingBaseSnapshot` with no task behind it strands the repo: the
+    // maintenance probe and every build entry point are gated on the phase.
+    let status = get_status(&service, &repo_id);
+    assert!(
+        status.active_task_id.is_none(),
+        "failed build should clear the active task"
+    );
+    assert!(
+        matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::MissingBaseSnapshot
+        ),
+        "failed build should hand the phase back, got {:?}",
+        status.phase
+    );
+    assert!(
+        status.last_error.is_some(),
+        "failed build should surface the error"
+    );
+}
+
+#[test]
+fn stranded_build_phase_recovers_without_a_task_to_finish_it() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
+        .expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyClean
+                | crate::daemon::protocol::RepoPhase::ReadyDirty
+        )
+    });
+
+    strand_repo_phase(
+        &service,
+        &repo_id,
+        crate::daemon::repo::RepoPhase::BuildingBaseSnapshot,
+        true,
+    );
+
+    // Nothing is going to finish this build, so only the maintenance probe can
+    // rescue the repo. It has to be willing to run in a phase it does not
+    // normally probe in, otherwise the repo is stuck for good.
+    let status = wait_for_status(&service, &repo_id, |status| {
+        matches!(
+            status.phase,
+            crate::daemon::protocol::RepoPhase::ReadyClean
+                | crate::daemon::protocol::RepoPhase::ReadyDirty
+        )
+    });
+    assert!(status.active_task_id.is_none());
+}
+
+#[test]
+fn stranded_repo_without_a_base_snapshot_is_rebuilt_on_ensure() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(repo_path.join("main.rs"), "const NAME: &str = \"HELLO\";\n")
+        .expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&service, repo_path.clone());
+    strand_repo_phase(
+        &service,
+        &repo_id,
+        crate::daemon::repo::RepoPhase::BuildingBaseSnapshot,
+        // No probe: this test covers the `ensure_repo` recovery path on its own,
+        // and a probe would re-derive the phase before the request is handled.
+        false,
+    );
+
+    // `ensure_repo` used to build only for `MissingBaseSnapshot`, so a repo
+    // stranded mid-build never got its index back and every search fell through
+    // to the `rg` fallback.
+    match ensure_repo(&service, repo_path) {
+        Response::RepoEnsured {
+            indexed_docs,
+            status,
+            ..
+        } => {
+            assert_eq!(indexed_docs, Some(1));
+            assert!(matches!(
+                status.phase,
+                crate::daemon::protocol::RepoPhase::ReadyClean
+                    | crate::daemon::protocol::RepoPhase::ReadyDirty
+            ));
+        }
+        other => panic!("unexpected response: {other:?}"),
+    }
+}

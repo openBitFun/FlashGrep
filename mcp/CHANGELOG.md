@@ -2,14 +2,19 @@
 
 ## Unreleased
 
+- Fixed an index that stayed permanently invalid after switching Git branches during a base snapshot build: a build that ended without succeeding now hands the repository phase back instead of stranding it mid-build.
+- Recovered repositories already stranded in a build or degraded phase through the background workspace probe, which now re-derives the phase from on-disk state rather than refusing to run outside the ready phases.
+- Restarted the base snapshot build from `ensure_repo` and from the MCP server when a repository reports building with no task behind it, instead of falling back to `rg` indefinitely.
+- Fixed `flashgrep mcp-bridge` timing out when reusing an existing index: the `initialize` handshake is now answered before the repository is opened, so opening a large base snapshot no longer runs inside the client's handshake budget.
+- Raised the backend startup budgets and made them configurable through `FLASHGREP_MCP_START_TIMEOUT_MS` and `FLASHGREP_DAEMON_START_TIMEOUT_MS`, and named the former in the timeout error message.
+
+## v0.2.12 - 2026-07-20
+
 - Kept compatible base manifests readable across branch switches instead of invalidating the index or scheduling an automatic full rebuild.
 - Added commit-diff base advancement with candidate-manifest CAS activation, delta/delete segments, cancellation, and stale-HEAD rejection.
 - Added a bounded persistent HEAD manifest cache so recent branch switch-backs require zero document tokenization.
 - Added delta-only compaction and GC roots for current, active-search, and cached manifests without selecting foundation segments.
 - Added branch/base/overlay identity, delta metrics, cache count, compaction status, and incremental maintenance configuration to daemon, CLI, and MCP surfaces.
-
-## v0.2.12 - 2026-07-20
-
 - Reused one managed daemon, index reader, and workspace watcher across MCP processes for the same Git worktree.
 - Dispatched MCP JSON-RPC requests concurrently so a slow search no longer blocks unrelated requests.
 - Streamed transition `rg` results and terminated the process once the global result limit was reached.

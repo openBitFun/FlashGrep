@@ -17,10 +17,11 @@ use super::{
 };
 
 impl RepoTaskRecord {
-    fn new(task_id: String, repo_id: String, kind: RepoTaskKind) -> Self {
+    fn new(task_id: String, repo_id: String, kind: RepoTaskKind, owns_repo_phase: bool) -> Self {
         let now = SystemTime::now();
         Self {
             kind,
+            owns_repo_phase,
             cancel_requested: std::sync::atomic::AtomicBool::new(false),
             state: std::sync::Mutex::new(RepoTaskStatus {
                 task_id,
@@ -190,6 +191,7 @@ impl RepoRuntime {
             task_id.clone(),
             self.repo_id.clone(),
             kind,
+            update_repo_phase,
         ));
         {
             let mut tasks = match self.tasks.lock() {
@@ -436,6 +438,14 @@ impl RepoRuntime {
         completed_units: Option<usize>,
         last_error: Option<Option<String>>,
     ) {
+        let succeeded = matches!(task.snapshot().state, RepoTaskState::Completed);
+        // A task that claimed the repo phase must hand it back when it does not
+        // succeed. Otherwise the repo keeps a transient phase (e.g. building)
+        // with no active task, which no recovery path can leave: the maintenance
+        // probe refuses to run outside the ready phases, and the build entry
+        // points only fire on `MissingBaseSnapshot`.
+        let restore_phase = task.owns_repo_phase && !succeeded;
+        let dirty_stats = restore_phase.then(|| self.dirty_catalog_stats());
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -443,6 +453,9 @@ impl RepoRuntime {
         state.active_task_id = None;
         if let Some(last_error) = last_error {
             state.last_error = last_error;
+        }
+        if let Some(dirty_stats) = dirty_stats {
+            super::status::apply_workspace_dirty_status(&mut state, dirty_stats);
         }
         drop(state);
         self.emit_task_finished(task.snapshot());

@@ -503,6 +503,34 @@ impl RepoManager {
         Ok(self.repo(repo_id)?.workspace_probe_pending())
     }
 
+    /// Strands the repo in `phase` with no task behind it, reproducing the state
+    /// an aborted task used to leave. Recovery must not depend on a task being
+    /// there to finish.
+    #[cfg(test)]
+    /// `wake_maintenance` requests an immediate probe instead of waiting out the
+    /// regular poll interval. Pass `false` to leave the repo stranded, so a caller
+    /// can observe how another recovery path behaves before any probe intervenes.
+    pub(crate) fn strand_repo_phase_for_tests(
+        &self,
+        repo_id: &str,
+        phase: RepoPhase,
+        wake_maintenance: bool,
+    ) -> Result<()> {
+        let runtime = self.repo(repo_id)?;
+        {
+            let mut state = match runtime.state.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            state.phase = phase;
+            state.active_task_id = None;
+        }
+        if wake_maintenance {
+            runtime.schedule_workspace_probe(std::time::Duration::from_millis(0));
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     pub(crate) fn workspace_watcher_active_for_tests(&self, repo_id: &str) -> Result<bool> {
         Ok(self.repo(repo_id)?.workspace_watcher_active())
@@ -602,6 +630,10 @@ struct RepoState {
 
 struct RepoTaskRecord {
     kind: RepoTaskKind,
+    /// Whether starting this task overwrote the repo phase. Tasks that own the
+    /// phase must restore it when they finish without succeeding, otherwise the
+    /// repo is stranded in a transient phase with no active task.
+    owns_repo_phase: bool,
     cancel_requested: AtomicBool,
     state: Mutex<RepoTaskStatus>,
 }
