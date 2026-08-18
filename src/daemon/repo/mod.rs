@@ -114,6 +114,14 @@ pub struct RepoStatus {
     /// the current one.
     pub workspace_probe_pending: bool,
     pub last_error: Option<String>,
+    /// Failure of the most recent background base-maintenance task (advance or
+    /// compaction), kept in its own slot.
+    ///
+    /// `last_error` is shared with the worktree probe, and a probe succeeds
+    /// every few seconds, so a maintenance failure parked there is erased
+    /// before a status poller running on a human timescale can observe it.
+    /// Only the next maintenance task of the same kind clears this one.
+    pub last_maintenance_error: Option<String>,
     pub overlay: Option<WorkspaceOverlayStatus>,
 }
 
@@ -639,6 +647,7 @@ struct RepoState {
     active_task_id: Option<String>,
     probe_healthy: bool,
     last_error: Option<String>,
+    last_maintenance_error: Option<String>,
 }
 
 struct RepoTaskRecord {

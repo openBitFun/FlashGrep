@@ -452,7 +452,27 @@ impl RepoRuntime {
         };
         state.active_task_id = None;
         if let Some(last_error) = last_error {
-            state.last_error = last_error;
+            state.last_error = last_error.clone();
+            // Background base maintenance also reports into its own slot. The
+            // shared `last_error` is cleared by every successful worktree
+            // probe, which happens on a seconds timescale, so a failure left
+            // only there is gone before a status poller can see it.
+            if matches!(
+                task.kind,
+                RepoTaskKind::AdvanceBaseSnapshot | RepoTaskKind::CompactBaseDeltas
+            ) {
+                state.last_maintenance_error = last_error;
+            }
+        }
+        // A maintenance task that got through clears the sticky slot; nothing
+        // else does, so the failure survives until the same work succeeds.
+        if succeeded
+            && matches!(
+                task.kind,
+                RepoTaskKind::AdvanceBaseSnapshot | RepoTaskKind::CompactBaseDeltas
+            )
+        {
+            state.last_maintenance_error = None;
         }
         if let Some(dirty_stats) = dirty_stats {
             super::status::apply_workspace_dirty_status(&mut state, dirty_stats);

@@ -155,7 +155,8 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
   "active_task_id": null,
   "probe_healthy": true,
   "workspace_probe_pending": false,
-  "last_error": null
+  "last_error": null,
+  "last_maintenance_error": null
 }
 ```
 
@@ -189,6 +190,13 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
   遍历，超大仓上可省数秒），因此打开后该字段为 `true`，直到 maintenance worker 完成
   authoritative probe 后自动清零。需要 authoritative 结果的调用方应显式调用
   `refresh_repo`；daemon 不会因为该字段为 `true` 就把查询降级到 `rg` 全量扫描
+- `last_error` 由 worktree probe 和后台任务共用，且**每一次成功的 probe 都会把它清零**。
+  probe 以秒级频率运行，所以只落在这里的后台维护失败会在轮询者看到之前被抹掉
+  （实测 v0.2.14 上约 3.5 s）
+- `last_maintenance_error` 是后台 base 维护（`advance_base_snapshot` /
+  `compact_base_deltas`）失败的**独立**插槽：probe 不碰它，只有同类维护任务下一次成功
+  才清零。以人的时间尺度轮询 `get_repo_status` 的调用方应当读这个字段，而不是 `last_error`。
+  早于 v0.2.15 的 daemon 不发送该字段
 
 `overlay` 字段：
 

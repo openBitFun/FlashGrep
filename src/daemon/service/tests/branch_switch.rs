@@ -929,3 +929,108 @@ fn atomic_rename_replace_updates_tracked_file_contents() {
     let _ = wait_for_search_count(&service, &repo_id, "ATOMIC_REPLACED", 1);
     let _ = wait_for_search_count(&service, &repo_id, "ATOMIC_BASE", 0);
 }
+
+/// A background maintenance failure must survive the worktree probes that keep
+/// running after it.
+///
+/// `last_error` is shared with the probe, and every successful probe clears it.
+/// Probes land on a seconds timescale, so a maintenance failure parked only
+/// there is erased before a status poller on a human timescale can see it —
+/// measured at ~3.5 s against v0.2.14, versus a 5 s idle poll in the embedding
+/// client. `last_maintenance_error` is the slot that keeps it.
+#[cfg(unix)]
+#[test]
+fn base_maintenance_failure_outlives_the_probes_that_clear_last_error() {
+    use std::os::unix::fs::PermissionsExt;
+
+    fn set_mode(path: &Path, mode: u32) {
+        for entry in walkdir(path) {
+            let mut perms = fs::metadata(&entry)
+                .expect("index entry metadata should be readable")
+                .permissions();
+            perms.set_mode(mode);
+            let _ = fs::set_permissions(&entry, perms);
+        }
+        let mut perms = fs::metadata(path)
+            .expect("index root metadata should be readable")
+            .permissions();
+        perms.set_mode(mode);
+        fs::set_permissions(path, perms).expect("index root permissions should be settable");
+    }
+
+    fn walkdir(path: &Path) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        let Ok(entries) = fs::read_dir(path) else {
+            return found;
+        };
+        for entry in entries.flatten() {
+            let child = entry.path();
+            if child.is_dir() {
+                found.extend(walkdir(&child));
+            }
+            found.push(child);
+        }
+        found
+    }
+
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    let tracked = repo_path.join("tracked.rs");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    fs::write(&tracked, "const NAME: &str = \"MAINTENANCE_TOKEN\";\n")
+        .expect("tracked write should succeed");
+    init_git_repo(&repo_path);
+    git_commit_all(&repo_path, "base");
+
+    let storage_root = temp.path().join("storage");
+    let repo_id = match service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: Some(storage_root.clone()),
+                config: RepoConfig::default(),
+                refresh: Default::default(),
+            },
+        })
+        .expect("open repo should succeed")
+    {
+        Response::RepoOpened { repo_id, .. } => repo_id,
+        other => panic!("unexpected response: {other:?}"),
+    };
+    build_repo(&service, &repo_id);
+    wait_for_status(&service, &repo_id, |status| {
+        status.active_task_id.is_none() && !status.workspace_probe_pending
+    });
+
+    // Take away write access to the base snapshot only. The overlay lives in a
+    // sibling directory, so the worktree probe keeps succeeding — which is
+    // precisely the condition that used to erase the failure.
+    let base_root = storage_root.join("base-snapshot");
+    set_mode(&base_root, 0o555);
+
+    fs::write(&tracked, "const NAME: &str = \"ADVANCED_TOKEN\";\n")
+        .expect("tracked rewrite should succeed");
+    git_commit_all(&repo_path, "advance");
+    refresh_repo(&service, &repo_id, true);
+
+    let failed = wait_for_status(&service, &repo_id, |status| {
+        status.last_maintenance_error.is_some()
+    });
+    let recorded = failed
+        .last_maintenance_error
+        .clone()
+        .expect("maintenance failure should be recorded");
+
+    // Now let the probes run. They clear `last_error`; they must not touch the
+    // maintenance slot.
+    let after_probes = wait_for_status(&service, &repo_id, |status| status.last_error.is_none());
+    assert_eq!(
+        after_probes.last_maintenance_error.as_deref(),
+        Some(recorded.as_str()),
+        "a successful worktree probe must not clear the maintenance failure"
+    );
+
+    set_mode(&base_root, 0o755);
+}
