@@ -533,6 +533,16 @@ pub struct RepoStatus {
     #[serde(default)]
     pub workspace_probe_pending: bool,
     pub last_error: Option<String>,
+    /// Failure of the most recent background base-maintenance task (advance or
+    /// compaction). Unlike `last_error`, which the worktree probe clears on
+    /// every success, this slot is only cleared when the same kind of
+    /// maintenance work succeeds — a poller on a human timescale can therefore
+    /// still see it.
+    ///
+    /// Defaulted so daemons older than v0.2.15, which never send the field,
+    /// still decode.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_maintenance_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<WorkspaceOverlayStatus>,
 }

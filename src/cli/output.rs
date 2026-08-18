@@ -138,6 +138,9 @@ fn format_repo_status_human(status: &RepoStatus) -> String {
         "base_compaction_recommended: {}",
         status.base_compaction_recommended
     );
+    if let Some(error) = status.last_maintenance_error.as_deref() {
+        let _ = writeln!(output, "last_maintenance_error: {error}");
+    }
     let _ = writeln!(
         output,
         "last_probe_unix_secs: {}",
@@ -218,6 +221,7 @@ mod tests {
             base_advance_target_head: None,
             cached_head_count: 0,
             base_compaction_recommended: false,
+            last_maintenance_error: None,
             last_probe_unix_secs: Some(1),
             last_rebuild_unix_secs: Some(2),
             dirty_files: crate::daemon::protocol::DirtyFileStats {

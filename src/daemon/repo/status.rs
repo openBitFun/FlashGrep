@@ -30,6 +30,7 @@ impl Default for RepoState {
             active_task_id: None,
             probe_healthy: true,
             last_error: None,
+            last_maintenance_error: None,
         }
     }
 }
@@ -81,6 +82,7 @@ impl RepoRuntime {
             probe_healthy: state.probe_healthy,
             workspace_probe_pending: self.workspace_probe_pending(),
             last_error: state.last_error,
+            last_maintenance_error: state.last_maintenance_error,
             overlay,
         };
         if matches!(

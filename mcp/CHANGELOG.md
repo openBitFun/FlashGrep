@@ -1,5 +1,10 @@
 # Changelog
 
+## v0.2.15 - 2026-08-18
+
+- Added `RepoStatus.last_maintenance_error`, which reports the failure of the last background base-maintenance task (`advance_base_snapshot` or `compact_base_deltas`). It is written when one of those tasks fails and cleared only when the same kind of work succeeds; the worktree probe never touches it.
+- Fixed background maintenance failures being unobservable in practice: they were parked in `last_error`, which the worktree probe shares and every successful probe clears. Probes complete on a seconds timescale — measured at ~3.5 s on v0.2.14 — so a failure reported only there was erased before a status poller on a human timescale could read it.
+
 ## v0.2.14 - 2026-08-18
 
 - Cut `open_repo` on a very large repository from seconds to hundreds of milliseconds by mounting the persisted workspace overlay without walking the worktree; the authoritative reconcile now runs on the background maintenance worker (Chromium: 8.5 s to 0.62 s).
