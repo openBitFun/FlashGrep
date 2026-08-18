@@ -1,6 +1,6 @@
 {
   "name": "flashgrep-mcp",
-  "version": "0.2.13",
+  "version": "0.2.14",
   "private": true,
   "description": "MCP server for flashgrep repository search",
   "engines": {

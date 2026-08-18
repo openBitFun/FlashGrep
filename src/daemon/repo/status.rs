@@ -79,6 +79,7 @@ impl RepoRuntime {
             dirty_files: state.dirty_files,
             active_task_id: state.active_task_id,
             probe_healthy: state.probe_healthy,
+            workspace_probe_pending: self.workspace_probe_pending(),
             last_error: state.last_error,
             overlay,
         };
@@ -137,7 +138,6 @@ impl RepoRuntime {
         self.emit_workspace_status_changed();
     }
 
-    #[cfg(test)]
     pub(super) fn mark_workspace_probe_pending(&self) {
         self.workspace_probe_pending.store(true, Ordering::Relaxed);
         self.schedule_workspace_probe(super::maintenance::GIT_WORKSPACE_EVENT_RETRY_DELAY);

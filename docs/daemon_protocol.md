@@ -154,6 +154,7 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
   },
   "active_task_id": null,
   "probe_healthy": true,
+  "workspace_probe_pending": false,
   "last_error": null
 }
 ```
@@ -182,6 +183,12 @@ indexed daemon workspace requires a Git worktree with a HEAD commit: <path>
   worktree overlay，再以 commit diff 增量推进 base manifest
 - `overlay` 存在时表示 daemon 已打开 workspace overlay engine，并暴露其当前已发布 overlay 与后台维护状态
 - `probe_healthy=false` 表示最近一次 Git dirty probe 失败；daemon 会保留上一份成功发布的查询视图，并由 maintenance worker 重试
+- `workspace_probe_pending=true` 表示 daemon 仍欠一次 worktree reconcile：此时
+  `dirty_files`、`phase` 和已发布 overlay 描述的是**最近一次观测到**的 worktree 状态，
+  而不是当前状态。`open_repo` / `ensure_repo` 只恢复上次持久化的 overlay（不走 worktree
+  遍历，超大仓上可省数秒），因此打开后该字段为 `true`，直到 maintenance worker 完成
+  authoritative probe 后自动清零。需要 authoritative 结果的调用方应显式调用
+  `refresh_repo`；daemon 不会因为该字段为 `true` 就把查询降级到 `rg` 全量扫描
 
 `overlay` 字段：
 
@@ -373,10 +380,10 @@ parent/candidate manifest ID 和 cache hit。
   },
   "search": {
     "search_modes": [
+      "files_with_matches",
+      "line_matches",
       "count_only",
-      "count_matches",
-      "first_hit_only",
-      "materialize_matches"
+      "count_matches"
     ]
   }
 }
@@ -415,6 +422,9 @@ parent/candidate manifest ID 和 cache hit。
 - 启动后台 maintenance / workspace probe 循环
 - 不自动构建 base snapshot
 - 要求 `repo_path` 位于非 bare Git worktree 内，且该 repo 已有 `HEAD` commit
+- 只恢复上次持久化的 workspace overlay（校验 manifest 身份与 `HEAD`，不遍历 worktree），
+  authoritative worktree reconcile 交给 maintenance worker；因此响应中的
+  `status.workspace_probe_pending` 为 `true`，`dirty_files` / `phase` 是上次观测值
 
 补充约定：
 
@@ -486,7 +496,9 @@ parent/candidate manifest ID 和 cache hit。
 - `indexed_docs = null` 表示已有 base snapshot 的 `HEAD`、config fingerprint、repo root 均匹配当前 Git discovery
 - 如果 repo 已提交/checkout 到新的 `HEAD`，`ensure_repo` 会同步构建当前 `HEAD + config`
   的 base snapshot，而不是复用任意旧 snapshot
-- 重启后会通过 Git dirty probe 恢复当前状态，这会增加启动阶段耗时，但不会改变对外语义
+- 重启后不再在打开阶段做 Git dirty probe：与 `open_repo` 一样只恢复持久化 overlay，
+  并用 `workspace_probe_pending` 声明仍欠的 reconcile；这样超大仓的打开耗时从秒级降到
+  百毫秒级，语义变化只在于 dirty 字段是最近观测值
 
 ### `get_repo_status`
 
@@ -513,6 +525,8 @@ parent/candidate manifest ID 和 cache hit。
 
 - 主动从 worktree 重算 dirty 集
 - 当后台 probe 尚未收敛或客户端怀疑状态过期时使用
+- 这是 `workspace_probe_pending=true` 时拿到 authoritative 状态的唯一手段：调用返回时
+  该字段已清零，`dirty_files` / `phase` / overlay 都对应当次 worktree 观测结果
 
 请求：
 
@@ -658,11 +672,10 @@ repo fingerprint fallback 只属于库层/低层能力，不属于 daemon indexe
     "fixed_strings": false,
     "word_regexp": false,
     "line_regexp": false,
-    "before_context": 0,
-    "after_context": 0,
     "top_k_tokens": 6,
     "max_count": null,
-    "search_mode": "materialize_matches"
+    "global_max_results": null,
+    "search_mode": "line_matches"
   },
   "scope": {
     "roots": [],
@@ -672,8 +685,7 @@ repo fingerprint fallback 只属于库层/低层能力，不属于 daemon indexe
     "type_clear": [],
     "types": [],
     "type_not": []
-  },
-  "allow_scan_fallback": false
+  }
 }
 ```
 
@@ -683,8 +695,10 @@ repo fingerprint fallback 只属于库层/低层能力，不属于 daemon indexe
 
 - `scope.roots` 必须为空，或解析后仍位于 `repo_id` 对应 repo 根目录之内
 - daemon 不接受借助 `roots` 越出 repo 边界的搜索请求
-- `allow_scan_fallback` 只用于 indexed repo 未 ready 时的一次性过渡搜索；它不会绕过
-  `open_repo` / `ensure_repo` 的 Git worktree discovery 要求
+- `QuerySpec` 不支持上下文行（`before_context` / `after_context`）；需要上下文的调用方要自己走 `rg`
+- 没有 `allow_scan_fallback` 开关：indexed repo 未 ready 时由 daemon 内部按
+  `QueryBackend`（index → `rg` → 全量扫描）自行过渡，调用方无法请求或禁止它，
+  也不能借此绕过 `open_repo` / `ensure_repo` 的 Git worktree discovery 要求
 
 调用方应至少读取：
 
@@ -696,6 +710,10 @@ repo fingerprint fallback 只属于库层/低层能力，不属于 daemon indexe
 - 走了 index
 - 使用了 dirty overlay / repair
 - 退回 `rg` 或全量扫描
+
+`status.workspace_probe_pending=true` 表示本次结果基于最近观测到的 worktree 视图：daemon
+不会为此自行降级到全量扫描，需要 authoritative 结果的调用方应调用一次 `refresh_repo`
+后重搜。
 
 ### `glob`
 

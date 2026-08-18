@@ -1,5 +1,13 @@
 # Changelog
 
+## v0.2.14 - 2026-08-18
+
+- Cut `open_repo` on a very large repository from seconds to hundreds of milliseconds by mounting the persisted workspace overlay without walking the worktree; the authoritative reconcile now runs on the background maintenance worker (Chromium: 8.5 s to 0.62 s).
+- Fixed a clean worktree rebuilding its whole workspace overlay on every open: an empty overlay now persists a manifest carrying its source identity instead of deleting its storage, so the next open reuses it.
+- Merged the startup worktree probe into a single `git status` walk when HEAD still matches the base snapshot, replacing the previous `git diff` plus `git ls-files --others` pair; unrecognised output and moved HEADs fall back to the old path.
+- Added `RepoStatus.workspace_probe_pending`, which reports that `dirty_files`, `phase`, and the published overlay are last-observed values because a worktree reconcile is still owed. `refresh_repo` remains the way to force an authoritative view.
+- Kept queries on the restored overlay while a probe is pending rather than downgrading them to a full `rg` scan.
+
 ## v0.2.13 - 2026-08-17
 
 - Fixed an index that stayed permanently invalid after switching Git branches during a base snapshot build: a build that ended without succeeding now hands the repository phase back instead of stranding it mid-build.
