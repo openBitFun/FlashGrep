@@ -6,6 +6,7 @@ use std::{
     path::{Path, PathBuf},
     process::Command,
     sync::Arc,
+    time::Instant,
 };
 
 use crate::{
@@ -286,35 +287,53 @@ impl RepoRuntime {
         self.diff_against_base_snapshot_git_worktree_with_scope(None)
     }
 
-    pub(super) fn startup_worktree_candidates(&self) -> Result<(DirtyPathSet, Vec<PathBuf>)> {
-        let Some(base_metadata) =
-            WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&self.build_config)?
-        else {
-            return Ok((DirtyPathSet::default(), Vec::new()));
+    fn git_status_dirty_paths_at_head(&self, expected_head: &str) -> Result<Option<DirtyPathSet>> {
+        // `git status` can report tracked and untracked paths in one worktree walk. It compares
+        // against the current HEAD, so only use it when its branch oid matches the base snapshot;
+        // otherwise the existing diff + ls-files path is required to include committed changes.
+        if self.build_config.corpus_mode != CorpusMode::RespectIgnore {
+            return Ok(None);
+        }
+        let output = self.run_git_output(
+            [
+                "status",
+                "--porcelain=v2",
+                "--branch",
+                "-z",
+                "--untracked-files=all",
+                "--no-renames",
+                "--ignore-submodules=all",
+            ],
+            &[],
+        )?;
+        let Some((head, records)) = parse_git_status_v2_z(&output) else {
+            return Ok(None);
         };
-        let Some(head_commit) = base_metadata
-            .head_commit
-            .or(base_metadata.revision.map(|revision| revision.0))
-        else {
-            return Ok((DirtyPathSet::default(), Vec::new()));
-        };
+        if head != expected_head {
+            return Ok(None);
+        }
+
         let mut dirty = DirtyPathSet::default();
-        for (path, kind) in self.git_tracked_dirty_paths(&head_commit, None)? {
-            dirty.upsert(path, kind);
+        for (status, logical_path) in records {
+            let path = resolve_repo_path(&self.build_config.repo_path, &logical_path);
+            if is_workspace_internal_path(&path)
+                || self.is_storage_path(&path)
+                || (!self.build_config.include_hidden && self.path_is_hidden_for_build(&path))
+            {
+                continue;
+            }
+            let kind = if status == "?" {
+                DirtyPathKind::New
+            } else if status.chars().any(|status| status == 'D') {
+                DirtyPathKind::Deleted
+            } else if status.chars().any(|status| status == 'A') {
+                DirtyPathKind::New
+            } else {
+                DirtyPathKind::Modified
+            };
+            dirty.upsert(path.to_string_lossy().into_owned(), kind);
         }
-        for path in self.git_untracked_visible_paths(None)? {
-            dirty.upsert(path, DirtyPathKind::New);
-        }
-        let mut paths = dirty
-            .modified
-            .iter()
-            .chain(dirty.deleted.iter())
-            .chain(dirty.new.iter())
-            .map(PathBuf::from)
-            .collect::<Vec<_>>();
-        paths.sort();
-        paths.dedup();
-        Ok((dirty, paths))
+        Ok(Some(dirty))
     }
 
     pub(super) fn diff_against_base_snapshot_git_worktree_paths(
@@ -344,8 +363,51 @@ impl RepoRuntime {
             )));
         };
 
-        let tracked_changes = self.git_tracked_dirty_paths(&head_commit, paths)?;
-        let untracked_visible_paths = self.git_untracked_visible_paths(paths)?;
+        // A whole-worktree probe is the expensive case: `git diff` and
+        // `git ls-files --others` each walk the tree, which is ~5.7 s on
+        // Chromium. When HEAD still matches the base snapshot, one
+        // `git status` walk reports tracked and untracked paths together, so
+        // prefer it and keep the two-command path for the cases it cannot
+        // answer (HEAD moved, `NoIgnore`, unparsable output).
+        let probe_started_at = Instant::now();
+        let (tracked_changes, untracked_visible_paths, probe_mode) = match paths {
+            None => match self.git_status_dirty_paths_at_head(&head_commit)? {
+                // `git status` already merges tracked and untracked paths, and
+                // the shared classification below decides which of them really
+                // differ from the base snapshot.
+                Some(dirty) => (
+                    dirty
+                        .modified
+                        .iter()
+                        .map(|path| (path.clone(), DirtyPathKind::Modified))
+                        .chain(
+                            dirty
+                                .deleted
+                                .iter()
+                                .map(|path| (path.clone(), DirtyPathKind::Deleted)),
+                        )
+                        .chain(
+                            dirty
+                                .new
+                                .iter()
+                                .map(|path| (path.clone(), DirtyPathKind::New)),
+                        )
+                        .collect::<Vec<_>>(),
+                    Vec::new(),
+                    "status",
+                ),
+                None => (
+                    self.git_tracked_dirty_paths(&head_commit, None)?,
+                    self.git_untracked_visible_paths(None)?,
+                    "legacy",
+                ),
+            },
+            Some(paths) => (
+                self.git_tracked_dirty_paths(&head_commit, Some(paths))?,
+                self.git_untracked_visible_paths(Some(paths))?,
+                "scoped",
+            ),
+        };
 
         let mut dirty = DirtyPathSet::default();
         let mut tracked_current_paths = Vec::new();
@@ -361,6 +423,15 @@ impl RepoRuntime {
         }
         dirty.merge(self.classify_paths_against_base_snapshot(tracked_current_paths)?);
         dirty.merge(self.classify_paths_against_base_snapshot(untracked_visible_paths)?);
+
+        if paths.is_none() {
+            eprintln!(
+                "flashgrep[overlay-metrics][info] stage=worktree_probe mode={} elapsed_ms={} dirty_paths={}",
+                probe_mode,
+                probe_started_at.elapsed().as_millis(),
+                dirty.stats().modified + dirty.stats().deleted + dirty.stats().new,
+            );
+        }
 
         Ok(dirty)
     }
@@ -711,6 +782,43 @@ fn parse_git_name_status_z(output: &[u8]) -> Vec<(String, String)> {
     parsed
 }
 
+fn parse_git_status_v2_z(output: &[u8]) -> Option<(String, Vec<(String, String)>)> {
+    let mut head = None;
+    let mut records = Vec::new();
+    let chunks = output
+        .split(|byte| *byte == 0)
+        .filter(|record| !record.is_empty());
+    for record in chunks {
+        if let Some(value) = record.strip_prefix(b"# branch.oid ") {
+            head = Some(String::from_utf8_lossy(value).into_owned());
+            continue;
+        }
+        if record.starts_with(b"# ") {
+            continue;
+        }
+        if record.starts_with(b"?") {
+            let path = record.strip_prefix(b"? ")?;
+            records.push(("?".to_string(), String::from_utf8_lossy(path).into_owned()));
+            continue;
+        }
+        if record.starts_with(b"1 ") {
+            let mut fields = record.splitn(9, |byte| *byte == b' ');
+            let _record_type = fields.next()?;
+            let status = String::from_utf8_lossy(fields.next()?).into_owned();
+            for _ in 0..6 {
+                fields.next()?;
+            }
+            let path = fields.next()?;
+            records.push((status, String::from_utf8_lossy(path).into_owned()));
+            continue;
+        }
+        // `--no-renames` should keep the common path on record type 1. If Git emits a record
+        // shape we do not understand, use the legacy probes instead of risking a partial set.
+        return None;
+    }
+    Some((head?, records))
+}
+
 fn file_mtime_nanos(metadata: &fs::Metadata) -> u64 {
     metadata
         .modified()
@@ -776,7 +884,10 @@ fn decide_overlay_update_mode(
 mod tests {
     use std::ffi::OsString;
 
-    use super::{decide_overlay_update_mode, git_pathspec_chunks, DirtyPathSet, OverlayUpdateMode};
+    use super::{
+        decide_overlay_update_mode, git_pathspec_chunks, parse_git_status_v2_z, DirtyPathSet,
+        OverlayUpdateMode,
+    };
 
     fn dirty_paths(modified: &[&str], deleted: &[&str], new: &[&str]) -> DirtyPathSet {
         DirtyPathSet {
@@ -784,6 +895,36 @@ mod tests {
             deleted: deleted.iter().map(|path| (*path).to_string()).collect(),
             new: new.iter().map(|path| (*path).to_string()).collect(),
         }
+    }
+
+    #[test]
+    fn parses_status_v2_branch_and_path_records() {
+        let output = b"# branch.oid abc123\0# branch.head main\0"
+            .iter()
+            .chain(b"1 .M N... 100644 100644 100644 hash hash src/changed.rs\0")
+            .chain(b"? new file.rs\0")
+            .copied()
+            .collect::<Vec<_>>();
+
+        assert_eq!(
+            parse_git_status_v2_z(&output),
+            Some((
+                "abc123".to_string(),
+                vec![
+                    (".M".to_string(), "src/changed.rs".to_string()),
+                    ("?".to_string(), "new file.rs".to_string()),
+                ],
+            ))
+        );
+    }
+
+    #[test]
+    fn rejects_status_v2_records_without_branch_or_known_shape() {
+        assert_eq!(parse_git_status_v2_z(b"? orphan.txt\0"), None);
+        assert_eq!(
+            parse_git_status_v2_z(b"# branch.oid abc123\0u invalid\0"),
+            None
+        );
     }
 
     #[test]

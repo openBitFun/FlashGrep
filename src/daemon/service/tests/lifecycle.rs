@@ -126,6 +126,37 @@ fn opening_empty_git_repo_fails_without_creating_gitignore() {
 }
 
 #[test]
+fn opening_bare_git_repo_fails_without_creating_gitignore() {
+    let _serial = daemon_test_serial();
+    let service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("bare.git");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let status = std::process::Command::new("git")
+        .args(["init", "--bare"])
+        .arg(&repo_path)
+        .status()
+        .expect("git init should run");
+    assert!(status.success(), "git init --bare should succeed");
+
+    let error = service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: repo_path.clone(),
+                storage_root: None,
+                config: RepoConfig::default(),
+                refresh: Default::default(),
+            },
+        })
+        .expect_err("bare git open should fail");
+
+    assert!(error
+        .to_string()
+        .contains("indexed daemon workspace requires a Git worktree with a HEAD commit"));
+    assert!(!repo_path.join(".gitignore").exists());
+}
+
+#[test]
 fn opening_repo_subdirectory_uses_git_root_identity_and_default_storage() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
@@ -532,7 +563,7 @@ fn reopening_repo_reuses_base_snapshot_shard_for_workspace_search() {
 }
 
 #[test]
-fn reopening_repo_detects_preexisting_dirty_files_during_open() {
+fn reopening_repo_detects_preexisting_dirty_files_after_the_deferred_probe() {
     let _serial = daemon_test_serial();
     let setup_service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -563,17 +594,68 @@ fn reopening_repo_detects_preexisting_dirty_files_during_open() {
 
     let service = DaemonService::new();
     let (repo_id, status) = open_repo(&service, repo_path);
-    assert!(matches!(
-        status.phase,
-        crate::daemon::protocol::RepoPhase::ReadyDirty
-    ));
+    // Opening only restores the persisted overlay, so the edit made while the
+    // daemon was closed is still owed: the status says so through
+    // `workspace_probe_pending` instead of walking the worktree inline.
+    assert!(
+        status.workspace_probe_pending,
+        "a deferred open must report the reconcile it still owes"
+    );
     assert!(has_base_snapshot_engine(&service, &repo_id));
+
+    let status = wait_for_status(&service, &repo_id, |status| {
+        !status.workspace_probe_pending
+            && matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
+    });
     assert_exact_dirty_stats(&status, 0, 0, 1);
 
     let (backend, search_status) =
         wait_for_search_count(&service, &repo_id, "REOPEN_DIRTY_FILE", 1);
     assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
     assert_eq!(search_status.dirty_files.new, 1);
+}
+
+#[test]
+fn reopening_repo_serves_the_restored_overlay_before_the_deferred_probe_lands() {
+    let _serial = daemon_test_serial();
+    let setup_service = DaemonService::new();
+    let temp = tempdir().expect("temp dir should succeed");
+    let repo_path = temp.path().join("repo");
+    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let tracked = repo_path.join("tracked.rs");
+    fs::write(&tracked, "const NAME: &str = \"BASELINE\";\n").expect("write should succeed");
+
+    let (repo_id, _) = open_repo(&setup_service, repo_path.clone());
+    build_repo(&setup_service, &repo_id);
+    wait_for_status(&setup_service, &repo_id, |status| {
+        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
+    });
+
+    fs::write(&tracked, "const NAME: &str = \"RESTORED_OVERLAY_TOKEN\";\n")
+        .expect("rewrite should succeed");
+    let dirty = refresh_repo(&setup_service, &repo_id, true);
+    assert_exact_dirty_stats(&dirty, 1, 0, 0);
+    let _ = wait_for_search_count(&setup_service, &repo_id, "RESTORED_OVERLAY_TOKEN", 1);
+    setup_service.shutdown_all();
+
+    let service = DaemonService::new();
+    let (repo_id, status) = open_repo(&service, repo_path);
+    assert!(
+        status.workspace_probe_pending,
+        "a deferred open must report the reconcile it still owes"
+    );
+    // The overlay the previous session persisted is installed at open, so the
+    // first search is served from the index instead of waiting for the probe or
+    // falling back to a worktree scan.
+    let (backend, _) = assert_search_count_now(&service, &repo_id, "RESTORED_OVERLAY_TOKEN", 1);
+    assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+    assert_exact_dirty_stats(&status, 1, 0, 0);
+
+    // A caller that needs authoritative state asks for it, and the refresh both
+    // reconciles the worktree and clears the pending flag.
+    let refreshed = refresh_repo(&service, &repo_id, false);
+    assert!(!refreshed.workspace_probe_pending);
+    assert_exact_dirty_stats(&refreshed, 1, 0, 0);
 }
 
 #[test]

@@ -2802,6 +2802,12 @@ fn probe_clears_restored_tracked_file_without_refresh() {
 
     fs::write(&tracked, "const VALUE: &str = \"BASE\";\n").expect("tracked restore should succeed");
     wait_for_workspace_overlay_match_count(&repo_path, "PROBE_RESTORE_TOKEN_20260416", 0);
+    assert!(
+        workspace_overlay_index_root(&repo_path)
+            .join("CURRENT_MANIFEST")
+            .exists(),
+        "an empty overlay should retain a durable manifest"
+    );
     let repo_status = get_status(&service, &repo_id);
     let build_config = crate::BuildConfig {
         repo_path: repo_path.clone(),

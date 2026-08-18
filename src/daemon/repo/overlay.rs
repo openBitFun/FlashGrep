@@ -205,7 +205,9 @@ impl RepoRuntime {
     ) -> Result<WorkspaceOverlayPublication> {
         let dirty_paths = plan.dirty_paths;
         match plan.kind {
-            WorkspaceOverlayWritePlanKind::Clear => self.try_reset_workspace_overlay_engine(),
+            WorkspaceOverlayWritePlanKind::Clear => {
+                self.try_reset_workspace_overlay_engine(manifest_source)
+            }
             WorkspaceOverlayWritePlanKind::Rebuild { snapshot } => {
                 self.try_apply_overlay_snapshot(snapshot, manifest_source)
             }
@@ -256,7 +258,10 @@ impl RepoRuntime {
         Ok(WorkspaceOverlayPublication::Committed)
     }
 
-    fn try_reset_workspace_overlay_engine(&self) -> Result<WorkspaceOverlayPublication> {
+    fn try_reset_workspace_overlay_engine(
+        &self,
+        manifest_source: Option<crate::index_engine::manifest::ManifestSource>,
+    ) -> Result<WorkspaceOverlayPublication> {
         {
             let mut slot = match self.workspace_overlay_engine.lock() {
                 Ok(guard) => guard,
@@ -265,6 +270,16 @@ impl RepoRuntime {
             *slot = None;
         }
         WorkspaceOverlayIndex::clear_storage(&self.build_config)?;
+        if let Some(source) = manifest_source {
+            let overlay_index = Arc::new(self.open_workspace_overlay_index()?);
+            overlay_index.set_manifest_source(source);
+            overlay_index.checkpoint()?;
+            let mut slot = match self.workspace_overlay_engine.lock() {
+                Ok(guard) => guard,
+                Err(poisoned) => poisoned.into_inner(),
+            };
+            *slot = Some(overlay_index);
+        }
         Ok(WorkspaceOverlayPublication::Committed)
     }
 
@@ -285,7 +300,7 @@ impl RepoRuntime {
         .cloned();
         if overlay_index.is_none() {
             if dirty.is_empty() {
-                return self.try_reset_workspace_overlay_engine();
+                return self.try_reset_workspace_overlay_engine(manifest_source);
             }
             if self.dirty_catalog_pending_paths() == *dirty {
                 WorkspaceOverlayIndex::clear_storage(&self.build_config)?;

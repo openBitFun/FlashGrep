@@ -189,13 +189,26 @@ fn daemon_restart_reuses_compatible_base_when_existing_snapshot_head_is_stale() 
                 .expect("reused status should include a snapshot key");
             assert!(snapshot_key.contains(&base_head));
             assert!(!snapshot_key.contains(&updated_head));
-            assert!(matches!(
-                status.phase,
-                crate::daemon::protocol::RepoPhase::ReadyDirty
-            ));
+            // Reconciling the worktree against the reused base needs a full
+            // worktree walk, so ensure reports the debt instead of paying it
+            // inline.
+            assert!(
+                status.workspace_probe_pending,
+                "ensure must report the reconcile it still owes"
+            );
         }
         other => panic!("unexpected response: {other:?}"),
     }
+    // The deferred probe reconciles the worktree against the reused base and
+    // hands the new head to a base advance, so the repo settles clean again.
+    let _ = wait_for_status(&service, &repo_id, |status| {
+        !status.workspace_probe_pending
+            && matches!(
+                status.phase,
+                crate::daemon::protocol::RepoPhase::ReadyClean
+                    | crate::daemon::protocol::RepoPhase::ReadyDirty
+            )
+    });
     let _ = wait_for_search_count(&service, &repo_id, "UPDATED", 1);
     let _ = wait_for_search_count(&service, &repo_id, "BASE", 0);
 }

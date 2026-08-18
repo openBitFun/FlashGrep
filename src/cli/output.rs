@@ -227,6 +227,7 @@ mod tests {
             },
             active_task_id: None,
             probe_healthy: true,
+            workspace_probe_pending: false,
             last_error: None,
             overlay: Some(crate::daemon::protocol::WorkspaceOverlayStatus {
                 base_manifest_id: None,

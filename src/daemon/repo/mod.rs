@@ -109,6 +109,10 @@ pub struct RepoStatus {
     pub dirty_files: DirtyStats,
     pub active_task_id: Option<String>,
     pub probe_healthy: bool,
+    /// A worktree reconcile is still owed, so `dirty_files`, `phase`, and the
+    /// published overlay describe the last observed worktree state rather than
+    /// the current one.
+    pub workspace_probe_pending: bool,
     pub last_error: Option<String>,
     pub overlay: Option<WorkspaceOverlayStatus>,
 }
@@ -299,13 +303,22 @@ impl RepoManager {
 
         runtime.bootstrap_from_existing_snapshot()?;
         if runtime.status_snapshot().snapshot_key.is_some() {
-            if let Err(error) = runtime.restore_or_refresh_workspace_overlay() {
-                runtime.mark_workspace_probe_pending_with_error(format!(
-                    "initial workspace refresh failed: {error}"
-                ));
+            // Opening restores the persisted overlay only. The authoritative
+            // worktree reconcile walks the whole worktree, so it runs on the
+            // maintenance worker and the returned status reports
+            // `workspace_probe_pending` until it lands. Dirty counts and phase
+            // come from the recovered dirty catalog, so they are last-known
+            // state rather than a guess.
+            match runtime.restore_persisted_workspace_overlay() {
+                Ok(_) => runtime.mark_workspace_probe_pending(),
+                Err(error) => runtime.mark_workspace_probe_pending_with_error(format!(
+                    "initial workspace restore failed: {error}"
+                )),
             }
+            runtime.schedule_workspace_probe(std::time::Duration::from_millis(0));
+        } else {
+            runtime.schedule_workspace_probe(runtime.workspace_probe_interval());
         }
-        runtime.schedule_workspace_probe(runtime.workspace_probe_interval());
         let status = runtime.status_snapshot();
         if status.base_compaction_recommended {
             runtime.schedule_base_compaction();

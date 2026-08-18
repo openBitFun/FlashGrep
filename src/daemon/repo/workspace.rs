@@ -117,34 +117,44 @@ impl DirtyPathSet {
 }
 
 impl RepoRuntime {
-    pub(super) fn restore_or_refresh_workspace_overlay(&self) -> Result<()> {
-        let Some(snapshot_key) = self.current_base_snapshot_key()? else {
+    /// Reuses the overlay the previous session persisted, without probing the
+    /// worktree.
+    ///
+    /// The authoritative reconcile needs a full `git status` walk, which costs
+    /// seconds on a very large worktree (~3.8 s on Chromium), so `open_repo`
+    /// only restores what is already on disk and leaves the reconcile to the
+    /// maintenance worker. The restored overlay is exact for everything the
+    /// daemon observed before it closed and stale for edits made while it was
+    /// closed, so callers must treat it as last-known state: `open_repo` keeps
+    /// `workspace_probe_pending` set until the deferred probe lands, and a
+    /// caller that needs authoritative results asks for `refresh_repo` instead
+    /// of silently accepting the restored snapshot.
+    ///
+    /// Returns whether a matching overlay was installed. A missing, invalid, or
+    /// mismatched overlay is not an error here — the deferred probe rebuilds it
+    /// — so this never walks the worktree itself.
+    pub(super) fn restore_persisted_workspace_overlay(&self) -> Result<bool> {
+        if self.current_base_snapshot_key()?.is_none() {
             self.apply_missing_base_overlay_state(None);
-            return Ok(());
-        };
+            return Ok(false);
+        }
 
-        let (candidate_dirty, candidate_paths) = self.startup_worktree_candidates()?;
-        let dirty = if self.dirty_catalog_visible_paths() == candidate_dirty {
-            candidate_dirty
-        } else {
-            self.diff_against_base_snapshot_git_worktree_paths(&candidate_paths)?
-        };
         let current_head = self.current_git_head()?;
         let overlay = match self.open_workspace_overlay_index_manifest_only() {
             Ok(overlay) => overlay,
             Err(AppError::InvalidIndex(error)) => {
                 eprintln!(
-                    "flashgrep[overlay][warn] persisted overlay is invalid for {}; rebuilding: {error}",
+                    "flashgrep[overlay][warn] persisted overlay is invalid for {}; the deferred probe will rebuild it: {error}",
                     self.build_config.repo_path.display()
                 );
-                return self.rebuild_workspace_overlay();
+                return Ok(false);
             }
             Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
                 eprintln!(
-                    "flashgrep[overlay][info] persisted overlay is missing for {}; rebuilding",
+                    "flashgrep[overlay][info] persisted overlay is missing for {}; the deferred probe will rebuild it",
                     self.build_config.repo_path.display()
                 );
-                return self.rebuild_workspace_overlay();
+                return Ok(false);
             }
             Err(error) => return Err(error),
         };
@@ -165,10 +175,10 @@ impl RepoRuntime {
         };
         if !source_matches {
             eprintln!(
-                "flashgrep[overlay][info] persisted overlay source does not match the active base for {}; rebuilding",
+                "flashgrep[overlay][info] persisted overlay source does not match the active base for {}; the deferred probe will rebuild it",
                 self.build_config.repo_path.display()
             );
-            return self.rebuild_workspace_overlay();
+            return Ok(false);
         }
 
         {
@@ -178,14 +188,8 @@ impl RepoRuntime {
             };
             *slot = Some(std::sync::Arc::new(overlay));
         }
-        let plan = self.plan_overlay_update_from_dirty_probe(dirty)?;
-        if let Some(plan) = plan {
-            self.apply_refreshed_overlay(snapshot_key, plan);
-        } else {
-            self.mark_overlay_published_for_head(Some(current_head));
-            self.finish_workspace_probe_without_overlay_change(Some(snapshot_key));
-        }
-        Ok(())
+        self.mark_overlay_published_for_head(Some(current_head));
+        Ok(true)
     }
 
     pub(super) fn refresh_workspace_overlay(&self) -> Result<()> {

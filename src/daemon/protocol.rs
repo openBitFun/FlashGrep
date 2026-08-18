@@ -530,6 +530,8 @@ pub struct RepoStatus {
     pub dirty_files: DirtyFileStats,
     pub active_task_id: Option<String>,
     pub probe_healthy: bool,
+    #[serde(default)]
+    pub workspace_probe_pending: bool,
     pub last_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<WorkspaceOverlayStatus>,
