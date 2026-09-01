@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.16 - 2026-09-01
+
+- Fixed `Too many open files (os error 24)` when a long-lived daemon opened many Git-backed base segments: segment readers now share a lazy, bounded `git cat-file --batch` pool instead of retaining one child process and three pipes per segment.
+- Fixed first-time base snapshot builds exceeding low per-process file-descriptor limits: spilled posting buckets now buffer records in 64 KiB batches and briefly open one append handle per flush instead of keeping all 64 bucket files open for every parallel shard.
+- Added `FLASHGREP_GIT_BLOB_READER_POOL_SIZE` for explicit reader-pool tuning; the default is four readers and values are capped at sixteen.
+
 ## v0.2.15 - 2026-08-18
 
 - Added `RepoStatus.last_maintenance_error`, which reports the failure of the last background base-maintenance task (`advance_base_snapshot` or `compact_base_deltas`). It is written when one of those tasks fails and cleared only when the same kind of work succeeds; the worktree probe never touches it.
