@@ -75,6 +75,25 @@ fn posting_buckets_spill_and_finish_preserves_postings() {
 }
 
 #[test]
+fn spilled_posting_buckets_flush_bounded_buffers() {
+    let temp = TempDir::new().expect("temp dir");
+    let mut buckets = PostingBuckets::with_memory_threshold(temp.path(), 1);
+    let term = 0x0063_6261;
+    let records_to_flush = super::BASE_SNAPSHOT_POSTING_BUCKET_BUFFER_BYTES
+        / (std::mem::size_of::<u64>() + std::mem::size_of::<u32>())
+        + 1;
+
+    for doc_id in 0..records_to_flush as u32 {
+        buckets.append_terms(doc_id, &[term]).expect("append");
+    }
+
+    let PostingBucketsState::Spilled(spilled) = &buckets.state else {
+        panic!("posting buckets should spill");
+    };
+    assert!(spilled.max_buffered_bucket_bytes() < super::BASE_SNAPSHOT_POSTING_BUCKET_BUFFER_BYTES);
+}
+
+#[test]
 fn spilled_posting_runs_merge_preserves_postings_across_multiple_runs() {
     let temp = TempDir::new().expect("temp dir");
     let bucket_path = temp.path().join("bucket-000.bin");

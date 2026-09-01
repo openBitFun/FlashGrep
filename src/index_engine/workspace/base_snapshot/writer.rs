@@ -38,7 +38,7 @@ pub(super) struct InMemoryPostingBuckets {
 pub(super) struct SpilledPostingBuckets {
     bucket_dir: PathBuf,
     bucket_paths: Vec<PathBuf>,
-    writers: Vec<BufWriter<File>>,
+    buffers: Vec<Vec<u8>>,
 }
 
 pub(super) struct BaseSnapshotBulkSegmentWriter {
@@ -340,16 +340,17 @@ impl SpilledPostingBuckets {
         let bucket_dir = index_root.join("posting-buckets");
         fs::create_dir_all(&bucket_dir)?;
         let mut bucket_paths = Vec::with_capacity(BASE_SNAPSHOT_POSTING_BUCKET_COUNT);
-        let mut writers = Vec::with_capacity(BASE_SNAPSHOT_POSTING_BUCKET_COUNT);
         for bucket_id in 0..BASE_SNAPSHOT_POSTING_BUCKET_COUNT {
             let path = bucket_dir.join(format!("bucket-{bucket_id:03}.bin"));
-            bucket_paths.push(path.clone());
-            writers.push(BufWriter::new(File::create(path)?));
+            File::create(&path)?;
+            bucket_paths.push(path);
         }
         Ok(Self {
             bucket_dir,
             bucket_paths,
-            writers,
+            buffers: (0..BASE_SNAPSHOT_POSTING_BUCKET_COUNT)
+                .map(|_| Vec::new())
+                .collect(),
         })
     }
 
@@ -362,25 +363,47 @@ impl SpilledPostingBuckets {
 
     fn append_term_doc_id(&mut self, term: u64, doc_id: u32) -> Result<()> {
         let bucket_id = posting_bucket_id(term);
-        let writer = self
-            .writers
+        let buffer = self
+            .buffers
             .get_mut(bucket_id)
             .ok_or_else(|| AppError::InvalidIndex(format!("missing posting bucket {bucket_id}")))?;
-        write_spilled_posting_record(writer, PostingRecord { term, doc_id })?;
+        write_spilled_posting_record(buffer, PostingRecord { term, doc_id })?;
+        if buffer.len() >= BASE_SNAPSHOT_POSTING_BUCKET_BUFFER_BYTES {
+            self.flush_bucket(bucket_id)?;
+        }
         Ok(())
     }
 
-    fn finish(self, term_dict_path: &Path, postings_path: &Path) -> Result<()> {
+    fn flush_bucket(&mut self, bucket_id: usize) -> Result<()> {
+        let buffer = self
+            .buffers
+            .get_mut(bucket_id)
+            .ok_or_else(|| AppError::InvalidIndex(format!("missing posting bucket {bucket_id}")))?;
+        if buffer.is_empty() {
+            return Ok(());
+        }
+        let mut writer = OpenOptions::new()
+            .append(true)
+            .open(&self.bucket_paths[bucket_id])?;
+        writer.write_all(buffer)?;
+        buffer.clear();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(super) fn max_buffered_bucket_bytes(&self) -> usize {
+        self.buffers.iter().map(Vec::len).max().unwrap_or(0)
+    }
+
+    fn finish(mut self, term_dict_path: &Path, postings_path: &Path) -> Result<()> {
+        for bucket_id in 0..self.bucket_paths.len() {
+            self.flush_bucket(bucket_id)?;
+        }
         let SpilledPostingBuckets {
             bucket_dir,
             bucket_paths,
-            mut writers,
+            buffers: _,
         } = self;
-
-        for writer in &mut writers {
-            writer.flush()?;
-        }
-        drop(writers);
 
         let mut term_dict_writer = TermDictStreamWriter::create(term_dict_path)?;
         let mut postings_writer = PostingsStreamWriter::create(postings_path)?;
@@ -415,7 +438,7 @@ pub(super) fn estimated_term_entry_bytes(_term: &u64) -> usize {
         .saturating_add(std::mem::size_of::<usize>() * 2)
 }
 
-fn posting_bucket_id(term: u64) -> usize {
+pub(super) fn posting_bucket_id(term: u64) -> usize {
     let mixed = term ^ (term >> 33) ^ (term >> 17);
     (mixed as usize) % BASE_SNAPSHOT_POSTING_BUCKET_COUNT
 }

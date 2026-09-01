@@ -1,9 +1,13 @@
 use std::{
     collections::HashSet,
+    env,
     io::{BufRead, BufReader, BufWriter, Read, Write},
-    path::Path,
+    path::{Path, PathBuf},
     process::{Child, ChildStdin, ChildStdout, Command, Output, Stdio},
-    sync::Mutex,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, Mutex,
+    },
     thread,
     time::Duration,
 };
@@ -21,10 +25,20 @@ use crate::{
 const INITIAL_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
 const SEARCH_INDEX_FINGERPRINT_VERSION: &str = "index-engine-postings-v2";
+const DEFAULT_GIT_BLOB_READER_POOL_SIZE: usize = 4;
+const MAX_GIT_BLOB_READER_POOL_SIZE: usize = 16;
+const GIT_BLOB_READER_POOL_SIZE_ENV: &str = "FLASHGREP_GIT_BLOB_READER_POOL_SIZE";
 
 pub(crate) struct GitBlobReader {
     repo_root: std::path::PathBuf,
     state: Mutex<GitBlobReaderState>,
+}
+
+pub(crate) struct GitBlobReaderPool {
+    repo_root: PathBuf,
+    max_readers: usize,
+    readers: Mutex<Vec<Arc<GitBlobReader>>>,
+    next_reader: AtomicUsize,
 }
 
 struct GitBlobReaderState {
@@ -37,6 +51,15 @@ impl std::fmt::Debug for GitBlobReader {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("GitBlobReader")
             .field("repo_root", &self.repo_root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl std::fmt::Debug for GitBlobReaderPool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GitBlobReaderPool")
+            .field("repo_root", &self.repo_root)
+            .field("max_readers", &self.max_readers)
             .finish_non_exhaustive()
     }
 }
@@ -360,6 +383,54 @@ impl GitBlobReader {
     }
 }
 
+impl GitBlobReaderPool {
+    pub(crate) fn new(repo_root: &Path) -> Self {
+        Self::with_max_readers(repo_root, configured_git_blob_reader_pool_size())
+    }
+
+    fn with_max_readers(repo_root: &Path, max_readers: usize) -> Self {
+        Self {
+            repo_root: repo_root.to_path_buf(),
+            max_readers: max_readers.clamp(1, MAX_GIT_BLOB_READER_POOL_SIZE),
+            readers: Mutex::new(Vec::new()),
+            next_reader: AtomicUsize::new(0),
+        }
+    }
+
+    pub(crate) fn read_blob(&self, head_commit: &str, logical_path: &str) -> Result<Vec<u8>> {
+        let slot = self.next_reader.fetch_add(1, Ordering::Relaxed) % self.max_readers;
+        let reader = {
+            let mut readers = self
+                .readers
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            while readers.len() <= slot {
+                readers.push(Arc::new(GitBlobReader::new(&self.repo_root)?));
+            }
+            Arc::clone(&readers[slot])
+        };
+        reader.read_blob(head_commit, logical_path)
+    }
+
+    #[cfg(test)]
+    fn reader_count(&self) -> usize {
+        self.readers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .len()
+    }
+}
+
+fn configured_git_blob_reader_pool_size() -> usize {
+    env::var(GIT_BLOB_READER_POOL_SIZE_ENV)
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .map_or(DEFAULT_GIT_BLOB_READER_POOL_SIZE, |value| {
+            value.min(MAX_GIT_BLOB_READER_POOL_SIZE)
+        })
+}
+
 impl Drop for GitBlobReader {
     fn drop(&mut self) {
         if let Ok(mut state) = self.state.lock() {
@@ -367,6 +438,61 @@ impl Drop for GitBlobReader {
             let _ = state.child.kill();
             let _ = state.child.wait();
         }
+    }
+}
+
+#[cfg(test)]
+mod git_blob_reader_pool_tests {
+    use super::*;
+
+    fn git(repo: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .expect("git should start");
+        assert!(status.success(), "git command failed: {args:?}");
+    }
+
+    fn head(repo: &Path) -> String {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(["rev-parse", "HEAD"])
+            .output()
+            .expect("git should start");
+        assert!(output.status.success());
+        String::from_utf8(output.stdout)
+            .expect("HEAD should be UTF-8")
+            .trim()
+            .to_string()
+    }
+
+    #[test]
+    fn git_blob_reader_pool_is_lazy_and_bounded() {
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        let repo = temp.path();
+        git(repo, &["init", "-q"]);
+        git(repo, &["config", "user.email", "flashgrep@example.invalid"]);
+        git(repo, &["config", "user.name", "Flashgrep Test"]);
+        fs::write(repo.join("file.txt"), "pool test\n").expect("file should be written");
+        git(repo, &["add", "file.txt"]);
+        git(repo, &["commit", "-q", "-m", "initial"]);
+        let head = head(repo);
+
+        let pool = GitBlobReaderPool::with_max_readers(repo, 4);
+        assert_eq!(pool.reader_count(), 0);
+
+        for _ in 0..12 {
+            assert_eq!(
+                pool.read_blob(&head, "file.txt")
+                    .expect("blob should be read"),
+                b"pool test\n"
+            );
+        }
+
+        assert_eq!(pool.reader_count(), 4);
     }
 }
 

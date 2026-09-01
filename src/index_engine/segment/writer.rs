@@ -2,7 +2,7 @@ use std::{
     collections::HashMap,
     env, fs,
     path::{Path, PathBuf},
-    sync::RwLock,
+    sync::{Arc, RwLock},
     time::Instant,
 };
 
@@ -10,6 +10,7 @@ use crate::index_engine::segment::reader::{
     FileSegmentReader, MemorySegmentReader, SegmentReaderHandle,
 };
 use crate::{
+    git_snapshot::GitBlobReaderPool,
     index_engine::{config::PostingTokenizerConfig, types::SegmentId},
     Result,
 };
@@ -73,6 +74,7 @@ pub struct FileSegmentStore {
     tokenizer: PostingTokenizerConfig,
     repo_root: Option<PathBuf>,
     base_head_commit: Option<String>,
+    git_blob_reader_pool: Option<Arc<GitBlobReaderPool>>,
     cache: RwLock<HashMap<SegmentId, SegmentReaderHandle>>,
 }
 
@@ -89,11 +91,16 @@ impl FileSegmentStore {
     ) -> Result<Self> {
         let segments_dir = index_root.join("segments");
         fs::create_dir_all(&segments_dir)?;
+        let git_blob_reader_pool = match (base_head_commit.as_ref(), repo_root.as_deref()) {
+            (Some(_), Some(repo_root)) => Some(Arc::new(GitBlobReaderPool::new(repo_root))),
+            _ => None,
+        };
         Ok(Self {
             segments_dir,
             tokenizer,
             repo_root,
             base_head_commit,
+            git_blob_reader_pool,
             cache: RwLock::new(HashMap::new()),
         })
     }
@@ -147,7 +154,8 @@ impl SegmentStore for FileSegmentStore {
             posting_lists,
             self.repo_root.clone(),
             self.base_head_commit.clone(),
-        )?);
+            self.git_blob_reader_pool.clone(),
+        ));
         let reader_elapsed = reader_started.elapsed();
         if profile_open {
             eprintln!(
@@ -178,5 +186,63 @@ impl SegmentStore for FileSegmentStore {
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         cache.remove(&id);
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn empty_segment(id: &str) -> SegmentBuildOutput {
+        SegmentBuildOutput {
+            meta: SegmentMeta {
+                segment_id: SegmentId(id.to_string()),
+                min_seq_no: 0,
+                max_seq_no: 0,
+                doc_count: 0,
+                live_doc_count: 0,
+                created_by_merge: false,
+            },
+            documents: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn file_segment_readers_share_one_git_blob_reader_pool_per_store() {
+        let temp = tempfile::tempdir().expect("tempdir should succeed");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("repo should create");
+        let status = std::process::Command::new("git")
+            .args(["init", "--quiet"])
+            .current_dir(&repo)
+            .status()
+            .expect("git should start");
+        assert!(status.success());
+
+        let index_root = temp.path().join("index");
+        let store = FileSegmentStore::open_with_repo_root(
+            &index_root,
+            PostingTokenizerConfig::default(),
+            Some(repo),
+            Some("0123456789abcdef0123456789abcdef01234567".to_string()),
+        )
+        .expect("segment store should open");
+        for id in ["segment-a", "segment-b"] {
+            store
+                .write_segment(empty_segment(id))
+                .expect("segment should write");
+        }
+
+        let first = store
+            .open_segment(SegmentId("segment-a".to_string()))
+            .expect("first segment should open")
+            .git_blob_reader_pool_identity();
+        let second = store
+            .open_segment(SegmentId("segment-b".to_string()))
+            .expect("second segment should open")
+            .git_blob_reader_pool_identity();
+
+        assert!(first.is_some());
+        assert_eq!(first, second);
     }
 }

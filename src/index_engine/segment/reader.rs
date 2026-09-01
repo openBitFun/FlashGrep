@@ -11,7 +11,7 @@ use memmap2::Mmap;
 
 use crate::{
     files::resolve_repo_path,
-    git_snapshot::GitBlobReader,
+    git_snapshot::GitBlobReaderPool,
     index_engine::{
         query::{QueryFilters, QueryPlan},
         segment::{
@@ -45,6 +45,11 @@ pub trait SegmentReader: Send + Sync {
         _prefer_worktree_for_git_head_blob: bool,
     ) -> Result<SegmentVerifySource> {
         self.verify_source(doc_id)
+    }
+
+    #[cfg(test)]
+    fn git_blob_reader_pool_identity(&self) -> Option<usize> {
+        None
     }
 }
 
@@ -178,7 +183,7 @@ pub struct FileSegmentReader {
     path_doc_ids: OnceLock<BTreeMap<String, Vec<SegmentDocId>>>,
     repo_root: Option<PathBuf>,
     base_head_commit: Option<String>,
-    git_blob_reader: Option<GitBlobReader>,
+    git_blob_reader_pool: Option<Arc<GitBlobReaderPool>>,
     decoded_keys: LazyDocCache<DocKey>,
     decoded_source_bytes: LazyDocCache<Arc<[u8]>>,
     decoded_documents: LazyDocCache<IndexDocument>,
@@ -199,13 +204,10 @@ impl FileSegmentReader {
         posting_lists: PostingLists,
         repo_root: Option<PathBuf>,
         base_head_commit: Option<String>,
-    ) -> Result<Self> {
+        git_blob_reader_pool: Option<Arc<GitBlobReaderPool>>,
+    ) -> Self {
         let profile_open = env::var_os("FLASHGREP_PROFILE_OPEN_SEGMENT").is_some();
         let reader_init_started = Instant::now();
-        let git_blob_reader = match (base_head_commit.as_ref(), repo_root.as_deref()) {
-            (Some(_), Some(repo_root)) => Some(GitBlobReader::new(repo_root)?),
-            _ => None,
-        };
         let decoded_keys = LazyDocCache::new(doc_table.len());
         let decoded_source_bytes = LazyDocCache::new(doc_table.len());
         let decoded_documents = LazyDocCache::new(doc_table.len());
@@ -218,19 +220,19 @@ impl FileSegmentReader {
                 doc_table.len(),
             );
         }
-        Ok(Self {
+        Self {
             meta,
             doc_table,
             posting_lists,
             path_doc_ids: OnceLock::new(),
             repo_root,
             base_head_commit,
-            git_blob_reader,
+            git_blob_reader_pool,
             decoded_keys,
             decoded_source_bytes,
             decoded_documents,
             decoded_metadata,
-        })
+        }
     }
 
     fn path_doc_ids(&self) -> Result<&BTreeMap<String, Vec<SegmentDocId>>> {
@@ -321,7 +323,7 @@ impl FileSegmentReader {
         key: &DocKey,
         head_commit: &str,
     ) -> Result<Arc<[u8]>> {
-        let reader = self.git_blob_reader.as_ref().ok_or_else(|| {
+        let reader = self.git_blob_reader_pool.as_ref().ok_or_else(|| {
             AppError::InvalidIndex(format!(
                 "segment {} cannot read {} from git blob storage",
                 self.meta.segment_id.0, key.logical_path
@@ -575,6 +577,13 @@ impl SegmentReader for FileSegmentReader {
         }
 
         self.verify_source(doc_id)
+    }
+
+    #[cfg(test)]
+    fn git_blob_reader_pool_identity(&self) -> Option<usize> {
+        self.git_blob_reader_pool
+            .as_ref()
+            .map(|reader| Arc::as_ptr(reader) as usize)
     }
 }
 
