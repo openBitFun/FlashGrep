@@ -34,7 +34,7 @@ impl RepoRuntime {
                     .map(|revision| revision.0.clone())
             })
         });
-        let observed_head_commit = self.current_git_head().ok();
+        let observed_head_commit = self.current_git_head().ok().flatten();
         let opened_base_snapshot = compatible_metadata.as_ref().and_then(|_| {
             match WorkspaceBaseSnapshotIndex::open_read_only(&self.build_config) {
                 Ok(index) => Some(index),
@@ -157,13 +157,12 @@ impl RepoRuntime {
         Ok(())
     }
 
-    pub(super) fn current_git_head(&self) -> Result<String> {
-        resolve_git_head_blocking(&self.build_config.repo_path)?.ok_or_else(|| {
-            AppError::InvalidIndex(format!(
-                "daemon workspace requires a Git HEAD commit for {}",
-                self.build_config.repo_path.display()
-            ))
-        })
+    pub(super) fn current_git_head(&self) -> Result<Option<String>> {
+        if self.build_config.git_mode == crate::config::GitMode::Filesystem {
+            return Ok(None);
+        }
+
+        resolve_git_head_blocking(&self.build_config.repo_path)
     }
 
     pub(super) fn observe_git_head_transition(&self) -> Result<bool> {
@@ -172,10 +171,10 @@ impl RepoRuntime {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        if state.observed_head_commit.as_deref() == Some(&current_head) {
+        if state.observed_head_commit == current_head {
             return Ok(false);
         }
-        state.observed_head_commit = Some(current_head);
+        state.observed_head_commit = current_head;
         state.overlay_head_commit = None;
         state.overlay_base_manifest_id = None;
         if state.snapshot_key.is_some() {
@@ -197,7 +196,7 @@ impl RepoRuntime {
 
     pub(super) fn overlay_manifest_source(
         &self,
-        observed_head: &str,
+        observed_head: Option<&str>,
     ) -> Result<crate::index_engine::manifest::ManifestSource> {
         let state = match self.state.lock() {
             Ok(guard) => guard,
@@ -209,7 +208,7 @@ impl RepoRuntime {
         Ok(
             crate::index_engine::manifest::ManifestSource::WorkspaceOverlay {
                 base_manifest_id: crate::index_engine::ManifestId(base_manifest_id),
-                observed_head: observed_head.to_string(),
+                observed_head: observed_head.map(str::to_owned),
                 probe_epoch: self
                     .glob_cache_epoch
                     .load(std::sync::atomic::Ordering::Relaxed),
@@ -218,8 +217,8 @@ impl RepoRuntime {
     }
 
     pub(super) fn mark_overlay_published_for_head(&self, source_head: Option<String>) {
-        let current_head = self.current_git_head().ok();
-        let aligned = source_head.is_some() && source_head == current_head;
+        let current_head = self.current_git_head().ok().flatten();
+        let aligned = source_head == current_head;
         let mut state = match self.state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),

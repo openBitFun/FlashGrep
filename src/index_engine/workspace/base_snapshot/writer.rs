@@ -115,11 +115,10 @@ impl BaseSnapshotBulkSegmentWriter {
             .ok_or_else(|| AppError::ValueOutOfRange("path map offset overflow".into()))?;
 
         if matches!(source_kind, SegmentDocSourceKind::Inline) {
-            let encoded_len = encoded_source_bytes_len(&document.source_bytes)?;
+            let encoded_len = write_source_bytes(&mut self.staged_sources, &document.source_bytes)?;
             let source_len = u32::try_from(encoded_len).map_err(|_| {
                 AppError::ValueOutOfRange("inline source length exceeds u32 range".into())
             })?;
-            write_source_bytes(&mut self.staged_sources, &document.source_bytes)?;
             self.pending_inline_sources.push(PendingInlineSource {
                 record_offset,
                 relative_offset: self.staged_source_bytes,
@@ -208,6 +207,7 @@ impl BaseSnapshotBulkSegmentWriter {
         write_segment_meta(&segment_dir.join(SEGMENT_META_FILE), &meta)?;
 
         Ok(Some(SegmentRef {
+            applied_delete_seq_no: 0,
             id: segment_id,
             min_seq_no: 1,
             max_seq_no: 1,

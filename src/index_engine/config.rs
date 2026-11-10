@@ -61,6 +61,8 @@ pub struct EngineConfig {
     pub refresh_interval: Duration,
     pub merge_policy: MergePolicyConfig,
     pub tokenizer: PostingTokenizerConfig,
+    /// Decoded query payload admission budget; excludes metadata and working buffers.
+    pub query_source_cache_bytes: usize,
 }
 
 impl Default for EngineConfig {
@@ -71,6 +73,7 @@ impl Default for EngineConfig {
             refresh_interval: Duration::from_millis(500),
             merge_policy: MergePolicyConfig::default(),
             tokenizer: PostingTokenizerConfig::default(),
+            query_source_cache_bytes: 0,
         }
     }
 }

@@ -20,7 +20,7 @@ pub struct PostingLists {
 
 #[derive(Debug)]
 enum PostingListStorage {
-    Eager(HashMap<u64, Arc<[u32]>>),
+    Eager(Arc<HashMap<u64, Arc<[u32]>>>),
     Lazy(Box<FileBackedPostingLists>),
 }
 
@@ -48,7 +48,7 @@ pub struct PostingBlock {
 impl Default for PostingLists {
     fn default() -> Self {
         Self {
-            storage: PostingListStorage::Eager(HashMap::new()),
+            storage: PostingListStorage::Eager(Arc::new(HashMap::new())),
         }
     }
 }
@@ -56,12 +56,18 @@ impl Default for PostingLists {
 impl PostingLists {
     pub fn from_eager(posting_lists: HashMap<u64, Vec<u32>>) -> Self {
         Self {
-            storage: PostingListStorage::Eager(
+            storage: PostingListStorage::Eager(Arc::new(
                 posting_lists
                     .into_iter()
                     .map(|(key, doc_ids)| (key, Arc::<[u32]>::from(doc_ids)))
                     .collect(),
-            ),
+            )),
+        }
+    }
+
+    pub(crate) fn from_shared(postings: Arc<HashMap<u64, Arc<[u32]>>>) -> Self {
+        Self {
+            storage: PostingListStorage::Eager(postings),
         }
     }
 
@@ -168,9 +174,9 @@ impl FileBackedPostingLists {
     }
 }
 
-pub(crate) fn write_postings_file(
+pub(crate) fn write_postings_file<V: AsRef<[u32]>>(
     path: &Path,
-    posting_lists: &HashMap<u64, Vec<u32>>,
+    posting_lists: &HashMap<u64, V>,
 ) -> Result<()> {
     let mut buffer = Vec::new();
     buffer.write_all(POSTINGS_MAGIC)?;
@@ -181,8 +187,8 @@ pub(crate) fn write_postings_file(
         let doc_ids = posting_lists
             .get(&key)
             .ok_or_else(|| AppError::InvalidIndex("posting key missing during write".into()))?;
-        write_u32(&mut buffer, doc_ids.len() as u32)?;
-        write_posting_payload(&mut buffer, doc_ids)?;
+        write_u32(&mut buffer, doc_ids.as_ref().len() as u32)?;
+        write_posting_payload(&mut buffer, doc_ids.as_ref())?;
     }
 
     fs::write(path, buffer)?;

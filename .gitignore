@@ -4,3 +4,8 @@
 .bitfun/
 /.bitfun/search/flashgrep-index/
 /.flashgrep-index-engine/
+
+# Local build and packaging outputs
+/dist/
+.DS_Store
+/research_github_actions_quota/

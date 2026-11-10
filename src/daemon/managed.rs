@@ -11,11 +11,11 @@ use crate::error::{AppError, Result};
 
 use super::{
     client::DaemonClient,
-    git_workspace::resolve_repo_config,
     protocol::{
         EnsureRepoParams, GlobParams, OpenRepoParams, RepoStatus, Request, Response, SearchParams,
     },
     server::read_state_file,
+    workspace_location::resolve_repo_config,
 };
 
 const DEFAULT_DAEMON_STATE_FILE: &str = "daemon-state.json";

@@ -8,6 +8,8 @@ mod candidates;
 mod catalog;
 mod diagnostics;
 mod fast_path;
+#[cfg(test)]
+mod lease_tests;
 mod query_helpers;
 mod visibility_cache;
 
@@ -166,10 +168,7 @@ impl IndexReaderFactory {
     }
 
     pub fn open_snapshot(&self) -> Result<IndexSnapshotReader> {
-        let snapshot = self.snapshots.load_refreshed();
-        let lease = self
-            .snapshots
-            .acquire_lease(snapshot.manifest.manifest_id.clone());
+        let (snapshot, lease) = self.snapshots.lease_refreshed();
         Ok(IndexSnapshotReader::new(
             ManifestSnapshot::new(snapshot.manifest.clone()),
             Arc::clone(&self.segment_store),
@@ -181,10 +180,7 @@ impl IndexReaderFactory {
     }
 
     pub fn open_committed(&self) -> Result<IndexSnapshotReader> {
-        let snapshot = self.snapshots.load_committed();
-        let lease = self
-            .snapshots
-            .acquire_lease(snapshot.manifest.manifest_id.clone());
+        let (snapshot, lease) = self.snapshots.lease_committed();
         Ok(IndexSnapshotReader::new(
             ManifestSnapshot::new(snapshot.manifest.clone()),
             Arc::clone(&self.segment_store),
@@ -196,6 +192,7 @@ impl IndexReaderFactory {
     }
 
     pub fn open_persisted_current(&self) -> Result<IndexSnapshotReader> {
+        let _open = self.snapshots.protect_manifest_open();
         let manifest = self.manifest_store.load_current()?;
         Ok(self.open_with_manifest(manifest))
     }
@@ -204,6 +201,7 @@ impl IndexReaderFactory {
         &self,
         manifest_id: crate::index_engine::types::ManifestId,
     ) -> Result<IndexSnapshotReader> {
+        let _open = self.snapshots.protect_manifest_open();
         let manifest = self.manifest_store.load_manifest(&manifest_id)?;
         if manifest.manifest_id != manifest_id {
             return Err(AppError::InvalidIndex(format!(
@@ -215,7 +213,7 @@ impl IndexReaderFactory {
     }
 
     fn open_with_manifest(&self, manifest: Manifest) -> IndexSnapshotReader {
-        let lease = self.snapshots.acquire_lease(manifest.manifest_id.clone());
+        let lease = self.snapshots.acquire_lease(&manifest);
         IndexSnapshotReader::new(
             ManifestSnapshot::new(manifest.clone()),
             Arc::clone(&self.segment_store),
@@ -272,6 +270,10 @@ impl IndexSnapshotReader {
         self.snapshot.manifest()
     }
 
+    pub(crate) fn snapshot_identity(&self) -> Arc<()> {
+        Arc::clone(&self.data.identity)
+    }
+
     pub fn visible_documents(&self) -> Result<std::collections::BTreeMap<DocKey, IndexDocument>> {
         let mut effective_docs = std::collections::BTreeMap::<
             DocKey,
@@ -323,7 +325,12 @@ impl IndexSnapshotReader {
             }
         }
 
-        for key in &self.data.deleted_keys {
+        for key in self
+            .data
+            .deleted_keys
+            .iter()
+            .chain(&self.data.retracted_keys)
+        {
             effective_docs.remove(key);
         }
         for (key, entry) in &self.data.docs {
@@ -395,7 +402,12 @@ impl IndexSnapshotReader {
             }
         }
 
-        for key in &self.data.deleted_keys {
+        for key in self
+            .data
+            .deleted_keys
+            .iter()
+            .chain(&self.data.retracted_keys)
+        {
             effective_entries.remove(key);
         }
         for (key, entry) in &self.data.docs {

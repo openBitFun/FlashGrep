@@ -100,8 +100,7 @@ pub struct WorkspaceSearchView {
 }
 
 struct ShadowedBasePathsCache {
-    manifest_id: crate::index_engine::ManifestId,
-    refreshed_seq_no: u64,
+    snapshot_identity: Arc<()>,
     paths: Arc<HashSet<String>>,
 }
 
@@ -161,15 +160,8 @@ impl WorkspaceSearchView {
         // Workspace query truth comes only from the read-only base snapshot plus the currently
         // published overlay snapshot. Dirty catalog/runtime state may schedule future publishes,
         // but it does not participate in query result correctness.
-        WorkspaceQuerySnapshot {
-            base_snapshot: base_snapshot.cloned(),
-            overlay_snapshot: overlay_snapshot.cloned(),
-            shadowed_base_paths: overlay_snapshot
-                .map(|snapshot| self.shadowed_base_paths_for_overlay_snapshot(snapshot))
-                .transpose()?
-                .unwrap_or_else(|| Arc::new(HashSet::new())),
-        }
-        .search(self, query, query_filters, filter, true)
+        self.open_workspace_query_snapshot(base_snapshot.cloned(), overlay_snapshot.cloned())?
+            .search(self, query, query_filters, filter, true)
     }
 
     pub(crate) fn open_workspace_query_snapshot(
@@ -177,6 +169,19 @@ impl WorkspaceSearchView {
         base_snapshot: Option<IndexSnapshotReader>,
         overlay_snapshot: Option<IndexSnapshotReader>,
     ) -> Result<WorkspaceQuerySnapshot> {
+        if let (Some(base), Some(overlay)) = (&base_snapshot, &overlay_snapshot) {
+            if let Some(crate::index_engine::manifest::ManifestSource::WorkspaceOverlay {
+                base_manifest_id,
+                ..
+            }) = &overlay.manifest().source
+            {
+                if *base_manifest_id != base.manifest().manifest_id {
+                    return Err(AppError::InvalidIndex(
+                        "workspace overlay belongs to a different base publication".into(),
+                    ));
+                }
+            }
+        }
         let shadowed_base_paths = overlay_snapshot
             .as_ref()
             .map(|snapshot| self.shadowed_base_paths_for_overlay_snapshot(snapshot))
@@ -258,15 +263,18 @@ impl WorkspaceSearchView {
         &self,
         overlay_snapshot: &IndexSnapshotReader,
     ) -> Result<Arc<HashSet<String>>> {
-        let manifest_id = overlay_snapshot.manifest().manifest_id.clone();
-        let refreshed_seq_no = overlay_snapshot.manifest().refreshed_seq_no;
+        // Manifest IDs and sequence numbers can repeat after an overlay reset.
+        // Retain the identity token so even an older in-flight reader cannot
+        // mistake a replacement publication for its own cached paths.
+        let snapshot_identity = overlay_snapshot.snapshot_identity();
         let mut cache = self
             .shadowed_base_paths_cache
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        if let Some(cached) = cache.as_ref().filter(|cached| {
-            cached.manifest_id == manifest_id && cached.refreshed_seq_no == refreshed_seq_no
-        }) {
+        if let Some(cached) = cache
+            .as_ref()
+            .filter(|cached| Arc::ptr_eq(&cached.snapshot_identity, &snapshot_identity))
+        {
             return Ok(Arc::clone(&cached.paths));
         }
 
@@ -280,8 +288,7 @@ impl WorkspaceSearchView {
                 .collect(),
         );
         *cache = Some(ShadowedBasePathsCache {
-            manifest_id,
-            refreshed_seq_no,
+            snapshot_identity,
             paths: Arc::clone(&paths),
         });
         Ok(paths)
@@ -307,6 +314,7 @@ mod tests {
 
     fn build_config(repo: &std::path::Path, index: &std::path::Path) -> BuildConfig {
         BuildConfig {
+            git_mode: Default::default(),
             repo_path: repo.to_path_buf(),
             storage_root: index.to_path_buf(),
             tokenizer: TokenizerMode::SparseNgram,
@@ -467,6 +475,91 @@ mod tests {
     }
 
     #[test]
+    fn rebuilt_overlay_does_not_reuse_deleted_paths_from_previous_snapshot() {
+        let temp = TempDir::new().expect("temp dir");
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).expect("create repo");
+        let repo_id = RepoId("repo".into());
+        let base = IndexEngine::open(EngineConfig {
+            index_root: temp.path().join("base"),
+            ..EngineConfig::default()
+        })
+        .expect("open base");
+        base.writer()
+            .add_document(test_doc(&repo_id, "restored.txt", "OLD_TOKEN\n"))
+            .expect("add base document");
+        base.writer().commit().expect("commit base");
+        let base_snapshot = base.reader().open_committed().expect("base snapshot");
+        let deleted = IndexEngine::open(EngineConfig {
+            index_root: temp.path().join("deleted-overlay"),
+            ..EngineConfig::default()
+        })
+        .expect("open deleted overlay");
+        deleted
+            .writer()
+            .delete_document(&DocKey {
+                repo_id: repo_id.clone(),
+                logical_path: "restored.txt".into(),
+            })
+            .expect("delete document");
+        deleted.writer().refresh().expect("refresh deletion");
+        let deleted_snapshot = deleted.reader().open_snapshot().expect("deleted snapshot");
+        let rebuilt = IndexEngine::open(EngineConfig {
+            index_root: temp.path().join("rebuilt-overlay"),
+            ..EngineConfig::default()
+        })
+        .expect("open rebuilt overlay");
+        rebuilt
+            .writer()
+            .add_document(test_doc(&repo_id, "added.txt", "NEW_TOKEN\n"))
+            .expect("add new document");
+        rebuilt.writer().refresh().expect("refresh addition");
+        let rebuilt_snapshot = rebuilt.reader().open_snapshot().expect("rebuilt snapshot");
+        assert_ne!(
+            deleted_snapshot.manifest().manifest_id,
+            rebuilt_snapshot.manifest().manifest_id
+        );
+        assert_eq!(
+            deleted_snapshot.manifest().refreshed_seq_no,
+            rebuilt_snapshot.manifest().refreshed_seq_no
+        );
+        let view = WorkspaceSearchView::open(build_config(&repo, &temp.path().join("index")))
+            .expect("open view");
+        // Revisit an older in-flight snapshot after the replacement was queried.
+        for (overlay, old_count, new_count) in [
+            (Some(&deleted_snapshot), 0, 0),
+            (None, 1, 0),
+            (Some(&rebuilt_snapshot), 1, 1),
+            (Some(&deleted_snapshot), 0, 0),
+            (Some(&rebuilt_snapshot), 1, 1),
+        ] {
+            for (token, expected) in [("OLD_TOKEN", old_count), ("NEW_TOKEN", new_count)] {
+                let result = view
+                    .search_workspace_snapshots(
+                        &fixed_query(token),
+                        &QueryFilters::default(),
+                        None,
+                        Some(&base_snapshot),
+                        overlay,
+                    )
+                    .expect("search snapshot");
+                assert_eq!(result.matched_lines, expected, "{token}");
+            }
+        }
+        let reopened = rebuilt
+            .reader()
+            .open_snapshot()
+            .expect("reopen same snapshot");
+        let first = view
+            .shadowed_base_paths_for_overlay_snapshot(&rebuilt_snapshot)
+            .expect("cache paths");
+        let second = view
+            .shadowed_base_paths_for_overlay_snapshot(&reopened)
+            .expect("reuse paths");
+        assert!(Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
     fn search_workspace_snapshots_shadow_base_with_overlay_deletes() {
         let temp = TempDir::new().expect("temp dir");
         let repo = temp.path().join("repo");
@@ -528,5 +621,64 @@ mod tests {
             .expect("search old token");
         assert_eq!(old_results.matched_lines, 0);
         assert!(old_results.file_counts.is_empty());
+    }
+    #[test]
+    fn retraction_restores_base_results_without_changing_held_query_views() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        fs::create_dir_all(&repo).unwrap();
+        fs::write(repo.join("restored.txt"), "BASE_TOKEN\n").unwrap();
+        fs::write(repo.join("other.txt"), "DIRTY_TOKEN\n").unwrap();
+        let repo_id = RepoId("repo".into());
+        let base = IndexEngine::open(EngineConfig {
+            index_root: temp.path().join("base"),
+            ..Default::default()
+        })
+        .unwrap();
+        base.writer()
+            .add_document(test_doc(&repo_id, "restored.txt", "BASE_TOKEN\n"))
+            .unwrap();
+        base.writer().commit().unwrap();
+        let base_snapshot = base.reader().open_committed().unwrap();
+        let config = EngineConfig {
+            index_root: temp.path().join("overlay"),
+            ..Default::default()
+        };
+        let overlay = IndexEngine::open(config.clone()).unwrap();
+        let key = DocKey {
+            repo_id: repo_id.clone(),
+            logical_path: "restored.txt".into(),
+        };
+        overlay.writer().delete_document(&key).unwrap();
+        overlay
+            .writer()
+            .add_document(test_doc(&repo_id, "other.txt", "DIRTY_TOKEN\n"))
+            .unwrap();
+        overlay.writer().commit().unwrap();
+        let deleted = overlay.reader().open_committed().unwrap();
+        overlay.writer().retract_document(&key).unwrap();
+        overlay.writer().refresh().unwrap();
+        let refreshed = overlay.reader().open_snapshot().unwrap();
+        overlay.writer().commit().unwrap();
+        let reopened = IndexEngine::open(config).unwrap();
+        let durable = reopened.reader().open_committed().unwrap();
+        let view =
+            WorkspaceSearchView::open(build_config(&repo, &temp.path().join("index"))).unwrap();
+        for (snapshot, expected_base) in
+            [(&deleted, 0), (&refreshed, 1), (&durable, 1), (&deleted, 0)]
+        {
+            for (token, expected) in [("BASE_TOKEN", expected_base), ("DIRTY_TOKEN", 1)] {
+                let results = view
+                    .search_workspace_snapshots(
+                        &fixed_query(token),
+                        &QueryFilters::default(),
+                        None,
+                        Some(&base_snapshot),
+                        Some(snapshot),
+                    )
+                    .unwrap();
+                assert_eq!(results.matched_lines, expected, "{token}");
+            }
+        }
     }
 }

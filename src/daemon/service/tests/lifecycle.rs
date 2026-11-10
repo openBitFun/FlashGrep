@@ -74,55 +74,106 @@ fn opening_git_repo_ignores_custom_repo_local_storage_root_in_gitignore() {
 }
 
 #[test]
-fn opening_non_git_repo_fails_without_creating_gitignore() {
+fn filesystem_workspace_builds_and_updates_without_a_git_commit() {
     let _serial = daemon_test_serial();
-    let service = DaemonService::new();
-    let temp = tempdir().expect("temp dir should succeed");
-    let repo_path = temp.path().join("repo");
-    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
-
-    let error = service
-        .handle_request_only(Request::OpenRepo {
-            params: OpenRepoParams {
-                repo_path: repo_path.clone(),
-                storage_root: None,
-                config: RepoConfig::default(),
-                refresh: Default::default(),
-            },
-        })
-        .expect_err("non-git open should fail");
-
-    assert!(error
-        .to_string()
-        .contains("indexed daemon workspace requires a Git worktree with a HEAD commit"));
-
-    assert!(!repo_path.join(".gitignore").exists());
-}
-
-#[test]
-fn opening_empty_git_repo_fails_without_creating_gitignore() {
-    let _serial = daemon_test_serial();
-    let service = DaemonService::new();
-    let temp = tempdir().expect("temp dir should succeed");
-    let repo_path = temp.path().join("repo");
-    fs::create_dir_all(&repo_path).expect("repo dir should succeed");
-    init_git_repo(&repo_path);
-
-    let error = service
-        .handle_request_only(Request::OpenRepo {
-            params: OpenRepoParams {
-                repo_path: repo_path.clone(),
-                storage_root: None,
-                config: RepoConfig::default(),
-                refresh: Default::default(),
-            },
-        })
-        .expect_err("empty git repo open should fail");
-
-    assert!(error
-        .to_string()
-        .contains("indexed daemon workspace requires a Git worktree with a HEAD commit"));
-    assert!(!repo_path.join(".gitignore").exists());
+    for unborn in [false, true] {
+        let service = DaemonService::new();
+        let temp = tempdir().expect("temp");
+        let repo_path = temp.path().join("repo");
+        fs::create_dir(&repo_path).expect("dir");
+        if unborn {
+            init_git_repo(&repo_path);
+        }
+        fs::write(repo_path.join("a.rs"), "ORIGINAL_MARKER\n").expect("file");
+        let response = service
+            .handle_request_only(Request::OpenRepo {
+                params: OpenRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: None,
+                    config: RepoConfig::default(),
+                    refresh: Default::default(),
+                },
+            })
+            .expect("plain workspace open");
+        let Response::RepoOpened { repo_id, .. } = response else {
+            panic!("open response")
+        };
+        wait_for_status(&service, &repo_id, |s| {
+            !matches!(s.phase, crate::daemon::protocol::RepoPhase::Opening)
+        });
+        build_repo(&service, &repo_id);
+        let check = |token: &str, count| {
+            let Response::SearchCompleted {
+                backend, results, ..
+            } = search_repo(&service, &repo_id, token)
+            else {
+                panic!("search response")
+            };
+            assert!(
+                matches!(
+                    backend,
+                    SearchBackend::IndexedClean | SearchBackend::IndexedWorkspaceView
+                ),
+                "{backend:?}"
+            );
+            assert_eq!(results.searches_with_match, count, "{token}");
+        };
+        check("ORIGINAL_MARKER", 1);
+        let original_mtime = fs::metadata(repo_path.join("a.rs"))
+            .unwrap()
+            .modified()
+            .unwrap();
+        fs::write(repo_path.join("a.rs"), "MODIFIED_MARKER\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(repo_path.join("a.rs"))
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(original_mtime))
+            .unwrap();
+        let stats = service
+            .repos
+            .candidate_dirty_stats_for_tests(
+                &repo_id,
+                &[fs::canonicalize(repo_path.join("a.rs")).unwrap()],
+            )
+            .unwrap();
+        assert_eq!(
+            stats,
+            (1, 0, 0),
+            "direct events must verify equal-size, equal-mtime edits"
+        );
+        fs::write(repo_path.join("a.rs"), "CHANGED_MARKER\n").expect("edit");
+        fs::write(repo_path.join("b.rs"), "CHANGED_MARKER\n").expect("add");
+        refresh_repo(&service, &repo_id, true);
+        check("ORIGINAL_MARKER", 0);
+        check("CHANGED_MARKER", 2);
+        fs::remove_file(repo_path.join("a.rs")).expect("delete");
+        refresh_repo(&service, &repo_id, true);
+        check("CHANGED_MARKER", 1);
+        service.shutdown_all();
+        drop(service);
+        fs::write(repo_path.join("b.rs"), "OFFLINE_MARKER\n").unwrap();
+        fs::write(repo_path.join("c.rs"), "OFFLINE_MARKER\n").unwrap();
+        let restarted = DaemonService::new();
+        let Response::RepoOpened { repo_id, .. } = restarted
+            .handle_request_only(Request::OpenRepo {
+                params: OpenRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: None,
+                    config: RepoConfig::default(),
+                    refresh: Default::default(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("reopen response")
+        };
+        let (backend, _) = wait_for_search_count(&restarted, &repo_id, "OFFLINE_MARKER", 2);
+        assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+        wait_for_search_count(&restarted, &repo_id, "CHANGED_MARKER", 0);
+        restarted.shutdown_all();
+        assert_eq!(repo_path.join(".git").exists(), unborn);
+    }
 }
 
 #[test]
@@ -152,7 +203,7 @@ fn opening_bare_git_repo_fails_without_creating_gitignore() {
 
     assert!(error
         .to_string()
-        .contains("indexed daemon workspace requires a Git worktree with a HEAD commit"));
+        .contains("a bare Git repository has no workspace files"));
     assert!(!repo_path.join(".gitignore").exists());
 }
 
@@ -1092,9 +1143,14 @@ fn clean_indexed_search_does_not_schedule_workspace_probe_for_missing_overlay() 
             && status.dirty_files.modified == 0
             && status.dirty_files.deleted == 0
             && status.dirty_files.new == 0
-            && status.overlay.is_none()
     });
     assert_exact_dirty_stats(&status, 0, 0, 0);
+    // Clear now publishes an empty generation to preserve old reader backing
+    // files. Explicitly remove the reader to exercise this test's missing case.
+    service
+        .repos
+        .drop_workspace_overlay_reader_for_tests(&repo_id)
+        .unwrap();
 
     match search_repo(&service, &repo_id, "BASE_NO_OVERLAY_PROBE") {
         Response::SearchCompleted {
@@ -1123,7 +1179,7 @@ fn clean_indexed_search_does_not_schedule_workspace_probe_for_missing_overlay() 
 }
 
 #[test]
-fn background_reconcile_uses_git_incremental_recovery() {
+fn background_reconcile_recovers_filesystem_changes() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1267,9 +1323,14 @@ fn failed_base_snapshot_build_hands_the_repo_phase_back() {
 
     let (repo_id, _) = open_repo(&service, repo_path.clone());
 
-    // Fail the build the way a mid-build branch switch does: the Git state the
-    // build reads disappears from under it.
-    fs::remove_dir_all(repo_path.join(".git")).expect("removing .git should succeed");
+    // A missing Git repository is now a supported filesystem workspace.
+    // Instead keep a Git HEAD but point it at an unavailable object, so the
+    // selected Git base build must fail rather than invent a source snapshot.
+    fs::write(
+        repo_path.join(".git/HEAD"),
+        "1111111111111111111111111111111111111111\n",
+    )
+    .expect("writing broken HEAD should succeed");
 
     let started = service
         .handle_request_only(Request::BaseSnapshotBuild {
@@ -1387,5 +1448,188 @@ fn stranded_repo_without_a_base_snapshot_is_rebuilt_on_ensure() {
             ));
         }
         other => panic!("unexpected response: {other:?}"),
+    }
+}
+
+#[test]
+fn filesystem_mode_keeps_requested_subdirectory_inside_git() {
+    let _serial = daemon_test_serial();
+    let temp = tempdir().unwrap();
+    let parent = temp.path().join("parent");
+    fs::create_dir(&parent).unwrap();
+    ensure_git_repo_with_head(&parent);
+    let root = parent.join("subdirectory");
+    fs::create_dir(&root).unwrap();
+    fs::write(parent.join("outside.rs"), "SCOPED_MODE_TOKEN\n").unwrap();
+    fs::write(root.join("inside.rs"), "SCOPED_MODE_TOKEN\n").unwrap();
+    let service = DaemonService::new();
+    let Response::RepoOpened { repo_id, .. } = service
+        .handle_request_only(Request::OpenRepo {
+            params: OpenRepoParams {
+                repo_path: root.clone(),
+                storage_root: None,
+                config: RepoConfig {
+                    git_mode: crate::config::GitMode::Filesystem,
+                    ..Default::default()
+                },
+                refresh: Default::default(),
+            },
+        })
+        .unwrap()
+    else {
+        panic!("open response")
+    };
+    assert_eq!(PathBuf::from(&repo_id), fs::canonicalize(&root).unwrap());
+    build_repo(&service, &repo_id);
+    let Response::SearchCompleted {
+        backend, results, ..
+    } = search_repo(&service, &repo_id, "SCOPED_MODE_TOKEN")
+    else {
+        panic!("search response")
+    };
+    assert!(matches!(
+        backend,
+        SearchBackend::IndexedClean | SearchBackend::IndexedWorkspaceView
+    ));
+    assert_eq!(results.searches_with_match, 1);
+    assert!(!root.join(".gitignore").exists());
+    service.shutdown_all();
+}
+
+#[test]
+fn filesystem_mode_works_without_a_git_program() {
+    let _serial = daemon_test_serial();
+    for force_filesystem in [false, true] {
+        let temp = tempdir().unwrap();
+        let root = temp.path().join("repo");
+        fs::create_dir_all(&root).unwrap();
+        if force_filesystem {
+            fs::create_dir_all(root.join(".git/objects")).unwrap();
+            fs::write(root.join(".git/HEAD"), "ref: refs/heads/unborn\n").unwrap();
+            fs::write(root.join(".git/objects/fake"), "NO_GIT_EXECUTABLE_TOKEN\n").unwrap();
+        }
+        fs::write(root.join("source.rs"), "NO_GIT_EXECUTABLE_TOKEN\n").unwrap();
+        let service = DaemonService::new();
+        let Response::RepoOpened { repo_id, .. } = service
+            .handle_request_only(Request::OpenRepo {
+                params: OpenRepoParams {
+                    repo_path: root,
+                    storage_root: None,
+                    config: RepoConfig {
+                        git_mode: if force_filesystem {
+                            crate::config::GitMode::Filesystem
+                        } else {
+                            crate::config::GitMode::Auto
+                        },
+                        corpus_mode: crate::daemon::protocol::CorpusModeConfig::NoIgnore,
+                        include_hidden: true,
+                        ..Default::default()
+                    },
+                    refresh: Default::default(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("open response")
+        };
+        build_repo(&service, &repo_id);
+        let Response::SearchCompleted {
+            backend, results, ..
+        } = search_repo(&service, &repo_id, "NO_GIT_EXECUTABLE_TOKEN")
+        else {
+            panic!("search response")
+        };
+        assert!(matches!(
+            backend,
+            SearchBackend::IndexedClean | SearchBackend::IndexedWorkspaceView
+        ));
+        assert_eq!(
+            results.searches_with_match, 1,
+            "Git metadata must not enter the corpus"
+        );
+        service.shutdown_all();
+    }
+}
+
+#[test]
+#[cfg(unix)]
+fn workspace_symlink_policy_matches_across_git_modes_and_refreshes() {
+    use std::os::unix::fs::symlink;
+    let _serial = daemon_test_serial();
+    for mode in 0..4 {
+        let temp = tempdir().unwrap();
+        let repo_path = temp.path().join("repo");
+        let outside = temp.path().join("outside");
+        fs::create_dir_all(repo_path.join("nested")).unwrap();
+        fs::create_dir(&outside).unwrap();
+        fs::write(outside.join("file.rs"), "OUTSIDE_SYMLINK_TOKEN\n").unwrap();
+        fs::write(repo_path.join("file.rs"), "REGULAR_SYMLINK_TOKEN\n").unwrap();
+        fs::write(repo_path.join("nested/file.rs"), "REGULAR_SYMLINK_TOKEN\n").unwrap();
+        symlink(outside.join("file.rs"), repo_path.join("linked.rs")).unwrap();
+        symlink(outside.join("missing.rs"), repo_path.join("broken.rs")).unwrap();
+        if mode != 0 {
+            init_git_repo(&repo_path);
+            if mode >= 2 {
+                git_commit_all(&repo_path, "initial regular files and links");
+            }
+        }
+        let service = DaemonService::new();
+        let Response::RepoEnsured { repo_id, .. } = service
+            .handle_request_only(Request::EnsureRepo {
+                params: EnsureRepoParams {
+                    repo_path: repo_path.clone(),
+                    storage_root: Some(temp.path().join("index")),
+                    config: RepoConfig {
+                        git_mode: if mode == 3 {
+                            crate::config::GitMode::Filesystem
+                        } else {
+                            crate::config::GitMode::Auto
+                        },
+                        ..Default::default()
+                    },
+                    refresh: Default::default(),
+                },
+            })
+            .unwrap()
+        else {
+            panic!("ensure response")
+        };
+        let check = |token, count| {
+            let Response::SearchCompleted { results, .. } = search_repo(&service, &repo_id, token)
+            else {
+                panic!("search response")
+            };
+            assert_eq!(results.searches_with_match, count, "mode {mode}: {token}");
+        };
+        refresh_repo(&service, &repo_id, true);
+        check("REGULAR_SYMLINK_TOKEN", 2);
+        check("OUTSIDE_SYMLINK_TOKEN", 0);
+        fs::remove_file(repo_path.join("file.rs")).unwrap();
+        symlink(outside.join("file.rs"), repo_path.join("file.rs")).unwrap();
+        fs::remove_dir_all(repo_path.join("nested")).unwrap();
+        symlink(&outside, repo_path.join("nested")).unwrap();
+        let root = fs::canonicalize(&repo_path).unwrap();
+        assert_eq!(
+            service
+                .repos
+                .candidate_dirty_stats_for_tests(
+                    &repo_id,
+                    &[root.join("file.rs"), root.join("nested")]
+                )
+                .unwrap(),
+            (0, 2, 0)
+        );
+        refresh_repo(&service, &repo_id, true);
+        check("REGULAR_SYMLINK_TOKEN", 0);
+        check("OUTSIDE_SYMLINK_TOKEN", 0);
+        fs::remove_file(repo_path.join("file.rs")).unwrap();
+        fs::remove_file(repo_path.join("nested")).unwrap();
+        fs::create_dir(repo_path.join("nested")).unwrap();
+        fs::write(repo_path.join("file.rs"), "REGULAR_SYMLINK_TOKEN\n").unwrap();
+        fs::write(repo_path.join("nested/file.rs"), "REGULAR_SYMLINK_TOKEN\n").unwrap();
+        refresh_repo(&service, &repo_id, true);
+        check("REGULAR_SYMLINK_TOKEN", 2);
+        check("OUTSIDE_SYMLINK_TOKEN", 0);
+        service.shutdown_all();
     }
 }

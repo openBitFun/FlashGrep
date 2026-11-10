@@ -3,7 +3,10 @@ use std::{
     env,
     fs::{self, File},
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        Arc, OnceLock,
+    },
     time::Instant,
 };
 
@@ -186,6 +189,9 @@ pub struct FileSegmentReader {
     git_blob_reader_pool: Option<Arc<GitBlobReaderPool>>,
     decoded_keys: LazyDocCache<DocKey>,
     decoded_source_bytes: LazyDocCache<Arc<[u8]>>,
+    query_source_bytes: LazyDocCache<Arc<[u8]>>,
+    query_source_budget: Option<Arc<super::source_cache::SourceCacheBudget>>,
+    query_cached_bytes: AtomicUsize,
     decoded_documents: LazyDocCache<IndexDocument>,
     decoded_metadata: LazyDocCache<SegmentDocMetadataValue>,
 }
@@ -210,6 +216,7 @@ impl FileSegmentReader {
         let reader_init_started = Instant::now();
         let decoded_keys = LazyDocCache::new(doc_table.len());
         let decoded_source_bytes = LazyDocCache::new(doc_table.len());
+        let query_source_bytes = LazyDocCache::new(doc_table.len());
         let decoded_documents = LazyDocCache::new(doc_table.len());
         let decoded_metadata = LazyDocCache::new(doc_table.len());
         if profile_open {
@@ -230,9 +237,43 @@ impl FileSegmentReader {
             git_blob_reader_pool,
             decoded_keys,
             decoded_source_bytes,
+            query_source_bytes,
+            query_source_budget: None,
+            query_cached_bytes: AtomicUsize::new(0),
             decoded_documents,
             decoded_metadata,
         }
+    }
+
+    pub(crate) fn with_query_source_budget(
+        mut self,
+        budget: Option<Arc<super::source_cache::SourceCacheBudget>>,
+    ) -> Self {
+        self.query_source_budget = budget;
+        self
+    }
+
+    fn inline_query_source_bytes(&self, doc_id: usize) -> Result<Arc<[u8]>> {
+        if let Some(bytes) = self.decoded_source_bytes.get(doc_id)?.get() {
+            return Ok(Arc::clone(bytes));
+        }
+        let Some(budget) = self.query_source_budget.as_ref() else {
+            return self.read_source_bytes_from_inline_segment(doc_id);
+        };
+        let cache = self.query_source_bytes.get(doc_id)?;
+        if let Some(bytes) = cache.get() {
+            return Ok(Arc::clone(bytes));
+        }
+        let bytes = self.read_source_bytes_from_inline_segment(doc_id)?;
+        let size = bytes.len();
+        if budget.reserve(size) {
+            if cache.set(Arc::clone(&bytes)).is_ok() {
+                self.query_cached_bytes.fetch_add(size, Ordering::Relaxed);
+            } else {
+                budget.release(size);
+            }
+        }
+        Ok(cache.get().map(Arc::clone).unwrap_or(bytes))
     }
 
     fn path_doc_ids(&self) -> Result<&BTreeMap<String, Vec<SegmentDocId>>> {
@@ -362,7 +403,10 @@ impl FileSegmentReader {
         if let Some(bytes) = cache.get() {
             return Ok(Arc::clone(bytes));
         }
-        let bytes = self.load_source_bytes(doc_id)?;
+        let bytes = match self.query_source_bytes.get(doc_id)?.get() {
+            Some(bytes) => Arc::clone(bytes),
+            None => self.load_source_bytes(doc_id)?,
+        };
         if cache.set(Arc::clone(&bytes)).is_err() {
             let bytes = cache.get().ok_or_else(|| {
                 AppError::Protocol(format!(
@@ -550,7 +594,12 @@ impl SegmentReader for FileSegmentReader {
     fn verify_source(&self, doc_id: SegmentDocId) -> Result<SegmentVerifySource> {
         match self.doc_record(doc_id as usize)?.source_kind {
             SegmentDocSourceKind::Worktree => self.worktree_verify_source(doc_id),
-            SegmentDocSourceKind::Inline | SegmentDocSourceKind::GitHeadBlob => {
+            // Base queries decode on demand. Overlay readers may retain payloads
+            // within their shared admission budget, retiring them with segments.
+            SegmentDocSourceKind::Inline => Ok(SegmentVerifySource::Bytes(
+                self.inline_query_source_bytes(doc_id as usize)?,
+            )),
+            SegmentDocSourceKind::GitHeadBlob => {
                 Ok(SegmentVerifySource::Bytes(self.source_bytes(doc_id)?))
             }
         }
@@ -584,6 +633,14 @@ impl SegmentReader for FileSegmentReader {
         self.git_blob_reader_pool
             .as_ref()
             .map(|reader| Arc::as_ptr(reader) as usize)
+    }
+}
+
+impl Drop for FileSegmentReader {
+    fn drop(&mut self) {
+        if let Some(budget) = self.query_source_budget.as_ref() {
+            budget.release(self.query_cached_bytes.load(Ordering::Relaxed));
+        }
     }
 }
 

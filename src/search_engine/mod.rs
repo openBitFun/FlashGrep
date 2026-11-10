@@ -502,6 +502,7 @@ mod tests {
         fs::write(&file_path, "const NAME: &str = \"BASE_SHARD_ONLY\";\n")
             .expect("write should succeed");
         let build_config = BuildConfig {
+            git_mode: Default::default(),
             repo_path: repo_path.clone(),
             storage_root: repo_path.join(".flashgrep-index-engine"),
             tokenizer: TokenizerMode::Trigram,
@@ -565,6 +566,7 @@ mod tests {
         }
 
         let engine = SearchEngine::new(BuildConfig {
+            git_mode: Default::default(),
             repo_path: repo_path.clone(),
             storage_root: repo_path.join(".flashgrep-index-engine"),
             tokenizer: TokenizerMode::Trigram,

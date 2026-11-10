@@ -1,5 +1,4 @@
 use std::{
-    path::Path,
     sync::{atomic::AtomicU64, atomic::Ordering, Arc},
     time::{SystemTime, UNIX_EPOCH},
 };
@@ -133,7 +132,7 @@ impl WorkspaceBaseSnapshotIndex {
         let modified_paths = diff.modified.len();
         let deleted_paths = diff.deleted.len();
         let enumerated_paths = added_paths + modified_paths + deleted_paths;
-        let git_blobs_read = added_paths + modified_paths;
+        let mut git_blobs_read = 0;
         let diff_ms = diff_started.elapsed().as_millis();
         let blob_reader = GitBlobReader::new(&build_config.repo_path)?;
 
@@ -151,7 +150,11 @@ impl WorkspaceBaseSnapshotIndex {
         let mut documents = Vec::new();
         for path in diff.added.iter().chain(diff.modified.iter()) {
             check_cancel(should_cancel)?;
+            if diff.non_regular_targets.contains(path) {
+                continue;
+            }
             let bytes = blob_reader.read_blob(target_head, path)?;
+            git_blobs_read += 1;
             if let Some(document) = index_document_from_blob(build_config, repo_id, path, bytes) {
                 documents.push(document);
             }
@@ -311,6 +314,7 @@ fn write_live_delta(
         documents,
     })?;
     Ok(Some(SegmentRef {
+        applied_delete_seq_no: 0,
         id,
         min_seq_no: seq_no,
         max_seq_no: seq_no,
@@ -333,6 +337,7 @@ fn write_delete_delta(
     let records = paths
         .into_iter()
         .map(|logical_path| DeleteRecord {
+            retract_to_base: false,
             seq_no,
             key: DocKey {
                 repo_id: repo_id.clone(),
@@ -395,15 +400,13 @@ fn index_document_from_blob(
 
 fn is_indexable_blob(build_config: &BuildConfig, logical_path: &str, bytes: &[u8]) -> bool {
     bytes.len() as u64 <= build_config.max_file_size
-        && (build_config.include_hidden || !path_is_hidden(Path::new(logical_path)))
+        && crate::files::workspace_path_is_eligible(
+            &build_config.repo_path,
+            &resolve_repo_path(&build_config.repo_path, logical_path),
+            Some(&build_config.storage_root),
+            build_config.include_hidden,
+        )
         && !bytes[..bytes.len().min(8 * 1024)].contains(&0)
-}
-
-fn path_is_hidden(path: &Path) -> bool {
-    path.components().any(|component| match component {
-        std::path::Component::Normal(value) => value.to_string_lossy().starts_with('.'),
-        _ => false,
-    })
 }
 
 fn check_cancel(should_cancel: &mut impl FnMut() -> bool) -> Result<()> {
@@ -429,7 +432,7 @@ mod tests {
         base_snapshot_build::BaseSnapshotBuildOptions,
         config::{CorpusMode, TokenizerMode},
     };
-    use std::{fs, process::Command};
+    use std::{fs, path::Path, process::Command};
     use tempfile::TempDir;
 
     fn git(repo: &Path, args: &[&str]) {
@@ -458,6 +461,7 @@ mod tests {
 
     fn config(temp: &TempDir, repo: &Path) -> BuildConfig {
         BuildConfig {
+            git_mode: Default::default(),
             repo_path: repo.to_path_buf(),
             storage_root: temp.path().join("storage"),
             tokenizer: TokenizerMode::SparseNgram,
@@ -702,5 +706,113 @@ mod tests {
             store.load_current().expect("current should load").source,
             Some(ManifestSource::GitBase { head_commit, .. }) if head_commit == parent_head
         ));
+    }
+    #[test]
+    #[cfg(unix)]
+    fn git_base_build_and_advance_exclude_symlinks_and_restore_regular_files() {
+        use std::os::unix::fs::symlink;
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        initialize_repo(&repo);
+        fs::write(repo.join("value.rs"), "BASE_TOKEN\n").unwrap();
+        symlink("value.rs", repo.join("link.rs")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+        let build_config = config(&temp, &repo);
+        let repo_id = RepoId("repo".into());
+        WorkspaceBaseSnapshotIndex::build_with_options(
+            &build_config,
+            &repo_id,
+            BaseSnapshotBuildOptions::new().requiring_git_head(),
+        )
+        .unwrap();
+        let catalog = current_path_catalog(&build_config);
+        assert!(catalog.get("value.rs").is_some());
+        assert!(catalog.get("link.rs").is_none());
+        fs::remove_file(repo.join("value.rs")).unwrap();
+        symlink("missing.rs", repo.join("value.rs")).unwrap();
+        symlink("missing.rs", repo.join("added-link.rs")).unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "links"]);
+        let advance = WorkspaceBaseSnapshotIndex::advance_to_head(
+            &build_config,
+            &repo_id,
+            &catalog,
+            &head(&repo),
+            4,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(advance.git_blobs_read, 0);
+        assert_eq!(advance.deleted_documents, 1);
+        let catalog = current_path_catalog(&build_config);
+        for path in ["value.rs", "link.rs", "added-link.rs"] {
+            assert!(catalog.get(path).is_none(), "{path}");
+        }
+        fs::remove_file(repo.join("value.rs")).unwrap();
+        fs::write(repo.join("value.rs"), "RESTORED_TOKEN\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "restore"]);
+        WorkspaceBaseSnapshotIndex::advance_to_head(
+            &build_config,
+            &repo_id,
+            &catalog,
+            &head(&repo),
+            4,
+            &mut || false,
+        )
+        .unwrap();
+        let catalog = current_path_catalog(&build_config);
+        assert!(catalog.get("value.rs").is_some());
+        assert!(catalog.get("link.rs").is_none());
+    }
+    #[test]
+    fn git_base_excludes_custom_storage_and_internal_paths_on_build_and_advance() {
+        let temp = TempDir::new().unwrap();
+        let repo = temp.path().join("repo");
+        initialize_repo(&repo);
+        let mut build_config = config(&temp, &repo);
+        build_config.storage_root = repo.join("custom-index");
+        build_config.include_hidden = true;
+        for directory in ["custom-index", ".flashgrep-bench"] {
+            fs::create_dir_all(repo.join(directory)).unwrap();
+            fs::write(repo.join(directory).join("old.rs"), "INTERNAL_TOKEN\n").unwrap();
+        }
+        fs::write(repo.join(".visible.rs"), "VISIBLE_TOKEN\n").unwrap();
+        git(&repo, &["add", "."]);
+        git(&repo, &["commit", "-q", "-m", "initial"]);
+        let repo_id = RepoId("repo".into());
+        WorkspaceBaseSnapshotIndex::build_with_options(
+            &build_config,
+            &repo_id,
+            BaseSnapshotBuildOptions::new().requiring_git_head(),
+        )
+        .unwrap();
+        let catalog = current_path_catalog(&build_config);
+        assert!(catalog.get(".visible.rs").is_some());
+        for directory in ["custom-index", ".flashgrep-bench"] {
+            assert!(catalog.get(&format!("{directory}/old.rs")).is_none());
+            fs::write(repo.join(directory).join("new.rs"), "NEW_INTERNAL_TOKEN\n").unwrap();
+        }
+        git(
+            &repo,
+            &["add", "custom-index/new.rs", ".flashgrep-bench/new.rs"],
+        );
+        git(&repo, &["commit", "-q", "-m", "internal files"]);
+        let advance = WorkspaceBaseSnapshotIndex::advance_to_head(
+            &build_config,
+            &repo_id,
+            &catalog,
+            &head(&repo),
+            4,
+            &mut || false,
+        )
+        .unwrap();
+        assert_eq!(advance.tokenized_documents, 0);
+        let catalog = current_path_catalog(&build_config);
+        assert!(catalog.get(".visible.rs").is_some());
+        for directory in ["custom-index", ".flashgrep-bench"] {
+            assert!(catalog.get(&format!("{directory}/new.rs")).is_none());
+        }
     }
 }

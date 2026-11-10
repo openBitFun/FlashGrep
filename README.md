@@ -1,126 +1,114 @@
-# flashgrep
+# FlashGrep
 
-[![version](https://img.shields.io/badge/version-0.2.10-blue.svg)](https://github.com/flashgrep/flashgrep)
-[![rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
-[![license](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
+[![CI](https://github.com/openBitFun/FlashGrep/actions/workflows/build-packages.yml/badge.svg)](https://github.com/openBitFun/FlashGrep/actions/workflows/build-packages.yml)
+[![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
+[![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
-> 本地 regex 预筛索引系统 — 字符级倒排索引召回 + 精确 regex 验证，两段式加速全库正则搜索。
+> **The indexed search engine for OpenBitFun.**
+>
+> FlashGrep turns repeated repository-wide `grep` and `glob` calls into an indexed, incremental search service for coding agents. It is designed for the moment when an agent should spend its time understanding code, not waiting for the next scan to finish.
 
-本项目是一个本地 regex 预筛索引系统骨架，目标是把全库正则搜索拆成两段：
+FlashGrep is an open-source project in the [openBitFun](https://github.com/openBitFun) organization and the search engine used by [BitFun](https://github.com/GCWing/OpenBitFun). It provides a Rust daemon, a stable cross-process protocol, and an MCP server that can be embedded in an IDE, agent runtime, or desktop application.
 
-1. 先用字符级倒排索引召回候选文件。
-2. 再只对候选文件执行真实 regex 验证。
+[中文](#中文) · [Architecture](#architecture) · [MCP integration](#mcp-integration)
 
-当前实现采用：
+## Why FlashGrep
 
-- Git snapshot 或 repo fingerprint 驱动的 `base snapshot`
-- `dirty catalog` 跟踪工作区变化
-- `published workspace overlay` 表达当前 worktree 的已发布增量视图
-- 保守型 regex 查询规划器
-- 候选召回 + `regex` 精确验证
-- daemon 驱动的 build / refresh / search / glob 协议
+Coding agents search much more often than a human developer. A single task may ask for symbols, call sites, configuration keys, tests, generated files, and several regular expressions in sequence. On a large repository, repeatedly scanning every file turns a capable agent into a process that spends most of its time waiting.
 
-## 模块布局
+FlashGrep builds a repository index once, uses character-level inverted indexes to produce a conservative candidate set, and runs the exact regex verifier only on those candidates. The result is a search path that stays useful as the repository grows and as the same workspace is queried again and again.
 
-- `src/cli.rs`
-  命令行入口；当前只保留服务进程、daemon 管理和 build/bench 运维子命令。
-- `src/files.rs`
-  仓库扫描、文本过滤、基础文件元数据采集。
-- `src/index_engine/`
-  base snapshot、workspace overlay、manifest、segment、reader、merge 的核心实现。
-- `src/daemon/`
-  稳定外部协议、repo runtime、状态管理、任务调度。
-- `src/workspace.rs`
-  专家向本地 workspace facade，用于按需打开当前 workspace 视图。
-- `src/search_engine.rs`
-  简化的 build/search facade，适合本地工具和测试。
-- `src/tokenizer/`
-  token 抽取策略，当前含 trigram 和 sparse n-gram。
-- `src/planner.rs`
-  regex 查询规划，先做保守提取，不覆盖完整语义。
-- `src/search.rs`
-  搜索结果类型定义。
-- `mcp/`
-  对外 MCP server、使用文档和 agent skill 的唯一源码；发布时与各平台二进制一起打包。
+### A real large-repository result
 
-## 存储布局
+The benchmark that motivated this project was run on Chromium, a repository with nearly **60 million lines of code** and more than **4 GB of Git-tracked files**:
 
-repo 默认把索引数据落在 `.flashgrep-index-engine/`：
+- indexed search reduced the search portion of a representative agent workflow from about **137.2 s to 7.82 s**;
+- across a broader set of Chromium queries, FlashGrep averaged about **36.1×** the throughput of `ripgrep` in BitFun's internal comparison;
+- the initial base index took about **79.0 s** to build and occupied about **2.5 GB**.
 
-- `base-snapshot/`
-  只读基线 snapshot，按 snapshot key 分目录保存。
-- `workspace-overlay/`
-  已发布 overlay shard，使用 manifest + segment + delete segment 结构。
-- `dirty-catalog.json`
-  跟踪工作区 dirty/building/ready/failed 状态。
+These figures describe the Chromium benchmark setup documented in the project materials. They are a reference point for the design, not a promise that every repository or query will see the same speedup. See [benchmark notes](docs/chromium_query_benchmark_2026-07-25.md) and [workspace results](docs/filesystem_workspace_results.md) for the measurement details.
 
-## 快速开始
+## What it provides
+
+- **Indexed literal and regex search** — sparse n-gram or trigram tokenization narrows candidates before exact verification.
+- **Incremental workspaces** — file events, Git changes, branch switches, additions, edits, deletions, and restores are reconciled into published overlay segments.
+- **Git and filesystem modes** — use Git snapshots when available, or index an ordinary directory with `--no-git`.
+- **One daemon per workspace** — multiple clients share the same index reader, watcher, build tasks, and lifecycle.
+- **Stable protocol** — integrate through `daemon::protocol` and `DaemonClient` / `ManagedDaemonClient` instead of coupling to internal index structures.
+- **MCP server** — expose search, glob, status, refresh, and index-build tools to Claude Code, Codex, Cursor, Trae, and other MCP hosts.
+- **Safe fallback behavior** — a repository can be searched while its first base index is building, and freshness can be selected explicitly when a caller needs reconciliation.
+
+## Quick start
+
+### Build from source
+
+Requirements: Rust 1.85+ with Cargo, and Node.js 18+ if you want to use the MCP server.
 
 ```bash
-cargo run --bin flashgrep -- serve
+git clone https://github.com/openBitFun/FlashGrep.git
+cd FlashGrep
+cargo build --release
 ```
 
-推荐把 `flashgrep` 当成一个独立常驻进程来使用，形态更接近本地搜索 server，而不是 ripgrep 风格的一次性搜索 CLI。
-
-如果你使用 `ManagedDaemonClient`：
-
-- daemon 默认按 `index_path/daemon-state.json` 发现和复用。
-- 多个调用方会通过同一路径下的 `daemon-state.lock` 协调启动，避免重复拉起。
-- 调用方通常不需要自己再包一层自定义 daemon 生命周期管理器。
-
-常用运维/调试入口：
+### Start the daemon
 
 ```bash
-# 前台拉起 server
-cargo run --bin flashgrep -- serve --bind 127.0.0.1:4597
+# Start the repository search server.
+./target/release/flashgrep serve --bind 127.0.0.1:4597
 
-# 注册或打开一个 repo
-cargo run --bin flashgrep -- daemon open --repo /path/to/repo
+# Register a repository and start its index build.
+./target/release/flashgrep daemon open --repo /path/to/repository
+./target/release/flashgrep daemon build --repo-id /path/to/repository
 
-# 对 repo 建索引
-cargo run --bin flashgrep -- daemon build --repo-id /path/to/repo
+# Search through the daemon protocol.
+./target/release/flashgrep daemon search --repo-id /path/to/repository 'ManagedDaemonClient'
 
-# 通过 daemon 发搜索请求
-cargo run --bin flashgrep -- daemon search --repo-id /path/to/repo 'foo.*bar'
-
-# 通过 daemon 做路径 glob / scope 解析
-cargo run --bin flashgrep -- daemon glob --repo-id /path/to/repo -g '*.rs' src
-
-# 查询 repo 状态
-cargo run --bin flashgrep -- daemon status --repo-id /path/to/repo
-
-# 关闭 repo，或关闭整个 server
-cargo run --bin flashgrep -- daemon close --repo-id /path/to/repo
-cargo run --bin flashgrep -- daemon shutdown
+# Inspect status or ask for a path glob.
+./target/release/flashgrep daemon status --repo-id /path/to/repository
+./target/release/flashgrep daemon glob --repo-id /path/to/repository -g '*.rs' src
 ```
 
-## MCP 集成
-
-如果你想把 `flashgrep` 作为 MCP server 暴露给别的项目，而不改宿主源码，可以直接启动：
+`build` is also available as a managed one-shot entry point. It starts or reuses the daemon, ensures the repository is registered, and returns while the base build can continue in the background:
 
 ```bash
-# Node MCP server，固定 repo
-node mcp/server.js --repo /path/to/repo
-
-# 也可以显式指定索引目录或 flashgrep daemon 二进制
-node mcp/server.js --repo /path/to/repo --storage-root /tmp/flashgrep-index
-node mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
+./target/release/flashgrep build --repo /path/to/repository
 ```
 
-这个 MCP server 当前暴露 5 个 tools：
+For ordinary directories, or for a Git subdirectory that should have an independent filesystem index:
 
-- `search_code`
-  对 repo 执行 flashgrep 搜索。缺少 base snapshot 时会启动后台构建，并立即使用过渡搜索返回结果，不等待索引完成。
-- `glob_files`
-  按 ignore/glob/type 规则返回当前可见文件。
-- `repo_status`
-  返回 daemon 里的 repo 状态。
-- `refresh_repo`
-  触发 workspace refresh。
-- `build_index`
-  显式启动缺失的基础索引构建并立即返回，不等待构建完成。
+```bash
+./target/release/flashgrep build --repo /path/to/directory --no-git
+```
 
-典型 MCP 配置示例：
+### Search freshness
+
+The daemon and MCP APIs expose three freshness policies:
+
+| Policy | Behavior |
+| --- | --- |
+| `published` | Query the last published base plus overlay while background maintenance continues. |
+| `reconciled` | Reconcile the known workspace changes before querying; fail if publication fails. |
+| `filesystem` | Scan the current files directly without updating the index. |
+
+Use `reconciled` when a caller needs known changes published before the query, and `filesystem` when it needs a direct current-filesystem read. Neither direct scanning nor reconciliation is an atomic snapshot across concurrent edits.
+
+## MCP integration
+
+The `mcp/` directory contains the MCP server source, its documentation, and the FlashGrep agent skill. The server starts a lightweight bridge to the managed daemon and exposes five tools:
+
+- `search_code` — indexed or transition search with regex, literal, count, and path-scope options;
+- `glob_files` — enumerate files using the same ignore and scope rules;
+- `repo_status` — inspect repository and workspace progress;
+- `refresh_repo` — ask the watcher to reconcile known changes;
+- `build_index` — start a missing base-index build without waiting for completion.
+
+Run it directly from a checkout:
+
+```bash
+node mcp/server.js --repo /path/to/repository --daemon-bin /absolute/path/to/flashgrep
+```
+
+A minimal MCP configuration looks like this:
 
 ```json
 {
@@ -128,231 +116,143 @@ node mcp/server.js --repo /path/to/repo --daemon-bin /path/to/flashgrep
     "flashgrep": {
       "command": "node",
       "args": [
-        "/absolute/path/to/flashgrep/mcp/server.js",
+        "/absolute/path/to/FlashGrep/mcp/server.js",
         "--repo",
-        "/path/to/repo"
+        "/path/to/repository"
       ]
     }
   }
 }
 ```
 
-说明：
+The full host-specific setup, release bundle layout, tool schemas, and option reference are in [`mcp/README.md`](mcp/README.md).
 
-- 如果启动时已经传了 `--repo`，tool 调用里可以省略 `repo_path`。该路径可以是 Git worktree 根目录或其中的子目录。
-- 如果没有传 `--repo`，server 会默认使用启动进程的当前工作目录（`cwd`）。子目录会复用 Git worktree 根索引，并作为默认搜索范围。
-- MCP transport 走 stdio，framing 使用 `Content-Length`。
-- MCP server 自身是 Node 进程；它通过轻量 `mcp-bridge` 子进程连接仓库级 managed daemon。同一 Git worktree 的多个 MCP session 复用一个 daemon、索引 reader 和 workspace watcher。
-- 如果没显式传 `--daemon-bin`，server 会依次尝试分发包 `mcp/bin/` 中与当前平台匹配的二进制、源码仓库的 `target/release/flashgrep`、`target/debug/flashgrep`，最后使用环境里的 `flashgrep`。
+## Architecture
 
-完整的 MCP 分发包由 CI 从 `mcp/` 源码和六个平台的 release 二进制自动生成，主仓库不提交 `mcp/bin/` 构建产物。
+FlashGrep has a clear split between the stable integration surface and the index implementation:
 
-如果只是离线准备索引或做 bench，也保留这两个入口：
-
-```bash
-# 通过 managed daemon 自动拉起/连接 server，并确保 repo 已可搜索
-cargo run --bin flashgrep -- build --repo /path/to/repo
-
-# benchmark 仍是本地运维工具入口
-cargo run --bin flashgrep -- bench --suite-dir bench_data
+```text
+MCP / IDE / agent runtime
+            │
+            ▼
+     daemon protocol
+            │
+     managed daemon
+       ┌────┴────┐
+       │         │
+ base snapshot  workspace overlay
+       │         │
+       └────┬────┘
+            ▼
+   indexed candidate retrieval
+            │
+            ▼
+      exact regex verification
 ```
 
-当前 CLI 语义：
+The main components are:
 
-- 默认入口不再提供 ripgrep 风格的一次性搜索命令。
-- 搜索相关命令通过 `daemon search` 暴露，面向服务进程调试和手工排障。
-- 路径枚举/glob 相关能力通过 `daemon glob` 暴露。
-- `serve` 用于拉起 TCP server，`daemon *` 用于向该 server 发协议请求。
-- `build` 现在也会通过 managed daemon 走进程协议，不再直接在 CLI 进程里调用建索引库函数。
+- `src/daemon/` — server lifecycle, repository sessions, watcher, status, protocol, and managed-client coordination.
+- `src/index_engine/` — manifests, segments, posting lists, deletes, readers, merge policy, base snapshots, and overlays.
+- `src/query_runtime/` and `src/planner.rs` — query normalization, conservative token extraction, candidate execution, and result limits.
+- `src/files.rs`, `src/git_snapshot.rs`, and `src/worktree_diff.rs` — repository discovery, ignore rules, Git snapshots, and worktree changes.
+- `mcp/` — the Node MCP server and the reusable FlashGrep agent skill.
 
-## External Interface
+The on-disk index normally lives under `.flashgrep-index-engine/` and is separate from the source tree. A base snapshot is immutable after publication; workspace overlays contain published changes. A query therefore reads a consistent `base + overlay` view while background tasks build, merge, reclaim, or recover newer layers.
 
-当前稳定的对外接口应视为 daemon 进程协议，以及围绕它的二进制与基础客户端：
+The stable external contract is the daemon protocol described in [`docs/daemon_protocol.md`](docs/daemon_protocol.md). Rust library modules outside that protocol remain useful for tests, benchmarks, and expert integrations, but they are intentionally not the primary compatibility surface.
 
-- daemon protocol request/response/notification schema
-- `DaemonClient` / `ManagedDaemonClient`
-- `flashgrep serve` 与 `flashgrep daemon *` 这些围绕 daemon 的工具入口
+## Benchmarks and experiments
 
-其中：
-
-- `daemon::protocol` 是跨语言/跨进程集成时的规范基线。
-- 下游产品应自己在客户端侧封装 SDK / service facade；`flashgrep` 不再内置 Rust SDK facade。
-- `flashgrep` 这边的交付物以 daemon 二进制 `flashgrep` 为主；像 BitFun 这类宿主只需要打包 `flashgrep` 并按协议接入。
-- crate 根上仍然保留若干库导出，主要服务于本地工具、测试和专家向集成，不应当作稳定产品接入面。
-
-入口选择（推荐）：
-
-- 外部集成 / IDE / agent / 宿主产品：以 daemon 协议为准。
-- 需要自动拉起和复用 daemon 的 Rust 调用方：使用 `ManagedDaemonClient`。
-- 需要直接发协议请求的调用方：使用 `DaemonClient` + `daemon::protocol::*`。
-
-路径边界约定：
-
-- `flashgrep` 只把自己的产物目录 `.flashgrep-index`、`.flashgrep-bench`，以及调用方显式配置的 `index_path` 视为内部路径。
-- `flashgrep` 不会内建保留某个宿主产品目录名；像 `.bitfun`、`.idea`、`.vscode` 这类目录是否排除，应由接入方或 ignore 规则决定。
-
-最小接入示例：
-
-```rust
-use flashgrep::daemon::{
-    protocol::{
-        EnsureRepoParams, PathScope, QuerySpec, RepoConfig, Request, SearchModeConfig,
-        SearchParams,
-    },
-    DaemonClient, ManagedDaemonClient,
-};
-
-let managed = ManagedDaemonClient::new();
-let ensured = managed.ensure_repo(EnsureRepoParams {
-    repo_path: "/path/to/repo".into(),
-    index_path: None,
-    config: RepoConfig::default(),
-    refresh: Default::default(),
-})?;
-
-let client = DaemonClient::new(ensured.addr);
-let response = client.send(Request::Search {
-    params: SearchParams {
-        repo_id: ensured.repo_id,
-        query: QuerySpec {
-            pattern: "LLVMContext".into(),
-            patterns: vec!["LLVMContext".into()],
-            case_insensitive: false,
-            multiline: false,
-            dot_matches_new_line: false,
-            fixed_strings: true,
-            word_regexp: false,
-            line_regexp: false,
-            top_k_tokens: 6,
-            max_count: None,
-            global_max_results: None,
-            search_mode: SearchModeConfig::LineMatches,
-        },
-        scope: PathScope::default(),
-    },
-})?;
-```
-
-如果宿主产品只需要打包资源：
-
-- 打包 `flashgrep` 二进制到产品资源目录。
-- 启动时通过 `FLASHGREP_DAEMON_BIN` 或显式路径把二进制位置传给调用侧。
-- 客户端自己管理更高层的 repo session、事件订阅、重试策略和 API facade。
-
-核心职责边界（固定定义）：
-
-- `daemon::protocol`：唯一稳定外部 contract。
-- `DaemonClient` / `ManagedDaemonClient`：daemon protocol 的低层 transport/client 封装。
-- 其他 crate library API：内部实现、测试、benchmark 和专家向辅助，不作为稳定外部接口。
-
-## Internal Library Notes
-
-crate 根上仍然保留若干库导出，主要用于：
-
-- daemon 内部实现
-- benchmark / fixture / 测试代码
-- 专家向本地集成和调试
-
-这些库接口不是推荐的外部接入方式；新的外部能力优先补到 daemon protocol，而不是继续扩展库层 facade。
-
-## Daemon Overlay
-
-daemon 运行时维护两类 workspace 状态：
-
-- `dirty catalog`
-  跟踪当前工作区相对 base snapshot 的变化集合和构建状态。
-- `published overlay`
-  只保存已经构建完成并原子发布、对查询可见的增量层。
-
-这意味着：
-
-- 查询只读取 `base snapshot + published overlay`。
-- 未发布 overlay 在进程重启后允许丢失，daemon 会通过 startup rescan 补回。
-- 查询统一使用 `WorkspaceEventual`，直接读取当前 `base snapshot + published overlay` 视图。
-
-## Benchmark
-
-当前项目已集成一版兼容 ripgrep `benchsuite` 命名方式的 benchmark runner。
-benchmark 的 `flashgrep` 结果只统计上层 daemon/service 查询路径；不再提供底层 direct benchmark 口径。
-
-语料目录默认按下面布局准备：
-
-- `bench_data/linux/`
-- `bench_data/subtitles/en.sample.txt`
-- `bench_data/subtitles/ru.txt`
-
-运行示例：
+The repository includes benchmark runners and reproducible notes for large repositories, dirty worktrees, cold and warm cache behavior, and watcher experiments.
 
 ```bash
-cargo run --bin flashgrep -- bench --suite-dir /Users/user/workspace/flashgrep/bench_data --filter linux_literal --rebuild
-```
+# Run a named suite and compare with ripgrep.
+cargo run --release --bin flashgrep -- bench \
+  --suite-dir /path/to/bench_data \
+  --filter linux_literal \
+  --compare-rg \
+  --rebuild
 
-如果希望顺带对比 `rg`：
-
-```bash
-cargo run --bin flashgrep -- bench --suite-dir /Users/user/workspace/flashgrep/bench_data --filter subtitles_en_literal --compare-rg --rebuild
-```
-
-如果希望 dirty worktree 更贴近“只改了几份文件”的 agent 场景，可以给 worktree fixture 加一个文件数上限。这个模式会从完整语料里抽一个保留真实目录结构的小型子仓库，并保证包含当前 benchmark 需要命中的文件：
-
-```bash
-cargo run --bin flashgrep -- bench \
-  --suite-dir /Users/user/workspace/flashgrep/bench_data \
+# Exercise a sampled dirty worktree.
+cargo run --release --bin flashgrep -- bench \
+  --suite-dir /path/to/bench_data \
   --filter linux_literal \
   --compare-worktree \
   --worktree-sample-files 32 \
   --rebuild
 ```
 
-如果希望比较 cold query，可以切到 `cold` cache mode。这个模式会在每个 sample 前主动驱逐本次 benchmark 会访问到的 index / corpus 文件页缓存；如果你还想连系统级 page cache 一起清掉，可以额外提供一个 hook：
+Benchmarks report index-build and query costs separately. `ripgrep` comparisons do not include any index-build time. The benchmark runner supports warm and cold cache modes, query traces, raw CSV output, and optional worktree sampling; see the [benchmark section](docs/chromium_query_benchmark_2026-07-25.md) before comparing numbers across machines.
+
+## Development
+
+Run the formatter, lints, and tests before sending a change:
 
 ```bash
-cargo run --bin flashgrep -- bench \
-  --suite-dir /Users/user/workspace/flashgrep/bench_data \
-  --filter linux_literal \
-  --compare-rg \
-  --cache-mode cold \
-  --bench-iter 3 \
-  --cold-hook 'sync && printf 3 | tee /proc/sys/vm/drop_caches >/dev/null'
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features
+cargo test --all-targets --all-features
 ```
 
-说明：
+The project uses GitHub Actions to build release binaries for Linux, macOS, and Windows and to assemble the MCP distribution bundle. Push a version tag such as `v0.2.17` to publish release assets through the workflow in [`.github/workflows/build-packages.yml`](.github/workflows/build-packages.yml).
 
-- `flashgrep` 的 benchmark 会单独统计索引构建时间和查询时间。
-- `--compare-worktree` 会额外跑 dirty worktree 查询路径；当前实现直接走“base snapshot + query-time dirty repair”，不再依赖持久化 overlay cache。
-- `--worktree-sample-files <N>` 只影响 `--compare-worktree` 的 fixture 构造：不再复制完整目录，而是抽一个最多 `N` 个文本文件的小型真实子仓库。这个模式更适合测“少量 dirty 文件”的真实查询成本；不传时仍然保留完整仓库 worst-case。
-- `rg` 对比项只统计直接搜索耗时，不包含任何建索引步骤。
-- `--raw-output <path>` 会把每个 sample 以 CSV 形式落盘；除了 `runner` 原始 id 之外，还会额外写出 `runner_family` 和 `runner_mode`，方便脚本稳定地区分 `daemon_steady_state` / `dirty_first_query` / `dirty_cached_query` 等路径。
-- bench 默认是 `warm` cache mode；`warmup_iter=1`、`bench_iter=3` 的默认值测出来的不是 cold query。
-- bench 默认是 `trace` query mode：如果 ad-hoc benchmark 传了多个 `--pattern`，会把它们当成一条 query trace 顺序执行，而不是把同一个 query 热重复很多次；需要旧的 steady-state 语义时可显式传 `--query-mode same`。
-- `cold` cache mode 默认使用 `posix_fadvise(..., DONTNEED)` 驱逐本次 benchmark 文件集的 page cache；额外的 `--cold-hook` 适合在 Linux 上配合 `drop_caches` 做更严格的系统级 cold run。
-- 当前 Linux 语料只要求仓库已 clone，不要求本机必须能成功构建内核。
+When changing execution paths, keep one clear primary path. Compatibility branches should exist only when they represent a real external constraint; the index engine and daemon are deliberately organized around a single published workspace view.
 
-## 当前边界
+## Documentation map
 
-- 只索引 UTF-8 文本文件。
-- 查询规划器优先保证正确性，复杂表达式会降级到弱查询或全量候选。
-- base snapshot 现在已经按 `snapshot_key` 缓存：Git 仓库使用 `HEAD commit + config fingerprint`，非 Git 目录使用稳定 fallback key。
-- dirty Git worktree 在 base snapshot 缺失时会按 `HEAD` materialize 一份只读 base，不会把脏工作树直接写进 commit base。
-- workspace 查询默认使用“base snapshot + 当前 dirty files 扫描修补”的两层视图，不再依赖持久化 overlay cache。
-- dirty files 当前仍按 `size + mtime` 探测，不是 content hash。
-- 当前没有引入阈值 sidecar；dirty files 始终走 query-time repair。
-- CLI 和库层都不会在后台偷偷重建 base snapshot；如果需要新的 commit base，需要显式调用 build/rebuild 接口。
+- [Daemon protocol](docs/daemon_protocol.md) — request, response, notification, and lifecycle contract.
+- [Index engine blueprint](docs/index_engine_blueprint.md) — storage and query design.
+- [Incremental index design](docs/incremental_index_design.md) — base snapshots, overlays, and publication.
+- [Workspace architecture](docs/workspace_index_architecture.md) — workspace view and freshness model.
+- [Chromium benchmark notes](docs/chromium_query_benchmark_2026-07-25.md) — benchmark context and methodology.
+- [Filesystem workspace results](docs/filesystem_workspace_results.md) — watcher, reconciliation, and performance validation.
 
-## 内部库层状态
+## Contributing
 
-`WorkspaceIndex::ensure_base_snapshot()` / `WorkspaceIndex::status()` 暴露的 `BaseSnapshotInfo` 现在包含：
+Issues, benchmark reports, protocol improvements, and pull requests are welcome. If you are integrating FlashGrep into an agent or desktop product, start with the daemon protocol and include the repository shape, query mix, cache mode, and hardware when sharing performance results.
 
-- `snapshot_key`
-- `snapshot_kind`
-- `head_commit`
-- `config_fingerprint`
+FlashGrep is maintained as part of the openBitFun open-source community. See the organization repositories and contribution guidance at [github.com/openBitFun](https://github.com/openBitFun).
 
-如果后续需要把 freshness 结果作为稳定外部 contract 暴露，优先补到 daemon protocol / SDK，而不是继续扩展库层 facade。
+## License
 
-## 下一步建议
+FlashGrep is released under the [MIT License](LICENSE). Third-party dependencies retain their respective licenses.
 
-- 给查询规划器补充更完整的 AST/HIR 解析。
-- 为 posting list 增加压缩和缓存。
-- 把 overlay 从“按 dirty state 命中的完整小索引 + 受影响 token 级重写”继续演进到“更细粒度的字节级 patch 和跨 base 复用”。
-- 加入 doc_freq 统计与更激进的 top-k token 选择器。
+---
+
+## 中文
+
+FlashGrep 是 openBitFun 组织下的高性能代码检索引擎，也是 BitFun 用来加速大仓库代码搜索的基础设施。它把反复执行的 `grep` / `glob` 调用变成可复用的增量索引服务：先用字符级倒排索引快速缩小候选文件范围，再对候选文件执行精确的 regex 验证。
+
+在 Chromium 这类接近 6000 万行代码、Git 跟踪文件超过 4 GB 的真实大仓库上，FlashGrep 的基础索引约 79 秒完成，索引大小约 2.5 GB；在 BitFun 内部的一组检索任务中，相比 `ripgrep` 平均约 36.1 倍加速。具体数据依赖仓库、查询集合、缓存状态和硬件，完整口径请看上面的 benchmark 文档。
+
+它支持：
+
+- Rust daemon 与稳定的跨进程 protocol；
+- Git commit base、普通目录 filesystem base，以及工作区增量 overlay；
+- 分支切换、文件新增/修改/删除/恢复和 watcher 事件的增量维护；
+- MCP server，可接入 Claude Code、Codex、Cursor、Trae 等 MCP 宿主；
+- `published`、`reconciled`、`filesystem` 三种查询新鲜度；
+- Linux、macOS、Windows 的 release 构建和 MCP 分发包。
+
+从源码构建和启动：
+
+```bash
+git clone https://github.com/openBitFun/FlashGrep.git
+cd FlashGrep
+cargo build --release
+./target/release/flashgrep serve --bind 127.0.0.1:4597
+./target/release/flashgrep daemon open --repo /path/to/repository
+./target/release/flashgrep daemon build --repo-id /path/to/repository
+./target/release/flashgrep daemon search --repo-id /path/to/repository 'ManagedDaemonClient'
+```
+
+如果要接入 MCP：
+
+```bash
+node mcp/server.js \
+  --repo /path/to/repository \
+  --daemon-bin /absolute/path/to/flashgrep
+```
+
+详细的 MCP 配置、daemon 协议、索引结构和 benchmark 说明见 [`mcp/README.md`](mcp/README.md)、[`docs/daemon_protocol.md`](docs/daemon_protocol.md) 和 [文档索引](#documentation-map)。欢迎在 [openBitFun](https://github.com/openBitFun) 组织下提交 issue、基准数据和改进。

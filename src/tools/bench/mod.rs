@@ -156,6 +156,7 @@ pub(super) fn bench_build_config(
     config: &BenchConfig,
 ) -> BuildConfig {
     BuildConfig {
+        git_mode: Default::default(),
         repo_path: repo_path.to_path_buf(),
         storage_root: storage_root.to_path_buf(),
         tokenizer: config.tokenizer,
@@ -812,6 +813,7 @@ pub(super) fn start_bench_daemon(
         repo_path: repo_path.to_path_buf(),
         storage_root: Some(storage_root.to_path_buf()),
         config: RepoConfig {
+            git_mode: Default::default(),
             tokenizer: match config.tokenizer {
                 TokenizerMode::Trigram => crate::daemon::protocol::TokenizerModeConfig::Trigram,
                 TokenizerMode::SparseNgram => {
@@ -865,6 +867,7 @@ pub(super) fn run_daemon_search_count(
     let response = daemon.client.search(SearchParams {
         repo_id: daemon.repo_id.clone(),
         query: QuerySpec {
+            freshness: Default::default(),
             pattern: pattern.to_string(),
             patterns: vec![pattern.to_string()],
             case_insensitive,

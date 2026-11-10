@@ -460,7 +460,6 @@ parent/candidate manifest ID 和 cache hit。
     "base_delta_max_delete_segments": 8,
     "base_delta_max_bytes_ratio": 0.1,
     "base_head_cache_entries": 4,
-    "overlay_auto_checkpoint_max_uncommitted_ops": 256,
     "overlay_merge_min_delay_ms": 2000,
     "overlay_merge_retry_delay_ms": 10000
   }

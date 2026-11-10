@@ -132,7 +132,12 @@ pub(super) fn resolve_base_snapshot_build(
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<ResolvedBaseSnapshotBuild> {
     let config_fingerprint = base_snapshot_config_fingerprint(build_config);
-    match resolve_git_head(&build_config.repo_path, should_cancel)? {
+    let head = if build_config.git_mode == crate::config::GitMode::Filesystem {
+        None
+    } else {
+        resolve_git_head(&build_config.repo_path, should_cancel)?
+    };
+    match head {
         Some(head_commit) => {
             let snapshot_key = format!("base-git-{head_commit}-{config_fingerprint}");
             Ok(ResolvedBaseSnapshotBuild {

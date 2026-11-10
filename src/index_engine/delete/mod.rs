@@ -11,3 +11,6 @@ pub(crate) use format::{
 pub use reader::{DeleteSegmentReader, DeleteSegmentReaderHandle, MemoryDeleteSegmentReader};
 pub use resolver::{MemoryVisibilityResolver, VisibilityResolver};
 pub use writer::{DeleteBuffer, DeleteStore, FileDeleteStore, MemoryDeleteStore};
+
+mod staged;
+pub(crate) use staged::StagedDeleteStore;

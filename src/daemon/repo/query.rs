@@ -41,7 +41,9 @@ impl RepoRuntime {
 
     pub(super) fn refresh(&self, force: bool) -> Result<RepoStatus> {
         let head_changed = self.observe_git_head_transition()?;
-        if force || self.workspace_probe_pending() {
+        if force {
+            self.refresh_workspace_overlay()?;
+        } else if self.workspace_probe_pending() {
             if head_changed || self.branch_transition_pending() {
                 self.rebuild_workspace_overlay()?;
             } else if self.workspace_watcher_active() {
@@ -66,6 +68,29 @@ impl RepoRuntime {
         let scope =
             normalize_repo_scope_args(&self.build_config.repo_path, &request.path_filter_args)?;
         let filter = build_path_filter(&self.build_config.repo_path, &scope)?;
+        if request.freshness == crate::config::QueryFreshness::Filesystem {
+            return Ok(SearchResponse {
+                repo_id: self.repo_id.clone(),
+                backend: QueryBackend::ScanFallback,
+                status: self.status_snapshot(),
+                results: self.scan_workspace_search(&request.query, filter.as_ref())?,
+            });
+        }
+        if request.freshness == crate::config::QueryFreshness::Reconciled {
+            let phase = self.status_snapshot().phase;
+            if !self.has_active_task()
+                && matches!(phase, RepoPhase::ReadyClean | RepoPhase::ReadyDirty)
+            {
+                self.refresh_workspace_overlay()?;
+            } else {
+                return Ok(SearchResponse {
+                    repo_id: self.repo_id.clone(),
+                    backend: QueryBackend::ScanFallback,
+                    status: self.status_snapshot(),
+                    results: self.scan_workspace_search(&request.query, filter.as_ref())?,
+                });
+            }
+        }
         let query_filters = QueryFilters::default();
         let status = self.status_snapshot();
         if self.branch_transition_pending() {
@@ -114,9 +139,22 @@ impl RepoRuntime {
                 let dirty_stats = self.dirty_catalog_stats();
                 let has_dirty = !dirty_stats.is_empty();
                 let overlay_snapshot = if has_dirty { overlay_snapshot } else { None };
-                let workspace_snapshot = self
+                let workspace_snapshot = match self
                     .workspace_search_view
-                    .open_workspace_query_snapshot(base_snapshot, overlay_snapshot)?;
+                    .open_workspace_query_snapshot(base_snapshot, overlay_snapshot)
+                {
+                    Ok(snapshot) => snapshot,
+                    Err(AppError::InvalidIndex(_)) => {
+                        self.enqueue_full_workspace_probe();
+                        return Ok(SearchResponse {
+                            repo_id: self.repo_id.clone(),
+                            backend: QueryBackend::ScanFallback,
+                            status: self.status_snapshot(),
+                            results: self.scan_workspace_search(&request.query, filter.as_ref())?,
+                        });
+                    }
+                    Err(error) => return Err(error),
+                };
                 let mut response_status = status.clone();
                 super::status::apply_repo_status_dirty_fields(&mut response_status, dirty_stats);
                 let backend = if has_dirty {
@@ -407,6 +445,40 @@ impl RepoRuntime {
         }
     }
 
+    fn scan_workspace_search(
+        &self,
+        query: &crate::config::QueryConfig,
+        filter: Option<&PathFilter>,
+    ) -> Result<crate::search::SearchResults> {
+        let mut files = Vec::new();
+        for path in self.workspace_inventory_paths(None)? {
+            let path = Path::new(&path);
+            if filter.is_some_and(|filter| !filter.matches_file(path)) {
+                continue;
+            }
+            let file = match crate::files::repository_file(
+                path,
+                files.len(),
+                self.build_config.max_file_size,
+            ) {
+                Ok(file) => file,
+                Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {
+                    continue
+                }
+                Err(error) => return Err(error),
+            };
+            if let Some(file) = file {
+                match crate::files::is_corpus_text_file(path) {
+                    Ok(true) => files.push(file),
+                    Ok(false) => {}
+                    Err(AppError::Io(error)) if error.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(error) => return Err(error),
+                }
+            }
+        }
+        crate::search_engine::search_scanned_files(query, &files)
+    }
+
     fn scan_search_fallback(
         &self,
         query: &crate::config::QueryConfig,
@@ -506,4 +578,168 @@ fn scan_roots(repo_root: &Path, args: &PathFilterArgs) -> Vec<PathBuf> {
         .iter()
         .map(|root| normalize_path(root, repo_root))
         .collect()
+}
+
+#[cfg(test)]
+mod freshness_tests {
+    use super::*;
+    use crate::config::{BuildConfig, GitMode, QueryConfig, QueryFreshness};
+    use std::{fs, sync::Arc};
+
+    fn setup(temp: &tempfile::TempDir) -> RepoRuntime {
+        let root = temp.path().join("repo");
+        fs::create_dir(&root).unwrap();
+        fs::write(root.join("base.rs"), "BASE_TOKEN\n").unwrap();
+        let runtime = RepoRuntime::new(
+            "repo".into(),
+            BuildConfig {
+                repo_path: root,
+                storage_root: temp.path().join("index"),
+                git_mode: GitMode::Filesystem,
+                ..Default::default()
+            },
+            Default::default(),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        runtime.build_base_snapshot().unwrap();
+        runtime
+    }
+
+    fn request(freshness: QueryFreshness) -> SearchRequest {
+        SearchRequest {
+            repo_id: "repo".into(),
+            freshness,
+            path_filter_args: Default::default(),
+            query: QueryConfig {
+                regex_pattern: "UNOBSERVED_TOKEN".into(),
+                patterns: vec!["UNOBSERVED_TOKEN".into()],
+                ..Default::default()
+            },
+        }
+    }
+
+    #[test]
+    fn query_freshness_distinguishes_publication_reconciliation_and_direct_scan() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = setup(&temp); // Deliberately no watcher/maintenance worker.
+        fs::write(
+            runtime.build_config.repo_path.join("new.rs"),
+            "UNOBSERVED_TOKEN\n",
+        )
+        .unwrap();
+        let old = runtime.search(request(QueryFreshness::Published)).unwrap();
+        assert_eq!(old.results.searches_with_match, 0);
+        let disk = runtime.search(request(QueryFreshness::Filesystem)).unwrap();
+        assert_eq!(disk.backend, QueryBackend::ScanFallback);
+        assert_eq!(disk.results.searches_with_match, 1);
+        assert_eq!(
+            runtime
+                .search(request(QueryFreshness::Published))
+                .unwrap()
+                .results
+                .searches_with_match,
+            0
+        );
+        let fresh = runtime.search(request(QueryFreshness::Reconciled)).unwrap();
+        assert_eq!(fresh.backend, QueryBackend::IndexedWorkspaceView);
+        assert_eq!(fresh.results.searches_with_match, 1);
+        assert_eq!(
+            runtime
+                .search(request(QueryFreshness::Published))
+                .unwrap()
+                .results
+                .searches_with_match,
+            1
+        );
+        fs::write(
+            runtime.build_config.repo_path.join("another.rs"),
+            "UNOBSERVED_TOKEN\n",
+        )
+        .unwrap();
+        runtime.refresh(true).unwrap();
+        assert_eq!(
+            runtime
+                .search(request(QueryFreshness::Published))
+                .unwrap()
+                .results
+                .searches_with_match,
+            2
+        );
+    }
+
+    #[test]
+    fn repeated_file_events_publish_edits_with_unchanged_metadata() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = setup(&temp);
+        // Cover both an existing base file and a file introduced into the overlay.
+        for name in ["base.rs", "new.rs"] {
+            let path = runtime.build_config.repo_path.join(name);
+            let original = fs::read(&path).ok();
+            fs::write(&path, "UNOBSERVED_TOKEN\n").unwrap();
+            let stamp = fs::metadata(&path).unwrap().modified().unwrap();
+            for (contents, expected) in [
+                ("UNOBSERVED_TOKEN\n", 1),
+                ("REPLACED___TOKEN\n", 0),
+                ("UNOBSERVED_TOKEN\n", 1),
+            ] {
+                fs::write(&path, contents).unwrap();
+                fs::OpenOptions::new()
+                    .write(true)
+                    .open(&path)
+                    .unwrap()
+                    .set_times(fs::FileTimes::new().set_modified(stamp))
+                    .unwrap();
+                let plan = runtime
+                    .plan_overlay_update_from_event_probe(
+                        [path.clone()],
+                        runtime.observe_workspace_revision(),
+                    )
+                    .unwrap()
+                    .expect("observed dirty contents must be published again");
+                runtime.apply_overlay_write_plan(plan).unwrap();
+                let response = runtime.search(request(QueryFreshness::Published)).unwrap();
+                assert_eq!(response.backend, QueryBackend::IndexedWorkspaceView);
+                assert_eq!(
+                    response.results.searches_with_match, expected,
+                    "{name}: {contents}"
+                );
+            }
+            if let Some(original) = original {
+                fs::write(&path, original).unwrap();
+            } else {
+                fs::remove_file(&path).unwrap();
+            }
+            let plan = runtime
+                .plan_overlay_update_from_event_probe([path], runtime.observe_workspace_revision())
+                .unwrap()
+                .unwrap();
+            runtime.apply_overlay_write_plan(plan).unwrap();
+            assert_eq!(
+                runtime
+                    .search(request(QueryFreshness::Published))
+                    .unwrap()
+                    .results
+                    .searches_with_match,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn reconciled_query_returns_publication_error_and_can_retry() {
+        let temp = tempfile::tempdir().unwrap();
+        let runtime = setup(&temp);
+        fs::write(
+            runtime.build_config.repo_path.join("new.rs"),
+            "UNOBSERVED_TOKEN\n",
+        )
+        .unwrap();
+        *runtime.overlay_publication_failpoint.lock().unwrap() =
+            Some(super::super::OverlayPublicationFailpoint::BeforeOverlayPublish);
+        assert!(runtime.search(request(QueryFreshness::Reconciled)).is_err());
+        assert!(runtime.workspace_probe_pending());
+        let repaired = runtime.search(request(QueryFreshness::Reconciled)).unwrap();
+        assert_eq!(repaired.results.searches_with_match, 1);
+    }
 }

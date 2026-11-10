@@ -1,6 +1,7 @@
 use std::{
     collections::{BTreeMap, BTreeSet},
-    sync::{Arc, Mutex, OnceLock, RwLock},
+    path::{Path, PathBuf},
+    sync::{Arc, Mutex, OnceLock, RwLock, Weak},
 };
 
 use crate::index_engine::{
@@ -25,9 +26,12 @@ pub(crate) struct SnapshotVisibilityState {
 
 #[derive(Debug, Clone, Default)]
 pub(crate) struct SnapshotData {
+    // Shared by readers of this publication, unique across engine recreation.
+    pub(crate) identity: Arc<()>,
     pub(crate) manifest: Manifest,
     pub(crate) docs: BTreeMap<DocKey, VersionedDocument>,
     pub(crate) deleted_keys: BTreeSet<DocKey>,
+    pub(crate) retracted_keys: BTreeSet<DocKey>,
     pub(crate) visibility_cache: Arc<OnceLock<Arc<SnapshotVisibilityState>>>,
 }
 
@@ -41,6 +45,66 @@ pub(crate) struct SharedSnapshotState {
 impl SharedSnapshotState {
     pub(crate) fn new() -> Self {
         Self::default()
+    }
+
+    pub(crate) fn for_index_root(root: &Path) -> crate::Result<Self> {
+        static REGISTRIES: OnceLock<Mutex<BTreeMap<PathBuf, Weak<LeaseEntries>>>> = OnceLock::new();
+        let root = std::fs::canonicalize(root)?;
+        let mut registries = REGISTRIES
+            .get_or_init(Default::default)
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        registries.retain(|_, registry| registry.strong_count() > 0);
+        let inner = registries
+            .get(&root)
+            .and_then(Weak::upgrade)
+            .unwrap_or_else(|| {
+                let registry = Arc::new(LeaseEntries::default());
+                registries.insert(root, Arc::downgrade(&registry));
+                registry
+            });
+        Ok(Self {
+            leases: SnapshotLeaseRegistry { inner },
+            ..Self::default()
+        })
+    }
+
+    // Lock before reading a manifest, not merely before registering its lease:
+    // GC must not delete its segments in the load-to-pin window.
+    pub(crate) fn protect_manifest_open(&self) -> std::sync::RwLockReadGuard<'_, ()> {
+        self.leases
+            .inner
+            .reclamation
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn protect_reclamation(&self) -> std::sync::RwLockWriteGuard<'_, ()> {
+        self.leases
+            .inner
+            .reclamation
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub(crate) fn lease_refreshed(&self) -> (SnapshotData, SnapshotLease) {
+        let _open = self.protect_manifest_open();
+        let snapshot = self
+            .refreshed
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lease = self.acquire_lease(&snapshot.manifest);
+        (snapshot.clone(), lease)
+    }
+
+    pub(crate) fn lease_committed(&self) -> (SnapshotData, SnapshotLease) {
+        let _open = self.protect_manifest_open();
+        let snapshot = self
+            .committed
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let lease = self.acquire_lease(&snapshot.manifest);
+        (snapshot.clone(), lease)
     }
 
     pub(crate) fn load_refreshed(&self) -> SnapshotData {
@@ -73,8 +137,19 @@ impl SharedSnapshotState {
         *guard = snapshot;
     }
 
-    pub(crate) fn acquire_lease(&self, manifest_id: ManifestId) -> SnapshotLease {
-        self.leases.acquire(manifest_id)
+    pub(crate) fn acquire_lease(&self, manifest: &Manifest) -> SnapshotLease {
+        self.leases.acquire(manifest)
+    }
+
+    pub(crate) fn pinned_manifests(&self) -> Vec<Manifest> {
+        self.leases
+            .inner
+            .entries
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .values()
+            .map(|(manifest, _)| manifest.clone())
+            .collect()
     }
 
     pub(crate) fn pinned_manifest_ids(&self) -> BTreeSet<ManifestId> {
@@ -82,19 +157,30 @@ impl SharedSnapshotState {
     }
 }
 
+#[derive(Debug, Default)]
+struct LeaseEntries {
+    entries: Mutex<BTreeMap<ManifestId, (Manifest, usize)>>,
+    reclamation: RwLock<()>,
+}
+
 #[derive(Debug, Clone, Default)]
 struct SnapshotLeaseRegistry {
-    inner: Arc<Mutex<BTreeMap<ManifestId, usize>>>,
+    inner: Arc<LeaseEntries>,
 }
 
 impl SnapshotLeaseRegistry {
-    fn acquire(&self, manifest_id: ManifestId) -> SnapshotLease {
+    fn acquire(&self, manifest: &Manifest) -> SnapshotLease {
+        let manifest_id = manifest.manifest_id.clone();
         {
             let mut guard = self
                 .inner
+                .entries
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            *guard.entry(manifest_id.clone()).or_default() += 1;
+            guard
+                .entry(manifest_id.clone())
+                .or_insert_with(|| (manifest.clone(), 0))
+                .1 += 1;
         }
         SnapshotLease {
             _entry: Arc::new(SnapshotLeaseEntry {
@@ -106,6 +192,7 @@ impl SnapshotLeaseRegistry {
 
     fn pinned_manifest_ids(&self) -> BTreeSet<ManifestId> {
         self.inner
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .keys()
@@ -116,10 +203,11 @@ impl SnapshotLeaseRegistry {
     fn release(&self, manifest_id: &ManifestId) {
         let mut guard = self
             .inner
+            .entries
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let remove = match guard.get_mut(manifest_id) {
-            Some(count) if *count > 1 => {
+            Some((_, count)) if *count > 1 => {
                 *count -= 1;
                 false
             }

@@ -240,6 +240,7 @@ pub(super) fn git_checkout_new_branch(repo_path: &std::path::Path, branch: &str)
 
 pub(super) fn query(pattern: &str) -> QuerySpec {
     QuerySpec {
+        freshness: Default::default(),
         pattern: pattern.into(),
         patterns: Vec::new(),
         case_insensitive: false,

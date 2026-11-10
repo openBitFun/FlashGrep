@@ -1,13 +1,13 @@
 mod bridge;
 mod client;
 mod convert;
-mod git_workspace;
 mod managed;
 pub mod protocol;
 mod repo;
 mod rg_backend;
 mod server;
 mod service;
+mod workspace_location;
 
 pub use bridge::serve_managed_stdio_bridge;
 pub use client::DaemonClient;

@@ -104,9 +104,9 @@ pub(crate) fn collect_query_posting_terms(
     }
 }
 
-pub(crate) fn write_term_dict_file(
+pub(crate) fn write_term_dict_file<V: AsRef<[u32]>>(
     path: &Path,
-    posting_lists: &HashMap<u64, Vec<u32>>,
+    posting_lists: &HashMap<u64, V>,
 ) -> Result<()> {
     let mut buffer = Vec::new();
     buffer.write_all(TERM_DICT_MAGIC)?;
@@ -138,7 +138,7 @@ pub(crate) fn write_term_dict_file(
             .get(&key)
             .ok_or_else(|| AppError::InvalidIndex("posting key missing during write".into()))?;
         let posting_bytes = 4usize
-            .checked_add(encoded_posting_len(doc_ids)?)
+            .checked_add(encoded_posting_len(doc_ids.as_ref())?)
             .ok_or_else(|| AppError::ValueOutOfRange("posting size exceeds usize range".into()))?;
         let posting_bytes = u32::try_from(posting_bytes)
             .map_err(|_| AppError::ValueOutOfRange("posting size exceeds u32 range".into()))?;
@@ -150,7 +150,7 @@ pub(crate) fn write_term_dict_file(
     Ok(())
 }
 
-pub(crate) fn ordered_posting_keys(posting_lists: &HashMap<u64, Vec<u32>>) -> Vec<u64> {
+pub(crate) fn ordered_posting_keys<V>(posting_lists: &HashMap<u64, V>) -> Vec<u64> {
     posting_key_buckets(posting_lists)
         .into_iter()
         .flatten()
@@ -409,7 +409,7 @@ fn term_dict_bucket_id(key: u64) -> usize {
     (mixed as usize) % TERM_DICT_BUCKET_COUNT
 }
 
-fn posting_key_buckets(posting_lists: &HashMap<u64, Vec<u32>>) -> Vec<Vec<u64>> {
+fn posting_key_buckets<V>(posting_lists: &HashMap<u64, V>) -> Vec<Vec<u64>> {
     let mut buckets = vec![Vec::new(); TERM_DICT_BUCKET_COUNT];
     for key in posting_lists.keys().copied() {
         buckets[term_dict_bucket_id(key)].push(key);

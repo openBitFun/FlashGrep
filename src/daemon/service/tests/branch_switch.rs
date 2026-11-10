@@ -490,18 +490,14 @@ fn branch_switch_advances_base_without_automatic_full_rebuild() {
     git_checkout(&repo_path, "feature");
 
     let refreshed = refresh_repo(&service, &repo_id, true);
+    // Base advancement may already finish before refresh returns. Verify the
+    // durable result rather than requiring observation of a transient dirty phase.
     assert!(matches!(
         refreshed.phase,
         crate::daemon::protocol::RepoPhase::ReadyDirty
+            | crate::daemon::protocol::RepoPhase::ReadyClean
     ));
-
-    let dirty = wait_for_status(&service, &repo_id, |status| {
-        matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyDirty)
-            && status.dirty_files.modified >= 1
-            && status.dirty_files.deleted >= 1
-            && status.dirty_files.new >= 1
-    });
-    assert!(dirty.probe_healthy);
+    assert!(refreshed.probe_healthy);
     let settled = wait_for_status(&service, &repo_id, |status| {
         status.active_task_id.is_none()
             && matches!(status.phase, crate::daemon::protocol::RepoPhase::ReadyClean)
@@ -522,6 +518,8 @@ fn branch_switch_advances_base_without_automatic_full_rebuild() {
 
     let _ = assert_search_count_now(&service, &repo_id, "FEATURE_TOKEN", 1);
     let _ = assert_search_count_now(&service, &repo_id, "MAIN_TOKEN", 0);
+    let _ = assert_search_count_now(&service, &repo_id, "FEATURE_DIR_TOKEN", 1);
+    let _ = assert_search_count_now(&service, &repo_id, "LEGACY_BRANCH_TOKEN", 0);
 }
 
 #[test]
@@ -808,6 +806,12 @@ fn rapid_head_changes_coalesce_to_the_latest_target() {
     git_commit_all(&repo_path, "h1");
     let h1 = git_head_commit(&repo_path);
     let _ = refresh_repo(&service, &repo_id, true);
+    // Only a started/completed candidate is required to remain cacheable.
+    // Coalescing may legitimately skip a HEAD that never became a task target.
+    let _ = wait_for_status(&service, &repo_id, |status| {
+        status.base_advance_target_head.as_deref() == Some(h1.as_str())
+            || status.base_head_commit.as_deref() == Some(h1.as_str())
+    });
 
     git_checkout(&repo_path, "h2");
     let transition = refresh_repo(&service, &repo_id, true);

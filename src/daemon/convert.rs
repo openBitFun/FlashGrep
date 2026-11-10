@@ -256,6 +256,7 @@ pub(super) fn convert_repo_status(status: RepoStatus) -> proto::RepoStatus {
         active_task_id: status.active_task_id,
         probe_healthy: status.probe_healthy,
         workspace_probe_pending: status.workspace_probe_pending,
+        workspace_progress: status.workspace_progress,
         last_error: status.last_error,
         last_maintenance_error: status.last_maintenance_error,
         overlay: status.overlay.map(convert_workspace_overlay_status),

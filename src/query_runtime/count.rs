@@ -16,7 +16,7 @@ use super::{
     query::LinePrefilter,
     shared::{
         build_line_starts, build_regex_matcher, configure_verifier_searcher, line_index_for_offset,
-        validate_doc_id, validate_doc_ids, with_verify_path_bytes,
+        validate_doc_id, validate_doc_ids,
     },
     verify::VerifyCandidateSource,
 };
@@ -29,6 +29,8 @@ const LIMITED_VERIFY_CHUNK_SIZE: usize = 256;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum CountKind {
+    /// Presence only: stop verification at the first matching line.
+    Exists,
     Lines,
     Occurrences,
 }
@@ -52,7 +54,7 @@ impl VerifyPlan {
     ) -> Result<Self> {
         Ok(Self {
             matcher: build_regex_matcher(config, multiline_verifier)?,
-            literal_matcher: if config.max_count.is_none() {
+            literal_matcher: if config.max_count.is_none() && count_kind != CountKind::Exists {
                 PureLiteralMatcher::compile(config, multiline_verifier)?
             } else {
                 None
@@ -250,7 +252,33 @@ struct VerifyRuntime<'a> {
 
 impl VerifyRuntime<'_> {
     fn verify_path(&mut self, path: &Path) -> Result<DocCountStats> {
-        with_verify_path_bytes(path, |bytes| self.verify_slice(bytes))
+        let file = match std::fs::File::open(path) {
+            Ok(file) => file,
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    io::ErrorKind::NotFound | io::ErrorKind::IsADirectory
+                ) =>
+            {
+                return Ok(DocCountStats::default());
+            }
+            Err(error) => return Err(error.into()),
+        };
+        let mut sink = CountSink::new(&self.plan.matcher, self.plan.count_kind);
+        let result = if let Some(prefilter) = self.plan.line_prefilter.as_ref() {
+            let matcher = LinePrefilterMatcher::new(&self.plan.matcher, prefilter);
+            self.searcher.search_file(&matcher, &file, &mut sink)
+        } else {
+            self.searcher
+                .search_file(&self.plan.matcher, &file, &mut sink)
+        };
+        match result {
+            Ok(()) => Ok(sink.stats),
+            Err(error) if error.kind() == io::ErrorKind::IsADirectory => {
+                Ok(DocCountStats::default())
+            }
+            Err(error) => Err(error.into()),
+        }
     }
 
     fn verify_slice(&mut self, bytes: &[u8]) -> Result<DocCountStats> {
@@ -329,6 +357,10 @@ impl Sink for CountSink<'_> {
 
     fn matched(&mut self, searcher: &Searcher, mat: &SinkMatch<'_>) -> IoResult<bool> {
         match self.count_kind {
+            CountKind::Exists => {
+                self.stats.matched_lines = 1;
+                return Ok(false);
+            }
             CountKind::Lines => {
                 if searcher.multi_line() {
                     self.stats.matched_lines += mat.lines().count().max(1);
@@ -503,5 +535,74 @@ impl Matcher for LinePrefilterMatcher<'_> {
             .prefilter
             .find_candidate_line(haystack, b'\n')
             .map(LineMatchKind::Candidate))
+    }
+}
+
+#[cfg(test)]
+mod presence_tests {
+    use super::*;
+    use std::sync::Arc;
+
+    #[test]
+    fn presence_stops_after_first_match_without_changing_count_modes() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("many.txt");
+        let bytes = "needle needle\n".repeat(10000).into_bytes();
+        std::fs::write(&path, &bytes).unwrap();
+        let config = QueryConfig {
+            regex_pattern: "needle".into(),
+            ..QueryConfig::default()
+        };
+        for source in [
+            VerifyCandidateSource::Path(path),
+            VerifyCandidateSource::Bytes(Arc::from(bytes)),
+        ] {
+            for (kind, lines) in [
+                (CountKind::Exists, 1),
+                (CountKind::Lines, 10000),
+                (CountKind::Occurrences, 10000),
+            ] {
+                let plan = VerifyPlan::compile(&config, false, None, kind).unwrap();
+                let result = plan
+                    .verify_candidate_counts_by_doc_with_sources(
+                        &[0],
+                        1,
+                        &|_| Ok(source.clone()),
+                        None,
+                    )
+                    .unwrap();
+                assert_eq!(result.len(), 1);
+                assert_eq!(result[0].matched_lines, lines);
+                if kind == CountKind::Occurrences {
+                    assert_eq!(result[0].matched_occurrences, 20000);
+                }
+            }
+        }
+    }
+    #[test]
+    fn presence_preserves_regex_multiline_and_empty_match_semantics() {
+        for (pattern, bytes, multiline, expected) in [
+            (r"\bneedle\b", b"needles\n".as_slice(), false, false),
+            (r"\bneedle\b", b"a needle\n".as_slice(), false, true),
+            ("needle\\nnext", b"needle\nnext\n".as_slice(), true, true),
+            ("^$", b"\n".as_slice(), false, true),
+            ("needle", b"nothing\n".as_slice(), false, false),
+        ] {
+            let config = QueryConfig {
+                regex_pattern: pattern.into(),
+                multiline,
+                ..QueryConfig::default()
+            };
+            let plan = VerifyPlan::compile(&config, multiline, None, CountKind::Exists).unwrap();
+            let result = plan
+                .verify_candidate_counts_by_doc_with_sources(
+                    &[0],
+                    1,
+                    &|_| Ok(VerifyCandidateSource::Bytes(Arc::from(bytes))),
+                    None,
+                )
+                .unwrap();
+            assert_eq!(!result.is_empty(), expected, "{pattern}");
+        }
     }
 }

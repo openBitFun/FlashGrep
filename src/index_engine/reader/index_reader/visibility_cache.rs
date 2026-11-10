@@ -24,12 +24,19 @@ impl IndexSnapshotReader {
     ) -> Result<SnapshotVisibilityState> {
         let mut latest_delete_seq =
             std::collections::BTreeMap::<DocKey, crate::index_engine::types::SeqNo>::new();
+        let mut latest_retraction_seq = std::collections::BTreeMap::<DocKey, u64>::new();
         let delete_started = Instant::now();
         for delete_segment_ref in &self.snapshot.manifest().active_delete_segments {
             let reader = self
                 .delete_store
                 .open_delete_segment(delete_segment_ref.id.clone())?;
             for record in reader.records() {
+                if record.retract_to_base {
+                    latest_retraction_seq
+                        .entry(record.key.clone())
+                        .and_modify(|seq| *seq = (*seq).max(record.seq_no))
+                        .or_insert(record.seq_no);
+                }
                 latest_delete_seq
                     .entry(record.key.clone())
                     .and_modify(|seq_no| *seq_no = (*seq_no).max(record.seq_no))
@@ -70,6 +77,7 @@ impl IndexSnapshotReader {
                 let key = reader.doc_key(doc_id)?;
                 if latest_live_segment_seq.contains_key(key)
                     || self.data.deleted_keys.contains(key)
+                    || self.data.retracted_keys.contains(key)
                     || self.data.docs.contains_key(key)
                 {
                     continue;
@@ -98,7 +106,12 @@ impl IndexSnapshotReader {
             live_keys.insert(key.clone());
         }
         for key in latest_delete_seq.keys() {
-            if !live_keys.contains(key) && !self.data.docs.contains_key(key) {
+            if !live_keys.contains(key)
+                && !self.data.docs.contains_key(key)
+                && !self.data.retracted_keys.contains(key)
+                && (self.data.deleted_keys.contains(key)
+                    || latest_retraction_seq.get(key) != latest_delete_seq.get(key))
+            {
                 deleted_keys.insert(key.clone());
             }
         }

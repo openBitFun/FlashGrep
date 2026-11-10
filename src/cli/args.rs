@@ -6,7 +6,7 @@ use crate::{
     config::{CorpusMode, TokenizerMode},
     daemon::protocol::{
         EnsureRepoParams, GlobParams, OpenRepoParams, PathScope, QuerySpec, RepoConfig,
-        SearchModeConfig, SearchParams, DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
+        SearchModeConfig, SearchParams,
     },
     tools::bench::BenchQueryMode,
     tools::bench::{BenchCacheMode, BenchConfig},
@@ -98,6 +98,10 @@ pub(super) struct EngineMergeArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct BuildArgs {
+    /// Use filesystem indexing without Git root discovery or commit snapshots.
+    #[arg(long, default_value_t = false)]
+    pub(super) no_git: bool,
+
     #[arg(long)]
     pub(super) repo: PathBuf,
     #[arg(long = "storage-root")]
@@ -129,6 +133,11 @@ impl BuildArgs {
             repo_path: self.repo,
             storage_root: self.storage_root,
             config: RepoConfig {
+                git_mode: if self.no_git {
+                    crate::config::GitMode::Filesystem
+                } else {
+                    crate::config::GitMode::Auto
+                },
                 tokenizer: self.tokenizer.into(),
                 corpus_mode: match corpus_mode {
                     CorpusMode::RespectIgnore => {
@@ -271,6 +280,10 @@ pub(super) struct DaemonRefreshArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct DaemonOpenArgs {
+    /// Use filesystem indexing without Git root discovery or commit snapshots.
+    #[arg(long, default_value_t = false)]
+    pub(super) no_git: bool,
+
     #[command(flatten)]
     pub(super) connect: DaemonConnectArgs,
     #[arg(long)]
@@ -297,11 +310,6 @@ pub(super) struct DaemonOpenArgs {
     pub(super) base_delta_max_bytes_ratio: f64,
     #[arg(long, default_value_t = 4)]
     pub(super) base_head_cache_entries: usize,
-    #[arg(
-        long,
-        default_value_t = DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS
-    )]
-    pub(super) overlay_auto_checkpoint_max_uncommitted_ops: u64,
     #[arg(long, default_value_t = 2_000)]
     pub(super) overlay_merge_min_delay_ms: u64,
     #[arg(long, default_value_t = 10_000)]
@@ -318,6 +326,11 @@ impl DaemonOpenArgs {
             repo_path: self.repo,
             storage_root: self.storage_root,
             config: RepoConfig {
+                git_mode: if self.no_git {
+                    crate::config::GitMode::Filesystem
+                } else {
+                    crate::config::GitMode::Auto
+                },
                 tokenizer: self.tokenizer.into(),
                 corpus_mode: self.corpus_mode.into(),
                 include_hidden: self.hidden,
@@ -330,8 +343,7 @@ impl DaemonOpenArgs {
                 base_delta_max_delete_segments: self.base_delta_max_delete_segments,
                 base_delta_max_bytes_ratio: self.base_delta_max_bytes_ratio,
                 base_head_cache_entries: self.base_head_cache_entries,
-                overlay_auto_checkpoint_max_uncommitted_ops: self
-                    .overlay_auto_checkpoint_max_uncommitted_ops,
+
                 overlay_merge_min_delay_ms: self.overlay_merge_min_delay_ms,
                 overlay_merge_retry_delay_ms: self.overlay_merge_retry_delay_ms,
             },
@@ -341,6 +353,8 @@ impl DaemonOpenArgs {
 
 #[derive(Debug, Args)]
 pub(super) struct DaemonSearchArgs {
+    #[arg(long, value_enum, default_value = "published")]
+    pub(super) freshness: crate::config::QueryFreshness,
     #[command(flatten)]
     pub(super) repo: DaemonRepoArgs,
     #[arg(index = 1, value_name = "PATTERN")]
@@ -393,6 +407,7 @@ impl DaemonSearchArgs {
 
     pub(super) fn into_search_params(self) -> SearchParams {
         let Self {
+            freshness,
             repo,
             pattern,
             regexp,
@@ -418,6 +433,7 @@ impl DaemonSearchArgs {
         SearchParams {
             repo_id: repo.repo_id,
             query: QuerySpec {
+                freshness,
                 pattern: combine_patterns(&patterns, fixed_strings),
                 patterns,
                 case_insensitive: ignore_case,

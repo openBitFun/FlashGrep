@@ -20,8 +20,8 @@ fn mcp_initialize_and_tools_list_do_not_open_invalid_default_repo() {
     }
 
     let temp = tempdir().expect("temp dir should succeed");
-    let repo_path = temp.path().join("not-git");
-    std::fs::create_dir_all(&repo_path).expect("repo dir should succeed");
+    let repo_path = temp.path().join("not-a-directory");
+    std::fs::write(&repo_path, "invalid workspace target").expect("fixture file should exist");
 
     let mut server = McpServerProcess::spawn(&repo_path);
     let mut stdin = server.child.stdin.take().expect("stdin should be piped");
@@ -104,7 +104,7 @@ fn mcp_initialize_and_tools_list_do_not_open_invalid_default_repo() {
     assert!(
         tool_call
             .to_string()
-            .contains("indexed daemon workspace requires a Git worktree with a HEAD commit"),
+            .contains("workspace must be a directory"),
         "{tool_call}"
     );
 
@@ -689,6 +689,159 @@ fn repeated_mcp_open_after_checkout_keeps_base_readable_and_advances_incremental
     drop(stdin);
     server.wait_or_kill();
     shutdown_managed_daemon(&repo_path);
+}
+
+#[test]
+fn mcp_filesystem_and_unborn_workspaces_reconcile_changes_and_offline_restart() {
+    if !node_is_available() {
+        return;
+    }
+    for unborn in [false, true] {
+        let temp = tempdir().unwrap();
+        let repo = temp.path().join("repo");
+        std::fs::create_dir(&repo).unwrap();
+        let main = repo.join("main.rs");
+        std::fs::write(&main, "MCP_BASE_TOKEN\n").unwrap();
+        if unborn {
+            run_git(&repo, ["init", "-q"]);
+        }
+        for restarted in [false, true] {
+            let mut server = McpServerProcess::spawn(&repo);
+            let mut stdin = server.child.stdin.take().unwrap();
+            let mut stdout = BufReader::new(server.child.stdout.take().unwrap());
+            let initialized = send_mcp_request(
+                &mut stdin,
+                &mut stdout,
+                json!({
+                    "jsonrpc": "2.0", "id": 1, "method": "initialize",
+                    "params": { "protocolVersion": "2025-11-25", "capabilities": {},
+                        "clientInfo": { "name": "filesystem-lifecycle-test", "version": "test" } }
+                }),
+            );
+            assert!(initialized.get("error").is_none(), "{initialized}");
+            if !restarted {
+                mcp_expect_indexed_count(&mut stdin, &mut stdout, "MCP_BASE_TOKEN", 1);
+                std::fs::write(&main, "MCP_DIRTY_TOKEN_LONGER\n").unwrap();
+                let added = repo.join("added.rs");
+                std::fs::write(&added, "MCP_DIRTY_TOKEN_LONGER\n").unwrap();
+                mcp_expect_indexed_count(&mut stdin, &mut stdout, "MCP_DIRTY_TOKEN_LONGER", 2);
+                mcp_expect_indexed_count(&mut stdin, &mut stdout, "MCP_BASE_TOKEN", 0);
+                std::fs::rename(&added, repo.join("renamed.rs")).unwrap();
+                // Equal counts alone cannot establish that rename discovery completed.
+                let deadline = Instant::now() + Duration::from_secs(20);
+                loop {
+                    let response = mcp_expect_indexed_count(
+                        &mut stdin,
+                        &mut stdout,
+                        "MCP_DIRTY_TOKEN_LONGER",
+                        2,
+                    );
+                    let files = response["response"]["results"]["file_counts"].to_string();
+                    if files.contains("renamed.rs") && !files.contains("added.rs") {
+                        break;
+                    }
+                    assert!(
+                        Instant::now() < deadline,
+                        "rename did not converge: {response}"
+                    );
+                    thread::sleep(Duration::from_millis(25));
+                }
+                std::fs::remove_file(&main).unwrap();
+                mcp_expect_indexed_count(&mut stdin, &mut stdout, "MCP_DIRTY_TOKEN_LONGER", 1);
+                std::fs::write(&main, "MCP_BASE_TOKEN\n").unwrap();
+                mcp_expect_indexed_count(&mut stdin, &mut stdout, "MCP_BASE_TOKEN", 1);
+            } else {
+                let response = mcp_expect_indexed_count(
+                    &mut stdin,
+                    &mut stdout,
+                    "MCP_OFFLINE_RESTART_TOKEN",
+                    1,
+                );
+                mcp_expect_indexed_count(&mut stdin, &mut stdout, "MCP_DIRTY_TOKEN_LONGER", 0);
+                let status = &response["response"]["status"];
+                assert!(status["base_head_commit"].is_null(), "{status}");
+                assert!(status["workspace_head_commit"].is_null(), "{status}");
+                let progress = &status["workspace_progress"];
+                assert!(
+                    progress["published_revision"].as_u64().unwrap()
+                        <= progress["reconciled_revision"].as_u64().unwrap()
+                );
+                assert!(
+                    progress["reconciled_revision"].as_u64().unwrap()
+                        <= progress["observed_revision"].as_u64().unwrap()
+                );
+            }
+            drop(stdin);
+            server.wait_or_kill();
+            shutdown_managed_daemon(&repo);
+            let state = std::fs::canonicalize(&repo)
+                .unwrap()
+                .join(".flashgrep-index-engine/daemon-state.json");
+            let deadline = Instant::now() + Duration::from_secs(10);
+            while state.exists() {
+                assert!(Instant::now() < deadline, "daemon did not finish shutdown");
+                thread::sleep(Duration::from_millis(25));
+            }
+            if !restarted {
+                std::fs::remove_file(repo.join("renamed.rs")).unwrap();
+                std::fs::write(&main, "MCP_OFFLINE_RESTART_TOKEN\n").unwrap();
+            }
+        }
+        if unborn {
+            assert!(!Command::new("git")
+                .arg("-C")
+                .arg(&repo)
+                .args(["rev-parse", "--verify", "HEAD"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status()
+                .unwrap()
+                .success());
+        } else {
+            assert!(!repo.join(".git").exists());
+        }
+    }
+}
+
+fn mcp_expect_indexed_count(
+    stdin: &mut ChildStdin,
+    stdout: &mut BufReader<ChildStdout>,
+    pattern: &str,
+    count: u64,
+) -> Value {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        let response = send_mcp_request(
+            stdin,
+            stdout,
+            json!({
+                "jsonrpc": "2.0", "id": 10, "method": "tools/call",
+                "params": { "name": "search_code", "arguments": {
+                    "pattern": pattern, "fixed_strings": true, "search_mode": "count_only", "freshness": "published"
+                } }
+            }),
+        );
+        assert!(response.get("error").is_none(), "{response}");
+        assert_ne!(
+            response["result"]["isError"],
+            Value::Bool(true),
+            "{response}"
+        );
+        let payload = &response["result"]["structuredContent"];
+        if payload["response"]["results"]["matched_lines"].as_u64() == Some(count)
+            && matches!(
+                payload["response"]["backend"].as_str(),
+                Some("indexed_clean" | "indexed_workspace_view")
+            )
+        {
+            return payload.clone();
+        }
+        assert!(
+            Instant::now() < deadline,
+            "indexed result did not converge: {response}"
+        );
+        thread::sleep(Duration::from_millis(25));
+    }
 }
 
 fn node_is_available() -> bool {

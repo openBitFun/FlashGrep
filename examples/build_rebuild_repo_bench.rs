@@ -42,6 +42,7 @@ fn main() -> Result<()> {
         }
 
         let build_config = BuildConfig {
+            git_mode: Default::default(),
             repo_path: repo.clone(),
             storage_root: storage_root.clone(),
             tokenizer: TokenizerMode::SparseNgram,

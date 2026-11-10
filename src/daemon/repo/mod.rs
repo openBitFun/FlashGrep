@@ -17,8 +17,6 @@ use crate::{
         workspace::{
             WorkspaceOverlayIngestBatch, WorkspaceOverlayMergeEvent, WorkspaceOverlayPublication,
             WorkspaceOverlayPublishPolicy, WorkspaceOverlayRuntimeStats,
-            WorkspaceOverlaySnapshotState,
-            DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
         },
         RepoId, WorkspaceBaseSnapshotIndex, WorkspaceOverlayIndex,
     },
@@ -36,7 +34,10 @@ mod base;
 mod catalog;
 mod dirty_catalog;
 mod maintenance;
+mod membership;
+mod observations;
 mod overlay;
+mod progress_state;
 mod query;
 mod status;
 mod tasks;
@@ -113,6 +114,7 @@ pub struct RepoStatus {
     /// published overlay describe the last observed worktree state rather than
     /// the current one.
     pub workspace_probe_pending: bool,
+    pub workspace_progress: crate::daemon::protocol::WorkspaceProgress,
     pub last_error: Option<String>,
     /// Failure of the most recent background base-maintenance task (advance or
     /// compaction), kept in its own slot.
@@ -184,7 +186,7 @@ pub struct RepoRefreshPolicy {
     pub base_delta_max_delete_segments: usize,
     pub base_delta_max_bytes_ratio: f64,
     pub base_head_cache_entries: usize,
-    pub overlay_auto_checkpoint_max_uncommitted_ops: u64,
+
     pub overlay_merge_min_delay_ms: u64,
     pub overlay_merge_retry_delay_ms: u64,
 }
@@ -196,8 +198,7 @@ impl Default for RepoRefreshPolicy {
             base_delta_max_delete_segments: 8,
             base_delta_max_bytes_ratio: 0.10,
             base_head_cache_entries: 4,
-            overlay_auto_checkpoint_max_uncommitted_ops:
-                DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
+
             overlay_merge_min_delay_ms: 2_000,
             overlay_merge_retry_delay_ms: 10_000,
         }
@@ -212,6 +213,7 @@ pub struct OpenRepoRequest {
 
 #[derive(Debug, Clone)]
 pub struct SearchRequest {
+    pub freshness: crate::config::QueryFreshness,
     pub repo_id: String,
     pub query: QueryConfig,
     pub path_filter_args: PathFilterArgs,
@@ -260,7 +262,9 @@ impl RepoManager {
 
     pub fn open_repo(&self, request: OpenRepoRequest) -> Result<RepoStatus> {
         let build_config = request.build_config.normalized()?;
-        crate::gitignore::ensure_storage_root_ignored(&build_config)?;
+        if build_config.git_mode == crate::config::GitMode::Auto {
+            crate::gitignore::ensure_storage_root_ignored(&build_config)?;
+        }
         let repo_id = build_config.repo_path.to_string_lossy().into_owned();
         let (existing_runtime, stale_runtime) = {
             let mut repos = match self.repos.lock() {
@@ -451,8 +455,24 @@ impl RepoManager {
     #[cfg(test)]
     pub(crate) fn clear_workspace_overlay_engine_for_tests(&self, repo_id: &str) -> Result<()> {
         let runtime = self.repo(repo_id)?;
-        runtime.reset_workspace_overlay_engine();
+        // Simulate loss of the engine instance, not a successful publication of
+        // an empty overlay, which intentionally changes the published status.
+        self.drop_workspace_overlay_reader_for_tests(repo_id)?;
         runtime.mark_workspace_probe_pending();
+        Ok(())
+    }
+
+    #[cfg(test)]
+    pub(crate) fn drop_workspace_overlay_reader_for_tests(&self, repo_id: &str) -> Result<()> {
+        let runtime = self.repo(repo_id)?;
+        if let Some(old) = runtime
+            .workspace_overlay_engine
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            old.retire();
+        }
         Ok(())
     }
 
@@ -470,7 +490,7 @@ impl RepoManager {
     ) -> Result<(usize, usize, usize)> {
         let dirty = self
             .repo(repo_id)?
-            .diff_against_base_snapshot_git_worktree_paths(candidate_paths)?;
+            .diff_against_base_snapshot_event_paths(candidate_paths)?;
         Ok((dirty.modified.len(), dirty.deleted.len(), dirty.new.len()))
     }
 
@@ -592,22 +612,27 @@ struct RepoRuntime {
     base_snapshot_engine: Arc<Mutex<Option<WorkspaceBaseSnapshotIndex>>>,
     cached_base_snapshot_reader: Mutex<Option<crate::index_engine::IndexSnapshotReader>>,
     base_snapshot_catalog: Mutex<Option<CachedBaseSnapshotCatalog>>,
+    worktree_observations: Mutex<observations::WorktreeObservations>,
+    git_membership_cache: Mutex<membership::GitMembershipCache>,
     workspace_overlay_engine: Mutex<Option<Arc<WorkspaceOverlayIndex>>>,
     dirty_catalog: Mutex<dirty_catalog::DirtyCatalog>,
+    dirty_catalog_persist_pending: AtomicBool,
     overlay_write_lock: Mutex<()>,
+    workspace_discovery_lock: Mutex<()>,
     #[cfg(test)]
     overlay_publication_failpoint: Mutex<Option<OverlayPublicationFailpoint>>,
     base_delta_max_segments: usize,
     base_delta_max_delete_segments: usize,
     base_delta_max_bytes_ratio: f64,
     base_head_cache_entries: usize,
-    overlay_auto_checkpoint_max_uncommitted_ops: u64,
+
     overlay_merge_min_delay: std::time::Duration,
     overlay_merge_retry_delay: std::time::Duration,
     notifier: Arc<dyn Fn(ServiceNotificationEvent) + Send + Sync>,
     self_handle: OnceLock<Weak<RepoRuntime>>,
     maintenance_worker: Arc<(Mutex<MaintenanceWorkerState>, Condvar)>,
     maintenance_handle: Mutex<Option<JoinHandle<()>>>,
+    persistence_handle: Mutex<Option<JoinHandle<()>>>,
     watcher_handle: Mutex<Option<JoinHandle<()>>>,
     state: Mutex<RepoState>,
     published_overlay_paths_cache: Mutex<DirtyPathSet>,
@@ -619,6 +644,7 @@ struct RepoRuntime {
     artifact_gc_lock: RwLock<()>,
     next_background_task_id: AtomicU64,
     workspace_probe_pending: AtomicBool,
+    workspace_progress: Mutex<crate::daemon::protocol::WorkspaceProgress>,
     task_handle: Mutex<Option<ActiveTaskHandle>>,
     tasks: Mutex<HashMap<String, Arc<RepoTaskRecord>>>,
     shutting_down: AtomicBool,
@@ -652,6 +678,7 @@ struct RepoState {
 
 struct RepoTaskRecord {
     kind: RepoTaskKind,
+    target_head: Option<String>,
     /// Whether starting this task overwrote the repo phase. Tasks that own the
     /// phase must restore it when they finish without succeeding, otherwise the
     /// repo is stranded in a transient phase with no active task.
@@ -690,8 +717,6 @@ impl RepoRuntime {
             && self.base_delta_max_delete_segments == refresh_policy.base_delta_max_delete_segments
             && self.base_delta_max_bytes_ratio == refresh_policy.base_delta_max_bytes_ratio
             && self.base_head_cache_entries == refresh_policy.base_head_cache_entries
-            && self.overlay_auto_checkpoint_max_uncommitted_ops
-                == refresh_policy.overlay_auto_checkpoint_max_uncommitted_ops
             && self.overlay_merge_min_delay
                 == std::time::Duration::from_millis(refresh_policy.overlay_merge_min_delay_ms)
             && self.overlay_merge_retry_delay
@@ -723,17 +748,20 @@ impl RepoRuntime {
             base_snapshot_engine: Arc::new(Mutex::new(None)),
             cached_base_snapshot_reader: Mutex::new(None),
             base_snapshot_catalog: Mutex::new(None),
+            worktree_observations: Mutex::new(observations::WorktreeObservations::default()),
+            git_membership_cache: Mutex::new(Default::default()),
             workspace_overlay_engine: Mutex::new(None),
             dirty_catalog: Mutex::new(dirty_catalog::DirtyCatalog::load(&dirty_catalog_path)?),
+            dirty_catalog_persist_pending: AtomicBool::new(false),
             overlay_write_lock: Mutex::new(()),
+            workspace_discovery_lock: Mutex::new(()),
             #[cfg(test)]
             overlay_publication_failpoint: Mutex::new(None),
             base_delta_max_segments: refresh_policy.base_delta_max_segments,
             base_delta_max_delete_segments: refresh_policy.base_delta_max_delete_segments,
             base_delta_max_bytes_ratio: refresh_policy.base_delta_max_bytes_ratio,
             base_head_cache_entries: refresh_policy.base_head_cache_entries,
-            overlay_auto_checkpoint_max_uncommitted_ops: refresh_policy
-                .overlay_auto_checkpoint_max_uncommitted_ops,
+
             overlay_merge_min_delay: std::time::Duration::from_millis(
                 refresh_policy.overlay_merge_min_delay_ms,
             ),
@@ -747,6 +775,7 @@ impl RepoRuntime {
                 Condvar::new(),
             )),
             maintenance_handle: Mutex::new(None),
+            persistence_handle: Mutex::new(None),
             watcher_handle: Mutex::new(None),
             state: Mutex::new(RepoState::default()),
             published_overlay_paths_cache: Mutex::new(DirtyPathSet::default()),
@@ -758,6 +787,10 @@ impl RepoRuntime {
             artifact_gc_lock: RwLock::new(()),
             next_background_task_id: AtomicU64::new(0),
             workspace_probe_pending: AtomicBool::new(false),
+            workspace_progress: Mutex::new(crate::daemon::protocol::WorkspaceProgress {
+                observed_revision: 1,
+                ..Default::default()
+            }),
             task_handle: Mutex::new(None),
             tasks: Mutex::new(HashMap::new()),
             shutting_down: AtomicBool::new(false),

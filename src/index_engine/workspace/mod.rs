@@ -10,6 +10,5 @@ pub use overlay::WorkspaceOverlayIndex;
 pub(crate) use overlay::{
     WorkspaceOverlayIngestBatch, WorkspaceOverlayMergeEvent, WorkspaceOverlayPublication,
     WorkspaceOverlayPublishPolicy, WorkspaceOverlayRuntimeStats, WorkspaceOverlaySnapshotState,
-    DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
 };
 pub use search_view::{SnapshotHandle, WorkspaceSearchView};

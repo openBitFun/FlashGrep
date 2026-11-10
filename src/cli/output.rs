@@ -106,6 +106,13 @@ fn format_repo_status_human(status: &RepoStatus) -> String {
         status.workspace_overlay_root
     );
     let _ = writeln!(output, "phase: {:?}", status.phase);
+    let progress = status.workspace_progress;
+    let _ = writeln!(
+        output,
+        "workspace_revisions: observed={} reconciled={} published={}",
+        progress.observed_revision, progress.reconciled_revision, progress.published_revision
+    );
+
     let _ = writeln!(
         output,
         "snapshot_key: {}",
@@ -232,6 +239,7 @@ mod tests {
             active_task_id: None,
             probe_healthy: true,
             workspace_probe_pending: false,
+            workspace_progress: Default::default(),
             last_error: None,
             overlay: Some(crate::daemon::protocol::WorkspaceOverlayStatus {
                 base_manifest_id: None,

@@ -42,13 +42,10 @@ impl RepoRuntime {
             Err(poisoned) => poisoned.into_inner().clone(),
         };
         let overlay = self.workspace_overlay_status();
-        let base_advance_target_head = state.active_task_id.as_ref().and_then(|task_id| {
-            self.task_status(task_id).and_then(|task| {
-                (task.kind == super::RepoTaskKind::AdvanceBaseSnapshot)
-                    .then(|| state.observed_head_commit.clone())
-                    .flatten()
-            })
-        });
+        let base_advance_target_head = state
+            .active_task_id
+            .as_ref()
+            .and_then(|task_id| self.task_target_head(task_id));
         let mut status = RepoStatus {
             repo_id: self.repo_id.clone(),
             repo_path: self.build_config.repo_path.clone(),
@@ -81,6 +78,7 @@ impl RepoRuntime {
             active_task_id: state.active_task_id,
             probe_healthy: state.probe_healthy,
             workspace_probe_pending: self.workspace_probe_pending(),
+            workspace_progress: self.workspace_progress_snapshot(),
             last_error: state.last_error,
             last_maintenance_error: state.last_maintenance_error,
             overlay,

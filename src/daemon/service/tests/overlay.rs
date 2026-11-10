@@ -31,7 +31,14 @@ fn overlay_publication_boundaries_recover_exactly_after_restart() {
             .repos
             .set_overlay_publication_failpoint_for_tests(&repo_id, failpoint)
             .expect("failpoint should install");
-        let _ = refresh_repo(&service, &repo_id, true);
+        // A publication interruption is now returned to the caller. A watcher
+        // may consume this failpoint first, in which case refresh repairs it.
+        let _ = service.handle_request_only(Request::RefreshRepo {
+            params: crate::daemon::protocol::RefreshRepoParams {
+                repo_id: repo_id.clone(),
+                force: true,
+            },
+        });
         assert!(!service
             .repos
             .overlay_publication_failpoint_pending_for_tests(&repo_id)
@@ -281,7 +288,7 @@ fn eventual_search_rebuilds_full_overlay_after_overlay_engine_reset() {
 }
 
 #[test]
-fn eventual_search_honors_configured_overlay_auto_checkpoint_threshold() {
+fn eventual_publication_is_checkpointed_in_background() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -296,7 +303,6 @@ fn eventual_search_honors_configured_overlay_auto_checkpoint_threshold() {
                 storage_root: None,
                 config: RepoConfig::default(),
                 refresh: crate::daemon::protocol::RefreshPolicyConfig {
-                    overlay_auto_checkpoint_max_uncommitted_ops: 1,
                     ..crate::daemon::protocol::RefreshPolicyConfig::default()
                 },
             },
@@ -341,7 +347,6 @@ fn repo_status_reports_overlay_runtime_stats() {
                 storage_root: None,
                 config: RepoConfig::default(),
                 refresh: crate::daemon::protocol::RefreshPolicyConfig {
-                    overlay_auto_checkpoint_max_uncommitted_ops: 1,
                     ..crate::daemon::protocol::RefreshPolicyConfig::default()
                 },
             },
@@ -387,7 +392,6 @@ fn overlay_merge_is_deferred_and_runs_in_background() {
                 storage_root: None,
                 config: RepoConfig::default(),
                 refresh: crate::daemon::protocol::RefreshPolicyConfig {
-                    overlay_auto_checkpoint_max_uncommitted_ops: 1,
                     overlay_merge_min_delay_ms: 500,
                     overlay_merge_retry_delay_ms: 100,
                     ..crate::daemon::protocol::RefreshPolicyConfig::default()
@@ -409,12 +413,12 @@ fn overlay_merge_is_deferred_and_runs_in_background() {
     assert!(status
         .overlay
         .as_ref()
-        .is_some_and(|overlay| overlay.committed_seq_no >= 1));
+        .is_some_and(|overlay| overlay.last_seq_no >= 1));
 
     let requested = wait_for_status(&service, &repo_id, |status| {
         status.overlay.as_ref().is_some_and(|overlay| {
             overlay.active_segments >= 1
-                && overlay.committed_seq_no >= 1
+                && overlay.last_seq_no >= 1
                 && overlay.merge_requested
                 && !overlay.merge_running
         })
@@ -427,7 +431,8 @@ fn overlay_merge_is_deferred_and_runs_in_background() {
     let settled = wait_for_status(&service, &repo_id, |status| {
         status.overlay.as_ref().is_some_and(|overlay| {
             overlay.active_segments >= 1
-                && overlay.committed_seq_no >= 1
+                && overlay.last_seq_no >= 1
+                && overlay.committed_seq_no == overlay.last_seq_no
                 && !overlay.merge_requested
                 && !overlay.merge_running
         })
@@ -457,7 +462,6 @@ fn workspace_search_stays_stable_while_overlay_merge_is_pending() {
                 storage_root: None,
                 config: RepoConfig::default(),
                 refresh: crate::daemon::protocol::RefreshPolicyConfig {
-                    overlay_auto_checkpoint_max_uncommitted_ops: 1,
                     overlay_merge_min_delay_ms: 500,
                     overlay_merge_retry_delay_ms: 100,
                     ..crate::daemon::protocol::RefreshPolicyConfig::default()
@@ -476,7 +480,7 @@ fn workspace_search_stays_stable_while_overlay_merge_is_pending() {
 
     let requested = wait_for_status(&service, &repo_id, |status| {
         status.overlay.as_ref().is_some_and(|overlay| {
-            overlay.committed_seq_no >= 1 && overlay.merge_requested && !overlay.merge_running
+            overlay.last_seq_no >= 1 && overlay.merge_requested && !overlay.merge_running
         })
     });
     assert!(requested
@@ -486,35 +490,22 @@ fn workspace_search_stays_stable_while_overlay_merge_is_pending() {
 
     let mut saw_requested = false;
     for _ in 0..12 {
-        let (new_backend, new_results, new_status) =
-            match search_repo(&service, &repo_id, "MERGE_STABLE_NEW") {
-                Response::SearchCompleted {
-                    backend,
-                    results,
-                    status,
-                    ..
-                } => (backend, results, status),
-                other => panic!("unexpected response: {other:?}"),
-            };
-        assert!(is_indexed_workspace_backend(new_backend));
-
-        let (old_backend, old_results, _) =
-            match search_repo(&service, &repo_id, "MERGE_STABLE_OLD") {
-                Response::SearchCompleted {
-                    backend,
-                    results,
-                    status,
-                    ..
-                } => (backend, results, status),
-                other => panic!("unexpected response: {other:?}"),
-            };
-        assert!(is_indexed_workspace_backend(old_backend));
-        let visible_matches = new_results.matched_lines + old_results.matched_lines;
-        assert!(
-            (1..=2).contains(&visible_matches),
-            "expected pending merge to keep at least one visible revision, got new={} old={}",
-            new_results.matched_lines,
-            old_results.matched_lines
+        // One query must see exactly one complete revision. Two separate old/new
+        // queries can straddle publication and both legitimately return zero.
+        let (backend, results, new_status) = match search_repo(&service, &repo_id, "MERGE_STABLE_")
+        {
+            Response::SearchCompleted {
+                backend,
+                results,
+                status,
+                ..
+            } => (backend, results, status),
+            other => panic!("unexpected response: {other:?}"),
+        };
+        assert!(is_indexed_workspace_backend(backend));
+        assert_eq!(
+            results.matched_lines, 1,
+            "a query must see exactly one revision while merging"
         );
         if new_status
             .overlay
@@ -792,7 +783,7 @@ fn probe_tracks_new_text_files_inside_new_directory_without_extra_probe() {
 }
 
 #[test]
-fn watcher_file_events_use_git_pathspec_fast_probe() {
+fn watcher_file_events_use_scoped_filesystem_probe() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -832,7 +823,7 @@ fn watcher_file_events_use_git_pathspec_fast_probe() {
 }
 
 #[test]
-fn watcher_gitignore_events_fall_back_to_full_git_probe() {
+fn watcher_gitignore_events_trigger_full_filesystem_reconciliation() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
     let temp = tempdir().expect("temp dir should succeed");
@@ -1750,13 +1741,16 @@ fn watcher_reconciles_tracked_move_and_recreate_sequences() {
     remove_sequence_file(&moved);
     write_sequence_token(&moved_again, "SEQ_MOVE_NEW_3");
     let move_again_roots = vec![original.clone(), moved.clone(), moved_again.clone()];
-    let status = wait_for_scoped_token_count_for_roots(
+    // Search revalidates files on disk, so an old token can disappear before
+    // the watcher has published the replacement file and updated dirty stats.
+    let _ = wait_for_scoped_token_count_for_roots(
         &service,
         &repo_id,
         &move_again_roots,
         "SEQ_MOVE_NEW_2",
         0,
     );
+    let status = wait_for_dirty_stats(&service, &repo_id, 0, 1, 1);
     assert_exact_dirty_stats(&status, 0, 1, 1);
     let status = wait_for_scoped_token_count_for_roots(
         &service,
@@ -1769,13 +1763,16 @@ fn watcher_reconciles_tracked_move_and_recreate_sequences() {
 
     remove_sequence_file(&moved_again);
     write_sequence_token(&original, "SEQ_MOVE_ORIGINAL_BASE");
-    let status = wait_for_scoped_token_count_for_roots(
+    // Search revalidates files on disk, so an old token can disappear before
+    // the watcher has published the replacement file and updated dirty stats.
+    let _ = wait_for_scoped_token_count_for_roots(
         &service,
         &repo_id,
         &move_again_roots,
         "SEQ_MOVE_NEW_3",
         0,
     );
+    let status = wait_for_dirty_stats(&service, &repo_id, 0, 0, 0);
     assert_exact_dirty_stats(&status, 0, 0, 0);
     let status = wait_for_scoped_token_count_for_roots(
         &service,
@@ -2380,7 +2377,6 @@ fn repeated_incremental_edits_converge_to_expected_overlay_state() {
                 storage_root: None,
                 config: RepoConfig::default(),
                 refresh: crate::daemon::protocol::RefreshPolicyConfig {
-                    overlay_auto_checkpoint_max_uncommitted_ops: 1,
                     overlay_merge_min_delay_ms: 50,
                     overlay_merge_retry_delay_ms: 25,
                     ..crate::daemon::protocol::RefreshPolicyConfig::default()
@@ -2490,7 +2486,7 @@ fn refreshed_dirty_update_is_durable_after_graceful_restart() {
         status
             .overlay
             .as_ref()
-            .is_some_and(|overlay| overlay.uncommitted_ops > 0 && overlay.pending_docs == 1)
+            .is_some_and(|overlay| overlay.uncommitted_ops > 0 && overlay.active_segments >= 1)
     });
     assert!(status.probe_healthy);
     let durable_catalog_after_refresh =
@@ -2725,7 +2721,6 @@ fn probe_removes_overlay_only_new_file_without_refresh() {
         "const VALUE: &str = \"PROBE_DELETE_TOKEN_20260410\";\n",
     )
     .expect("transient write should succeed");
-    wait_for_workspace_overlay_match_count(&repo_path, "PROBE_DELETE_TOKEN_20260410", 1);
 
     let (backend, status) =
         wait_for_search_count(&service, &repo_id, "PROBE_DELETE_TOKEN_20260410", 1);
@@ -2737,7 +2732,6 @@ fn probe_removes_overlay_only_new_file_without_refresh() {
 
     fs::remove_file(&transient).expect("transient delete should succeed");
     fs::remove_dir(&nested).expect("nested dir delete should succeed");
-    wait_for_workspace_overlay_match_count(&repo_path, "PROBE_DELETE_TOKEN_20260410", 0);
 
     let (backend, status) =
         wait_for_search_count(&service, &repo_id, "PROBE_DELETE_TOKEN_20260410", 0);
@@ -2790,7 +2784,6 @@ fn probe_clears_restored_tracked_file_without_refresh() {
         "const VALUE: &str = \"PROBE_RESTORE_TOKEN_20260416\";\n",
     )
     .expect("tracked rewrite should succeed");
-    wait_for_workspace_overlay_match_count(&repo_path, "PROBE_RESTORE_TOKEN_20260416", 1);
 
     let (backend, status) =
         wait_for_search_count(&service, &repo_id, "PROBE_RESTORE_TOKEN_20260416", 1);
@@ -2801,7 +2794,14 @@ fn probe_clears_restored_tracked_file_without_refresh() {
     ));
 
     fs::write(&tracked, "const VALUE: &str = \"BASE\";\n").expect("tracked restore should succeed");
-    wait_for_workspace_overlay_match_count(&repo_path, "PROBE_RESTORE_TOKEN_20260416", 0);
+    // Retraction is an ordinary incremental publication and may precede its
+    // checkpoint. Query the live daemon rather than reopening the durable view.
+    wait_for_search_count(&service, &repo_id, "PROBE_RESTORE_TOKEN_20260416", 0);
+    wait_for_search_count(&service, &repo_id, "BASE", 1);
+    service
+        .repos
+        .checkpoint_workspace_overlay_for_tests(&repo_id)
+        .unwrap();
     assert!(
         workspace_overlay_index_root(&repo_path)
             .join("CURRENT_MANIFEST")
@@ -2810,6 +2810,7 @@ fn probe_clears_restored_tracked_file_without_refresh() {
     );
     let repo_status = get_status(&service, &repo_id);
     let build_config = crate::BuildConfig {
+        git_mode: Default::default(),
         repo_path: repo_path.clone(),
         storage_root: PathBuf::from(&repo_status.storage_root),
         tokenizer: crate::TokenizerMode::SparseNgram,
@@ -2993,7 +2994,6 @@ fn probe_updates_invalidate_glob_cache() {
 }
 
 #[test]
-#[ignore = "known gap: tracked directory restore can temporarily lose stable query results without refresh"]
 fn probe_reconciles_tracked_directory_delete_and_restore_without_refresh() {
     let _serial = daemon_test_serial();
     let service = DaemonService::new();
@@ -3038,4 +3038,34 @@ fn probe_reconciles_tracked_directory_delete_and_restore_without_refresh() {
 
     let _ = wait_for_search_count(&service, &repo_id, "DIR_DELETE_ALPHA", 1);
     let _ = wait_for_search_count(&service, &repo_id, "DIR_DELETE_BETA", 1);
+}
+
+#[test]
+fn git_index_only_membership_changes_update_ignored_files() {
+    let _serial = daemon_test_serial();
+    let temp = tempdir().unwrap();
+    let root = temp.path().join("repo");
+    fs::create_dir(&root).unwrap();
+    fs::write(root.join(".gitignore"), "ignored.rs\n").unwrap();
+    fs::write(root.join("base.rs"), "BASE_MEMBERSHIP_TOKEN\n").unwrap();
+    let service = DaemonService::new();
+    let (repo_id, _) = open_repo(&service, root.clone());
+    build_repo(&service, &repo_id);
+    fs::write(root.join("ignored.rs"), "STAGED_MEMBERSHIP_TOKEN\n").unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&root)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["add", "-f", "ignored.rs"]);
+    let (backend, _) = wait_for_search_count(&service, &repo_id, "STAGED_MEMBERSHIP_TOKEN", 1);
+    assert!(matches!(backend, SearchBackend::IndexedWorkspaceView));
+    git(&["rm", "--cached", "-f", "ignored.rs"]);
+    wait_for_search_count(&service, &repo_id, "STAGED_MEMBERSHIP_TOKEN", 0);
+    assert!(root.join("ignored.rs").exists());
+    service.shutdown_all();
 }

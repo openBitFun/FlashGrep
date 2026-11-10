@@ -61,17 +61,29 @@ impl Reclaimer {
         manifest_store: &dyn ManifestStore,
         pinned_manifest_ids: &BTreeSet<ManifestId>,
     ) -> Result<Vec<GcCandidate>> {
+        self.plan_with_reader_pins(index_root, manifest_store, pinned_manifest_ids, &[])
+    }
+
+    pub(crate) fn plan_with_reader_pins(
+        &self,
+        index_root: &Path,
+        manifest_store: &dyn ManifestStore,
+        pinned_manifest_ids: &BTreeSet<ManifestId>,
+        reader_manifests: &[Manifest],
+    ) -> Result<Vec<GcCandidate>> {
         let current_manifest = manifest_store.load_current()?;
         let (manifests, unreadable_manifest_ids) =
             self.load_manifests(manifest_store, &current_manifest.manifest_id)?;
 
         let mut retention_roots = pinned_manifest_ids.clone();
         retention_roots.insert(current_manifest.manifest_id);
-        let retained = retained_manifests(
+        let mut retained = retained_manifests(
             &manifests,
             self.retained_history_manifests,
             &retention_roots,
         );
+        // Refreshed readers can reference segments absent from durable manifests.
+        retained.extend(reader_manifests.iter().cloned());
         let retained_ids = retained
             .iter()
             .map(|manifest| manifest.manifest_id.clone())
@@ -310,6 +322,7 @@ mod tests {
 
     fn segment(id: &str) -> SegmentRef {
         SegmentRef {
+            applied_delete_seq_no: 0,
             id: SegmentId(id.into()),
             min_seq_no: 1,
             max_seq_no: 1,

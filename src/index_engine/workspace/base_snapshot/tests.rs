@@ -172,6 +172,7 @@ fn spilled_posting_runs_merge_preserves_postings_across_multiple_runs() {
 
 fn build_config(repo: &Path, index: &Path) -> BuildConfig {
     BuildConfig {
+        git_mode: Default::default(),
         repo_path: repo.to_path_buf(),
         storage_root: index.to_path_buf(),
         tokenizer: TokenizerMode::SparseNgram,
@@ -348,6 +349,7 @@ fn sharded_base_snapshot_reuses_unchanged_segment_files_via_hard_links() {
         collect_base_input_files(&build_config),
         Some(&previous_snapshot),
         None,
+        "filesystem-test-staging",
         &mut |_| {},
     )
     .expect("staged build should succeed");
@@ -439,6 +441,7 @@ fn sharded_base_snapshot_reports_incremental_tokenizing_progress() {
         collect_base_input_files(&build_config),
         None,
         None,
+        "filesystem-test-staging",
         &mut |event| events.push(event),
     )
     .expect("staged build should succeed");
@@ -534,7 +537,7 @@ fn base_snapshot_explicit_tuning_overrides_low_memory_defaults() {
 }
 
 #[test]
-fn git_base_snapshot_writes_per_doc_source_kind() {
+fn git_base_snapshot_embeds_immutable_commit_content() {
     let temp = TempDir::new().expect("temp dir");
     let repo = temp.path().join("repo");
     let storage = temp.path().join("index");
@@ -556,6 +559,14 @@ fn git_base_snapshot_writes_per_doc_source_kind() {
     .expect("dirty write should succeed");
     run_git(&repo, &["add", "."]);
     run_git(&repo, &["commit", "-qm", "initial"]);
+    run_git(&repo, &["config", "core.autocrlf", "true"]);
+    std::fs::write(
+        repo.join("clean.rs"),
+        concat!(r#"const VALUE: &str = "CLEAN_BASE";"#, "\r\n"),
+    )
+    .unwrap();
+    // A clean checkout can have different bytes from the commit (for example CRLF).
+    run_git(&repo, &["diff", "--quiet", "--", "clean.rs"]);
 
     std::fs::write(
         repo.join("dirty.rs"),
@@ -584,6 +595,20 @@ fn git_base_snapshot_writes_per_doc_source_kind() {
             let key = table.doc_key(doc_id).expect("doc key should load");
             if key.logical_path == "clean.rs" || key.logical_path == "dirty.rs" {
                 let record = table.record(doc_id).expect("doc record should load");
+                let bytes = crate::index_engine::segment::read_encoded_source_bytes_view(
+                    table.source_slice(doc_id).unwrap(),
+                )
+                .unwrap()
+                .decode()
+                .unwrap();
+                let content = std::str::from_utf8(&bytes).unwrap();
+                assert!(content.contains(if key.logical_path == "clean.rs" {
+                    "CLEAN_BASE"
+                } else {
+                    "DIRTY_BASE"
+                }));
+                assert!(!content.contains("DIRTY_WORKTREE"));
+                assert!(!content.contains('\r'));
                 source_kinds.insert(key.logical_path, record.source_kind);
             }
         }
@@ -591,11 +616,11 @@ fn git_base_snapshot_writes_per_doc_source_kind() {
 
     assert_eq!(
         source_kinds.get("clean.rs"),
-        Some(&SegmentDocSourceKind::GitHeadBlob)
+        Some(&SegmentDocSourceKind::Inline)
     );
     assert_eq!(
         source_kinds.get("dirty.rs"),
-        Some(&SegmentDocSourceKind::GitHeadBlob)
+        Some(&SegmentDocSourceKind::Inline)
     );
 }
 
@@ -627,4 +652,97 @@ fn base_snapshot_build_lock_serializes_independent_callers() {
     drop(first);
     handle.join().expect("lock waiter should join");
     assert!(acquired.load(std::sync::atomic::Ordering::Acquire));
+}
+
+#[test]
+fn filesystem_manifest_restores_identity_without_sidecar_or_git() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("main.rs"), "FILESYSTEM_IDENTITY_MARKER\n").unwrap();
+    let config = build_config(&repo, &temp.path().join("index"));
+    WorkspaceBaseSnapshotIndex::build_with_options(
+        &config,
+        &RepoId("repo".into()),
+        BaseSnapshotBuildOptions::new(),
+    )
+    .unwrap();
+    let original = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&config)
+        .unwrap()
+        .unwrap();
+    assert!(original.head_commit.is_none());
+    let root = WorkspaceBaseSnapshotIndex::index_root(&config);
+    let store = FileManifestStore::open(&root).unwrap();
+    let mut legacy = store.load_current().unwrap();
+    let segments = legacy.active_segments.clone();
+    legacy.source = None;
+    let name = std::fs::read_to_string(root.join("CURRENT_MANIFEST")).unwrap();
+    std::fs::write(
+        root.join("manifests").join(name.trim()),
+        serde_json::to_vec(&legacy).unwrap(),
+    )
+    .unwrap();
+    WorkspaceBaseSnapshotIndex::ensure_manifest_source_identity(&config).unwrap();
+    let migrated = store.load_current().unwrap();
+    assert_eq!(migrated.active_segments, segments);
+    assert!(matches!(
+        migrated.source,
+        Some(ManifestSource::FilesystemBase { .. })
+    ));
+    std::fs::write(
+        WorkspaceBaseSnapshotIndex::metadata_path(&config),
+        b"invalid sidecar",
+    )
+    .unwrap();
+    std::fs::remove_file(WorkspaceBaseSnapshotIndex::marker_path(&config)).unwrap();
+    let restored = WorkspaceBaseSnapshotIndex::read_snapshot_metadata(&config)
+        .unwrap()
+        .unwrap();
+    assert_eq!(restored.snapshot_key, original.snapshot_key);
+    assert_eq!(restored.doc_count, Some(1));
+    assert_eq!(restored.config_fingerprint, original.config_fingerprint);
+    assert_eq!(restored.repo_root, original.repo_root);
+    assert!(restored.revision.is_none());
+    assert!(WorkspaceBaseSnapshotIndex::marker_matches(&config, &original.snapshot_key).unwrap());
+    let reader = WorkspaceBaseSnapshotIndex::open_read_only(&config)
+        .unwrap()
+        .open_committed()
+        .unwrap();
+    assert_eq!(reader.path_catalog().unwrap().len(), 1);
+    assert!(!repo.join(".git").exists());
+}
+
+#[test]
+fn full_rebuild_has_a_distinct_base_publication_identity() {
+    let temp = TempDir::new().unwrap();
+    let repo = temp.path().join("repo");
+    std::fs::create_dir(&repo).unwrap();
+    std::fs::write(repo.join("source.rs"), "BASE_IDENTITY_TOKEN\n").unwrap();
+    let config = build_config(&repo, &temp.path().join("index"));
+    WorkspaceBaseSnapshotIndex::build_with_options(
+        &config,
+        &RepoId("repo".into()),
+        BaseSnapshotBuildOptions::new(),
+    )
+    .unwrap();
+    let root = WorkspaceBaseSnapshotIndex::index_root(&config);
+    let first = FileManifestStore::open(&root)
+        .unwrap()
+        .load_current()
+        .unwrap();
+    WorkspaceBaseSnapshotIndex::rebuild_with_options(
+        &config,
+        &RepoId("repo".into()),
+        BaseSnapshotBuildOptions::new(),
+    )
+    .unwrap();
+    let second = FileManifestStore::open(&root)
+        .unwrap()
+        .load_current()
+        .unwrap();
+    assert_ne!(first.manifest_id, second.manifest_id);
+    assert_eq!(
+        first.source, second.source,
+        "same corpus can have a different publication"
+    );
 }

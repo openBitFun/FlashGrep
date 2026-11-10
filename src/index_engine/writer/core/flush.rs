@@ -7,7 +7,7 @@ use crate::index_engine::{
 };
 
 use super::{
-    state::{build_snapshot, SnapshotKind},
+    state::{artifact_nonce, build_snapshot},
     WriterState,
 };
 
@@ -47,7 +47,8 @@ pub(super) fn build_flush_plan(state: &WriterState) -> Option<FlushPlan> {
         None
     } else {
         let segment_id = crate::index_engine::SegmentId(format!(
-            "seg-{generation:016}-{next_segment_ordinal:016}"
+            "seg-{generation:016}-{next_segment_ordinal:016}-{}",
+            artifact_nonce()
         ));
         let max_seq_no = live_docs
             .iter()
@@ -78,6 +79,7 @@ pub(super) fn build_flush_plan(state: &WriterState) -> Option<FlushPlan> {
             created_by_merge: false,
         };
         let segment_ref = SegmentRef {
+            applied_delete_seq_no: 0,
             id: segment_id,
             min_seq_no,
             max_seq_no,
@@ -116,22 +118,31 @@ pub(super) fn build_flush_plan(state: &WriterState) -> Option<FlushPlan> {
 
 pub(super) fn apply_completed_flush(state: &mut WriterState, plan: &FlushPlan) -> AppliedFlush {
     state.last_flushed_seq_no = plan.max_seq_no;
-    state.pending_docs.clear();
-    state.pending_delete_seq_by_key.clear();
+    state
+        .pending_docs
+        .retain(|_, pending| pending.seq_no > plan.max_seq_no);
+    state
+        .pending_delete_seq_by_key
+        .retain(|_, seq| *seq > plan.max_seq_no);
+    state
+        .pending_retractions
+        .retain(|key| state.pending_delete_seq_by_key.contains_key(key));
+    // Published readers own their source references. Once a version is in a
+    // segment the writer must release its history copy, retaining only writes
+    // that arrived after this flush plan was captured.
+    state.history.retain(|_, entries| {
+        entries.retain(|entry| entry.seq_no > plan.max_seq_no);
+        !entries.is_empty()
+    });
     if let Some(segment_ref) = plan.segment_ref.clone() {
         state.pending_segments.push(segment_ref);
     }
     if let Some(delete_segment_ref) = plan.delete_segment_ref.clone() {
         state.pending_delete_segments.push(delete_segment_ref);
     }
-    let generation = state.generation + 1;
-    let snapshot = build_snapshot(
-        state,
-        generation,
-        state.committed_seq_no,
-        state.last_seq_no,
-        SnapshotKind::Refreshed,
-    );
+    state.generation += 1;
+    let generation = state.generation;
+    let snapshot = build_snapshot(state, generation, state.committed_seq_no, state.last_seq_no);
 
     AppliedFlush {
         result: FlushResult {
@@ -166,6 +177,7 @@ fn build_delete_segment(
         .pending_delete_seq_by_key
         .iter()
         .map(|(key, seq_no)| DeleteRecord {
+            retract_to_base: state.pending_retractions.contains(key),
             seq_no: *seq_no,
             key: key.clone(),
         })
@@ -176,7 +188,10 @@ fn build_delete_segment(
             .then_with(|| left.key.cmp(&right.key))
     });
 
-    let delete_segment_id = DeleteSegmentId(format!("del-{generation:016}-{ordinal:016}"));
+    let delete_segment_id = DeleteSegmentId(format!(
+        "del-{generation:016}-{ordinal:016}-{}",
+        artifact_nonce()
+    ));
     let min_seq_no = records
         .iter()
         .map(|record| record.seq_no)
@@ -214,5 +229,5 @@ fn build_delete_segment(
 }
 
 fn delete_record_size_bytes(key: &crate::index_engine::types::DocKey) -> usize {
-    key.repo_id.0.len() + key.logical_path.len() + std::mem::size_of::<SeqNo>()
+    key.repo_id.0.len() + key.logical_path.len() + std::mem::size_of::<SeqNo>() + 1 + 8
 }

@@ -547,3 +547,705 @@ fn sparse_engine_uses_covering_query_tokens_for_dry_run() {
     assert!(!profile.plan.candidate_branches[0].grams.is_empty());
     assert!(profile.plan.candidate_branches[0].grams.len() < "getUserById".len() - 2);
 }
+
+#[test]
+fn memory_segments_preserve_postings_deletes_and_pinned_snapshots() {
+    let temp = tempdir().expect("temp dir");
+    let root = temp.path().join("must-not-be-created");
+    let engine = IndexEngine::in_memory(EngineConfig {
+        index_root: root.clone(),
+        ..EngineConfig::default()
+    })
+    .expect("memory engine");
+    let writer = engine.writer();
+    writer
+        .add_document(test_doc("a.rs", "OLD_TOKEN"))
+        .expect("add");
+    writer.commit().expect("commit");
+    let old = engine.reader().open_committed().expect("old snapshot");
+    assert_eq!(
+        old.search(&query("OLD_TOKEN"))
+            .expect("search")
+            .matched_lines,
+        1
+    );
+    writer
+        .update_document(test_doc("a.rs", "NEW_TOKEN"))
+        .expect("update");
+    writer
+        .add_document(test_doc("b.rs", "NEW_TOKEN"))
+        .expect("add");
+    writer.commit().expect("commit");
+    let updated = engine.reader().open_committed().expect("updated");
+    assert_eq!(
+        updated
+            .search(&query("OLD_TOKEN"))
+            .expect("search")
+            .matched_lines,
+        0
+    );
+    assert_eq!(
+        updated
+            .search(&query("NEW_TOKEN"))
+            .expect("search")
+            .matched_lines,
+        2
+    );
+    writer
+        .delete_document(&test_doc("a.rs", "").key)
+        .expect("delete");
+    writer.commit().expect("commit deletion");
+    assert_eq!(
+        engine
+            .reader()
+            .open_committed()
+            .expect("deleted")
+            .search(&query("NEW_TOKEN"))
+            .expect("search")
+            .matched_lines,
+        1
+    );
+    assert_eq!(
+        old.search(&query("OLD_TOKEN"))
+            .expect("old still visible")
+            .matched_lines,
+        1
+    );
+    assert!(!root.exists(), "memory publication must not touch disk");
+}
+
+#[test]
+fn unpublished_flush_preserves_readers_until_the_complete_batch_is_published() {
+    let config = test_config();
+    let engine = IndexEngine::open(config.clone()).unwrap();
+    let writer = engine.writer();
+    writer
+        .add_document(test_doc("old.rs", "OLD_TOKEN\n"))
+        .unwrap();
+    writer.commit().unwrap();
+    let held = engine.reader().open_snapshot().unwrap();
+    writer.delete_document(&test_doc("old.rs", "").key).unwrap();
+    for i in 0..3 {
+        writer
+            .add_document(test_doc(&format!("new{i}.rs"), "NEW_TOKEN\n"))
+            .unwrap();
+        writer.flush_unpublished().unwrap();
+        assert_eq!(writer.stats().pending_docs, 0);
+        let current = engine.reader().open_snapshot().unwrap();
+        assert_eq!(
+            current.search(&query("OLD_TOKEN")).unwrap().matched_lines,
+            1
+        );
+        assert_eq!(
+            current.search(&query("NEW_TOKEN")).unwrap().matched_lines,
+            0
+        );
+    }
+    writer.refresh().unwrap();
+    let published = engine.reader().open_snapshot().unwrap();
+    assert_eq!(
+        published.search(&query("OLD_TOKEN")).unwrap().matched_lines,
+        0
+    );
+    assert_eq!(
+        published.search(&query("NEW_TOKEN")).unwrap().matched_lines,
+        3
+    );
+    assert_eq!(held.search(&query("OLD_TOKEN")).unwrap().matched_lines, 1);
+    writer.commit().unwrap();
+    let reopened = IndexEngine::open(config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .open_snapshot()
+            .unwrap()
+            .search(&query("NEW_TOKEN"))
+            .unwrap()
+            .matched_lines,
+        3
+    );
+}
+
+#[test]
+fn abandoned_unpublished_flush_restores_the_durable_publication() {
+    let engine = IndexEngine::open(test_config()).unwrap();
+    let writer = engine.writer();
+    writer
+        .add_document(test_doc("old.rs", "OLD_TOKEN\n"))
+        .unwrap();
+    writer.commit().unwrap();
+    writer
+        .update_document(test_doc("old.rs", "NEW_TOKEN\n"))
+        .unwrap();
+    writer.flush_unpublished().unwrap();
+    writer.discard_uncommitted().unwrap();
+    writer.refresh().unwrap();
+    let current = engine.reader().open_snapshot().unwrap();
+    assert_eq!(
+        current.search(&query("OLD_TOKEN")).unwrap().matched_lines,
+        1
+    );
+    assert_eq!(
+        current.search(&query("NEW_TOKEN")).unwrap().matched_lines,
+        0
+    );
+}
+
+#[test]
+fn unpublished_flush_releases_source_payload_and_preserves_later_writes() {
+    let engine = IndexEngine::open(test_config()).unwrap();
+    let writer = engine.writer();
+    let document = test_doc("first.rs", "FIRST_TOKEN\n");
+    let source = Arc::downgrade(&document.source_bytes);
+    writer.add_document(document).unwrap();
+    writer.flush_unpublished().unwrap();
+    assert!(
+        source.upgrade().is_none(),
+        "writer history must not retain staged source bytes"
+    );
+
+    // Deterministically model a write admitted while a flush plan is on disk.
+    writer
+        .add_document(test_doc("second.rs", "SECOND_TOKEN\n"))
+        .unwrap();
+    let plan = super::flush::build_flush_plan(&writer.state.lock().unwrap()).unwrap();
+    writer
+        .update_document(test_doc("second.rs", "LATEST_TOKEN\n"))
+        .unwrap();
+    if let Some(segment) = plan.segment_build.clone() {
+        writer.segment_store.write_segment(segment).unwrap();
+    }
+    if let Some(deletes) = plan.delete_build.clone() {
+        writer.delete_store.write_delete_segment(deletes).unwrap();
+    }
+    super::flush::apply_completed_flush(&mut writer.state.lock().unwrap(), &plan);
+    assert_eq!(writer.stats().pending_docs, 1);
+    writer.commit().unwrap();
+    let snapshot = engine.reader().open_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .search(&query("FIRST_TOKEN"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+    assert_eq!(
+        snapshot
+            .search(&query("SECOND_TOKEN"))
+            .unwrap()
+            .matched_lines,
+        0
+    );
+    assert_eq!(
+        snapshot
+            .search(&query("LATEST_TOKEN"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+}
+
+#[test]
+fn retained_overlay_deletes_do_not_repeat_compaction_after_reopen() {
+    use crate::index_engine::{manifest::ManifestSource, ManifestId};
+    let config = test_config();
+    let engine = IndexEngine::open(config.clone()).unwrap();
+    let writer = engine.writer();
+    writer.set_manifest_source(Some(ManifestSource::WorkspaceOverlay {
+        base_manifest_id: ManifestId("base".into()),
+        observed_head: None,
+        probe_epoch: 0,
+    }));
+    writer
+        .add_document(test_doc("keep.rs", "KEEP_TOKEN\n"))
+        .unwrap();
+    writer
+        .add_document(test_doc("remove.rs", "REMOVE_TOKEN\n"))
+        .unwrap();
+    writer.commit().unwrap();
+    let held = engine.reader().open_committed().unwrap();
+    writer
+        .delete_document(&test_doc("remove.rs", "").key)
+        .unwrap();
+    writer.commit().unwrap();
+    assert!(engine.admin().maybe_merge().unwrap());
+    // Bounded calls deliberately expose a repeated task without hanging maintain().
+    assert!(
+        !engine.admin().maybe_merge().unwrap(),
+        "retained mask must not reschedule the same merge"
+    );
+    let manifest = engine.admin().manifest().unwrap();
+    assert_eq!(
+        manifest.active_delete_segments.len(),
+        1,
+        "base deletion mask must survive"
+    );
+    assert!(manifest.active_segments[0].applied_delete_seq_no > 0);
+    assert_eq!(
+        held.search(&query("REMOVE_TOKEN")).unwrap().matched_lines,
+        1
+    );
+    assert_eq!(
+        engine
+            .reader()
+            .open_committed()
+            .unwrap()
+            .search(&query("REMOVE_TOKEN"))
+            .unwrap()
+            .matched_lines,
+        0
+    );
+    assert_eq!(
+        engine
+            .reader()
+            .open_committed()
+            .unwrap()
+            .search(&query("KEEP_TOKEN"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+    drop(held);
+    drop(engine);
+
+    let reopened = IndexEngine::open(config).unwrap();
+    assert!(
+        !reopened.admin().maybe_merge().unwrap(),
+        "durable watermark must survive reopen"
+    );
+    reopened
+        .writer()
+        .delete_document(&test_doc("keep.rs", "").key)
+        .unwrap();
+    reopened.writer().commit().unwrap();
+    assert!(
+        reopened.admin().maybe_merge().unwrap(),
+        "later deletions must still be applied"
+    );
+    assert!(!reopened.admin().maybe_merge().unwrap());
+    assert_eq!(
+        reopened
+            .reader()
+            .open_committed()
+            .unwrap()
+            .search(&query("KEEP_TOKEN"))
+            .unwrap()
+            .matched_lines,
+        0
+    );
+}
+
+#[test]
+fn budgeted_overlay_deletion_maintenance_terminates_and_preserves_reader_pins() {
+    use crate::index_engine::{manifest::ManifestSource, ManifestId};
+    let mut config = test_config();
+    config.merge_policy.floor_segment_bytes = 1;
+    config.merge_policy.max_merged_segment_bytes = 30;
+    let engine = IndexEngine::open(config).unwrap();
+    let writer = engine.writer();
+    writer.set_manifest_source(Some(ManifestSource::WorkspaceOverlay {
+        base_manifest_id: ManifestId("base".into()),
+        observed_head: None,
+        probe_epoch: 0,
+    }));
+    for i in 0..5 {
+        writer
+            .add_document(test_doc(&format!("keep-{i}.rs"), "KEPT_TOKEN\n"))
+            .unwrap();
+        writer
+            .add_document(test_doc(&format!("drop-{i}.rs"), "DROP_TOKEN\n"))
+            .unwrap();
+        writer.commit().unwrap();
+    }
+    let held = engine.reader().open_committed().unwrap();
+    for i in 0..5 {
+        writer
+            .delete_document(&test_doc(&format!("drop-{i}.rs"), "").key)
+            .unwrap();
+    }
+    writer.commit().unwrap();
+    // Each source segment is 22 bytes; the 30-byte budget permits one per task.
+    for _ in 0..5 {
+        assert!(engine.admin().maybe_merge().unwrap());
+        engine.admin().vacuum().unwrap();
+    }
+    assert!(!engine.admin().maybe_merge().unwrap());
+    assert_eq!(held.search(&query("DROP_TOKEN")).unwrap().matched_lines, 5);
+    let current = engine.reader().open_committed().unwrap();
+    assert_eq!(
+        current.search(&query("DROP_TOKEN")).unwrap().matched_lines,
+        0
+    );
+    assert_eq!(
+        current.search(&query("KEPT_TOKEN")).unwrap().matched_lines,
+        5
+    );
+    drop(held);
+    assert!(engine.admin().vacuum().unwrap() > 0);
+    assert_eq!(engine.admin().maintain().unwrap().merge_tasks, 0);
+}
+
+#[test]
+fn memory_publication_checkpoints_captured_revision_without_losing_newer_writes() {
+    let temp = tempdir().unwrap();
+    let config = EngineConfig {
+        index_root: temp.path().join("index"),
+        ..Default::default()
+    };
+    let engine = IndexEngine::open_staged(config.clone()).unwrap();
+    let writer = engine.writer();
+    writer
+        .add_document(test_doc("a.rs", "FIRST_VERSION"))
+        .unwrap();
+    writer.flush().unwrap();
+    let held = engine.reader().open_snapshot().unwrap();
+    assert_eq!(
+        held.search(&query("FIRST_VERSION")).unwrap().matched_lines,
+        1
+    );
+    assert_eq!(
+        fs::read_dir(config.index_root.join("segments"))
+            .unwrap()
+            .count(),
+        0
+    );
+    assert_eq!(writer.stats().committed_seq_no, 0);
+    let captured = writer.capture_checkpoint();
+    let captured_seq = captured.snapshot.manifest.committed_seq_no;
+    writer
+        .update_document(test_doc("a.rs", "SECOND_VERSION"))
+        .unwrap();
+    writer
+        .add_document(test_doc("b.rs", "ADDED_VERSION"))
+        .unwrap();
+    writer.flush().unwrap();
+    writer
+        .persist_snapshot(&captured.snapshot.manifest)
+        .unwrap();
+    assert!(writer.finish_checkpoint(captured).unwrap());
+    assert_eq!(writer.stats().committed_seq_no, captured_seq);
+    assert!(writer.stats().uncommitted_ops > 0);
+    let current = engine.reader().open_snapshot().unwrap();
+    assert_eq!(
+        current
+            .search(&query("FIRST_VERSION"))
+            .unwrap()
+            .matched_lines,
+        0
+    );
+    assert_eq!(
+        current
+            .search(&query("SECOND_VERSION|ADDED_VERSION"))
+            .unwrap()
+            .matched_lines,
+        2
+    );
+    assert_eq!(
+        held.search(&query("FIRST_VERSION")).unwrap().matched_lines,
+        1
+    );
+    let reopened = IndexEngine::open_staged(config.clone()).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .open_snapshot()
+            .unwrap()
+            .search(&query("FIRST_VERSION"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+    drop(reopened);
+    writer.delete_document(&test_doc("a.rs", "").key).unwrap();
+    writer.flush().unwrap();
+    writer.commit().unwrap();
+    let reopened = IndexEngine::open_staged(config).unwrap();
+    let durable = reopened.reader().open_snapshot().unwrap();
+    assert_eq!(
+        durable
+            .search(&query("FIRST_VERSION|SECOND_VERSION"))
+            .unwrap()
+            .matched_lines,
+        0
+    );
+    assert_eq!(
+        durable
+            .search(&query("ADDED_VERSION"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+}
+
+#[test]
+fn memory_checkpoint_failure_keeps_visible_bytes_and_durable_sequence_retryable() {
+    let temp = tempdir().unwrap();
+    let config = EngineConfig {
+        index_root: temp.path().join("index"),
+        ..Default::default()
+    };
+    let engine = IndexEngine::open_staged(config.clone()).unwrap();
+    let writer = engine.writer();
+    writer
+        .add_document(test_doc("a.rs", "RETRY_CONTENT"))
+        .unwrap();
+    writer.flush().unwrap();
+    let segments = config.index_root.join("segments");
+    fs::remove_dir(&segments).unwrap();
+    fs::write(&segments, "obstruct persistence").unwrap();
+    assert!(writer.commit().is_err());
+    assert_eq!(writer.stats().committed_seq_no, 0);
+    assert_eq!(
+        engine
+            .reader()
+            .open_snapshot()
+            .unwrap()
+            .search(&query("RETRY_CONTENT"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+    fs::remove_file(&segments).unwrap();
+    writer.commit().unwrap();
+    let reopened = IndexEngine::open_staged(config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .open_snapshot()
+            .unwrap()
+            .search(&query("RETRY_CONTENT"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+}
+
+#[test]
+fn replacement_rejects_inflight_checkpoint_from_previous_base() {
+    let temp = tempdir().unwrap();
+    let config = EngineConfig {
+        index_root: temp.path().join("index"),
+        ..Default::default()
+    };
+    let engine = IndexEngine::open_staged(config.clone()).unwrap();
+    let writer = engine.writer();
+    writer.add_document(test_doc("old.rs", "OLD_BASE")).unwrap();
+    writer.flush().unwrap();
+    let captured = writer.capture_checkpoint();
+    writer.begin_replacement();
+    writer.add_document(test_doc("new.rs", "NEW_BASE")).unwrap();
+    writer.flush().unwrap();
+    writer
+        .persist_snapshot(&captured.snapshot.manifest)
+        .unwrap();
+    assert!(!writer.finish_checkpoint(captured).unwrap());
+    assert_eq!(writer.stats().committed_seq_no, 0);
+    assert_eq!(
+        engine
+            .reader()
+            .open_snapshot()
+            .unwrap()
+            .search(&query("OLD_BASE"))
+            .unwrap()
+            .matched_lines,
+        0
+    );
+    writer.commit().unwrap();
+    let reopened = IndexEngine::open_staged(config).unwrap();
+    assert_eq!(
+        reopened
+            .reader()
+            .open_snapshot()
+            .unwrap()
+            .search(&query("NEW_BASE"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+}
+
+#[test]
+fn background_disk_wait_does_not_block_new_publication_or_queries() {
+    use crate::index_engine::{
+        delete::{FileDeleteStore, StagedDeleteStore},
+        manifest::FileManifestStore,
+        reader::state::SharedSnapshotState,
+        segment::{
+            FileSegmentStore, SegmentBuildOutput, SegmentMeta, SegmentReaderHandle, SegmentStore,
+            StagedSegmentStore,
+        },
+        types::SegmentId,
+        workspace::{
+            WorkspaceOverlayIndex, WorkspaceOverlayIngestBatch, WorkspaceOverlayPublishPolicy,
+        },
+    };
+    use std::{
+        sync::{mpsc, Mutex},
+        time::Duration,
+    };
+    fn batch(text: &str) -> WorkspaceOverlayIngestBatch {
+        let path = "/repo/a.rs".to_string();
+        WorkspaceOverlayIngestBatch::from_paths(
+            &RepoId("repo".into()),
+            std::path::Path::new("/repo"),
+            &std::collections::HashSet::from([path.clone()]),
+            &Default::default(),
+            &Default::default(),
+            &std::collections::HashMap::from([(
+                path.clone(),
+                crate::search_engine::SearchDocument::from_loaded_bytes(
+                    path,
+                    text.len() as u64,
+                    1,
+                    Arc::from(text.as_bytes()),
+                ),
+            )]),
+        )
+        .unwrap()
+    }
+    struct GatedStore {
+        inner: StagedSegmentStore,
+        gate: Mutex<Option<(mpsc::Sender<()>, mpsc::Receiver<()>)>>,
+    }
+    impl SegmentStore for GatedStore {
+        fn write_segment(&self, b: SegmentBuildOutput) -> crate::Result<SegmentMeta> {
+            self.inner.write_segment(b)
+        }
+        fn open_segment(&self, id: SegmentId) -> crate::Result<SegmentReaderHandle> {
+            self.inner.open_segment(id)
+        }
+        fn remove_segment(&self, id: SegmentId) -> crate::Result<()> {
+            self.inner.remove_segment(id)
+        }
+        fn persist_segment(&self, id: &SegmentId) -> crate::Result<()> {
+            let gate = self.gate.lock().unwrap().take();
+            if let Some((entered, release)) = gate {
+                entered.send(()).unwrap();
+                release.recv().unwrap();
+            }
+            self.inner.persist_segment(id)
+        }
+    }
+    let temp = tempdir().unwrap();
+    let config = EngineConfig {
+        index_root: temp.path().to_path_buf(),
+        ..Default::default()
+    };
+    let (entered_tx, entered_rx) = mpsc::channel();
+    let (release_tx, release_rx) = mpsc::channel();
+    let segments = Arc::new(GatedStore {
+        inner: StagedSegmentStore::new(
+            FileSegmentStore::open(temp.path(), config.tokenizer.clone()).unwrap(),
+            config.tokenizer.clone(),
+            256 * 1024 * 1024,
+        ),
+        gate: Mutex::new(Some((entered_tx, release_rx))),
+    });
+    let engine = IndexEngine::from_stores(
+        config,
+        Arc::new(FileManifestStore::open(temp.path()).unwrap()),
+        segments,
+        Arc::new(StagedDeleteStore::new(
+            FileDeleteStore::open(temp.path()).unwrap(),
+        )),
+        false,
+        SharedSnapshotState::for_index_root(temp.path()).unwrap(),
+    )
+    .unwrap();
+    let overlay = Arc::new(WorkspaceOverlayIndex::new_with_policy(
+        engine,
+        WorkspaceOverlayPublishPolicy::Background,
+    ));
+    overlay.ingest_batch(&batch("BEFORE_DISK")).unwrap();
+    let maintenance = {
+        let o = overlay.clone();
+        std::thread::spawn(move || o.run_requested_merge())
+    };
+    entered_rx.recv_timeout(Duration::from_secs(5)).unwrap();
+    let (done_tx, done_rx) = mpsc::channel();
+    let publication = {
+        let o = overlay.clone();
+        std::thread::spawn(move || {
+            let result = o.ingest_batch(&batch("DURING_DISK"));
+            done_tx.send(result).unwrap();
+        })
+    };
+    let published = done_rx.recv_timeout(Duration::from_secs(2));
+    // Always release the worker so a regression cannot strand the test process.
+    let visible = published
+        .as_ref()
+        .ok()
+        .and_then(|r| r.as_ref().ok())
+        .map(|_| {
+            overlay
+                .open_snapshot()
+                .unwrap()
+                .search(&query("DURING_DISK"))
+                .unwrap()
+                .matched_lines
+        });
+    release_tx.send(()).unwrap();
+    publication.join().unwrap();
+    maintenance.join().unwrap().unwrap();
+    assert!(
+        published.is_ok(),
+        "disk encoding blocked memory publication"
+    );
+    published.unwrap().unwrap();
+    assert_eq!(visible, Some(1));
+    assert_eq!(
+        overlay
+            .open_snapshot()
+            .unwrap()
+            .search(&query("DURING_DISK"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+    overlay.checkpoint().unwrap();
+}
+
+#[test]
+fn retired_writer_cannot_publish_over_reopened_engine() {
+    let temp = tempdir().unwrap();
+    let config = EngineConfig {
+        index_root: temp.path().join("index"),
+        ..Default::default()
+    };
+    let old = IndexEngine::open_staged(config.clone()).unwrap();
+    let writer = old.writer();
+    writer
+        .add_document(test_doc("old.rs", "OBSOLETE_CONTENT"))
+        .unwrap();
+    writer.flush().unwrap();
+    let captured = writer.capture_checkpoint();
+    writer.retire();
+    assert!(!writer.needs_checkpoint());
+    assert_eq!(old.admin().vacuum().unwrap(), 0);
+    let replacement = IndexEngine::open_staged(config.clone()).unwrap();
+    replacement
+        .writer()
+        .add_document(test_doc("new.rs", "CURRENT_CONTENT"))
+        .unwrap();
+    replacement.writer().commit().unwrap();
+    writer
+        .persist_snapshot(&captured.snapshot.manifest)
+        .unwrap();
+    assert!(!writer.finish_checkpoint(captured).unwrap());
+    let reopened = IndexEngine::open_staged(config).unwrap();
+    let snapshot = reopened.reader().open_snapshot().unwrap();
+    assert_eq!(
+        snapshot
+            .search(&query("CURRENT_CONTENT"))
+            .unwrap()
+            .matched_lines,
+        1
+    );
+    assert_eq!(
+        snapshot
+            .search(&query("OBSOLETE_CONTENT"))
+            .unwrap()
+            .matched_lines,
+        0
+    );
+}

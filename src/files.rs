@@ -46,6 +46,28 @@ pub fn is_workspace_internal_path(path: &Path) -> bool {
     })
 }
 
+/// Static path policy shared by filesystem walks and Git base inputs.
+/// Git membership may exempt ignore rules, never hidden/internal/storage rules.
+pub(crate) fn workspace_path_is_eligible(
+    root: &Path,
+    path: &Path,
+    storage_root: Option<&Path>,
+    include_hidden: bool,
+) -> bool {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return false;
+    };
+    !is_workspace_internal_path(path)
+        && !storage_root.is_some_and(|storage| path.starts_with(storage))
+        && relative.components().all(|part| match part {
+            std::path::Component::Normal(name) => {
+                name != OsStr::new(".git")
+                    && (include_hidden || !name.to_string_lossy().starts_with('.'))
+            }
+            _ => false,
+        })
+}
+
 pub fn scan_repository(config: &BuildConfig) -> Result<Vec<RepositoryFile>> {
     scan_paths(
         std::slice::from_ref(&config.repo_path),
@@ -74,7 +96,8 @@ pub fn read_text_file(path: &std::path::Path) -> Result<Option<String>> {
 }
 
 pub fn is_corpus_text_file(path: &Path) -> Result<bool> {
-    let bytes = fs::read(path)?;
+    let mut bytes = Vec::with_capacity(8 * 1024);
+    File::open(path)?.take(8 * 1024).read_to_end(&mut bytes)?;
     Ok(!looks_binary(&bytes))
 }
 
@@ -114,7 +137,7 @@ pub fn scan_paths(
             continue;
         }
 
-        let walker = build_walker_from_options(root, storage_root, &options)?;
+        let walker = build_walker_from_options(root, storage_root, &options, None)?;
         for entry in walker.build() {
             let entry = entry?;
             if !entry
@@ -135,21 +158,68 @@ pub fn scan_paths(
     Ok(files)
 }
 
+/// Walk selected scopes using ignore rules anchored at the workspace root.
+/// Missing scopes are valid: their old index entries are reconciled as deletions.
+pub(crate) fn scan_workspace_scopes(
+    root: &Path,
+    scopes: Option<&[PathBuf]>,
+    storage_root: Option<&Path>,
+    options: ScanOptions,
+) -> Result<Vec<RepositoryFile>> {
+    let walker = build_walker_from_options(root, storage_root, &options, scopes)?;
+    let mut files = Vec::new();
+    for entry in walker.build() {
+        let entry = entry?;
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+        if let Some(file) = repository_file(entry.path(), files.len(), options.max_file_size)? {
+            files.push(file);
+        }
+    }
+    Ok(files)
+}
+
 fn build_walker_from_options(
     root: &Path,
     storage_root: Option<&Path>,
     options: &ScanOptions,
+    scopes: Option<&[PathBuf]>,
 ) -> Result<WalkBuilder> {
     let mut builder = WalkBuilder::new(root);
     builder.follow_links(false);
-    builder.max_filesize(Some(options.max_file_size));
+    // Enforce size in repository_file. ignore's max_filesize shortcut can
+    // bypass filter_entry, which would break scope/internal-path pruning.
     builder.max_depth(options.max_depth);
     let storage_root = storage_root.map(PathBuf::from);
+    let scopes = scopes.map(|scopes| {
+        let selected = scopes
+            .iter()
+            .cloned()
+            .collect::<std::collections::HashSet<_>>();
+        let parents = scopes
+            .iter()
+            .flat_map(|path| path.ancestors().skip(1))
+            .map(Path::to_path_buf)
+            .collect::<std::collections::HashSet<_>>();
+        (selected, parents)
+    });
+    let workspace_root = root.to_path_buf();
+    let include_hidden = options.include_hidden;
     builder.filter_entry(move |entry| {
-        !is_workspace_internal_path(entry.path())
-            && !storage_root
-                .as_ref()
-                .is_some_and(|storage_root| entry.path().starts_with(storage_root))
+        let path = entry.path();
+        let directory = entry.file_type().is_some_and(|t| t.is_dir());
+        let in_scope = scopes.as_ref().is_none_or(|(selected, parents)| {
+            path.ancestors().any(|ancestor| selected.contains(ancestor))
+                || (directory && parents.contains(path))
+        });
+        in_scope
+            && workspace_path_is_eligible(
+                &workspace_root,
+                path,
+                storage_root.as_deref(),
+                include_hidden,
+            )
     });
 
     if options.respect_ignore {
@@ -178,7 +248,54 @@ fn build_walker_from_options(
     Ok(builder)
 }
 
-fn repository_file(
+/// Check paths supplied outside the walker (for example Git membership) using
+/// the workspace walker's no-follow policy, including symlinked ancestors.
+pub(crate) fn workspace_file_metadata(root: &Path, path: &Path) -> Result<Option<fs::Metadata>> {
+    let Ok(relative) = path.strip_prefix(root) else {
+        return Ok(None);
+    };
+    if relative
+        .components()
+        .any(|part| !matches!(part, std::path::Component::Normal(_)))
+    {
+        return Ok(None);
+    }
+    let metadata = match fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.is_file() => metadata,
+        Ok(_) => return Ok(None),
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    for parent in path
+        .ancestors()
+        .skip(1)
+        .take_while(|parent| *parent != root)
+    {
+        match fs::symlink_metadata(parent) {
+            Ok(metadata) if metadata.is_dir() => (),
+            Ok(_) => return Ok(None),
+            Err(error)
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+                ) =>
+            {
+                return Ok(None)
+            }
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(Some(metadata))
+}
+
+pub(crate) fn repository_file(
     path: &Path,
     ordinal: usize,
     max_file_size: u64,

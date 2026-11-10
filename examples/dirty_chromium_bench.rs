@@ -287,6 +287,7 @@ fn main() -> Result<()> {
 
     let build_started = Instant::now();
     let build_config = BuildConfig {
+        git_mode: Default::default(),
         repo_path: worktree.worktree_path.clone(),
         storage_root: storage_root.clone(),
         tokenizer: TokenizerMode::SparseNgram,
@@ -772,6 +773,7 @@ fn run_rg_query(repo_path: &Path, query: &str) -> Result<(usize, f64)> {
 fn count_only_query(pattern: impl Into<String>) -> QuerySpec {
     let pattern = pattern.into();
     QuerySpec {
+        freshness: Default::default(),
         pattern: pattern.clone(),
         patterns: vec![pattern],
         case_insensitive: false,

@@ -5,12 +5,14 @@ impl IndexSnapshotReader {
         self.snapshot.manifest().active_segments.len() == 1
             && self.snapshot.manifest().active_delete_segments.is_empty()
             && self.data.deleted_keys.is_empty()
+            && self.data.retracted_keys.is_empty()
             && self.data.docs.is_empty()
     }
 
     pub(super) fn can_use_streaming_segment_fast_path(&self, query: &QueryRequest) -> bool {
         self.snapshot.manifest().active_segments.len() > 1
             && self.data.deleted_keys.is_empty()
+            && self.data.retracted_keys.is_empty()
             && self.data.docs.is_empty()
             && query.filters.languages.is_empty()
             && matches!(
@@ -221,14 +223,11 @@ impl IndexSnapshotReader {
                 &config,
                 multiline_verifier,
                 line_prefilter,
-                if matches!(
-                    query.mode,
-                    crate::search::SearchMode::FilesWithMatches
-                        | crate::search::SearchMode::CountOnly
-                ) {
-                    CountVerifyKind::Lines
-                } else {
-                    CountVerifyKind::Occurrences
+                match query.mode {
+                    crate::search::SearchMode::FilesWithMatches => CountVerifyKind::Exists,
+                    crate::search::SearchMode::CountOnly => CountVerifyKind::Lines,
+                    crate::search::SearchMode::CountMatches => CountVerifyKind::Occurrences,
+                    crate::search::SearchMode::LineMatches => unreachable!(),
                 },
             )?;
             let counts = verify_plan.verify_candidate_counts_by_doc_with_sources(
@@ -531,14 +530,11 @@ impl IndexSnapshotReader {
                 &config,
                 multiline_verifier,
                 line_prefilter,
-                if matches!(
-                    query.mode,
-                    crate::search::SearchMode::FilesWithMatches
-                        | crate::search::SearchMode::CountOnly
-                ) {
-                    CountVerifyKind::Lines
-                } else {
-                    CountVerifyKind::Occurrences
+                match query.mode {
+                    crate::search::SearchMode::FilesWithMatches => CountVerifyKind::Exists,
+                    crate::search::SearchMode::CountOnly => CountVerifyKind::Lines,
+                    crate::search::SearchMode::CountMatches => CountVerifyKind::Occurrences,
+                    crate::search::SearchMode::LineMatches => unreachable!(),
                 },
             )?;
             if let Some(limit) = config.effective_global_max_results() {

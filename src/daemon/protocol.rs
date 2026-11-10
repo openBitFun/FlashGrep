@@ -3,9 +3,6 @@ use std::path::PathBuf;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-pub const DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS: u64 =
-    crate::index_engine::workspace::DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS;
-
 fn default_jsonrpc_version() -> String {
     "2.0".to_string()
 }
@@ -164,6 +161,8 @@ pub struct GlobParams {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct QuerySpec {
+    #[serde(default)]
+    pub freshness: crate::config::QueryFreshness,
     pub pattern: String,
     #[serde(default)]
     pub patterns: Vec<String>,
@@ -210,6 +209,8 @@ pub struct PathScope {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RepoConfig {
     #[serde(default)]
+    pub git_mode: crate::config::GitMode,
+    #[serde(default)]
     pub tokenizer: TokenizerModeConfig,
     #[serde(default)]
     pub corpus_mode: CorpusModeConfig,
@@ -226,6 +227,7 @@ pub struct RepoConfig {
 impl Default for RepoConfig {
     fn default() -> Self {
         Self {
+            git_mode: crate::config::GitMode::Auto,
             tokenizer: TokenizerModeConfig::default(),
             corpus_mode: CorpusModeConfig::default(),
             include_hidden: false,
@@ -246,8 +248,7 @@ pub struct RefreshPolicyConfig {
     pub base_delta_max_bytes_ratio: f64,
     #[serde(default = "default_base_head_cache_entries")]
     pub base_head_cache_entries: usize,
-    #[serde(default = "default_overlay_auto_checkpoint_max_uncommitted_ops")]
-    pub overlay_auto_checkpoint_max_uncommitted_ops: u64,
+
     #[serde(default = "default_overlay_merge_min_delay_ms")]
     pub overlay_merge_min_delay_ms: u64,
     #[serde(default = "default_overlay_merge_retry_delay_ms")]
@@ -261,8 +262,7 @@ impl Default for RefreshPolicyConfig {
             base_delta_max_delete_segments: default_base_delta_max_delete_segments(),
             base_delta_max_bytes_ratio: default_base_delta_max_bytes_ratio(),
             base_head_cache_entries: default_base_head_cache_entries(),
-            overlay_auto_checkpoint_max_uncommitted_ops:
-                default_overlay_auto_checkpoint_max_uncommitted_ops(),
+
             overlay_merge_min_delay_ms: default_overlay_merge_min_delay_ms(),
             overlay_merge_retry_delay_ms: default_overlay_merge_retry_delay_ms(),
         }
@@ -532,6 +532,8 @@ pub struct RepoStatus {
     pub probe_healthy: bool,
     #[serde(default)]
     pub workspace_probe_pending: bool,
+    #[serde(default)]
+    pub workspace_progress: WorkspaceProgress,
     pub last_error: Option<String>,
     /// Failure of the most recent background base-maintenance task (advance or
     /// compaction). Unlike `last_error`, which the worktree probe clears on
@@ -545,6 +547,14 @@ pub struct RepoStatus {
     pub last_maintenance_error: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub overlay: Option<WorkspaceOverlayStatus>,
+}
+
+/// Session-local work revisions, not file counts or a guarantee against missed notifications.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WorkspaceProgress {
+    pub observed_revision: u64,
+    pub reconciled_revision: u64,
+    pub published_revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
@@ -738,10 +748,6 @@ fn default_min_sparse_len() -> usize {
 
 fn default_max_sparse_len() -> usize {
     8
-}
-
-fn default_overlay_auto_checkpoint_max_uncommitted_ops() -> u64 {
-    DEFAULT_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS
 }
 
 fn default_base_delta_max_segments() -> usize {

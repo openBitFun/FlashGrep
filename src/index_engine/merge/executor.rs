@@ -79,11 +79,18 @@ impl MergeExecutor for StoreMergeExecutor {
             .collect::<Vec<_>>();
 
         let mut max_delete_seq_by_key = BTreeMap::<DocKey, u64>::new();
+        let mut max_retraction_seq_by_key = BTreeMap::<DocKey, u64>::new();
         for delete_segment in &source_delete_segments {
             let reader = self
                 .delete_store
                 .open_delete_segment(delete_segment.id.clone())?;
             for record in reader.records() {
+                if record.retract_to_base {
+                    max_retraction_seq_by_key
+                        .entry(record.key.clone())
+                        .and_modify(|seq| *seq = (*seq).max(record.seq_no))
+                        .or_insert(record.seq_no);
+                }
                 max_delete_seq_by_key
                     .entry(record.key.clone())
                     .and_modify(|seq_no| *seq_no = (*seq_no).max(record.seq_no))
@@ -145,7 +152,30 @@ impl MergeExecutor for StoreMergeExecutor {
                 meta: segment_meta,
                 documents: documents.clone(),
             })?;
+            // A watermark is safe only when no earlier delete segment was omitted.
+            // Partial merges may retain a prior common watermark but must not skip gaps.
+            let previous_applied = source_segments
+                .iter()
+                .map(|segment| segment.applied_delete_seq_no)
+                .min()
+                .unwrap_or(0);
+            let applied_delete_seq_no = if manifest
+                .active_delete_segments
+                .iter()
+                .all(|segment| source_delete_segment_ids.contains(&segment.id))
+            {
+                previous_applied.max(
+                    source_delete_segments
+                        .iter()
+                        .map(|segment| segment.max_seq_no)
+                        .max()
+                        .unwrap_or(0),
+                )
+            } else {
+                previous_applied
+            };
             output_segments.push(SegmentRef {
+                applied_delete_seq_no,
                 id: segment_id,
                 min_seq_no,
                 max_seq_no,
@@ -166,12 +196,36 @@ impl MergeExecutor for StoreMergeExecutor {
                 segment.max_seq_no > max_delete_seq || source_segment_ids.contains(&segment.id)
             })
         });
+        // A retraction also supersedes older deletion masks. Keep it while an
+        // unconsumed delete segment can still resurrect such a mask.
+        let can_drop_retractions = can_drop_consumed_deletes
+            && max_consumed_delete_seq.is_some_and(|max_seq| {
+                manifest.active_delete_segments.iter().all(|segment| {
+                    segment.min_seq_no > max_seq || source_delete_segment_ids.contains(&segment.id)
+                })
+            });
         let mut output_delete_segments = Vec::new();
-        if !max_delete_seq_by_key.is_empty() && !can_drop_consumed_deletes {
-            let records = max_delete_seq_by_key
-                .into_iter()
-                .map(|(key, seq_no)| crate::index_engine::delete::DeleteRecord { key, seq_no })
-                .collect::<Vec<_>>();
+        let overlay = matches!(
+            manifest.source,
+            Some(crate::index_engine::manifest::ManifestSource::WorkspaceOverlay { .. })
+        );
+        let records = max_delete_seq_by_key
+            .into_iter()
+            .filter_map(|(key, seq_no)| {
+                let retract_to_base = max_retraction_seq_by_key.get(&key) == Some(&seq_no);
+                (if retract_to_base {
+                    !can_drop_retractions
+                } else {
+                    !can_drop_consumed_deletes || overlay
+                })
+                .then_some(crate::index_engine::delete::DeleteRecord {
+                    key,
+                    seq_no,
+                    retract_to_base,
+                })
+            })
+            .collect::<Vec<_>>();
+        if !records.is_empty() {
             let min_seq_no = records
                 .iter()
                 .map(|record| record.seq_no)
@@ -257,6 +311,7 @@ mod tests {
                             delete_count: 1,
                         },
                         records: vec![DeleteRecord {
+                            retract_to_base: false,
                             seq_no,
                             key: key.clone(),
                         }],
@@ -272,6 +327,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let foundation = SegmentRef {
+            applied_delete_seq_no: 0,
             id: SegmentId("foundation".into()),
             min_seq_no: 1,
             max_seq_no: 1,
@@ -306,5 +362,101 @@ mod tests {
         assert_eq!(reader.records().len(), 1);
         assert_eq!(reader.records()[0].key, key);
         assert_eq!(reader.records()[0].seq_no, 3);
+    }
+    #[test]
+    fn retraction_compaction_keeps_unconsumed_deletion_mask_superseded() {
+        let temp = tempfile::tempdir().unwrap();
+        let segments = Arc::new(
+            FileSegmentStore::open(temp.path(), PostingTokenizerConfig::default()).unwrap(),
+        );
+        let deletes = Arc::new(FileDeleteStore::open(temp.path()).unwrap());
+        let key = DocKey {
+            repo_id: RepoId("repo".into()),
+            logical_path: "restored.rs".into(),
+        };
+        let refs: Vec<_> = [(1, false), (2, true)]
+            .into_iter()
+            .map(|(seq_no, retract_to_base)| {
+                let id = DeleteSegmentId(format!("input-{seq_no}"));
+                deletes
+                    .write_delete_segment(DeleteSegmentBuildOutput {
+                        meta: DeleteSegmentMeta {
+                            delete_segment_id: id.clone(),
+                            min_seq_no: seq_no,
+                            max_seq_no: seq_no,
+                            delete_count: 1,
+                        },
+                        records: vec![DeleteRecord {
+                            seq_no,
+                            key: key.clone(),
+                            retract_to_base,
+                        }],
+                    })
+                    .unwrap();
+                DeleteSegmentRef {
+                    id,
+                    min_seq_no: seq_no,
+                    max_seq_no: seq_no,
+                    delete_count: 1,
+                    size_bytes: 1,
+                }
+            })
+            .collect();
+        let manifest = Manifest {
+            manifest_id: ManifestId("retraction-parent".into()),
+            active_delete_segments: refs.clone(),
+            source: Some(
+                crate::index_engine::manifest::ManifestSource::WorkspaceOverlay {
+                    base_manifest_id: ManifestId("base".into()),
+                    observed_head: None,
+                    probe_epoch: 0,
+                },
+            ),
+            ..Default::default()
+        };
+        let executor = StoreMergeExecutor::new(segments, deletes.clone());
+        let snapshot = ManifestSnapshot::new(manifest);
+        let partial = executor
+            .execute(
+                MergeTask {
+                    source_segments: Vec::new(),
+                    source_delete_segments: vec![refs[1].id.clone()],
+                },
+                &snapshot,
+            )
+            .unwrap();
+        assert_eq!(partial.output_delete_segments.len(), 1);
+        let output = deletes
+            .open_delete_segment(partial.output_delete_segments[0].id.clone())
+            .unwrap();
+        assert!(output.records()[0].retract_to_base);
+        assert_eq!(output.records()[0].seq_no, 2);
+        let complete = executor
+            .execute(
+                MergeTask {
+                    source_segments: Vec::new(),
+                    source_delete_segments: refs.iter().map(|r| r.id.clone()).collect(),
+                },
+                &snapshot,
+            )
+            .unwrap();
+        assert!(complete.output_delete_segments.is_empty());
+        let deletion_only = executor
+            .execute(
+                MergeTask {
+                    source_segments: Vec::new(),
+                    source_delete_segments: vec![refs[0].id.clone()],
+                },
+                &snapshot,
+            )
+            .unwrap();
+        assert_eq!(deletion_only.output_delete_segments.len(), 1);
+        assert!(
+            !deletes
+                .open_delete_segment(deletion_only.output_delete_segments[0].id.clone())
+                .unwrap()
+                .records()[0]
+                .retract_to_base
+        );
     }
 }

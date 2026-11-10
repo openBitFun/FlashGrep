@@ -27,8 +27,8 @@ use crate::{
     error::AppError,
     files::{repo_relative_path, scan_paths, RepositoryFile, ScanOptions},
     git_snapshot::{
-        build_config_fingerprint, canonical_repo_root, dirty_tracked_paths, head_tracked_entries,
-        resolve_git_head, GitBlobReader,
+        build_config_fingerprint, canonical_repo_root, head_tracked_entries, resolve_git_head,
+        GitBlobReader,
     },
     index_engine::{
         config::{EngineConfig, PostingTokenizerConfig},
@@ -36,10 +36,10 @@ use crate::{
         manifest::{FileManifestStore, Manifest, ManifestSource, ManifestStore, SegmentRef},
         reader::{state::SharedSnapshotState, IndexReaderFactory, IndexSnapshotReader},
         segment::{
-            collect_document_posting_terms_from_text, encoded_source_bytes_len,
-            write_path_offsets_file, write_segment_meta, write_source_bytes, FileSegmentStore,
-            PostingsStreamWriter, SegmentDocSourceKind, SegmentMeta, TermDictStreamWriter,
-            DOCS_FILE, PATH_MAP_FILE, PATH_OFFSETS_FILE, SEGMENT_META_FILE,
+            collect_document_posting_terms_from_text, write_path_offsets_file, write_segment_meta,
+            write_source_bytes, FileSegmentStore, PostingsStreamWriter, SegmentDocSourceKind,
+            SegmentMeta, TermDictStreamWriter, DOCS_FILE, PATH_MAP_FILE, PATH_OFFSETS_FILE,
+            SEGMENT_META_FILE,
         },
         writer::IndexDocument,
         DocKey, GitRevision, ManifestId, RepoId, SegmentId, ShardId,
@@ -142,7 +142,6 @@ const ENV_BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES: &str =
     "FLASHGREP_BASE_SNAPSHOT_IN_MEMORY_POSTING_THRESHOLD_BYTES";
 const ENV_BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN: &str =
     "FLASHGREP_BASE_SNAPSHOT_SPILLED_BUCKET_SORT_MAX_RECORDS_PER_RUN";
-const BASE_SNAPSHOT_MANIFEST_ID: &str = "manifest-0000000000000001";
 const SEGMENT_SCHEMA_FINGERPRINT: &str = "segment-publish-v3";
 const DOCS_MAGIC: &[u8; 8] = b"CGDOCS01";
 const DOCS_VERSION: u32 = 4;
@@ -377,6 +376,7 @@ impl WorkspaceBaseSnapshotIndex {
         let manifest = manifest_store.load_current()?;
         let base_head_commit = match manifest.source.as_ref() {
             Some(ManifestSource::GitBase { head_commit, .. }) => Some(head_commit.clone()),
+            Some(ManifestSource::FilesystemBase { .. }) => None,
             _ => Self::read_metadata_file(build_config)?.and_then(|metadata| metadata.head_commit),
         };
         let reader = Arc::new(IndexReaderFactory::new(
@@ -388,7 +388,7 @@ impl WorkspaceBaseSnapshotIndex {
                 base_head_commit,
             )?),
             Arc::new(FileDeleteStore::open(&config.index_root)?),
-            SharedSnapshotState::new(),
+            SharedSnapshotState::for_index_root(&config.index_root)?,
             config.tokenizer.clone(),
         ));
         Ok(Self { reader })
@@ -399,6 +399,9 @@ impl WorkspaceBaseSnapshotIndex {
         expected_snapshot_key: &str,
     ) -> Result<bool> {
         let manifest = FileManifestStore::open(&Self::index_root(build_config))?.load_current()?;
+        if let Some(ManifestSource::FilesystemBase { snapshot_key, .. }) = &manifest.source {
+            return Ok(snapshot_key == expected_snapshot_key);
+        }
         if let Some(ManifestSource::GitBase {
             head_commit,
             config_fingerprint,
@@ -451,6 +454,28 @@ impl WorkspaceBaseSnapshotIndex {
         build_config: &BuildConfig,
     ) -> Result<Option<WorkspaceBaseSnapshotMetadata>> {
         let manifest = FileManifestStore::open(&Self::index_root(build_config))?.load_current()?;
+        if let Some(ManifestSource::FilesystemBase {
+            snapshot_key,
+            config_fingerprint,
+            repo_root,
+            document_count,
+        }) = &manifest.source
+        {
+            let sidecar = Self::read_metadata_file(build_config)
+                .ok()
+                .flatten()
+                .filter(|metadata| metadata.snapshot_key == *snapshot_key);
+            return Ok(Some(WorkspaceBaseSnapshotMetadata {
+                snapshot_key: snapshot_key.clone(),
+                revision: None,
+                tokenizer: Some(build_config.tokenizer),
+                doc_count: Some(*document_count),
+                head_commit: None,
+                config_fingerprint: Some(config_fingerprint.clone()),
+                repo_root: Some(repo_root.clone()),
+                shards: sidecar.map_or_else(Vec::new, |metadata| metadata.shards),
+            }));
+        }
         if let Some(ManifestSource::GitBase {
             head_commit,
             config_fingerprint,
@@ -502,18 +527,12 @@ impl WorkspaceBaseSnapshotIndex {
         let Some(metadata) = Self::read_metadata_file(build_config)? else {
             return Ok(());
         };
-        let head_commit = metadata
-            .head_commit
-            .clone()
-            .or_else(|| {
-                metadata
-                    .revision
-                    .as_ref()
-                    .map(|revision| revision.0.clone())
-            })
-            .ok_or_else(|| {
-                AppError::InvalidIndex("legacy base snapshot is missing Git HEAD identity".into())
-            })?;
+        let head_commit = metadata.head_commit.clone().or_else(|| {
+            metadata
+                .revision
+                .as_ref()
+                .map(|revision| revision.0.clone())
+        });
         let config_fingerprint = metadata.config_fingerprint.clone().ok_or_else(|| {
             AppError::InvalidIndex("legacy base snapshot is missing config fingerprint".into())
         })?;
@@ -522,30 +541,45 @@ impl WorkspaceBaseSnapshotIndex {
         })?;
         let mut migrated = current.clone();
         migrated.manifest_id = ManifestId(format!(
-            "manifest-base-{head_commit}-migrated-{}",
+            "manifest-base-migrated-{}",
             delta::next_candidate_nonce()
         ));
         migrated.generation = current.generation.saturating_add(1);
         migrated.created_at_unix_ms = now_unix_ms();
-        migrated.source = Some(ManifestSource::GitBase {
-            head_commit,
-            config_fingerprint,
-            repo_root,
-            document_count: metadata.doc_count.unwrap_or_else(|| {
-                current
+        migrated.source = Some(if let Some(head_commit) = head_commit {
+            ManifestSource::GitBase {
+                head_commit,
+                config_fingerprint,
+                repo_root,
+                document_count: metadata.doc_count.unwrap_or_else(|| {
+                    current
+                        .active_segments
+                        .iter()
+                        .map(|segment| segment.doc_count as usize)
+                        .sum()
+                }),
+                parent_manifest_id: Some(current.manifest_id.clone()),
+                foundation_segment_ids: current
                     .active_segments
                     .iter()
-                    .map(|segment| segment.doc_count as usize)
-                    .sum()
-            }),
-            parent_manifest_id: Some(current.manifest_id.clone()),
-            foundation_segment_ids: current
-                .active_segments
-                .iter()
-                .map(|segment| segment.id.clone())
-                .collect(),
-            delta_depth: 0,
-            delta_bytes: 0,
+                    .map(|segment| segment.id.clone())
+                    .collect(),
+                delta_depth: 0,
+                delta_bytes: 0,
+            }
+        } else {
+            ManifestSource::FilesystemBase {
+                snapshot_key: metadata.snapshot_key,
+                config_fingerprint,
+                repo_root,
+                document_count: metadata.doc_count.unwrap_or_else(|| {
+                    current
+                        .active_segments
+                        .iter()
+                        .map(|segment| segment.doc_count as usize)
+                        .sum()
+                }),
+            }
         });
         let _ = manifest_store.publish_if_current(&current.manifest_id, &migrated)?;
         Ok(())
@@ -624,13 +658,7 @@ impl WorkspaceBaseSnapshotIndex {
 
         let (doc_count, shards) = if let Some(head_commit) = head_commit {
             check_cancel(should_cancel)?;
-            let files = build_head_snapshot_input_files(
-                &build_config.repo_path,
-                head_commit,
-                build_config.include_hidden,
-                build_config.max_file_size,
-                should_cancel,
-            )?;
+            let files = build_head_snapshot_input_files(build_config, head_commit, should_cancel)?;
             build_sharded_base_snapshot(
                 &staging_root,
                 build_config,
@@ -639,6 +667,7 @@ impl WorkspaceBaseSnapshotIndex {
                 files,
                 previous_snapshot.as_ref(),
                 Some(head_commit),
+                snapshot_key,
                 on_progress,
             )?
         } else {
@@ -662,6 +691,7 @@ impl WorkspaceBaseSnapshotIndex {
                 base_snapshot_input_files_from_repository_files(&files, &build_config.repo_path),
                 previous_snapshot.as_ref(),
                 None,
+                snapshot_key,
                 on_progress,
             )?
         };

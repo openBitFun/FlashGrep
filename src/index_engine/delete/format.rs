@@ -17,6 +17,8 @@ pub(crate) const DELETE_RECORDS_MAGIC: &[u8; 8] = b"CGDELS01";
 pub struct DeleteRecord {
     pub seq_no: SeqNo,
     pub key: DocKey,
+    #[serde(default)]
+    pub retract_to_base: bool,
 }
 
 pub(crate) fn write_delete_segment_meta(
@@ -44,10 +46,11 @@ pub(crate) fn read_delete_segment_meta(
 pub(crate) fn write_delete_records(path: &Path, records: &[DeleteRecord]) -> Result<()> {
     let mut buffer = Vec::new();
     buffer.write_all(DELETE_RECORDS_MAGIC)?;
-    write_u32(&mut buffer, 1)?;
+    write_u32(&mut buffer, 2)?;
     write_u32(&mut buffer, records.len() as u32)?;
     for record in records {
         write_u64(&mut buffer, record.seq_no)?;
+        buffer.push(u8::from(record.retract_to_base));
         write_string(&mut buffer, &record.key.repo_id.0)?;
         write_string(&mut buffer, &record.key.logical_path)?;
     }
@@ -66,7 +69,7 @@ pub(crate) fn read_delete_records(path: &Path) -> Result<Vec<DeleteRecord>> {
         ));
     }
     let version = read_u32(&mut cursor)?;
-    if version != 1 {
+    if !matches!(version, 1 | 2) {
         return Err(AppError::InvalidIndex(format!(
             "unsupported delete records version: {version}"
         )));
@@ -75,9 +78,21 @@ pub(crate) fn read_delete_records(path: &Path) -> Result<Vec<DeleteRecord>> {
     let mut records = Vec::with_capacity(count);
     for _ in 0..count {
         let seq_no = read_u64(&mut cursor)?;
+        let retract_to_base = if version == 2 {
+            let mut flag = [0u8; 1];
+            cursor.read_exact(&mut flag)?;
+            match flag[0] {
+                0 => false,
+                1 => true,
+                _ => return Err(AppError::InvalidIndex("invalid delete record kind".into())),
+            }
+        } else {
+            false
+        };
         let repo_id = crate::index_engine::types::RepoId(read_string(&mut cursor)?);
         let logical_path = read_string(&mut cursor)?;
         records.push(DeleteRecord {
+            retract_to_base,
             seq_no,
             key: DocKey {
                 repo_id,
@@ -125,4 +140,54 @@ fn read_string(cursor: &mut Cursor<&[u8]>) -> Result<String> {
     cursor.read_exact(&mut bytes)?;
     String::from_utf8(bytes)
         .map_err(|error| AppError::Protocol(format!("delete string decode failed: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn retraction_records_roundtrip_and_reject_unknown_kind() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("records");
+        let records: Vec<_> = [false, true]
+            .into_iter()
+            .enumerate()
+            .map(|(i, retract_to_base)| DeleteRecord {
+                seq_no: i as u64 + 1,
+                key: DocKey {
+                    repo_id: crate::index_engine::RepoId("repo".into()),
+                    logical_path: "file.rs".into(),
+                },
+                retract_to_base,
+            })
+            .collect();
+        write_delete_records(&path, &records).unwrap();
+        assert_eq!(read_delete_records(&path).unwrap(), records);
+        let mut bytes = fs::read(&path).unwrap();
+        bytes[24] = 2;
+        fs::write(&path, bytes).unwrap();
+        assert!(matches!(
+            read_delete_records(&path),
+            Err(AppError::InvalidIndex(_))
+        ));
+    }
+
+    #[test]
+    fn retraction_decoder_preserves_legacy_deletion_semantics() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("legacy");
+        let mut bytes = DELETE_RECORDS_MAGIC.to_vec();
+        write_u32(&mut bytes, 1).unwrap();
+        write_u32(&mut bytes, 1).unwrap();
+        write_u64(&mut bytes, 42).unwrap();
+        write_string(&mut bytes, "repo").unwrap();
+        write_string(&mut bytes, "file.rs").unwrap();
+        fs::write(&path, bytes).unwrap();
+        let records = read_delete_records(&path).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].seq_no, 42);
+        assert_eq!(records[0].key.logical_path, "file.rs");
+        assert!(!records[0].retract_to_base);
+    }
 }

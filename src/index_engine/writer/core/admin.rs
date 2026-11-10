@@ -93,12 +93,27 @@ impl IndexAdmin {
         Ok(true)
     }
 
+    /// One bounded background merge, returning control to the workspace worker.
+    pub(crate) fn maintain_step(&self) -> Result<MaintenanceStats> {
+        let merge_tasks = u64::from(self.maybe_merge()?);
+        let vacuumed_files = self.vacuum()?;
+        Ok(MaintenanceStats {
+            merge_tasks,
+            vacuumed_files,
+        })
+    }
+
     pub fn maintain(&self) -> Result<MaintenanceStats> {
         let mut merge_tasks = 0u64;
+        let mut vacuumed_files = 0usize;
         while self.maybe_merge()? {
             merge_tasks += 1;
+            // Release obsolete cached readers between batches, not only after
+            // the whole dirty set has been compacted. Reader leases still pin
+            // every artifact needed by concurrent queries.
+            vacuumed_files += self.vacuum()?;
         }
-        let vacuumed_files = self.vacuum()?;
+        vacuumed_files += self.vacuum()?;
         Ok(MaintenanceStats {
             merge_tasks,
             vacuumed_files,
@@ -133,12 +148,24 @@ impl IndexAdmin {
     }
 
     pub fn vacuum(&self) -> Result<usize> {
+        // Retirement must finish after any old-instance reclamation, before a
+        // replacement engine starts staging new artifacts in the same root.
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retired {
+            return Ok(0);
+        }
+        let _reclamation = self.snapshots.protect_reclamation();
         let reclaimer = Reclaimer::default();
         let pinned_manifest_ids = self.snapshots.pinned_manifest_ids();
-        let candidates = reclaimer.plan_with_pins(
+        let reader_manifests = self.snapshots.pinned_manifests();
+        let candidates = reclaimer.plan_with_reader_pins(
             &self.index_root,
             self.manifest_store.as_ref(),
             &pinned_manifest_ids,
+            &reader_manifests,
         )?;
         let candidate_count = candidates.len();
         reclaimer.execute(
@@ -206,6 +233,19 @@ impl IndexAdmin {
             ),
             source: manifest.source.clone(),
         };
+        for segment in &merged_manifest.active_segments {
+            self.segment_store.persist_segment(&segment.id)?;
+        }
+        for segment in &merged_manifest.active_delete_segments {
+            self.delete_store.persist_delete_segment(&segment.id)?;
+        }
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if state.retired {
+            return Ok(());
+        }
         if !self
             .manifest_store
             .publish_if_current(&base_manifest_id, &merged_manifest)?
@@ -213,10 +253,6 @@ impl IndexAdmin {
             return Ok(());
         }
         {
-            let mut state = self
-                .state
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
             state.generation = next_generation;
             state.committed_seq_no = manifest.committed_seq_no;
             state.last_flushed_seq_no = manifest.committed_seq_no;

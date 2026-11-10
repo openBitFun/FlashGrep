@@ -23,6 +23,7 @@ fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     let workspace = WorkspaceIndex::open(WorkspaceIndexOptions {
         build_config: BuildConfig {
+            git_mode: Default::default(),
             repo_path,
             storage_root,
             tokenizer: TokenizerMode::SparseNgram,

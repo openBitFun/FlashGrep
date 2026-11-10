@@ -24,7 +24,6 @@ const DEFAULTS = {
   baseDeltaMaxDeleteSegments: 8,
   baseDeltaMaxBytesRatio: 0.10,
   baseHeadCacheEntries: 4,
-  overlayAutoCheckpointMaxUncommittedOps: 256,
   overlayMergeMinDelayMs: 2000,
   overlayMergeRetryDelayMs: 10000,
 };
@@ -415,6 +414,7 @@ function parseServerArgs(argv) {
     storageRoot: undefined,
     daemonBin: undefined,
     config: {
+      git_mode: "auto",
       tokenizer: DEFAULTS.tokenizer,
       corpus_mode: DEFAULTS.corpusMode,
       include_hidden: DEFAULTS.hidden,
@@ -427,8 +427,6 @@ function parseServerArgs(argv) {
       base_delta_max_delete_segments: DEFAULTS.baseDeltaMaxDeleteSegments,
       base_delta_max_bytes_ratio: DEFAULTS.baseDeltaMaxBytesRatio,
       base_head_cache_entries: DEFAULTS.baseHeadCacheEntries,
-      overlay_auto_checkpoint_max_uncommitted_ops:
-        DEFAULTS.overlayAutoCheckpointMaxUncommittedOps,
       overlay_merge_min_delay_ms: DEFAULTS.overlayMergeMinDelayMs,
       overlay_merge_retry_delay_ms: DEFAULTS.overlayMergeRetryDelayMs,
     },
@@ -441,6 +439,9 @@ function parseServerArgs(argv) {
       case "--repo":
         args.repoPath = normalizeExistingPath(requireValue(arg, next));
         index += 1;
+        break;
+      case "--no-git":
+        args.config.git_mode = "filesystem";
         break;
       case "--storage-root":
         args.storageRoot = path.resolve(requireValue(arg, next));
@@ -472,10 +473,6 @@ function parseServerArgs(argv) {
         break;
       case "--max-sparse-len":
         args.config.max_sparse_len = parseNonNegativeInt(arg, next);
-        index += 1;
-        break;
-      case "--overlay-auto-checkpoint-max-uncommitted-ops":
-        args.refresh.overlay_auto_checkpoint_max_uncommitted_ops = parseNonNegativeInt(arg, next);
         index += 1;
         break;
       case "--base-delta-max-segments":
@@ -549,6 +546,7 @@ function parseSearchArguments(value) {
   }
   return {
     ...parseGlobArguments(value),
+    freshness: enumValue(value.freshness, "freshness", ["published", "reconciled", "filesystem"], "published"),
     pattern: value.pattern,
     regexp: stringArray(value.regexp),
     fixed_strings: Boolean(value.fixed_strings),
@@ -702,11 +700,12 @@ function managedBridgeArgs(options) {
     "--base-delta-max-delete-segments", String(options.refresh.base_delta_max_delete_segments),
     "--base-delta-max-bytes-ratio", String(options.refresh.base_delta_max_bytes_ratio),
     "--base-head-cache-entries", String(options.refresh.base_head_cache_entries),
-    "--overlay-auto-checkpoint-max-uncommitted-ops",
-    String(options.refresh.overlay_auto_checkpoint_max_uncommitted_ops),
     "--overlay-merge-min-delay-ms", String(options.refresh.overlay_merge_min_delay_ms),
     "--overlay-merge-retry-delay-ms", String(options.refresh.overlay_merge_retry_delay_ms),
   ];
+  if (options.config.git_mode === "filesystem") {
+    args.push("--no-git");
+  }
   if (options.storageRoot) {
     args.push("--storage-root", options.storageRoot);
   }
@@ -927,6 +926,7 @@ function buildSearchParams(repoContext, args, pattern, patterns) {
   return {
     repo_id: repoContext.repoId,
     query: {
+      freshness: args.freshness,
       pattern,
       patterns,
       case_insensitive: args.case_insensitive,
@@ -987,6 +987,11 @@ function toolDefinitions() {
           global_max_results: schemaNullableInteger(
             "Global result cap for the selected search mode. Defaults to 100. Caps returned lines for line_matches, paths for files_with_matches, file_counts for count_only, and file_match_counts for count_matches.",
           ),
+          freshness: {
+            type: "string",
+            enum: ["published", "reconciled", "filesystem"],
+            description: "published: latest published index (default); reconciled: reconcile files and publish before searching; filesystem: scan current files without consulting the index. Concurrent edits are not a filesystem snapshot.",
+          },
           search_mode: {
             type: "string",
             enum: ["files_with_matches", "line_matches", "count_only", "count_matches"],
@@ -1385,6 +1390,7 @@ function printHelp() {
 
 Options:
   --repo <REPO>  (defaults to the server process cwd)
+  --no-git  (use the requested directory without Git optimization)
   --storage-root <STORAGE_ROOT>
   --daemon-bin <DAEMON_BIN>
   --tokenizer <trigram|sparse-ngram>
@@ -1397,7 +1403,6 @@ Options:
   --base-delta-max-delete-segments <N>
   --base-delta-max-bytes-ratio <RATIO>
   --base-head-cache-entries <N>
-  --overlay-auto-checkpoint-max-uncommitted-ops <N>
   --overlay-merge-min-delay-ms <MS>
   --overlay-merge-retry-delay-ms <MS>
   -h, --help

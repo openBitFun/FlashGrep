@@ -13,7 +13,7 @@ pub(super) struct BaseSnapshotInputFile {
 #[derive(Clone)]
 pub(super) enum BaseSnapshotFileSource {
     Worktree,
-    GitHeadBlob { head_commit: String },
+    GitObject { object_id: String },
 }
 
 #[derive(Clone)]
@@ -48,16 +48,12 @@ pub(super) fn base_snapshot_input_files_from_repository_files(
 }
 
 pub(super) fn build_head_snapshot_input_files(
-    repo_root: &Path,
+    build_config: &BuildConfig,
     head_commit: &str,
-    include_hidden: bool,
-    max_file_size: u64,
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<Vec<BaseSnapshotInputFile>> {
+    let repo_root = &build_config.repo_path;
     let started = std::time::Instant::now();
-    let dirty_started = std::time::Instant::now();
-    let dirty_paths = dirty_tracked_paths(repo_root, should_cancel)?;
-    let dirty_ms = dirty_started.elapsed().as_millis();
     let tree_started = std::time::Instant::now();
     let entries = head_tracked_entries(repo_root, head_commit, should_cancel)?;
     let tracked_entries = entries.len();
@@ -67,76 +63,39 @@ pub(super) fn build_head_snapshot_input_files(
 
     for entry in entries {
         let path = crate::files::resolve_repo_path(repo_root, &entry.logical_path);
-        if crate::files::is_workspace_internal_path(&path)
-            || (!include_hidden && path_has_hidden_components(&path, repo_root))
-            || entry.size > max_file_size
+        if !crate::files::workspace_path_is_eligible(
+            repo_root,
+            &path,
+            Some(&build_config.storage_root),
+            build_config.include_hidden,
+        ) || entry.size > build_config.max_file_size
         {
             continue;
         }
 
-        if entry.mode == "120000" {
-            let worktree_metadata = fs::metadata(&path).ok();
-            let Some(metadata) = worktree_metadata.filter(std::fs::Metadata::is_file) else {
-                continue;
-            };
-            files.push(BaseSnapshotInputFile {
-                path,
-                logical_path: entry.logical_path,
-                size: metadata.len(),
-                mtime_nanos: metadata
-                    .modified()
-                    .ok()
-                    .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                    .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
-                    .unwrap_or_default(),
-                source: BaseSnapshotFileSource::Worktree,
-                fingerprint: BaseSnapshotFileFingerprint::Worktree {
-                    mtime_nanos: metadata
-                        .modified()
-                        .ok()
-                        .and_then(|time| time.duration_since(UNIX_EPOCH).ok())
-                        .map(|duration| u64::try_from(duration.as_nanos()).unwrap_or(u64::MAX))
-                        .unwrap_or_default(),
-                },
-            });
+        if !matches!(entry.mode.as_str(), "100644" | "100755") {
             continue;
         }
-        if !dirty_paths.contains(&entry.logical_path) {
-            files.push(BaseSnapshotInputFile {
-                path,
-                logical_path: entry.logical_path,
+        files.push(BaseSnapshotInputFile {
+            path,
+            logical_path: entry.logical_path,
+            size: entry.size,
+            mtime_nanos: 0,
+            source: BaseSnapshotFileSource::GitObject {
+                object_id: entry.object_id.clone(),
+            },
+            fingerprint: BaseSnapshotFileFingerprint::GitObject {
+                object_id: entry.object_id,
                 size: entry.size,
-                mtime_nanos: 0,
-                source: BaseSnapshotFileSource::Worktree,
-                fingerprint: BaseSnapshotFileFingerprint::GitObject {
-                    object_id: entry.object_id,
-                    size: entry.size,
-                },
-            });
-        } else {
-            files.push(BaseSnapshotInputFile {
-                path,
-                logical_path: entry.logical_path,
-                size: entry.size,
-                mtime_nanos: 0,
-                source: BaseSnapshotFileSource::GitHeadBlob {
-                    head_commit: head_commit.to_string(),
-                },
-                fingerprint: BaseSnapshotFileFingerprint::GitObject {
-                    object_id: entry.object_id,
-                    size: entry.size,
-                },
-            });
-        }
+            },
+        });
     }
 
     eprintln!(
-        "[flashgrep][base-metrics] stage=enumerate_inputs elapsed_ms={} dirty_ms={} git_tree_ms={} classify_ms={} dirty_paths={} tracked_entries={} selected_files={} source_bytes={}",
+        "[flashgrep][base-metrics] stage=enumerate_inputs elapsed_ms={} git_tree_ms={} classify_ms={} tracked_entries={} selected_files={} source_bytes={}",
         started.elapsed().as_millis(),
-        dirty_ms,
         tree_ms,
         classify_started.elapsed().as_millis(),
-        dirty_paths.len(),
         tracked_entries,
         files.len(),
         files.iter().map(|file| file.size).sum::<u64>(),
@@ -164,7 +123,7 @@ pub(super) fn prepare_base_document(
     Ok(Some(PreparedBaseDocument {
         document,
         posting_terms,
-        source_kind: segment_doc_source_kind(file),
+        source_kind: SegmentDocSourceKind::Inline,
     }))
 }
 
@@ -184,22 +143,14 @@ fn read_base_snapshot_file_source_bytes(
 ) -> Result<Vec<u8>> {
     match &file.source {
         BaseSnapshotFileSource::Worktree => Ok(fs::read(&file.path)?),
-        BaseSnapshotFileSource::GitHeadBlob { head_commit } => git_blob_reader
+        BaseSnapshotFileSource::GitObject { object_id } => git_blob_reader
             .ok_or_else(|| {
                 AppError::InvalidIndex(
                     "Git-backed base input is missing its shard-local batch reader".into(),
                 )
             })?
-            .read_blob(head_commit, &file.logical_path),
+            .read_object(object_id),
     }
-}
-
-fn path_has_hidden_components(path: &Path, root: &Path) -> bool {
-    let relative = path.strip_prefix(root).unwrap_or(path);
-    relative.components().any(|component| match component {
-        std::path::Component::Normal(value) => value.to_string_lossy().starts_with('.'),
-        _ => false,
-    })
 }
 
 fn repository_file_to_index_document(
@@ -242,13 +193,6 @@ fn repository_file_to_index_document(
         content_hash,
         source_bytes,
     }))
-}
-
-fn segment_doc_source_kind(file: &BaseSnapshotInputFile) -> SegmentDocSourceKind {
-    match file.fingerprint {
-        BaseSnapshotFileFingerprint::Worktree { .. } => SegmentDocSourceKind::Inline,
-        BaseSnapshotFileFingerprint::GitObject { .. } => SegmentDocSourceKind::GitHeadBlob,
-    }
 }
 
 fn has_binary_source_bytes(bytes: &[u8]) -> bool {

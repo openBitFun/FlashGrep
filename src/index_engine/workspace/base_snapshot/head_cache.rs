@@ -249,6 +249,7 @@ mod tests {
 
     fn config(temp: &tempfile::TempDir) -> BuildConfig {
         BuildConfig {
+            git_mode: Default::default(),
             repo_path: temp.path().join("repo"),
             storage_root: temp.path().join("storage"),
             tokenizer: TokenizerMode::SparseNgram,

@@ -163,6 +163,7 @@ fn managed_client_spawns_ensures_and_searches() {
             SearchParams {
                 repo_id: String::new(),
                 query: QuerySpec {
+                    freshness: Default::default(),
                     pattern: "HELLO".into(),
                     patterns: Vec::new(),
                     case_insensitive: false,

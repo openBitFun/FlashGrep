@@ -1,8 +1,4 @@
-use std::{fs::File, path::Path};
-
-use aho_corasick::{AhoCorasick, MatchKind};
-use memmap2::Mmap;
-use rayon::prelude::*;
+use std::path::Path;
 
 use crate::{
     config::{BuildConfig, QueryConfig},
@@ -17,9 +13,6 @@ use crate::{
 };
 
 use super::document::{SearchDocument, SearchDocumentSource};
-
-const PARALLEL_DOC_THRESHOLD: usize = 16;
-const PARALLEL_BYTE_THRESHOLD: u64 = 8 * 1024 * 1024;
 
 pub(crate) fn search_scanned_files(
     config: &QueryConfig,
@@ -36,10 +29,6 @@ pub(crate) fn search_documents(
     config: &QueryConfig,
     documents: &[SearchDocument],
 ) -> Result<SearchResults> {
-    if let Some(results) = search_documents_multi_literal_fast(config, documents)? {
-        return Ok(results);
-    }
-
     let docs = repository_docs(documents)?;
     let candidate_ids = docs.iter().map(|doc| doc.doc_id).collect::<Vec<_>>();
     let multiline_verifier = requires_multiline_verification(config)?;
@@ -141,141 +130,10 @@ pub(crate) fn scan_text_files(files: Vec<RepositoryFile>) -> Result<Vec<Reposito
     Ok(text_files)
 }
 
-fn search_documents_multi_literal_fast(
-    config: &QueryConfig,
-    documents: &[SearchDocument],
-) -> Result<Option<SearchResults>> {
-    if matches!(config.search_mode, SearchMode::LineMatches) {
-        return Ok(None);
-    }
-    if config.max_count.is_some()
-        || config.fixed_strings
-        || config.word_regexp
-        || config.line_regexp
-    {
-        return Ok(None);
-    }
-
-    let plan = plan(&config.regex_pattern)?;
-    let Some(alternation) = plan.pure_literal_alternation else {
-        return Ok(None);
-    };
-    if config.case_insensitive
-        && !alternation
-            .literals
-            .iter()
-            .all(|literal| literal.is_ascii())
-    {
-        return Ok(None);
-    }
-
-    let matcher = AhoCorasick::builder()
-        .match_kind(MatchKind::LeftmostFirst)
-        .ascii_case_insensitive(config.case_insensitive)
-        .build(&alternation.literals)
-        .map_err(|error| AppError::InvalidPattern(error.to_string()))?;
-
-    let outcomes = if config.effective_global_max_results().is_none()
-        && should_parallel_scan_documents(documents)
-    {
-        documents
-            .par_iter()
-            .filter_map(|document| scan_document_multi_literal(document, &matcher))
-            .collect::<Vec<_>>()
-    } else {
-        documents
-            .iter()
-            .filter_map(|document| scan_document_multi_literal(document, &matcher))
-            .collect::<Vec<_>>()
-    };
-
-    let max_results = config.effective_global_max_results().unwrap_or(usize::MAX);
-    let limited = outcomes.into_iter().take(max_results).collect::<Vec<_>>();
-    Ok(Some(build_results_from_counts(
-        config.search_mode,
-        documents.len(),
-        limited.iter().map(|outcome| outcome.bytes_searched).sum(),
-        limited
-            .into_iter()
-            .map(|outcome| {
-                (
-                    outcome.path,
-                    outcome.matched_lines,
-                    outcome.matched_occurrences,
-                )
-            })
-            .collect(),
-    )?))
-}
-
-#[derive(Debug)]
-struct MultiLiteralDocumentOutcome {
-    path: String,
-    matched_lines: usize,
-    matched_occurrences: usize,
-    bytes_searched: u64,
-}
-
 #[derive(Debug, Clone)]
 struct ScannedDocMeta {
     doc_id: u32,
     path: String,
-}
-
-fn should_parallel_scan_documents(documents: &[SearchDocument]) -> bool {
-    if std::thread::available_parallelism().map_or(1, std::num::NonZero::get) <= 1 {
-        return false;
-    }
-
-    documents.len() >= PARALLEL_DOC_THRESHOLD
-        || documents.iter().map(|document| document.size).sum::<u64>() >= PARALLEL_BYTE_THRESHOLD
-}
-
-fn scan_document_multi_literal(
-    document: &SearchDocument,
-    matcher: &AhoCorasick,
-) -> Option<MultiLiteralDocumentOutcome> {
-    let bytes = document_bytes(document)?;
-    let (matched_lines, matched_occurrences) = count_matches(&bytes, matcher);
-    if matched_occurrences == 0 {
-        return None;
-    }
-    Some(MultiLiteralDocumentOutcome {
-        path: document.logical_path.clone(),
-        matched_lines,
-        matched_occurrences,
-        bytes_searched: u64::try_from(bytes.len()).unwrap_or(u64::MAX),
-    })
-}
-
-fn document_bytes(document: &SearchDocument) -> Option<Vec<u8>> {
-    match &document.source {
-        SearchDocumentSource::Path(path) => {
-            if document.size == 0 {
-                return None;
-            }
-            let file = File::open(path).ok()?;
-            let mmap = unsafe { Mmap::map(&file).ok()? };
-            Some(mmap.to_vec())
-        }
-        SearchDocumentSource::LoadedBytes(bytes) => Some(bytes.to_vec()),
-    }
-}
-
-fn count_matches(bytes: &[u8], matcher: &AhoCorasick) -> (usize, usize) {
-    let mut matched_lines = 0usize;
-    let mut matched_occurrences = 0usize;
-    let mut last_match_end = 0usize;
-
-    for matched in matcher.find_iter(bytes) {
-        if matched_occurrences == 0 || bytes[last_match_end..matched.start()].contains(&b'\n') {
-            matched_lines += 1;
-        }
-        matched_occurrences += 1;
-        last_match_end = matched.end();
-    }
-
-    (matched_lines, matched_occurrences)
 }
 
 fn repository_docs(documents: &[SearchDocument]) -> Result<Vec<ScannedDocMeta>> {
@@ -318,7 +176,8 @@ fn scan_doc_meta(documents: &[ScannedDocMeta], doc_id: u32) -> Result<&ScannedDo
 
 fn count_kind_for_mode(mode: SearchMode) -> CountVerifyKind {
     match mode {
-        SearchMode::FilesWithMatches | SearchMode::CountOnly => CountVerifyKind::Lines,
+        SearchMode::FilesWithMatches => CountVerifyKind::Exists,
+        SearchMode::CountOnly => CountVerifyKind::Lines,
         SearchMode::CountMatches => CountVerifyKind::Occurrences,
         SearchMode::LineMatches => unreachable!("line matches use the lightweight verifier"),
     }

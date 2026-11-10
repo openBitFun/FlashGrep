@@ -57,6 +57,7 @@ impl TestRepo {
 
     pub fn trigram_build_config(&self) -> BuildConfig {
         BuildConfig {
+            git_mode: Default::default(),
             repo_path: self.repo.clone(),
             storage_root: self.index.clone(),
             tokenizer: TokenizerMode::Trigram,

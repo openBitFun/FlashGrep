@@ -17,10 +17,17 @@ use super::{
 };
 
 impl RepoTaskRecord {
-    fn new(task_id: String, repo_id: String, kind: RepoTaskKind, owns_repo_phase: bool) -> Self {
+    fn new(
+        task_id: String,
+        repo_id: String,
+        kind: RepoTaskKind,
+        owns_repo_phase: bool,
+        target_head: Option<String>,
+    ) -> Self {
         let now = SystemTime::now();
         Self {
             kind,
+            target_head,
             owns_repo_phase,
             cancel_requested: std::sync::atomic::AtomicBool::new(false),
             state: std::sync::Mutex::new(RepoTaskStatus {
@@ -187,11 +194,19 @@ impl RepoRuntime {
         }
         self.ensure_no_active_task()?;
 
+        let target_head = if kind == RepoTaskKind::AdvanceBaseSnapshot {
+            Some(self.current_git_head()?.ok_or_else(|| {
+                AppError::InvalidIndex("Git base advance requires a commit".into())
+            })?)
+        } else {
+            None
+        };
         let task = Arc::new(RepoTaskRecord::new(
             task_id.clone(),
             self.repo_id.clone(),
             kind,
             update_repo_phase,
+            target_head,
         ));
         {
             let mut tasks = match self.tasks.lock() {
@@ -226,6 +241,14 @@ impl RepoRuntime {
         tasks.get(task_id).map(|task| task.snapshot())
     }
 
+    pub(super) fn task_target_head(&self, task_id: &str) -> Option<String> {
+        self.tasks
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(task_id)
+            .and_then(|task| task.target_head.clone())
+    }
+
     pub(super) fn cancel_task(&self, task_id: &str) -> Option<bool> {
         let tasks = match self.tasks.lock() {
             Ok(guard) => guard,
@@ -236,14 +259,19 @@ impl RepoRuntime {
 
     pub(super) fn build_base_snapshot(&self) -> Result<(usize, super::RepoStatus)> {
         self.ensure_no_active_task()?;
+        let discovery = self
+            .workspace_discovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.set_phase(RepoPhase::BuildingBaseSnapshot, None);
         let indexed_docs = WorkspaceBaseSnapshotIndex::build_with_options(
             &self.build_config,
             &self.overlay_repo_id,
-            BaseSnapshotBuildOptions::new().requiring_git_head(),
+            BaseSnapshotBuildOptions::new(),
         )?
         .indexed_docs;
         self.bootstrap_from_existing_snapshot()?;
+        drop(discovery);
         self.refresh_workspace_overlay()?;
         {
             let mut state = match self.state.lock() {
@@ -258,14 +286,19 @@ impl RepoRuntime {
 
     pub(super) fn rebuild_base_snapshot(&self) -> Result<(usize, super::RepoStatus)> {
         self.ensure_no_active_task()?;
+        let discovery = self
+            .workspace_discovery_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
         self.set_phase(RepoPhase::RebuildingBaseSnapshot, None);
         let indexed_docs = WorkspaceBaseSnapshotIndex::rebuild_with_options(
             &self.build_config,
             &self.overlay_repo_id,
-            BaseSnapshotBuildOptions::new().requiring_git_head(),
+            BaseSnapshotBuildOptions::new(),
         )?
         .indexed_docs;
         self.bootstrap_from_existing_snapshot()?;
+        drop(discovery);
         self.refresh_workspace_overlay()?;
         {
             let mut state = match self.state.lock() {
@@ -291,14 +324,20 @@ impl RepoRuntime {
             task_for_cancel.cancel_requested() || self.shutting_down.load(Ordering::Relaxed)
         };
 
+        // Base publication and its overlay transition share the discovery lock.
+        // Readers retain their published view and do not acquire this lock.
+        let discovery = (!matches!(task.kind, RepoTaskKind::RefreshWorkspace)).then(|| {
+            self.workspace_discovery_lock
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        });
         let result = match task.kind {
             RepoTaskKind::BuildBaseSnapshot => WorkspaceBaseSnapshotIndex::build_with_options(
                 &self.build_config,
                 &self.overlay_repo_id,
                 BaseSnapshotBuildOptions::new()
                     .with_progress(&mut progress)
-                    .with_cancel(&mut should_cancel)
-                    .requiring_git_head(),
+                    .with_cancel(&mut should_cancel),
             )
             .map(|result| result.indexed_docs),
             RepoTaskKind::RebuildBaseSnapshot => WorkspaceBaseSnapshotIndex::rebuild_with_options(
@@ -306,8 +345,7 @@ impl RepoRuntime {
                 &self.overlay_repo_id,
                 BaseSnapshotBuildOptions::new()
                     .with_progress(&mut progress)
-                    .with_cancel(&mut should_cancel)
-                    .requiring_git_head(),
+                    .with_cancel(&mut should_cancel),
             )
             .map(|result| result.indexed_docs),
             RepoTaskKind::AdvanceBaseSnapshot => {
@@ -317,7 +355,9 @@ impl RepoRuntime {
                     0,
                     None,
                 ));
-                self.current_git_head().and_then(|target_head| {
+                task.target_head.as_deref().ok_or_else(|| AppError::InvalidIndex(
+                    "base advance task has no captured target commit".into(),
+                )).and_then(|target_head| {
                     let base_catalog = self.base_snapshot_catalog()?.ok_or_else(|| {
                         AppError::InvalidIndex(
                             "base snapshot catalog is unavailable during branch advance".into(),
@@ -327,7 +367,7 @@ impl RepoRuntime {
                         &self.build_config,
                         &self.overlay_repo_id,
                         &base_catalog,
-                        &target_head,
+                        target_head,
                         self.base_head_cache_entries,
                         &mut should_cancel,
                     )
@@ -373,10 +413,14 @@ impl RepoRuntime {
                 .map(|_| 0),
         };
 
-        match result.and_then(|indexed_docs| {
+        let result = result.and_then(|indexed_docs| {
             self.finish_task_success(task.kind, indexed_docs, &mut progress)
                 .map(|message| (message, indexed_docs))
-        }) {
+        });
+        // GC takes the artifact lock, while reconciled queries take that lock
+        // before discovery. Release discovery before task-finalization GC.
+        drop(discovery);
+        match result {
             Ok((message, completed_units)) => {
                 task.finish_completed(message);
                 self.finish_task_execution(&task, Some(completed_units), None);
@@ -626,11 +670,140 @@ impl RepoRuntime {
         } {
             let _ = handle.join();
         }
+        if let Some(handle) = self
+            .persistence_handle
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .take()
+        {
+            let _ = handle.join();
+        }
         if let Err(error) = self.checkpoint_workspace_overlay_for_shutdown() {
             eprintln!(
                 "flashgrep[overlay][warn] failed to checkpoint workspace overlay during shutdown for {}: {error}",
                 self.build_config.repo_path.display()
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod target_tests {
+    use super::*;
+    use std::time::Duration;
+
+    #[test]
+    fn queued_advance_keeps_its_target_and_caches_a_superseded_candidate() {
+        let repo = crate::test_support::TestRepo::new();
+        repo.write("tracked.rs", "H0_TOKEN\n");
+        repo.init_git();
+        repo.commit_all("h0");
+        let runtime = RepoRuntime::new(
+            "repo".into(),
+            repo.build_config(),
+            Default::default(),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        runtime.build_base_snapshot().unwrap();
+        let h0 = runtime.current_git_head().unwrap();
+        repo.write("tracked.rs", "H1_TOKEN\n");
+        repo.commit_all("h1");
+        let h1 = runtime.current_git_head().unwrap().unwrap();
+        let task_id = "queued-h1".to_string();
+        let task = Arc::new(RepoTaskRecord::new(
+            task_id.clone(),
+            "repo".into(),
+            RepoTaskKind::AdvanceBaseSnapshot,
+            false,
+            Some(h1.clone()),
+        ));
+        runtime
+            .tasks
+            .lock()
+            .unwrap()
+            .insert(task_id.clone(), task.clone());
+        runtime.mark_task_started(
+            RepoTaskKind::AdvanceBaseSnapshot,
+            Some(task_id.clone()),
+            false,
+        );
+        // Reproduce the queue delay deterministically, before starting the worker.
+        repo.write("tracked.rs", "H2_TOKEN\n");
+        repo.commit_all("h2");
+        runtime.observe_git_head_transition().unwrap();
+        let status = runtime.status_snapshot();
+        assert_ne!(status.workspace_head_commit.as_deref(), Some(h1.as_str()));
+        assert_eq!(
+            status.base_advance_target_head.as_deref(),
+            Some(h1.as_str())
+        );
+        runtime.run_task(task.clone());
+        assert_eq!(task.snapshot().state, RepoTaskState::Cancelled);
+        assert_eq!(runtime.state.lock().unwrap().base_head_commit, h0);
+        let cache = std::fs::read_to_string(
+            runtime
+                .build_config
+                .storage_root
+                .join("base-snapshot/HEAD_MANIFESTS.json"),
+        )
+        .unwrap();
+        assert!(
+            cache.contains(&h1),
+            "the completed H1 candidate must remain cached"
+        );
+        assert!(runtime.status_snapshot().base_advance_target_head.is_none());
+    }
+    #[test]
+    fn base_task_waits_for_inflight_workspace_discovery() {
+        let repo = crate::test_support::TestRepo::new();
+        repo.write("tracked.rs", "H0_TOKEN\n");
+        repo.init_git();
+        repo.commit_all("h0");
+        let runtime = RepoRuntime::new(
+            "repo".into(),
+            repo.build_config(),
+            Default::default(),
+            Arc::new(|_| {}),
+        )
+        .unwrap();
+        runtime.build_base_snapshot().unwrap();
+        let original = runtime.current_base_publication_id().unwrap();
+        repo.write("tracked.rs", "H1_TOKEN\n");
+        repo.commit_all("h1");
+        let task = Arc::new(RepoTaskRecord::new(
+            "advance".into(),
+            "repo".into(),
+            RepoTaskKind::AdvanceBaseSnapshot,
+            false,
+            runtime.current_git_head().unwrap(),
+        ));
+        let discovery = runtime.workspace_discovery_lock.lock().unwrap();
+        std::thread::scope(|scope| {
+            let (started_tx, started_rx) = std::sync::mpsc::channel();
+            let (done_tx, done_rx) = std::sync::mpsc::channel();
+            let runtime_ref = &runtime;
+            let task_ref = &task;
+            scope.spawn(move || {
+                started_tx.send(()).unwrap();
+                runtime_ref.run_task(task_ref.clone());
+                done_tx.send(()).unwrap();
+            });
+            started_rx.recv().unwrap();
+            assert!(matches!(
+                done_rx.recv_timeout(Duration::from_millis(100)),
+                Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+            ));
+            assert_eq!(runtime.current_base_publication_id().unwrap(), original);
+            let plan = runtime
+                .plan_overlay_update_from_incremental_probe()
+                .unwrap()
+                .unwrap();
+            runtime.apply_overlay_write_plan(plan).unwrap();
+            drop(discovery);
+            done_rx.recv_timeout(Duration::from_secs(10)).unwrap();
+        });
+        assert_eq!(task.snapshot().state, RepoTaskState::Completed);
+        assert_ne!(runtime.current_base_publication_id().unwrap(), original);
     }
 }

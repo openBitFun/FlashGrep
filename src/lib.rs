@@ -5,6 +5,8 @@ mod cli;
 mod config;
 pub mod daemon;
 pub mod error;
+#[doc(hidden)]
+pub mod experiments;
 mod files;
 mod fs_atomic;
 mod git_snapshot;

@@ -37,6 +37,12 @@ impl Default for Manifest {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum ManifestSource {
+    FilesystemBase {
+        snapshot_key: String,
+        config_fingerprint: String,
+        repo_root: String,
+        document_count: usize,
+    },
     GitBase {
         head_commit: String,
         config_fingerprint: String,
@@ -49,13 +55,17 @@ pub enum ManifestSource {
     },
     WorkspaceOverlay {
         base_manifest_id: ManifestId,
-        observed_head: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        observed_head: Option<String>,
         probe_epoch: u64,
     },
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SegmentRef {
+    /// Deletions through this sequence have already been applied to this segment.
+    #[serde(default)]
+    pub applied_delete_seq_no: SeqNo,
     pub id: SegmentId,
     pub min_seq_no: SeqNo,
     pub max_seq_no: SeqNo,

@@ -30,11 +30,15 @@ pub trait DeleteStore: Send + Sync {
         id: DeleteSegmentId,
     ) -> Result<crate::index_engine::delete::DeleteSegmentReaderHandle>;
     fn remove_delete_segment(&self, id: DeleteSegmentId) -> Result<()>;
+    fn persist_delete_segment(&self, _id: &DeleteSegmentId) -> Result<()> {
+        Ok(())
+    }
 }
 
 #[derive(Default)]
 pub struct MemoryDeleteStore {
-    delete_segments: RwLock<HashMap<DeleteSegmentId, DeleteSegmentMeta>>,
+    delete_segments:
+        RwLock<HashMap<DeleteSegmentId, crate::index_engine::delete::DeleteSegmentReaderHandle>>,
 }
 
 impl DeleteStore for MemoryDeleteStore {
@@ -43,17 +47,25 @@ impl DeleteStore for MemoryDeleteStore {
             .delete_segments
             .write()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(build.meta.delete_segment_id.clone(), build.meta.clone());
+        guard.insert(
+            build.meta.delete_segment_id.clone(),
+            std::sync::Arc::new(MemoryDeleteSegmentReader::new(build.records)),
+        );
         Ok(build.meta)
     }
 
     fn open_delete_segment(
         &self,
-        _id: DeleteSegmentId,
+        id: DeleteSegmentId,
     ) -> Result<crate::index_engine::delete::DeleteSegmentReaderHandle> {
-        Ok(std::sync::Arc::new(MemoryDeleteSegmentReader::new(
-            Vec::new(),
-        )))
+        self.delete_segments
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(&id)
+            .cloned()
+            .ok_or_else(|| {
+                crate::AppError::InvalidIndex(format!("unknown in-memory delete segment: {}", id.0))
+            })
     }
 
     fn remove_delete_segment(&self, id: DeleteSegmentId) -> Result<()> {

@@ -1,5 +1,4 @@
 use std::{
-    collections::HashSet,
     env,
     io::{BufRead, BufReader, BufWriter, Read, Write},
     path::{Path, PathBuf},
@@ -13,7 +12,7 @@ use std::{
 };
 
 #[cfg(test)]
-use std::fs;
+use std::{collections::HashSet, fs};
 
 use crc32fast::Hasher;
 
@@ -24,7 +23,7 @@ use crate::{
 
 const INITIAL_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(1);
 const MAX_CANCEL_POLL_INTERVAL: Duration = Duration::from_millis(50);
-const SEARCH_INDEX_FINGERPRINT_VERSION: &str = "index-engine-postings-v2";
+const SEARCH_INDEX_FINGERPRINT_VERSION: &str = "index-engine-postings-v4-inline-snapshots";
 const DEFAULT_GIT_BLOB_READER_POOL_SIZE: usize = 4;
 const MAX_GIT_BLOB_READER_POOL_SIZE: usize = 16;
 const GIT_BLOB_READER_POOL_SIZE_ENV: &str = "FLASHGREP_GIT_BLOB_READER_POOL_SIZE";
@@ -68,11 +67,17 @@ pub(crate) fn resolve_git_head(
     repo_root: &Path,
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<Option<String>> {
+    if !repo_root.ancestors().any(|path| path.join(".git").exists()) {
+        return Ok(None);
+    }
     let output = run_git_command(repo_root, ["rev-parse", "--verify", "HEAD"], should_cancel)?;
     Ok(parse_git_head_output(output))
 }
 
 pub(crate) fn resolve_git_head_blocking(repo_root: &Path) -> Result<Option<String>> {
+    if !repo_root.ancestors().any(|path| path.join(".git").exists()) {
+        return Ok(None);
+    }
     if let Some(head) = resolve_git_head_from_files(repo_root) {
         return Ok(Some(head));
     }
@@ -177,6 +182,7 @@ pub(crate) struct GitCommitDiff {
     pub added: Vec<String>,
     pub modified: Vec<String>,
     pub deleted: Vec<String>,
+    pub non_regular_targets: std::collections::HashSet<String>,
 }
 
 pub(crate) fn commit_diff_paths(
@@ -188,7 +194,7 @@ pub(crate) fn commit_diff_paths(
     let mut command = Command::new("git");
     command.arg("-C").arg(repo_root).args([
         "diff",
-        "--name-status",
+        "--raw",
         "-z",
         "--no-renames",
         from_commit,
@@ -209,6 +215,7 @@ pub(crate) fn commit_diff_paths(
         added: Vec::new(),
         modified: Vec::new(),
         deleted: Vec::new(),
+        non_regular_targets: Default::default(),
     };
     while let Some(status) = fields.next().filter(|field| !field.is_empty()) {
         let path = fields
@@ -221,7 +228,16 @@ pub(crate) fn commit_diff_paths(
                 ))
             })?;
         let path = String::from_utf8_lossy(path).into_owned();
-        match status.first().copied() {
+        let header = status.split(|byte| *byte == b' ').collect::<Vec<_>>();
+        if header.len() != 5 || !header[0].starts_with(b":") {
+            return Err(AppError::InvalidIndex(
+                "git diff returned an invalid raw header".into(),
+            ));
+        }
+        if !matches!(header[1], b"100644" | b"100755" | b"000000") {
+            diff.non_regular_targets.insert(path.clone());
+        }
+        match header[4].first().copied() {
             Some(b'A') => diff.added.push(path),
             Some(b'D') => diff.deleted.push(path),
             Some(b'M' | b'T') => diff.modified.push(path),
@@ -290,40 +306,6 @@ pub(crate) fn head_tracked_entries(
     Ok(entries)
 }
 
-pub(crate) fn dirty_tracked_paths(
-    repo_root: &Path,
-    should_cancel: &mut impl FnMut() -> bool,
-) -> Result<HashSet<String>> {
-    let output = run_git_command(
-        repo_root,
-        [
-            "status",
-            "--porcelain=v1",
-            "--untracked-files=no",
-            "--",
-            ".",
-        ],
-        should_cancel,
-    )?;
-    if !output.status.success() {
-        return Err(AppError::InvalidIndex(format!(
-            "failed to inspect tracked git worktree state for {}",
-            repo_root.display()
-        )));
-    }
-
-    let mut paths = HashSet::new();
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    for line in stdout.lines() {
-        let Some(path) = line.get(3..) else {
-            continue;
-        };
-        let logical_path = path.split(" -> ").next().unwrap_or(path).to_string();
-        paths.insert(logical_path);
-    }
-    Ok(paths)
-}
-
 impl GitBlobReader {
     pub(crate) fn new(repo_root: &Path) -> Result<Self> {
         Ok(Self {
@@ -333,7 +315,10 @@ impl GitBlobReader {
     }
 
     pub(crate) fn read_blob(&self, head_commit: &str, logical_path: &str) -> Result<Vec<u8>> {
-        let spec = format!("{head_commit}:{logical_path}");
+        self.read_object(&format!("{head_commit}:{logical_path}"))
+    }
+
+    pub(crate) fn read_object(&self, spec: &str) -> Result<Vec<u8>> {
         let mut state = self
             .state
             .lock()
@@ -499,6 +484,10 @@ mod git_blob_reader_pool_tests {
 pub(crate) fn build_config_fingerprint(config: &BuildConfig) -> String {
     let mut hasher = Hasher::new();
     hasher.update(SEARCH_INDEX_FINGERPRINT_VERSION.as_bytes());
+    if config.git_mode == crate::config::GitMode::Filesystem {
+        hasher.update(b"filesystem-workspace-v1");
+    }
+
     hasher.update(config.tokenizer.as_str().as_bytes());
     hasher.update(config.corpus_mode.as_str().as_bytes());
     hasher.update(&[u8::from(config.include_hidden)]);
@@ -521,7 +510,11 @@ fn run_git_command<const N: usize>(
     should_cancel: &mut impl FnMut() -> bool,
 ) -> Result<Output> {
     let mut command = Command::new("git");
-    command.arg("-C").arg(repo_root).args(args);
+    command
+        .env("GIT_OPTIONAL_LOCKS", "0")
+        .arg("-C")
+        .arg(repo_root)
+        .args(args);
     run_command_with_cancellation(&mut command, should_cancel)
 }
 
@@ -742,6 +735,7 @@ mod commit_diff_tests {
 
         let diff =
             commit_diff_paths(repo, &from, &to, &mut || false).expect("commit diff should succeed");
+        assert_eq!(diff.non_regular_targets, HashSet::from(["type.txt".into()]));
         assert_eq!(
             diff.added.into_iter().collect::<HashSet<_>>(),
             HashSet::from(["added.txt".into(), "rename-new.txt".into()])

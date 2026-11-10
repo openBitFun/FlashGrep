@@ -75,6 +75,7 @@ fn main() -> Result<()> {
     let max_file_size = read_env_u64("FLASHGREP_PROFILE_MAX_FILE_SIZE", DEFAULT_MAX_FILE_SIZE);
 
     let build_config = BuildConfig {
+        git_mode: Default::default(),
         repo_path: repo_path.clone(),
         storage_root: storage_root.clone(),
         tokenizer: TokenizerMode::SparseNgram,

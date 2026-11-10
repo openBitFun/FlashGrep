@@ -17,12 +17,12 @@ use crate::daemon::{
         convert_compact_line_match_results, convert_grouped_line_match_results,
         convert_query_backend, convert_repo_status, convert_search_results, convert_task_status,
     },
-    git_workspace::resolve_repo_config,
     protocol::{
         ClientCapabilities, EnsureRepoParams, ErrorResponse, QuerySpec, Request, RequestEnvelope,
         Response, SearchProtocolCapabilities, ServerCapabilities, ServerInfo,
     },
     repo::{GlobRequest, OpenRepoRequest, RepoManager, RepoRefreshPolicy, SearchRequest},
+    workspace_location::resolve_repo_config,
 };
 
 impl DaemonService {
@@ -129,9 +129,7 @@ impl DaemonService {
                             .base_delta_max_delete_segments,
                         base_delta_max_bytes_ratio: params.refresh.base_delta_max_bytes_ratio,
                         base_head_cache_entries: params.refresh.base_head_cache_entries,
-                        overlay_auto_checkpoint_max_uncommitted_ops: params
-                            .refresh
-                            .overlay_auto_checkpoint_max_uncommitted_ops,
+
                         overlay_merge_min_delay_ms: params.refresh.overlay_merge_min_delay_ms,
                         overlay_merge_retry_delay_ms: params.refresh.overlay_merge_retry_delay_ms,
                     },
@@ -185,8 +183,9 @@ impl DaemonService {
                 ))
             }
             Request::Search { params } => {
-                let (query, scope, repo_id) = convert_search_params(params)?;
+                let (query, scope, repo_id, freshness) = convert_search_params(params)?;
                 let response = self.repos.search(SearchRequest {
+                    freshness,
                     repo_id,
                     query,
                     path_filter_args: scope,
@@ -203,10 +202,11 @@ impl DaemonService {
                 ))
             }
             Request::SearchGroupedLineMatches { params } => {
-                let (mut query, scope, repo_id) = convert_search_params(params)?;
+                let (mut query, scope, repo_id, freshness) = convert_search_params(params)?;
                 query.search_mode = SearchMode::LineMatches;
                 let global_limit = query.effective_global_max_results();
                 let response = self.repos.search(SearchRequest {
+                    freshness,
                     repo_id,
                     query,
                     path_filter_args: scope,
@@ -223,10 +223,11 @@ impl DaemonService {
                 ))
             }
             Request::SearchLineMatchesCompact { params } => {
-                let (mut query, scope, repo_id) = convert_search_params(params)?;
+                let (mut query, scope, repo_id, freshness) = convert_search_params(params)?;
                 query.search_mode = SearchMode::LineMatches;
                 let global_limit = query.effective_global_max_results();
                 let response = self.repos.search(SearchRequest {
+                    freshness,
                     repo_id,
                     query,
                     path_filter_args: scope,
@@ -290,9 +291,7 @@ impl DaemonService {
                 base_delta_max_delete_segments: params.refresh.base_delta_max_delete_segments,
                 base_delta_max_bytes_ratio: params.refresh.base_delta_max_bytes_ratio,
                 base_head_cache_entries: params.refresh.base_head_cache_entries,
-                overlay_auto_checkpoint_max_uncommitted_ops: params
-                    .refresh
-                    .overlay_auto_checkpoint_max_uncommitted_ops,
+
                 overlay_merge_min_delay_ms: params.refresh.overlay_merge_min_delay_ms,
                 overlay_merge_retry_delay_ms: params.refresh.overlay_merge_retry_delay_ms,
             },
@@ -386,7 +385,13 @@ fn convert_query_spec(query: QuerySpec) -> Result<QueryConfig> {
 
 fn convert_search_params(
     params: super::super::protocol::SearchParams,
-) -> Result<(QueryConfig, PathFilterArgs, String)> {
+) -> Result<(
+    QueryConfig,
+    PathFilterArgs,
+    String,
+    crate::config::QueryFreshness,
+)> {
+    let freshness = params.query.freshness;
     let query = convert_query_spec(params.query)?;
     let scope = PathFilterArgs {
         roots: normalize_scope_roots(params.scope.roots),
@@ -397,7 +402,7 @@ fn convert_search_params(
         types: params.scope.types,
         type_not: params.scope.type_not,
     };
-    Ok((query, scope, params.repo_id))
+    Ok((query, scope, params.repo_id, freshness))
 }
 
 fn normalize_scope_roots(roots: Vec<PathBuf>) -> Vec<PathBuf> {

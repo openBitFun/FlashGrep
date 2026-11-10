@@ -14,7 +14,7 @@ use crate::{error::Result, fs_atomic::replace_file, worktree_diff::DirtyPathKind
 
 use super::{DirtyPathSet, DirtyStats, RepoRuntime};
 
-const DIRTY_CATALOG_VERSION: u32 = 2;
+const DIRTY_CATALOG_VERSION: u32 = 3;
 const LEGACY_DIRTY_CATALOG_VERSION: u32 = 1;
 const DIRTY_CATALOG_PERSIST_RETRY_ATTEMPTS: usize = 20;
 const DIRTY_CATALOG_PERSIST_RETRY_DELAY_MS: u64 = 50;
@@ -33,6 +33,8 @@ pub(super) struct ObservedFileVersion {
     exists: bool,
     size: Option<u64>,
     modified_at_nanos: Option<u64>,
+    #[serde(default)]
+    identity: Option<super::observations::FileStamp>,
 }
 
 #[derive(Debug, Clone)]
@@ -74,6 +76,7 @@ struct CompactDirtyCatalogFileEntry(
     Option<u64>,
     DirtyCatalogState,
     Option<u64>,
+    #[serde(default)] Option<super::observations::FileStamp>,
 );
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -99,7 +102,7 @@ impl DirtyCatalog {
         };
         if !matches!(
             parsed.version,
-            DIRTY_CATALOG_VERSION | LEGACY_DIRTY_CATALOG_VERSION
+            DIRTY_CATALOG_VERSION | 2 | LEGACY_DIRTY_CATALOG_VERSION
         ) {
             quarantine_corrupt_catalog(path)?;
             return Ok(Self::default());
@@ -116,6 +119,7 @@ impl DirtyCatalog {
                     modified_at_nanos,
                     state,
                     last_attempt_at_ms,
+                    identity,
                 )) => (
                     path,
                     kind,
@@ -123,6 +127,7 @@ impl DirtyCatalog {
                         exists,
                         size,
                         modified_at_nanos,
+                        identity,
                     },
                     state,
                     last_attempt_at_ms,
@@ -175,6 +180,7 @@ impl DirtyCatalog {
                         entry.observed_version.modified_at_nanos,
                         entry.state,
                         entry.last_attempt_at.and_then(system_time_millis),
+                        entry.observed_version.identity,
                     ))
                 })
                 .collect(),
@@ -414,13 +420,35 @@ impl RepoRuntime {
         catalog.reconcile_with_dirty_set(dirty)
     }
 
+    pub(super) fn invalidate_observed_dirty_paths(&self, paths: &DirtyPathSet) {
+        let mut catalog = self
+            .dirty_catalog
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut changed = false;
+        for path in paths.all_paths() {
+            if let Some(entry) = catalog.entries.get_mut(path) {
+                if entry.state == DirtyCatalogState::ReadyOverlay {
+                    entry.state = DirtyCatalogState::Dirty;
+                    changed = true;
+                }
+            }
+        }
+        if changed {
+            catalog.generation = catalog.generation.saturating_add(1);
+        }
+    }
+
     pub(super) fn persist_dirty_catalog(&self) -> Result<()> {
         let path = dirty_catalog_path(&self.build_config.storage_root);
         let catalog = match self.dirty_catalog.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
         };
-        catalog.persist(&path)
+        let result = catalog.persist(&path);
+        self.dirty_catalog_persist_pending
+            .store(result.is_err(), std::sync::atomic::Ordering::Release);
+        result
     }
 
     pub(super) fn mark_dirty_catalog_building(&self, paths: &DirtyPathSet, generation: u64) {
@@ -430,7 +458,7 @@ impl RepoRuntime {
         };
         catalog.mark_building(paths, generation);
         // The previous durable catalog remains the recovery baseline. Keeping the building
-        // transition in memory avoids a full-catalog write on every success; startup Git
+        // transition in memory avoids a full-catalog write on every success; startup filesystem
         // reconciliation rediscovers any newer worktree state after a crash.
     }
 
@@ -537,6 +565,7 @@ fn observe_file_version(path: &str) -> Result<ObservedFileVersion> {
     match fs::metadata(path) {
         Ok(metadata) => Ok(ObservedFileVersion {
             exists: true,
+            identity: super::observations::FileStamp::from_metadata(&metadata),
             size: Some(metadata.len()),
             modified_at_nanos: metadata
                 .modified()
@@ -546,6 +575,7 @@ fn observe_file_version(path: &str) -> Result<ObservedFileVersion> {
         }),
         Err(error) if error.kind() == ErrorKind::NotFound => Ok(ObservedFileVersion {
             exists: false,
+            identity: None,
             size: None,
             modified_at_nanos: None,
         }),
@@ -626,6 +656,43 @@ mod tests {
         assert!(!catalog
             .matches_ready_versions(&dirty)
             .expect("validate changed file"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn restored_mtime_invalidates_ready_overlay_and_legacy_catalog_versions() {
+        let temp = tempdir().unwrap();
+        let file = temp.path().join("file.txt");
+        fs::write(&file, "before\n").unwrap();
+        let modified = fs::metadata(&file).unwrap().modified().unwrap();
+        let dirty = DirtyPathSet {
+            modified: HashSet::from([file.to_string_lossy().into_owned()]),
+            ..DirtyPathSet::default()
+        };
+        let mut catalog = DirtyCatalog::default();
+        catalog.reconcile_with_dirty_set(&dirty).unwrap();
+        catalog.mark_ready(&dirty, catalog.generation);
+        let stored = temp.path().join("catalog.json");
+        catalog.persist(&stored).unwrap();
+        let mut wire: serde_json::Value =
+            serde_json::from_slice(&fs::read(&stored).unwrap()).unwrap();
+        wire["version"] = 2.into();
+        wire["entries"][0].as_array_mut().unwrap().pop();
+        fs::write(&stored, serde_json::to_vec(&wire).unwrap()).unwrap();
+        let legacy = DirtyCatalog::load(&stored).unwrap();
+        assert_eq!(legacy.entries.len(), 1);
+        assert!(!legacy.matches_ready_versions(&dirty).unwrap());
+        fs::write(&file, "after!\n").unwrap();
+        fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(fs::FileTimes::new().set_modified(modified))
+            .unwrap();
+        assert!(!catalog.matches_ready_versions(&dirty).unwrap());
+        let generation = catalog.generation;
+        assert!(catalog.reconcile_with_dirty_set(&dirty).unwrap() > generation);
+        assert!(!catalog.matches_ready_versions(&dirty).unwrap());
     }
 
     #[test]

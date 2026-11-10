@@ -188,11 +188,21 @@ impl WorkspaceBaseSnapshotIndex {
         let segment_store =
             FileSegmentStore::open(&index_root, PostingTokenizerConfig::from(build_config))?;
         let delete_store = FileDeleteStore::open(&index_root)?;
-        let pinned = Self::cached_manifest_ids(build_config)
+        let mut pinned = Self::cached_manifest_ids(build_config)
             .into_iter()
             .collect::<BTreeSet<_>>();
+        let readers =
+            crate::index_engine::reader::state::SharedSnapshotState::for_index_root(&index_root)?;
+        let _reclamation = readers.protect_reclamation();
+        pinned.extend(readers.pinned_manifest_ids());
+        let reader_manifests = readers.pinned_manifests();
         let reclaimer = Reclaimer::default();
-        let candidates = reclaimer.plan_with_pins(&index_root, &manifest_store, &pinned)?;
+        let candidates = reclaimer.plan_with_reader_pins(
+            &index_root,
+            &manifest_store,
+            &pinned,
+            &reader_manifests,
+        )?;
         reclaimer.execute(&candidates, &manifest_store, &segment_store, &delete_store)?;
         Ok(candidates.len())
     }

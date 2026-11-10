@@ -37,23 +37,35 @@ impl MergePolicy for TieredMergePolicy {
             else {
                 return Vec::new();
             };
-            let source_segments = manifest
-                .active_segments
-                .iter()
-                .filter(|segment| segment.max_seq_no <= max_delete_seq_no)
-                .map(|segment| segment.id.clone())
-                .collect::<Vec<_>>();
-            if source_segments.is_empty() {
-                return Vec::new();
+            let mut source_segments = Vec::new();
+            let mut source_bytes = 0u64;
+            for segment in manifest.active_segments.iter().filter(|segment| {
+                segment.max_seq_no <= max_delete_seq_no
+                    && segment.applied_delete_seq_no < max_delete_seq_no
+            }) {
+                let bytes = segment.size_bytes.max(self.config.floor_segment_bytes);
+                // One legacy oversized segment must still make progress. New
+                // segments are bounded by the ingest/merge source budgets.
+                if !source_segments.is_empty()
+                    && source_bytes.saturating_add(bytes) > self.config.max_merged_segment_bytes
+                {
+                    break;
+                }
+                source_bytes = source_bytes.saturating_add(bytes);
+                source_segments.push(segment.id.clone());
             }
-            return vec![MergeTask {
-                source_segments,
-                source_delete_segments: manifest
-                    .active_delete_segments
-                    .iter()
-                    .map(|segment| segment.id.clone())
-                    .collect(),
-            }];
+            if !source_segments.is_empty() || stats.delete_segment_count > 1 {
+                return vec![MergeTask {
+                    source_segments,
+                    source_delete_segments: manifest
+                        .active_delete_segments
+                        .iter()
+                        .map(|segment| segment.id.clone())
+                        .collect(),
+                }];
+            }
+            // A single retained overlay mask is already compact. It must not
+            // retrigger the same merge or prevent ordinary tiered merging.
         }
 
         if stats.segment_count <= self.config.max_segments {
@@ -61,10 +73,14 @@ impl MergePolicy for TieredMergePolicy {
         }
 
         let mut candidates = manifest.active_segments.to_vec();
-        candidates.sort_by(|left, right| {
-            left.max_seq_no
-                .cmp(&right.max_seq_no)
-                .then_with(|| left.min_seq_no.cmp(&right.min_seq_no))
+        // Merge smaller segments first. A budget-sized old segment must not
+        // prevent later small segments from being compacted indefinitely.
+        candidates.sort_by_key(|segment| {
+            (
+                segment.size_bytes.max(self.config.floor_segment_bytes),
+                segment.max_seq_no,
+                segment.min_seq_no,
+            )
         });
 
         let target_count = stats
@@ -204,6 +220,97 @@ mod tests {
     use crate::index_engine::{manifest::SegmentRef, ManifestId, RepoId, SegmentId};
 
     #[test]
+    fn deletion_merges_respect_source_budget_and_advance_past_applied_segments() {
+        use crate::index_engine::{manifest::DeleteSegmentRef, DeleteSegmentId};
+        let policy = TieredMergePolicy::new(MergePolicyConfig {
+            floor_segment_bytes: 1,
+            max_merged_segment_bytes: 100,
+            ..MergePolicyConfig::default()
+        });
+        let mut manifest = Manifest {
+            active_segments: (0..5)
+                .map(|i| SegmentRef {
+                    applied_delete_seq_no: 0,
+                    id: SegmentId(format!("segment-{i}")),
+                    min_seq_no: i + 1,
+                    max_seq_no: i + 1,
+                    doc_count: 1,
+                    size_bytes: 40,
+                })
+                .collect(),
+            active_delete_segments: vec![DeleteSegmentRef {
+                id: DeleteSegmentId("delete".into()),
+                min_seq_no: 6,
+                max_seq_no: 6,
+                delete_count: 1,
+                size_bytes: 1,
+            }],
+            ..Manifest::default()
+        };
+        let stats = MergeStats {
+            segment_count: 5,
+            delete_segment_count: 1,
+        };
+        for expected_count in [2, 2, 1] {
+            let tasks = policy.pick_merges(&manifest, &stats);
+            assert_eq!(tasks.len(), 1);
+            assert_eq!(tasks[0].source_segments.len(), expected_count);
+            for segment in &mut manifest.active_segments {
+                if tasks[0].source_segments.contains(&segment.id) {
+                    segment.applied_delete_seq_no = 6;
+                }
+            }
+        }
+        assert!(policy.pick_merges(&manifest, &stats).is_empty());
+        manifest.active_segments[0].size_bytes = 1000;
+        manifest.active_segments[0].applied_delete_seq_no = 0;
+        assert_eq!(
+            policy.pick_merges(&manifest, &stats)[0]
+                .source_segments
+                .len(),
+            1,
+            "a single legacy oversized segment must not be starved"
+        );
+    }
+
+    #[test]
+    fn full_sized_old_segment_does_not_starve_small_segment_merges() {
+        let policy = TieredMergePolicy::new(MergePolicyConfig {
+            max_segments: 2,
+            floor_segment_bytes: 1,
+            max_merged_segment_bytes: 100,
+            ..MergePolicyConfig::default()
+        });
+        let manifest = Manifest {
+            active_segments: [100, 20, 20, 20]
+                .into_iter()
+                .enumerate()
+                .map(|(i, bytes)| SegmentRef {
+                    applied_delete_seq_no: 0,
+                    id: SegmentId(format!("segment-{i}")),
+                    min_seq_no: i as u64 + 1,
+                    max_seq_no: i as u64 + 1,
+                    doc_count: 1,
+                    size_bytes: bytes,
+                })
+                .collect(),
+            ..Manifest::default()
+        };
+        let tasks = policy.pick_merges(
+            &manifest,
+            &MergeStats {
+                segment_count: 4,
+                delete_segment_count: 0,
+            },
+        );
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].source_segments.len(), 3);
+        assert!(!tasks[0]
+            .source_segments
+            .contains(&SegmentId("segment-0".into())));
+    }
+
+    #[test]
     fn base_delta_policy_never_selects_foundation_segments() {
         let foundation = SegmentId("foundation".into());
         let mut manifest = Manifest {
@@ -228,6 +335,7 @@ mod tests {
         .into_iter()
         .enumerate()
         .map(|(index, id)| SegmentRef {
+            applied_delete_seq_no: 0,
             id,
             min_seq_no: index as u64,
             max_seq_no: index as u64,
@@ -262,6 +370,7 @@ mod tests {
                 delta_bytes: 1,
             }),
             active_segments: vec![SegmentRef {
+                applied_delete_seq_no: 0,
                 id: delta,
                 min_seq_no: 1,
                 max_seq_no: 1,

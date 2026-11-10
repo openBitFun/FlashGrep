@@ -26,22 +26,44 @@ const POSTINGS_FILE: &str = "postings.bin";
 pub trait SegmentStore: Send + Sync {
     fn write_segment(&self, build: SegmentBuildOutput) -> Result<SegmentMeta>;
     fn open_segment(&self, id: SegmentId) -> Result<SegmentReaderHandle>;
+    /// Ensure this immutable artifact is on disk before publishing a durable manifest.
+    fn persist_segment(&self, _id: &SegmentId) -> Result<()> {
+        Ok(())
+    }
     fn remove_segment(&self, id: SegmentId) -> Result<()>;
 }
 
 #[derive(Default)]
 pub struct MemorySegmentStore {
-    segments: RwLock<HashMap<SegmentId, SegmentMeta>>,
+    segments: RwLock<HashMap<SegmentId, SegmentReaderHandle>>,
+    tokenizer: PostingTokenizerConfig,
+}
+
+impl MemorySegmentStore {
+    pub(crate) fn new(tokenizer: PostingTokenizerConfig) -> Self {
+        Self {
+            segments: RwLock::default(),
+            tokenizer,
+        }
+    }
 }
 
 impl SegmentStore for MemorySegmentStore {
     fn write_segment(&self, build: SegmentBuildOutput) -> Result<SegmentMeta> {
-        let mut guard = self
-            .segments
+        // Tokenization is independent of existing readers. Acquire the store lock
+        // only to publish the completed immutable segment.
+        let postings = build_posting_lists(&build.documents, &self.tokenizer);
+        let meta = build.meta.clone();
+        let reader = Arc::new(MemorySegmentReader::new(
+            build.meta,
+            build.documents,
+            PostingLists::from_eager(postings),
+        ));
+        self.segments
             .write()
-            .unwrap_or_else(std::sync::PoisonError::into_inner);
-        guard.insert(build.meta.segment_id.clone(), build.meta.clone());
-        Ok(build.meta)
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(meta.segment_id.clone(), reader);
+        Ok(meta)
     }
 
     fn open_segment(&self, id: SegmentId) -> Result<SegmentReaderHandle> {
@@ -49,14 +71,9 @@ impl SegmentStore for MemorySegmentStore {
             .segments
             .read()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let meta = guard.get(&id).cloned().ok_or_else(|| {
+        guard.get(&id).cloned().ok_or_else(|| {
             crate::AppError::Protocol(format!("unknown in-memory segment: {}", id.0))
-        })?;
-        Ok(std::sync::Arc::new(MemorySegmentReader::new(
-            meta,
-            Vec::new(),
-            Default::default(),
-        )))
+        })
     }
 
     fn remove_segment(&self, id: SegmentId) -> Result<()> {
@@ -76,6 +93,7 @@ pub struct FileSegmentStore {
     base_head_commit: Option<String>,
     git_blob_reader_pool: Option<Arc<GitBlobReaderPool>>,
     cache: RwLock<HashMap<SegmentId, SegmentReaderHandle>>,
+    query_source_budget: Option<Arc<super::source_cache::SourceCacheBudget>>,
 }
 
 impl FileSegmentStore {
@@ -102,7 +120,28 @@ impl FileSegmentStore {
             base_head_commit,
             git_blob_reader_pool,
             cache: RwLock::new(HashMap::new()),
+            query_source_budget: None,
         })
+    }
+
+    pub(crate) fn with_query_source_cache_bytes(mut self, bytes: usize) -> Self {
+        self.query_source_budget =
+            (bytes > 0).then(|| Arc::new(super::source_cache::SourceCacheBudget::new(bytes)));
+        self
+    }
+
+    pub(super) fn write_prepared<V: AsRef<[u32]>>(
+        &self,
+        build: &SegmentBuildOutput,
+        postings: &HashMap<u64, V>,
+    ) -> Result<SegmentMeta> {
+        let dir = self.segment_dir(&build.meta.segment_id);
+        fs::create_dir_all(&dir)?;
+        write_segment_documents(&dir, &build.documents)?;
+        write_term_dict_file(&dir.join(TERM_DICT_FILE), postings)?;
+        write_postings_file(&dir.join(POSTINGS_FILE), postings)?;
+        write_segment_meta(&dir.join(SEGMENT_META_FILE), &build.meta)?;
+        Ok(build.meta.clone())
     }
 
     fn segment_dir(&self, id: &SegmentId) -> PathBuf {
@@ -112,16 +151,8 @@ impl FileSegmentStore {
 
 impl SegmentStore for FileSegmentStore {
     fn write_segment(&self, build: SegmentBuildOutput) -> Result<SegmentMeta> {
-        let segment_dir = self.segment_dir(&build.meta.segment_id);
-        fs::create_dir_all(&segment_dir)?;
-
-        write_segment_meta(&segment_dir.join(SEGMENT_META_FILE), &build.meta)?;
-        write_segment_documents(&segment_dir, &build.documents)?;
-        let posting_lists = build_posting_lists(&build.documents, &self.tokenizer);
-        write_term_dict_file(&segment_dir.join(TERM_DICT_FILE), &posting_lists)?;
-        write_postings_file(&segment_dir.join(POSTINGS_FILE), &posting_lists)?;
-
-        Ok(build.meta)
+        let postings = build_posting_lists(&build.documents, &self.tokenizer);
+        self.write_prepared(&build, &postings)
     }
 
     fn open_segment(&self, id: SegmentId) -> Result<SegmentReaderHandle> {
@@ -148,14 +179,17 @@ impl SegmentStore for FileSegmentStore {
         let posting_lists = PostingLists::open_lazy(term_dict, &segment_dir.join(POSTINGS_FILE))?;
         let postings_elapsed = postings_started.elapsed();
         let reader_started = Instant::now();
-        let reader = std::sync::Arc::new(FileSegmentReader::new(
-            meta,
-            doc_table,
-            posting_lists,
-            self.repo_root.clone(),
-            self.base_head_commit.clone(),
-            self.git_blob_reader_pool.clone(),
-        ));
+        let reader = std::sync::Arc::new(
+            FileSegmentReader::new(
+                meta,
+                doc_table,
+                posting_lists,
+                self.repo_root.clone(),
+                self.base_head_commit.clone(),
+                self.git_blob_reader_pool.clone(),
+            )
+            .with_query_source_budget(self.query_source_budget.clone()),
+        );
         let reader_elapsed = reader_started.elapsed();
         if profile_open {
             eprintln!(
@@ -205,6 +239,77 @@ mod tests {
             },
             documents: Vec::new(),
         }
+    }
+
+    fn payload_segment(id: &str, payload: &[u8]) -> SegmentBuildOutput {
+        let mut build = empty_segment(id);
+        build.meta.doc_count = 1;
+        build.meta.live_doc_count = 1;
+        build
+            .documents
+            .push(crate::index_engine::writer::IndexDocument {
+                key: crate::index_engine::DocKey {
+                    repo_id: crate::index_engine::RepoId("repo".into()),
+                    logical_path: format!("{id}.txt"),
+                },
+                repo_id: crate::index_engine::RepoId("repo".into()),
+                logical_path: format!("{id}.txt"),
+                file_name: format!("{id}.txt"),
+                language: None,
+                size: payload.len() as u64,
+                modified_at: 0,
+                content_hash: [0; 32],
+                source_bytes: Arc::from(payload),
+            });
+        build
+    }
+
+    fn source_bytes(reader: &SegmentReaderHandle) -> Arc<[u8]> {
+        match reader.verify_source(0).unwrap() {
+            super::super::reader::SegmentVerifySource::Bytes(bytes) => bytes,
+            _ => panic!("expected immutable bytes"),
+        }
+    }
+
+    #[test]
+    fn query_cache_budget_is_shared_and_released_after_last_reader() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileSegmentStore::open(temp.path(), PostingTokenizerConfig::default())
+            .unwrap()
+            .with_query_source_cache_bytes(4);
+        store.write_segment(payload_segment("a", b"aaaa")).unwrap();
+        store.write_segment(payload_segment("b", b"bbbb")).unwrap();
+        let a = store.open_segment(SegmentId("a".into())).unwrap();
+        let b = store.open_segment(SegmentId("b".into())).unwrap();
+        let budget = store.query_source_budget.as_ref().unwrap();
+        assert!(Arc::ptr_eq(&source_bytes(&a), &source_bytes(&a)));
+        assert_eq!(budget.used(), 4);
+        assert!(!Arc::ptr_eq(&source_bytes(&b), &source_bytes(&b)));
+        assert_eq!(budget.used(), 4);
+        // Removing a store's cache reference must not invalidate an in-flight reader.
+        store.remove_segment(SegmentId("a".into())).unwrap();
+        assert_eq!(budget.used(), 4);
+        assert_eq!(&*source_bytes(&a), b"aaaa");
+        drop(a);
+        assert_eq!(budget.used(), 0);
+        assert!(Arc::ptr_eq(&source_bytes(&b), &source_bytes(&b)));
+        assert_eq!(budget.used(), 4);
+    }
+
+    #[test]
+    fn base_source_verification_does_not_retain_decoded_payloads() {
+        let temp = tempfile::tempdir().unwrap();
+        let store = FileSegmentStore::open(temp.path(), PostingTokenizerConfig::default()).unwrap();
+        let payload = b"immutable payload\n".repeat(1000);
+        store
+            .write_segment(payload_segment("base", &payload))
+            .unwrap();
+        let reader = store.open_segment(SegmentId("base".into())).unwrap();
+        let first = source_bytes(&reader);
+        let second = source_bytes(&reader);
+        assert_eq!(&*first, payload.as_slice());
+        assert_eq!(&*second, payload.as_slice());
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     #[test]

@@ -74,6 +74,7 @@ pub(super) fn prepare_dirty_worktree_fixture(
     }
     let storage_root = fixture_root.join("index");
     let build_config = BuildConfig {
+        git_mode: Default::default(),
         repo_path: repo_path.clone(),
         storage_root: storage_root.clone(),
         tokenizer: config.tokenizer,

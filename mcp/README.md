@@ -16,7 +16,7 @@
 下文使用以下占位符：
 
 - `<FLASHGREP_MCP_DIR>`：本目录解压后的实际路径
-- `<REPO>`：需要搜索的 Git worktree 或其子目录
+- `<REPO>`：需要搜索的普通目录、Git worktree 或其子目录
 
 示例：
 
@@ -46,7 +46,7 @@
 }
 ```
 
-MCP 会自动发现当前目录所属的 Git worktree 根目录并复用根索引；如果当前目录是 monorepo 子目录，默认搜索范围仍限制在该子目录。
+普通目录直接作为工作区；Git 模式下，MCP 会自动发现当前目录所属的 Git worktree 根目录并复用根索引；如果当前目录是 monorepo 子目录，默认搜索范围仍限制在该子目录。
 
 #### 固定搜索某个仓库
 
@@ -118,9 +118,13 @@ args = ["<FLASHGREP_MCP_DIR>/server.js"]
 
 ## 可选参数
 
+### `--no-git`
+
+使用文件系统索引，保留指定目录作为工作区根，不使用 Git 提交快照或已跟踪文件清单。普通目录无需此参数也能工作；在 Git 子目录中需要独立索引时可显式启用。忽略规则仍会应用。该参数会传递到 managed daemon 的打开配置。
+
 ### `--repo <REPO>`
 
-指定当前工作目录或需要搜索的子目录。MCP 会自动发现其 Git worktree 根目录作为索引根。
+指定当前工作目录或需要搜索的子目录。默认模式下，Git 子目录会复用所属 worktree 的根索引；普通目录直接作为索引根。
 
 
 ### `--storage-root <DIR>`
@@ -166,7 +170,7 @@ args = ["<FLASHGREP_MCP_DIR>/server.js"]
 
 索引尚未建立或正在构建时，搜索会立即使用过渡后端返回结果，不会等待索引完成。响应中的 `backend` 字段会说明本次使用的是索引还是过渡搜索。
 
-同一 Git worktree 中启动的多个 MCP session 会连接同一个 managed daemon，共享索引 reader、后台构建任务和 workspace watcher。搜索请求可以并发执行；过渡 `rg` 搜索达到 `global_max_results` 后会主动结束子进程，避免高频匹配在大型仓库中持续占用 CPU 和内存。
+同一工作区启动的多个 MCP session 会连接同一个 managed daemon，共享索引 reader、后台构建任务和 workspace watcher。搜索请求可以并发执行；过渡 `rg` 搜索达到 `global_max_results` 后会主动结束子进程，避免高频匹配在大型仓库中持续占用 CPU 和内存。
 
 分支切换时，兼容 base 会保持可读。新 HEAD overlay 发布前，本次搜索使用有界 transition
 backend 读取当前 worktree；overlay 发布后立即恢复 indexed workspace view，base 再在后台按
@@ -280,7 +284,7 @@ Agent 会先调用 `refresh_repo`，再继续执行后续搜索。
 
 ### MCP 已连接成功，但搜索的是错误仓库
 
-通常是 MCP Server 启动目录不属于目标 Git worktree。
+通常是 MCP Server 启动目录不是期望搜索的工作区。
 可以在 MCP 配置中显式添加 `--repo` 参数：
 
 ```json
@@ -319,7 +323,7 @@ Agent 会先调用 `refresh_repo`，再继续执行后续搜索。
 - 优先使用 flashgrep MCP 进行仓库发现、文件枚举和代码搜索
 - 直接使用 `search_code` 和 `glob_files`，不要把 `repo_status` 或 `build_index` 作为搜索前置步骤
 - 不等待索引构建完成；索引过渡状态由 MCP 自动处理
-- 仅在 flashgrep MCP 调用失败、当前目录不是受支持的 Git worktree 或仓库处于 degraded 状态时使用 Agent 内建搜索
+- 仅在 flashgrep MCP 调用失败、当前目录无法打开 或仓库处于 degraded 状态时使用 Agent 内建搜索
 
 该 skill 适用于支持 skill、instruction 或规则配置的 Agent 环境。
 在这类环境中，可以将以下目录安装或复制到对应的本地 skill 目录：
@@ -346,3 +350,8 @@ CI 会先构建六个平台的 release 二进制，再运行：
 ```
 
 生成的 `dist/flashgrep-mcp.zip` 就是完整对外分发包。不要再手工维护另一份 `server.js` 或 skill 副本。
+
+### 查询新鲜度
+
+`flashgrep_search` 可传 `freshness: "published" | "reconciled" | "filesystem"`。
+默认 `published` 使用已发布索引；`reconciled` 先核对并发布，错误会返回调用方，基础索引构建期间直接扫描；`filesystem` 始终扫描文件且不更新索引。后两种模式在大目录上更慢。并发编辑不会被视为一个原子文件系统快照。

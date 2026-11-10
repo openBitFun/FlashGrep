@@ -9,6 +9,7 @@ pub(super) fn build_sharded_base_snapshot(
     files: Vec<BaseSnapshotInputFile>,
     previous_snapshot: Option<&ReusableBaseSnapshotShards>,
     head_commit: Option<&str>,
+    snapshot_key: &str,
     on_progress: &mut impl FnMut(IndexProgress),
 ) -> Result<(usize, Vec<WorkspaceBaseSnapshotShardMetadata>)> {
     fs::create_dir_all(index_root)?;
@@ -157,22 +158,35 @@ pub(super) fn build_sharded_base_snapshot(
         Some(3),
     );
     let committed_seq_no = u64::from(!active_segments.is_empty());
-    let source = head_commit.map(|head_commit| ManifestSource::GitBase {
-        head_commit: head_commit.to_string(),
-        config_fingerprint: base_snapshot_config_fingerprint(build_config),
-        repo_root: canonical_repo_root(&build_config.repo_path),
-        document_count: doc_count,
-        parent_manifest_id: None,
-        foundation_segment_ids: active_segments
-            .iter()
-            .map(|segment| segment.id.clone())
-            .collect(),
-        delta_depth: 0,
-        delta_bytes: 0,
-    });
+    let source = head_commit
+        .map(|head_commit| ManifestSource::GitBase {
+            head_commit: head_commit.to_string(),
+            config_fingerprint: base_snapshot_config_fingerprint(build_config),
+            repo_root: canonical_repo_root(&build_config.repo_path),
+            document_count: doc_count,
+            parent_manifest_id: None,
+            foundation_segment_ids: active_segments
+                .iter()
+                .map(|segment| segment.id.clone())
+                .collect(),
+            delta_depth: 0,
+            delta_bytes: 0,
+        })
+        .or_else(|| {
+            Some(ManifestSource::FilesystemBase {
+                snapshot_key: snapshot_key.to_string(),
+                config_fingerprint: base_snapshot_config_fingerprint(build_config),
+                repo_root: canonical_repo_root(&build_config.repo_path),
+                document_count: doc_count,
+            })
+        });
     let manifest_store = FileManifestStore::open(index_root)?;
     manifest_store.publish(&Manifest {
-        manifest_id: ManifestId(BASE_SNAPSHOT_MANIFEST_ID.into()),
+        manifest_id: ManifestId(format!(
+            "manifest-base-{}-{}",
+            snapshot_key,
+            delta::next_candidate_nonce()
+        )),
         generation: 1,
         created_at_unix_ms: now_unix_ms(),
         committed_seq_no,
@@ -325,7 +339,7 @@ fn build_base_snapshot_segment(
     let mut source_bytes = 0u64;
     let git_blob_reader = files
         .iter()
-        .any(|file| matches!(file.source, BaseSnapshotFileSource::GitHeadBlob { .. }))
+        .any(|file| matches!(file.source, BaseSnapshotFileSource::GitObject { .. }))
         .then(|| GitBlobReader::new(repo_root))
         .transpose()?;
 

@@ -30,7 +30,6 @@ const PATH_MAP_MAGIC: &[u8; 8] = b"CGPATH01";
 const SOURCE_ENCODING_RAW: u8 = 0;
 const SOURCE_ENCODING_ZSTD: u8 = 1;
 const SOURCE_ZSTD_LEVEL: i32 = 3;
-const SOURCE_COMPRESSION_ENABLED: bool = false;
 const SOURCE_MIN_COMPRESS_BYTES: usize = 4 * 1024;
 const PATH_MAP_HEADER_LEN: usize = 16;
 const DOCS_HEADER_LEN: usize = 16;
@@ -181,11 +180,10 @@ pub(crate) fn write_segment_documents(dir: &Path, documents: &[IndexDocument]) -
         write_string(&mut path_map, &document.repo_id.0)?;
         write_string(&mut path_map, &document.logical_path)?;
 
-        let source_len = encoded_source_bytes_len(&document.source_bytes)?;
+        let source_len = write_source_bytes(&mut encoded_sources, &document.source_bytes)?;
         let source_len = u32::try_from(source_len).map_err(|_| {
             AppError::ValueOutOfRange("inline source length exceeds u32 range".into())
         })?;
-        write_source_bytes(&mut encoded_sources, &document.source_bytes)?;
 
         doc_records.push(DocRecord {
             path_index: path_index as u32,
@@ -372,7 +370,9 @@ impl FileSegmentDocTable {
         let docs_started = Instant::now();
         let docs_file = File::open(dir.join(DOCS_FILE))?;
         let docs_mmap = unsafe { Mmap::map(&docs_file)? };
-        advise_mmap_sequential(&docs_mmap);
+        // Metadata and selected source records are queried sparsely. Sequential
+        // readahead would pull unrelated embedded source pages into memory.
+        advise_mmap_random(&docs_mmap);
         if docs_mmap.len() < DOCS_HEADER_LEN {
             return Err(AppError::InvalidIndex(format!(
                 "docs file is truncated: expected at least {DOCS_HEADER_LEN} bytes, got {}",
@@ -605,7 +605,7 @@ fn write_optional_string(buffer: &mut Vec<u8>, value: Option<&str>) -> Result<()
     Ok(())
 }
 
-pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Result<()> {
+pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Result<u64> {
     let len = u32::try_from(value.len())
         .map_err(|_| AppError::ValueOutOfRange("byte slice length exceeds u32 range".into()))?;
     if let Some(compressed) = maybe_compress_source_bytes(value)? {
@@ -618,37 +618,17 @@ pub(crate) fn write_source_bytes(writer: &mut impl Write, value: &[u8]) -> Resul
             })?,
         )?;
         writer.write_all(&compressed)?;
-        return Ok(());
+        return Ok(9 + compressed.len() as u64);
     }
 
     writer.write_all(&[SOURCE_ENCODING_RAW])?;
     write_u32(writer, len)?;
     write_u32(writer, len)?;
     writer.write_all(value)?;
-    Ok(())
-}
-
-pub(crate) fn encoded_source_bytes_len(value: &[u8]) -> Result<u64> {
-    let payload_len = if let Some(compressed) = maybe_compress_source_bytes(value)? {
-        compressed.len()
-    } else {
-        value.len()
-    };
-    let total = 1usize
-        .checked_add(4)
-        .and_then(|len| len.checked_add(4))
-        .and_then(|len| len.checked_add(payload_len))
-        .ok_or_else(|| {
-            AppError::ValueOutOfRange("stored source length exceeds usize range".into())
-        })?;
-    u64::try_from(total)
-        .map_err(|_| AppError::ValueOutOfRange("stored source length exceeds u64 range".into()))
+    Ok(9 + u64::from(len))
 }
 
 fn maybe_compress_source_bytes(value: &[u8]) -> Result<Option<Vec<u8>>> {
-    if !SOURCE_COMPRESSION_ENABLED {
-        return Ok(None);
-    }
     if value.len() < SOURCE_MIN_COMPRESS_BYTES {
         return Ok(None);
     }

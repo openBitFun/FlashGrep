@@ -11,7 +11,7 @@ use crate::{
     config::BuildConfig,
     error::AppError,
     index_engine::{
-        config::{EngineConfig, PostingTokenizerConfig},
+        config::{EngineConfig, MergePolicyConfig, PostingTokenizerConfig},
         reader::IndexSnapshotReader,
         types::DocKey,
         writer::{IndexDocument, IndexEngine, IndexWriter, WriterStats},
@@ -56,6 +56,7 @@ pub(crate) struct WorkspaceOverlayIngestBatch {
     new_documents: Vec<IndexDocument>,
     deleted_keys: Vec<DocKey>,
     missing_keys: Vec<DocKey>,
+    retracted_keys: Vec<DocKey>,
 }
 
 impl WorkspaceOverlayIngestBatch {
@@ -70,6 +71,7 @@ impl WorkspaceOverlayIngestBatch {
         let modified_paths = sorted_paths(modified_paths.iter());
         let new_paths = sorted_paths(new_paths.iter());
         Ok(Self {
+            retracted_keys: Vec::new(),
             modified_documents: build_index_documents(
                 repo_id,
                 repo_root,
@@ -90,6 +92,17 @@ impl WorkspaceOverlayIngestBatch {
         })
     }
 
+    pub(crate) fn from_retracted_paths(
+        repo_id: &RepoId,
+        repo_root: &Path,
+        paths: &[String],
+    ) -> Result<Self> {
+        Ok(Self {
+            retracted_keys: build_delete_keys(repo_id, repo_root, paths)?,
+            ..Default::default()
+        })
+    }
+
     pub(crate) fn from_deleted_paths(
         repo_id: &RepoId,
         repo_root: &Path,
@@ -100,13 +113,6 @@ impl WorkspaceOverlayIngestBatch {
             ..Self::default()
         })
     }
-
-    fn is_empty(&self) -> bool {
-        self.modified_documents.is_empty()
-            && self.new_documents.is_empty()
-            && self.deleted_keys.is_empty()
-            && self.missing_keys.is_empty()
-    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -114,9 +120,7 @@ pub(crate) enum WorkspaceOverlayPublishPolicy {
     #[default]
     Refresh,
     Checkpoint,
-    AutoCheckpoint {
-        max_uncommitted_ops: u64,
-    },
+    Background,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -130,8 +134,6 @@ impl WorkspaceOverlayPublication {
         self == Self::Committed
     }
 }
-
-pub(crate) const DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS: u64 = 256;
 
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct WorkspaceOverlayRuntimeStats {
@@ -170,7 +172,45 @@ pub struct WorkspaceOverlayIndex {
     engine: IndexEngine,
     publish_policy: WorkspaceOverlayPublishPolicy,
     merge_state: Mutex<MergeRuntimeState>,
+    checkpoint_serial: Mutex<()>,
+    write_budget: Mutex<OverlayWriteBudget>,
     merge_state_hook: MergeStateHook,
+}
+
+// Bounds the source payload accumulated by the writer between staged flushes.
+// This does not bound the caller's prepared batch or tokenizer expansion.
+const OVERLAY_STAGE_SOURCE_BYTES: usize = 8 * 1024 * 1024;
+const OVERLAY_STAGE_OPERATIONS: usize = 1024;
+
+#[derive(Default)]
+struct OverlayWriteBudget {
+    failed: bool,
+    source_bytes: usize,
+    operations: usize,
+}
+
+impl OverlayWriteBudget {
+    fn ensure_healthy(&self) -> Result<()> {
+        if self.failed {
+            return Err(AppError::InvalidIndex(
+                "overlay write failed; reopen before further publication or maintenance".into(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn account(&mut self, writer: &IndexWriter, bytes: usize, operations: usize) -> Result<()> {
+        self.source_bytes = self.source_bytes.saturating_add(bytes);
+        self.operations = self.operations.saturating_add(operations);
+        if self.source_bytes >= OVERLAY_STAGE_SOURCE_BYTES
+            || self.operations >= OVERLAY_STAGE_OPERATIONS
+        {
+            writer.flush_unpublished()?;
+            self.source_bytes = 0;
+            self.operations = 0;
+        }
+        Ok(())
+    }
 }
 
 type MergeStateHook = Arc<dyn Fn(WorkspaceOverlayMergeEvent) + Send + Sync>;
@@ -193,12 +233,7 @@ impl WorkspaceOverlayIndex {
     }
 
     pub(crate) fn open(build_config: &BuildConfig) -> Result<Self> {
-        Self::open_with_policy(
-            build_config,
-            WorkspaceOverlayPublishPolicy::AutoCheckpoint {
-                max_uncommitted_ops: DEFAULT_WORKSPACE_OVERLAY_AUTO_CHECKPOINT_MAX_UNCOMMITTED_OPS,
-            },
-        )
+        Self::open_with_policy(build_config, WorkspaceOverlayPublishPolicy::Background)
     }
 
     pub(crate) fn open_with_policy(
@@ -213,25 +248,15 @@ impl WorkspaceOverlayIndex {
         publish_policy: WorkspaceOverlayPublishPolicy,
         merge_state_hook: MergeStateHook,
     ) -> Result<Self> {
-        Self::open_with_restore_mode(build_config, publish_policy, merge_state_hook, true)
-    }
-
-    pub(crate) fn open_with_policy_and_hook_manifest_only(
-        build_config: &BuildConfig,
-        publish_policy: WorkspaceOverlayPublishPolicy,
-        merge_state_hook: MergeStateHook,
-    ) -> Result<Self> {
-        Self::open_with_restore_mode(build_config, publish_policy, merge_state_hook, false)
-    }
-
-    fn open_with_restore_mode(
-        build_config: &BuildConfig,
-        publish_policy: WorkspaceOverlayPublishPolicy,
-        merge_state_hook: MergeStateHook,
-        full_restore: bool,
-    ) -> Result<Self> {
         migrate_legacy_overlay_storage(build_config)?;
         let engine_config = EngineConfig {
+            // Keep commonly queried delta content hot without hydrating the base.
+            query_source_cache_bytes: 512 * 1024 * 1024,
+            // Keep background tokenization bounded even when the dirty set is huge.
+            merge_policy: MergePolicyConfig {
+                max_merged_segment_bytes: 64 * 1024 * 1024,
+                ..MergePolicyConfig::default()
+            },
             shard_id: ShardId(format!(
                 "{}#workspace-overlay",
                 build_config.repo_path.to_string_lossy()
@@ -240,11 +265,7 @@ impl WorkspaceOverlayIndex {
             tokenizer: PostingTokenizerConfig::from(build_config),
             ..EngineConfig::default()
         };
-        let engine = if full_restore {
-            IndexEngine::open(engine_config)?
-        } else {
-            IndexEngine::open_manifest_only(engine_config)?
-        };
+        let engine = IndexEngine::open_staged(engine_config)?;
         Ok(Self::new_with_policy_and_hook(
             engine,
             publish_policy,
@@ -272,12 +293,22 @@ impl WorkspaceOverlayIndex {
             engine,
             publish_policy,
             merge_state: Mutex::new(MergeRuntimeState::default()),
+            checkpoint_serial: Mutex::new(()),
+            write_budget: Mutex::new(OverlayWriteBudget::default()),
             merge_state_hook,
         }
     }
 
     pub fn open_snapshot(&self) -> Result<IndexSnapshotReader> {
         self.engine.reader().open_snapshot()
+    }
+
+    pub(crate) fn retire(&self) {
+        self.engine.writer().retire();
+    }
+
+    pub(crate) fn needs_checkpoint(&self) -> bool {
+        self.engine.writer().needs_checkpoint()
     }
 
     pub(crate) fn writer_stats(&self) -> WriterStats {
@@ -294,12 +325,12 @@ impl WorkspaceOverlayIndex {
     pub(crate) fn manifest_source(
         &self,
     ) -> Result<Option<crate::index_engine::manifest::ManifestSource>> {
-        Ok(self.engine.admin().manifest()?.source)
+        Ok(self.engine.writer().visible_manifest().source)
     }
 
     pub(crate) fn runtime_stats(&self) -> Result<WorkspaceOverlayRuntimeStats> {
         let writer_stats = self.engine.writer().stats();
-        let manifest = self.engine.admin().manifest()?;
+        let manifest = self.engine.writer().visible_manifest();
         let state = match self.merge_state.lock() {
             Ok(guard) => guard,
             Err(poisoned) => poisoned.into_inner(),
@@ -328,6 +359,20 @@ impl WorkspaceOverlayIndex {
     }
 
     pub(crate) fn run_requested_merge(&self) -> Result<bool> {
+        let _serial = self
+            .checkpoint_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // Vacuum must not reclaim staged, unpublished segments. Queries continue
+        // reading their previous snapshot while this lock serializes mutations.
+        let write_guard = self
+            .write_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        write_guard.ensure_healthy()?;
+        if self.engine.writer().is_retired() {
+            return Ok(false);
+        }
         {
             let mut state = match self.merge_state.lock() {
                 Ok(guard) => guard,
@@ -342,7 +387,37 @@ impl WorkspaceOverlayIndex {
         }
         (self.merge_state_hook)(WorkspaceOverlayMergeEvent::StateChanged);
 
-        let merge_result = self.engine.admin().maintain();
+        let writer = self.engine.writer();
+        let captured = writer
+            .flush_unpublished()
+            .map(|_| (writer.needs_checkpoint()).then(|| writer.capture_checkpoint()));
+        drop(write_guard);
+        // Query publication and discovery continue while immutable artifacts are encoded.
+        let prepared = captured.and_then(|captured| {
+            if let Some(c) = &captured {
+                writer.persist_snapshot(&c.snapshot.manifest)?;
+            }
+            Ok(captured)
+        });
+        let write_guard = self
+            .write_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let merge_result = (|| {
+            if let Some(captured) = prepared? {
+                if !writer.finish_checkpoint(captured)? {
+                    return Ok(Default::default());
+                }
+            }
+            if writer.is_retired() {
+                return Ok(Default::default());
+            }
+            // A newer publication must not be replaced by a durable-only merge snapshot.
+            if writer.needs_checkpoint() {
+                return Ok(Default::default());
+            }
+            self.engine.admin().maintain_step()
+        })();
         if let Err(error) = &merge_result {
             eprintln!(
                 "flashgrep[overlay][warn] workspace overlay background merge failed: {error}"
@@ -366,27 +441,45 @@ impl WorkspaceOverlayIndex {
                 }
             }
         }
+        drop(write_guard);
+        if merge_result
+            .as_ref()
+            .is_ok_and(|stats| stats.merge_tasks > 0 || writer.needs_checkpoint())
+        {
+            // Do not drain every task while holding the writer budget. The
+            // maintenance worker gets a chance to publish queued file changes
+            // before the next bounded merge. A final no-op step clears the request.
+            self.request_background_merge();
+        }
         (self.merge_state_hook)(WorkspaceOverlayMergeEvent::StateChanged);
         merge_result.map(|stats| stats.merge_tasks > 0 || stats.vacuumed_files > 0)
     }
 
     pub(crate) fn checkpoint(&self) -> Result<()> {
+        let _serial = self
+            .checkpoint_serial
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut budget = self
+            .write_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        budget.ensure_healthy()?;
+        budget.failed = true;
         let writer = self.engine.writer();
         let _ = writer.flush()?;
         let _ = writer.commit()?;
+        *budget = OverlayWriteBudget::default();
         self.request_background_merge();
         Ok(())
     }
 
     pub(crate) fn rebuild_snapshot(&self, snapshot: &WorkspaceOverlaySnapshotState) -> Result<()> {
-        let writer = self.engine.writer();
-        for document in &snapshot.existing_documents {
-            writer.add_document(document.clone())?;
-        }
-        for key in &snapshot.deleted_keys {
-            writer.delete_document(key)?;
-        }
-        let _ = self.publish_after_write(&writer)?;
+        self.replace_batches(std::iter::once(Ok(WorkspaceOverlayIngestBatch {
+            new_documents: snapshot.existing_documents.clone(),
+            deleted_keys: snapshot.deleted_keys.clone(),
+            ..Default::default()
+        })))?;
         Ok(())
     }
 
@@ -394,23 +487,90 @@ impl WorkspaceOverlayIndex {
         &self,
         batch: &WorkspaceOverlayIngestBatch,
     ) -> Result<WorkspaceOverlayPublication> {
-        if batch.is_empty() {
-            return Ok(WorkspaceOverlayPublication::Committed);
-        }
+        self.ingest_batches(std::iter::once(Ok(batch)))
+    }
+
+    /// Lazily prepare each input batch while preserving one publication boundary.
+    pub(crate) fn ingest_batches<I, B>(&self, batches: I) -> Result<WorkspaceOverlayPublication>
+    where
+        I: IntoIterator<Item = Result<B>>,
+        B: std::borrow::Borrow<WorkspaceOverlayIngestBatch>,
+    {
+        self.write_batches(batches, false)
+    }
+
+    pub(crate) fn replace_batches<I, B>(&self, batches: I) -> Result<WorkspaceOverlayPublication>
+    where
+        I: IntoIterator<Item = Result<B>>,
+        B: std::borrow::Borrow<WorkspaceOverlayIngestBatch>,
+    {
+        self.write_batches(batches, true)
+    }
+
+    fn write_batches<I, B>(&self, batches: I, replace: bool) -> Result<WorkspaceOverlayPublication>
+    where
+        I: IntoIterator<Item = Result<B>>,
+        B: std::borrow::Borrow<WorkspaceOverlayIngestBatch>,
+    {
+        let mut budget = self
+            .write_budget
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        budget.ensure_healthy()?;
+        budget.failed = true;
         let writer = self.engine.writer();
-        for key in &batch.deleted_keys {
-            writer.delete_document(key)?;
+        if replace {
+            writer.begin_replacement();
+            budget.source_bytes = 0;
+            budget.operations = 0;
         }
-        for document in &batch.modified_documents {
-            writer.update_document(document.clone())?;
+
+        for batch in batches {
+            let batch = batch?;
+            let batch = batch.borrow();
+            for key in &batch.deleted_keys {
+                writer.delete_document(key)?;
+                budget.account(&writer, 0, 1)?;
+            }
+            for document in &batch.modified_documents {
+                writer.update_document(document.clone())?;
+                budget.account(&writer, document.source_bytes.len(), 2)?;
+            }
+            for document in &batch.new_documents {
+                writer.add_document(document.clone())?;
+                budget.account(&writer, document.source_bytes.len(), 1)?;
+            }
+            for key in &batch.missing_keys {
+                writer.delete_document(key)?;
+                budget.account(&writer, 0, 1)?;
+            }
+            for key in &batch.retracted_keys {
+                writer.retract_document(key)?;
+                budget.account(&writer, 0, 1)?;
+            }
         }
-        for document in &batch.new_documents {
-            writer.add_document(document.clone())?;
+        // Empty input still publishes updated manifest source metadata.
+        let publication = if replace {
+            writer.flush_unpublished()?;
+            let publication = if matches!(
+                self.publish_policy,
+                WorkspaceOverlayPublishPolicy::Background
+            ) {
+                self.publish_after_write(&writer)?
+            } else {
+                writer.commit()?;
+                WorkspaceOverlayPublication::Committed
+            };
+            self.request_background_merge();
+            publication
+        } else {
+            self.publish_after_write(&writer)?
+        };
+        if publication.is_durable() {
+            *budget = OverlayWriteBudget::default();
         }
-        for key in &batch.missing_keys {
-            writer.delete_document(key)?;
-        }
-        self.publish_after_write(&writer)
+        budget.failed = false;
+        Ok(publication)
     }
 
     fn publish_after_write(
@@ -427,18 +587,11 @@ impl WorkspaceOverlayIndex {
                 self.request_background_merge();
                 Ok(WorkspaceOverlayPublication::Committed)
             }
-            WorkspaceOverlayPublishPolicy::AutoCheckpoint {
-                max_uncommitted_ops,
-            } => {
-                let stats = writer.stats();
-                if stats.uncommitted_ops >= max_uncommitted_ops {
-                    let _ = writer.commit()?;
-                    self.request_background_merge();
-                    Ok(WorkspaceOverlayPublication::Committed)
-                } else {
-                    writer.refresh()?;
-                    Ok(WorkspaceOverlayPublication::Refreshed)
-                }
+            WorkspaceOverlayPublishPolicy::Background => {
+                writer.flush_unpublished()?;
+                writer.refresh()?;
+                self.request_background_merge();
+                Ok(WorkspaceOverlayPublication::Refreshed)
             }
         }
     }

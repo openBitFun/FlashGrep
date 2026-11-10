@@ -4,15 +4,16 @@ mod mmap;
 mod path_map;
 mod postings;
 mod reader;
+mod source_cache;
 mod term_dict;
 mod writer;
 
 pub(crate) use format::{
-    encoded_source_bytes_len, file_name_from_logical_path, language_from_logical_path,
-    read_encoded_source_bytes_view, read_index_document_from_inline_slice, read_segment_meta,
-    write_path_offsets_file, write_segment_documents, write_segment_meta, write_source_bytes,
-    FileSegmentDocTable, SegmentDocRecord, SegmentDocSourceKind, DOCS_FILE, PATH_MAP_FILE,
-    PATH_OFFSETS_FILE, SEGMENT_META_FILE,
+    file_name_from_logical_path, language_from_logical_path, read_encoded_source_bytes_view,
+    read_index_document_from_inline_slice, read_segment_meta, write_path_offsets_file,
+    write_segment_documents, write_segment_meta, write_source_bytes, FileSegmentDocTable,
+    SegmentDocRecord, SegmentDocSourceKind, DOCS_FILE, PATH_MAP_FILE, PATH_OFFSETS_FILE,
+    SEGMENT_META_FILE,
 };
 pub use format::{DeleteSegmentBuildOutput, DeleteSegmentMeta, SegmentBuildOutput, SegmentMeta};
 pub(crate) use mmap::{advise_mmap_random, advise_mmap_sequential};
@@ -28,4 +29,7 @@ pub(crate) use term_dict::{
     collect_query_posting_terms, ordered_posting_keys, write_term_dict_file, TermDictEntry,
     TermDictStreamWriter, TermDictionary,
 };
-pub(crate) use writer::{FileSegmentStore, SegmentStore};
+pub(crate) use writer::{FileSegmentStore, MemorySegmentStore, SegmentStore};
+
+mod staged;
+pub(crate) use staged::StagedSegmentStore;

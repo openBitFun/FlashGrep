@@ -199,16 +199,38 @@ fn collect_ascii_span_fallback_trigrams(
 
         let span = &bytes[start..end];
         let char_len = span.len();
-        if char_len >= options.min_sparse_len {
-            let char_offsets = (0..=span.len()).collect::<Vec<_>>();
-            let weights = build_bigram_weights(span, &char_offsets);
-            if build_all_intervals(&weights, options).is_empty() {
-                collect_trigram_hashes(span, out);
-            }
+        if char_len >= options.min_sparse_len && !ascii_span_has_sparse_interval(span, options) {
+            collect_trigram_hashes(span, out);
         }
 
         start = end;
     }
+}
+
+/// The fallback only needs existence, not every interval. For the usual
+/// three-character minimum, most identifiers finish after two bigram hashes.
+fn ascii_span_has_sparse_interval(bytes: &[u8], options: &TokenizerOptions) -> bool {
+    debug_assert!(bytes.is_ascii());
+    let weights_len = bytes.len().saturating_sub(1);
+    let min_span = options.min_sparse_len.saturating_sub(2).max(1);
+    let max_span = options.max_sparse_len.saturating_sub(2).max(1);
+    if min_span >= weights_len || min_span > max_span {
+        return false;
+    }
+    for left in 0..weights_len - min_span {
+        let left_weight = crc32fast::hash(&bytes[left..left + 2]);
+        let end_right = left.saturating_add(max_span).min(weights_len - 1);
+        let mut interior_max = u32::MIN;
+        for right in left + 1..=end_right {
+            let right_weight = crc32fast::hash(&bytes[right..right + 2]);
+            if right >= left + min_span && left_weight > interior_max && right_weight > interior_max
+            {
+                return true;
+            }
+            interior_max = interior_max.max(right_weight);
+        }
+    }
+    false
 }
 
 fn collect_trigram_hashes(bytes: &[u8], out: &mut Vec<u64>) {
@@ -246,10 +268,40 @@ struct Interval {
 #[cfg(test)]
 mod tests {
     use super::{
-        build_all_intervals, build_bigram_weights, build_char_offsets, build_covering_intervals,
-        is_sparse_boundary, SparseNgramTokenizer,
+        ascii_span_has_sparse_interval, build_all_intervals, build_bigram_weights,
+        build_char_offsets, build_covering_intervals, is_sparse_boundary, SparseNgramTokenizer,
     };
     use crate::tokenizer::{Tokenizer, TokenizerOptions};
+
+    #[test]
+    fn ascii_interval_existence_matches_full_interval_construction() {
+        let mut seed = 0x5eed_u64;
+        for len in 0..96 {
+            for _ in 0..16 {
+                let bytes = (0..len)
+                    .map(|_| {
+                        seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                        ((seed >> 32) as u8) & 0x7f
+                    })
+                    .collect::<Vec<_>>();
+                let offsets = (0..=len).collect::<Vec<_>>();
+                let weights = build_bigram_weights(&bytes, &offsets);
+                for (min_sparse_len, max_sparse_len) in
+                    [(0, 0), (3, 3), (3, 8), (4, 8), (5, 5), (8, 12), (4, 3)]
+                {
+                    let options = TokenizerOptions {
+                        min_sparse_len,
+                        max_sparse_len,
+                    };
+                    assert_eq!(
+                        ascii_span_has_sparse_interval(&bytes, &options),
+                        !build_all_intervals(&weights, &options).is_empty(),
+                        "bytes={bytes:?}, options={options:?}"
+                    );
+                }
+            }
+        }
+    }
 
     #[test]
     fn sparse_tokenizer_emits_some_tokens_for_ascii() {

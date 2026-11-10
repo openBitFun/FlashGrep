@@ -66,8 +66,38 @@ impl CorpusMode {
     }
 }
 
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    Default,
+    PartialEq,
+    Eq,
+    serde::Serialize,
+    serde::Deserialize,
+    clap::ValueEnum,
+)]
+#[serde(rename_all = "snake_case")]
+pub enum QueryFreshness {
+    #[default]
+    Published,
+    Reconciled,
+    Filesystem,
+}
+
+/// Git is an optional optimization. Filesystem mode never discovers a Git root
+/// or uses commit snapshots/membership, even inside an existing worktree.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GitMode {
+    #[default]
+    Auto,
+    Filesystem,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BuildConfig {
+    pub git_mode: GitMode,
     pub repo_path: PathBuf,
     pub storage_root: PathBuf,
     pub tokenizer: TokenizerMode,
@@ -81,6 +111,7 @@ pub struct BuildConfig {
 impl Default for BuildConfig {
     fn default() -> Self {
         Self {
+            git_mode: GitMode::Auto,
             repo_path: PathBuf::new(),
             storage_root: PathBuf::new(),
             tokenizer: TokenizerMode::SparseNgram,
@@ -96,6 +127,7 @@ impl Default for BuildConfig {
 impl BuildConfig {
     pub(crate) fn normalized(&self) -> Result<Self> {
         Ok(Self {
+            git_mode: self.git_mode,
             repo_path: normalize_existing_path(&self.repo_path)?,
             storage_root: normalize_path_from_cwd(&self.storage_root)?,
             tokenizer: self.tokenizer,
