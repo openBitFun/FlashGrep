@@ -34,15 +34,11 @@ The benchmark that motivated this project was run on Chromium, a repository with
 
 These figures describe the Chromium benchmark setup documented in the project materials. They are a reference point for the design, not a promise that every repository or query will see the same speedup. See [benchmark notes](docs/chromium_query_benchmark_2026-07-25.md) and [workspace results](docs/filesystem_workspace_results.md) for the measurement details.
 
-![BitFun Chromium tool-time comparison](docs/assets/bitfun-chromium-tool-time.png)
+![FlashGrep query performance](docs/assets/flashgrep-query-performance.png)
 
-<p align="center"><em>A representative workflow dropped from roughly 145.9 seconds to 7.82 seconds after indexed search replaced repeated grep and glob scans.</em></p>
+<p align="center"><em>Representative Chromium query timings, with FlashGrep in mint and ripgrep in coral. The documented query set averages 36.1× faster.</em></p>
 
-![FlashGrep versus ripgrep benchmark](docs/assets/flashgrep-ripgrep-36x.png)
-
-<p align="center"><em>Across the documented Chromium query set, the internal comparison reports an average 36.1× speedup over ripgrep.</em></p>
-
-![FlashGrep Chromium index-build cost](docs/assets/flashgrep-index-build.png)
+![FlashGrep index snapshot](docs/assets/flashgrep-index-snapshot.png)
 
 ## What it provides
 
