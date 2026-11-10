@@ -10,6 +10,12 @@
 
 FlashGrep is an open-source project in the [openBitFun](https://github.com/openBitFun) organization and the search engine used by [BitFun](https://github.com/GCWing/OpenBitFun). It provides a Rust daemon, a stable cross-process protocol, and an MCP server that can be embedded in an IDE, agent runtime, or desktop application.
 
+<p align="center">
+  <img src="docs/assets/flashgrep-search-workflow.png" alt="FlashGrep narrows a repository search through an index before exact verification" width="820">
+</p>
+
+<p align="center"><em>Search the index first, then verify only the small set of relevant files.</em></p>
+
 [中文](#中文) · [Architecture](#architecture) · [MCP integration](#mcp-integration)
 
 ## Why FlashGrep
@@ -27,6 +33,16 @@ The benchmark that motivated this project was run on Chromium, a repository with
 - the initial base index took about **79.0 s** to build and occupied about **2.5 GB**.
 
 These figures describe the Chromium benchmark setup documented in the project materials. They are a reference point for the design, not a promise that every repository or query will see the same speedup. See [benchmark notes](docs/chromium_query_benchmark_2026-07-25.md) and [workspace results](docs/filesystem_workspace_results.md) for the measurement details.
+
+![BitFun Chromium tool-time comparison](docs/assets/bitfun-chromium-tool-time.png)
+
+<p align="center"><em>A representative workflow dropped from roughly 145.9 seconds to 7.82 seconds after indexed search replaced repeated grep and glob scans.</em></p>
+
+![FlashGrep versus ripgrep benchmark](docs/assets/flashgrep-ripgrep-36x.png)
+
+<p align="center"><em>Across the documented Chromium query set, the internal comparison reports an average 36.1× speedup over ripgrep.</em></p>
+
+![FlashGrep Chromium index-build cost](docs/assets/flashgrep-index-build.png)
 
 ## What it provides
 
