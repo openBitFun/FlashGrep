@@ -442,10 +442,11 @@ mod tests {
         )
         .expect("scan_paths should succeed");
 
-        let paths = scanned
+        let mut paths = scanned
             .into_iter()
             .map(|file| file.path)
             .collect::<Vec<_>>();
+        paths.sort();
         assert_eq!(
             paths,
             vec![

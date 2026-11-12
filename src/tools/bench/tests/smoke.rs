@@ -92,6 +92,8 @@ fn cold_bench_runs_hook_before_each_iteration() {
         "Шерлок Холмс встретил Джон Уотсон.\n",
     )
     .expect("test should succeed");
+    ensure_git_repo_with_head(&suite_dir.join("linux"));
+    ensure_git_repo_with_head(&suite_dir.join("subtitles"));
 
     let hook_path = suite_dir.join("cold-hook-count.txt");
     let hook = format!("printf x >> {}", hook_path.display());
