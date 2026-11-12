@@ -1,6 +1,7 @@
 # FlashGrep
 
-[![CI](https://github.com/openBitFun/FlashGrep/actions/workflows/build-packages.yml/badge.svg)](https://github.com/openBitFun/FlashGrep/actions/workflows/build-packages.yml)
+[![Checks](https://github.com/openBitFun/FlashGrep/actions/workflows/ci.yml/badge.svg)](https://github.com/openBitFun/FlashGrep/actions/workflows/ci.yml)
+[![Packages](https://github.com/openBitFun/FlashGrep/actions/workflows/build-packages.yml/badge.svg)](https://github.com/openBitFun/FlashGrep/actions/workflows/build-packages.yml)
 [![Rust](https://img.shields.io/badge/rust-2021-orange.svg)](https://www.rust-lang.org/)
 [![License](https://img.shields.io/badge/license-MIT-green.svg)](LICENSE)
 
