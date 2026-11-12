@@ -8,7 +8,7 @@
 >
 > FlashGrep turns repeated repository-wide `grep` and `glob` calls into an indexed, incremental search service for coding agents. It is designed for the moment when an agent should spend its time understanding code, not waiting for the next scan to finish.
 
-FlashGrep is an open-source project in the [openBitFun](https://github.com/openBitFun) organization and the search engine used by [BitFun](https://github.com/GCWing/OpenBitFun). It provides a Rust daemon, a stable cross-process protocol, and an MCP server that can be embedded in an IDE, agent runtime, or desktop application.
+FlashGrep is an open-source project in the [openBitFun](https://github.com/openBitFun) organization and the search engine used by [OpenBitFun](https://github.com/GCWing/OpenBitFun). It provides a Rust daemon, a stable cross-process protocol, and an MCP server that can be embedded in an IDE, agent runtime, or desktop application.
 
 <p align="center">
   <img src="docs/assets/flashgrep-search-workflow.png" alt="FlashGrep narrows a repository search through an index before exact verification" width="820">
@@ -29,7 +29,7 @@ FlashGrep builds a repository index once, uses character-level inverted indexes 
 The benchmark that motivated this project was run on Chromium, a repository with nearly **60 million lines of code** and more than **4 GB of Git-tracked files**:
 
 - indexed search reduced the search portion of a representative agent workflow from about **137.2 s to 7.82 s**;
-- across a broader set of Chromium queries, FlashGrep averaged about **36.1×** the throughput of `ripgrep` in BitFun's internal comparison;
+- across a broader set of Chromium queries, FlashGrep averaged about **36.1×** the throughput of `ripgrep` in OpenBitFun's internal comparison;
 - the initial base index took about **79.0 s** to build and occupied about **2.5 GB**.
 
 These figures describe the Chromium benchmark setup documented in the project materials. They are a reference point for the design, not a promise that every repository or query will see the same speedup. See [benchmark notes](docs/chromium_query_benchmark_2026-07-25.md) and [workspace results](docs/filesystem_workspace_results.md) for the measurement details.
@@ -234,9 +234,9 @@ FlashGrep is released under the [MIT License](LICENSE). Third-party dependencies
 
 ## 中文
 
-FlashGrep 是 openBitFun 组织下的高性能代码检索引擎，也是 BitFun 用来加速大仓库代码搜索的基础设施。它把反复执行的 `grep` / `glob` 调用变成可复用的增量索引服务：先用字符级倒排索引快速缩小候选文件范围，再对候选文件执行精确的 regex 验证。
+FlashGrep 是 openBitFun 组织下的高性能代码检索引擎，也是 OpenBitFun 用来加速大仓库代码搜索的基础设施。它把反复执行的 `grep` / `glob` 调用变成可复用的增量索引服务：先用字符级倒排索引快速缩小候选文件范围，再对候选文件执行精确的 regex 验证。
 
-在 Chromium 这类接近 6000 万行代码、Git 跟踪文件超过 4 GB 的真实大仓库上，FlashGrep 的基础索引约 79 秒完成，索引大小约 2.5 GB；在 BitFun 内部的一组检索任务中，相比 `ripgrep` 平均约 36.1 倍加速。具体数据依赖仓库、查询集合、缓存状态和硬件，完整口径请看上面的 benchmark 文档。
+在 Chromium 这类接近 6000 万行代码、Git 跟踪文件超过 4 GB 的真实大仓库上，FlashGrep 的基础索引约 79 秒完成，索引大小约 2.5 GB；在 OpenBitFun 内部的一组检索任务中，相比 `ripgrep` 平均约 36.1 倍加速。具体数据依赖仓库、查询集合、缓存状态和硬件，完整口径请看上面的 benchmark 文档。
 
 它支持：
 
