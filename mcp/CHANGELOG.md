@@ -1,5 +1,11 @@
 # Changelog
 
+## v0.2.17 - 2026-11-16
+
+- Published the OpenBitFun distribution with the current indexed workspace and MCP implementation.
+- Added CI coverage for Rust formatting, Clippy, unit and integration tests, MCP checks, and reproducible Linux builds.
+- Added benchmark documentation and refreshed the README with OpenBitFun branding and search performance visuals.
+
 ## v0.2.16 - 2026-09-01
 
 - Fixed `Too many open files (os error 24)` when a long-lived daemon opened many Git-backed base segments: segment readers now share a lazy, bounded `git cat-file --batch` pool instead of retaining one child process and three pipes per segment.

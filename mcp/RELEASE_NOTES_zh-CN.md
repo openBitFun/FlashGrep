@@ -1,5 +1,23 @@
 # flashgrep MCP 变更说明
 
+发布时间：2026-11-16 +0800
+
+## v0.2.17
+
+### 本次包内容
+
+- MCP Server 版本：`0.2.17`
+- 内置 `flashgrep` 后端版本：`0.2.17`
+- 继续提供 Linux、macOS 和 Windows 六个平台的 release 二进制，以及 `flashgrep-mcp.zip`。
+
+### 关键改动
+
+- 发布当前 OpenBitFun 版本的索引工作区和 MCP 实现。
+- 增加 Rust 格式检查、Clippy、单元测试、集成测试和 MCP 检查。
+- 增加可复现的 Linux 构建流程，并刷新 README、品牌说明和基准测试可视化内容。
+
+## v0.2.16
+
 发布时间：2026-09-01 +0800
 
 ## 本次包内容
