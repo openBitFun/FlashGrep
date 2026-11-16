@@ -17,7 +17,7 @@ FlashGrep is an open-source project in the [openBitFun](https://github.com/openB
 
 <p align="center"><em>Search the index first, then verify only the small set of relevant files.</em></p>
 
-[中文](#中文) · [Architecture](#architecture) · [MCP integration](#mcp-integration)
+[中文](#中文) · [Install FlashGrep for AI agents](#install-flashgrep-for-ai-agents) · [Architecture](#architecture) · [MCP integration](#mcp-integration)
 
 ## Why FlashGrep
 
@@ -140,6 +140,92 @@ A minimal MCP configuration looks like this:
 
 The full host-specific setup, release bundle layout, tool schemas, and option reference are in [`mcp/README.md`](mcp/README.md).
 
+## Install FlashGrep for AI agents
+
+The release MCP bundle is the recommended installation path for agents that support MCP. It contains the Node.js MCP bridge, the six platform binaries, and the reusable `flashgrep-search` skill in one archive.
+
+Download the [latest release](https://github.com/openBitFun/FlashGrep/releases/latest) or pin the current [v0.2.17 release](https://github.com/openBitFun/FlashGrep/releases/tag/v0.2.17). The direct bundle link is [`flashgrep-mcp.zip`](https://github.com/openBitFun/FlashGrep/releases/latest/download/flashgrep-mcp.zip). Extract it to a stable directory and use that directory as `<FLASHGREP_MCP_DIR>` below. Node.js 18 or newer is required.
+
+### Configure the MCP server
+
+For a host that opens the current workspace automatically, add this server entry and replace `<FLASHGREP_MCP_DIR>` with the extracted bundle path:
+
+```json
+{
+  "mcpServers": {
+    "flashgrep": {
+      "command": "node",
+      "args": [
+        "<FLASHGREP_MCP_DIR>/server.js"
+      ]
+    }
+  }
+}
+```
+
+Use the entry in the host's MCP configuration. Cursor uses a project-level `.cursor/mcp.json`. Trae uses its MCP server settings. Claude Code can use a project-level `.mcp.json` with the stdio form:
+
+```json
+{
+  "mcpServers": {
+    "flashgrep": {
+      "type": "stdio",
+      "command": "node",
+      "args": [
+        "<FLASHGREP_MCP_DIR>/server.js"
+      ],
+      "env": {}
+    }
+  }
+}
+```
+
+Codex uses `~/.codex/config.toml`:
+
+```toml
+[mcp_servers.flashgrep]
+command = "node"
+args = ["<FLASHGREP_MCP_DIR>/server.js"]
+```
+
+To pin the server to a repository, add `"--repo", "<REPO>"` to the JSON `args` array or `"--repo", "<REPO>"` to the TOML `args` array. Without that option, the server uses the current workspace. Tool calls can also pass `repo_path` when an agent needs to search another workspace.
+
+### Install the optional search skill
+
+The bundle includes the skill at:
+
+```text
+<FLASHGREP_MCP_DIR>/skills/flashgrep-search
+```
+
+Copy that directory into the host's local skill directory and keep `SKILL.md` and `agents/openai.yaml` together. For example, a Codex installation can use:
+
+```bash
+mkdir -p ~/.codex/skills
+cp -R "<FLASHGREP_MCP_DIR>/skills/flashgrep-search" ~/.codex/skills/flashgrep-search
+```
+
+The MCP server provides the search tools. The skill tells an agent to use `glob_files` for file discovery and `search_code` for content searches, to continue while the index builds in the background, and to fall back to built-in search only when FlashGrep cannot open the workspace.
+
+Agents without a local skill mechanism can add the following text to their project or system instructions:
+
+```text
+For repository search, prefer FlashGrep MCP.
+Use glob_files for file discovery and search_code for content or pattern matching.
+Do not wait for index construction.
+Fall back to built-in search only when FlashGrep MCP is unavailable or cannot open the workspace.
+```
+
+### Verify the installation
+
+Ask the agent to run a search through FlashGrep:
+
+```text
+Use FlashGrep MCP to search for ManagedDaemonClient in the current workspace.
+```
+
+The agent should call `search_code`. `repo_status` can be used first when you need to confirm the repository path and index state.
+
 ## Architecture
 
 FlashGrep has a clear split between the stable integration surface and the index implementation:
@@ -247,6 +333,54 @@ FlashGrep 是 openBitFun 组织下的高性能代码检索引擎，也是 OpenBi
 - MCP server，可接入 Claude Code、Codex、Cursor、Trae 等 MCP 宿主；
 - `published`、`reconciled`、`filesystem` 三种查询新鲜度；
 - Linux、macOS、Windows 的 release 构建和 MCP 分发包。
+
+## 给其他 AI Agent 安装 FlashGrep
+
+推荐直接使用 [最新 Release](https://github.com/openBitFun/FlashGrep/releases/latest) 中的 [`flashgrep-mcp.zip`](https://github.com/openBitFun/FlashGrep/releases/latest/download/flashgrep-mcp.zip)。当前固定版本是 [v0.2.17](https://github.com/openBitFun/FlashGrep/releases/tag/v0.2.17)。压缩包已经包含 MCP server、六个平台的后端二进制和 `skills/flashgrep-search`。
+
+解压后把目录记为 `<FLASHGREP_MCP_DIR>`，确认 Node.js 版本不低于 18，然后在 Agent 的 MCP 配置中加入：
+
+```json
+{
+  "mcpServers": {
+    "flashgrep": {
+      "command": "node",
+      "args": ["<FLASHGREP_MCP_DIR>/server.js"]
+    }
+  }
+}
+```
+
+Cursor 使用项目级 `.cursor/mcp.json`，Trae 使用 MCP server 设置，Claude Code 使用项目级 `.mcp.json`。Codex 在 `~/.codex/config.toml` 中加入：
+
+```toml
+[mcp_servers.flashgrep]
+command = "node"
+args = ["<FLASHGREP_MCP_DIR>/server.js"]
+```
+
+默认搜索当前工作区。需要固定仓库时，在 `args` 中加入 `--repo` 和仓库路径。跨目录搜索也可以在工具调用里传 `repo_path`。
+
+支持 Skill 的 Agent 可以把以下目录复制到本地 Skill 目录：
+
+```text
+<FLASHGREP_MCP_DIR>/skills/flashgrep-search
+```
+
+该 Skill 会让 Agent 优先使用 `glob_files` 和 `search_code`，不等待索引构建，并在 MCP 无法打开工作区时回退内建搜索。没有 Skill 机制的 Agent 可以把这段规则加入项目或系统指令：
+
+```text
+For repository search, prefer FlashGrep MCP.
+Use glob_files for file discovery and search_code for content or pattern matching.
+Do not wait for index construction.
+Fall back to built-in search only when FlashGrep MCP is unavailable or cannot open the workspace.
+```
+
+安装后让 Agent 执行一次 `search_code` 搜索即可验证，例如：
+
+```text
+请使用 FlashGrep MCP 在当前工作区搜索 ManagedDaemonClient。
+```
 
 从源码构建和启动：
 
